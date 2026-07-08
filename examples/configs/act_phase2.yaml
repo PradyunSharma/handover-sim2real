@@ -1,0 +1,66 @@
+# Phase-2 ACT training config (temporal transformer + CVAE action chunking).
+#
+# Used by examples/train_act.py. Mirrors bc_phase1.yaml; the DATA block and the
+# PointNet++ / pretrained fields are shared with Phase-1. The MODEL.<transformer>
+# and EXEC blocks are new. Sizing is tuned for ~700 episodes x ~20 steps — do NOT
+# import ACT's stock k=100 / d_model=512 (episodes are only ~20 steps long).
+
+DATA:
+  train_h5: output/bc_dataset/train.h5
+  # Keep val as a SEPARATE file (already episode-disjoint) — never slice val
+  # steps out of train, or overlapping chunks leak targets across the split.
+  val_h5:
+  pc_channels:     5      # xyz + ycb_flag + hand_flag
+  robot_state_dim: 32     # joint_pos(9)+joint_vel(9)+ee_pose(7)+gripper(1)+prev_act(6)
+  action_dim:      7      # Δpos(3)+Δeuler(3)+gripper_cmd(1)
+
+MODEL:
+  # ----- per-frame encoders (reused from Phase-1) -----
+  feature_dim:        256   # F — scene & robot encoders each output this width
+  robot_hidden:       128
+  pointnet_scale:     1
+  pointnet_radius:    0.02
+  pointnet_nclusters: 32
+  use_prev_act:       false # drop prev_action(6): copycat guard + removes the
+                            # "what is prev_act under chunked execution" ambiguity.
+
+  # ----- temporal transformer + ACT decoder -----
+  history_len:     4    # T observation frames (1 disables the temporal part)
+  chunk_len:       8    # k future actions predicted per step (~40% of a 20-step ep)
+  d_model:         256
+  n_heads:         4
+  enc_layers:      3    # temporal encoder depth
+  dec_layers:      3    # chunk decoder depth
+  cvae_enc_layers: 2    # CVAE posterior encoder depth
+  dropout:         0.1
+  latent_dim:      32
+  use_cvae:        true # false => z=0 always, KL term vanishes (ablation)
+
+  # ----- PointNet++ warm-start (same checkpoint as Phase-1, 68/68 exact) -----
+  pc_pretrained:   output/cvpr2023_models/2022-10-16_08-48-30_finetune_5_s0_train/DDPG_state_feat_PandaYCBEnv_latest
+  freeze_pc:       false
+
+OPTIM:
+  kind:         adamw
+  lr:           1.0e-4     # transformers from scratch like a lower lr than the MLP
+  weight_decay: 1.0e-4
+  scheduler:    cosine     # none | cosine | step
+
+LOSS:
+  gripper_weight: 1.0      # weight on chunk BCE term vs SmoothL1 pose term
+  kl_weight:      10.0     # beta on the CVAE KL term (ACT default; collapse is benign)
+
+EXEC:
+  mode:        ensemble    # ensemble | open_loop  (closed-loop rollout only)
+  ensemble_m:  0.01        # exponential temporal-ensembling rate
+
+TRAIN:
+  batch_size:      32      # smaller than Phase-1: T x PointNet++ forwards per step
+  num_epochs:      100
+  num_workers:     4
+  device:          cuda
+  mixed_precision: true    # T x PointNet++ forwards — AMP recommended
+  val_every:       1
+  save_every:      5
+  grad_clip:       1.0
+  seed:            0

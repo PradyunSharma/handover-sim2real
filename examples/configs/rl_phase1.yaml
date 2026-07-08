@@ -1,0 +1,179 @@
+# Phase-3 RL config — online TD3 + BC (GA-DDPG-style blend).
+#
+# Used by examples/train_rl.py. The scene/encoder/head dims come from the BC run
+# you warm-start from (--bc-run's config.yaml is authoritative), so the MODEL
+# block here only sets the critic-specific + clock knobs. Sim settings come from
+# --sim-cfg (e.g. examples/pretrain.yaml).
+
+DATA:
+  num_pts:         1024
+  pc_channels:     5
+
+MODEL:
+  q_hidden:  [256, 256]   # twin-critic head width
+  clock_dim: 1            # remaining-steps clock width (fed to actor + critic)
+
+RL:
+  gamma:        0.95      # discount (must be <1: finite-horizon, clock-in-state)
+  tau:          0.005     # Polyak soft-update rate for targets
+  policy_noise: 0.2       # TD3 target-smoothing noise std (normalized action units)
+  noise_clip:   0.5       # target-smoothing noise clamp
+  act_limit:    5.0       # normalized action clamp (|Δ| in std units)
+  policy_delay: 2         # TD3 delayed actor/target updates
+  mc_blend:     0.5       # critic target = (1-b)*Bellman + b*MC return (sparse-reward aid)
+  # pose-BC loss form (rl_run10): "pm" = point-matching on Panda gripper control
+  # points (proper SE(3) metric — weights wrist ROTATION by its real effect on the
+  # gripper, unlike the old L1 that summed metres+radians; targets the eval_min_rot
+  # ~0.4 rad plateau, GA-DDPG core/loss.py pose_bc_loss). "smooth_l1" = the old raw
+  # normalized L1. NOTE: PM is in metres so its magnitude is ~5-8x SMALLER than the
+  # normalized smooth_l1 — bc_weight is raised to compensate (calibrated so the BC
+  # term ~2x the pinned PG term |pg|~alpha; see the smoke calibration).
+  pose_loss:    pm
+  bc_weight:    80.0      # weight on the actor pose-BC term. Large because the PM loss
+                          # is small-valued (metres of control-point motion; smoke: raw
+                          # PM ~0.004-0.007 on warm-started states vs the pinned |pg|=
+                          # alpha=0.25). 80 puts the BC term ~1.3-2x the PG term EARLY
+                          # (BC leads while it learns the gross motion), and since PM
+                          # shrinks as the policy sharpens, PG naturally takes over to
+                          # refine the last-cm reach — a built-in BC->PG handoff. The
+                          # BC target is OMG at the policy's own visited states (online
+                          # DAgger): teaches the fine approach + the wrist rotation.
+  gripper_bc_weight: 1.0  # weight on the actor gripper BCE term (proximity label:
+                          # open far / close near). Agrees with the close reward;
+                          # the policy still executes its own logit at deployment.
+  gripper_close_weight_max: 10.0  # class-balance the gripper BCE: "close" (near-
+                          # grasp) is the rare label per batch, so plain BCE learns
+                          # only "open" and the gripper stays pinned open (BC base:
+                          # gprob==1.0 the whole rollout, never fires). Upweight close
+                          # examples to ~match the open mass, capped here.
+  aux_weight:   0.5       # goal-auxiliary: regress the EE-relative grasp pose on both
+                          # encoders (0 disables). Dense supervision that shapes the
+                          # PointNet++ features for the sparse-reward regime.
+  # reward: how a committed close is scored (terminal either way).
+  #   stable_grasp = contact-hold grasp check — hold the close `hold_steps` policy-
+  #     steps and require the object to be secured (handover-sim's release handshake
+  #     fired AND no drop). Paper-faithful (cf. GA-DDPG's lift test), no OMG grasp
+  #     pose needed for the reward, and closest to the real benchmark.
+  #   proximity = EE within (close_pos_thresh 0.02 m, close_rot_thresh 0.34 rad) of
+  #     the OMG grasp pose at the close (cheaper, but a geometric proxy).
+  reward_mode:  stable_grasp
+  hold_steps:   3
+  # hand-collision grasp filter (paper): OMG prunes grasp candidates whose gripper
+  # would collide with the human hand, so the expert reaches a hand-free grasp
+  # instead of driving into the hand (FAILURE_HUMAN_CONTACT). Applies to demo
+  # collection and the online OMG expert. A scene is skipped if every grasp collides.
+  hand_collision_filter: true
+  hand_collision_thresh: 0.08   # m, gripper control point -> nearest hand point.
+                                # Checked at the FINAL grasp; 0.08 (not 0.04) because
+                                # the sparse control-point/skeleton metric under-reads
+                                # true mesh clearance by a few cm (calibrated: 0.08
+                                # eliminates human-contact without over-pruning; 0.10
+                                # starts dropping good scenes).
+  hand_points_radius:    0.35   # m, keep MANO links within this of the object
+  # PG/BC blend: false = GA-DDPG mix schedule (mix_start->mix_end); true = TD3+BC alpha/|Q|.
+  # MUST be true here: with a FIXED lambda the PG term -(lam*Q) grows unbounded as the
+  # actor exploits the critic's out-of-distribution extrapolation (rl_run1 diverged in
+  # ~15 iters: Q(s,pi(s)) hit 1.6e5, pg_loss -1.6e4, bc_loss 2e6, 0% success forever).
+  # pg_normalize scales the PG term by 1/mean|Q| so it stays ~alpha and can't starve BC.
+  pg_normalize: true
+  alpha:        0.25      # TD3+BC PG scale (pg_normalize pins the PG term ~alpha).
+                          # RAISED 0.1->0.25 for rl_run10: alpha=0.1 was for the
+                          # reward-STARVED regime (rl_run8, buf_pos~0 — PG had no
+                          # signal). rl_run9's curriculum made buf_pos>0 and the policy
+                          # now earns successes, so PG finally has signal to push the
+                          # last-cm reach (0.06->0.02 m) and refine the grasp. Kept
+                          # below the bc term early (bc_weight*PM ~1.3-2x this) so BC
+                          # still anchors; PG leads later as PM shrinks. Raising alpha
+                          # further risks the rl_run1 OOD blowup — watch q_pi vs q_mean.
+  mix_start:    0.1       # RL weight early (BC-dominated)
+  mix_end:      0.2       # RL weight late
+  mix_ramp:     50000     # updates to ramp mix_start->mix_end
+  actor_lr:     3.0e-4
+  critic_lr:    3.0e-4
+  grad_clip:    1.0
+
+LOOP:
+  capacity:             20000   # replay transitions (~0.8 GB at 1024x5 clouds)
+  # offline demo pre-training: before any rollout, run this many gradient updates
+  # on the demo pool ONLY (calibrates the critic + actor so PG doesn't hit a random
+  # critic — the rl_run1 divergence root). 0 disables. Fresh runs only (not --resume).
+  pretrain_updates:     2000
+  # demo mixing: fraction of each online batch drawn from the permanent demo pool
+  # (DDPGfD). Scheduled demo_frac_start -> demo_frac_end over demo_frac_ramp iters,
+  # then HELD at demo_frac_end (a permanent floor — never 0, since the online expert
+  # produces no successes so the demos are the only +1 source). If the *_start knob
+  # is absent it falls back to the constant demo_frac.
+  demo_frac:            0.25    # fallback constant (used only if demo_frac_start unset)
+  demo_frac_start:      0.5     # demo-heavy early (offline->online transition)
+  demo_frac_end:        0.3     # permanent floor (keeps the +1 anchor). Raised
+                                # 0.1->0.3: the frozen demo pool is the strongest
+                                # on-manifold signal; annealing it away let the
+                                # policy drift toward its own zero-reward rollouts
+                                # (rl_run5 decayed after pretrain). Keep it strong.
+  demo_frac_ramp:       1000    # iters to anneal start->end
+  warmup_episodes:      0       # online expert reaches 0 successes; demo pool + pretrain
+                                # replace it. >0 seeds the online buffer expert-heavy.
+  warmup_beta:          1.0     # expert-heavy warmup (seed with successes)
+  episodes_per_iter:    2
+  updates_per_iter:     100
+  batch_size:           64
+  num_iters:            2000
+  # exploration
+  noise_std:            0.1     # rollout action noise (normalized units)
+  # reverse-curriculum warm start (GA-DDPG expert_initial): each POLICY episode
+  # first follows the FULL step-0 OMG trajectory BY INDEX for a RANDOM 0..N steps
+  # (sampled per episode in collect), so the policy takes over near the grasp and
+  # can finish+close → earns its OWN +1 (buf_pos>0). 0 disables (rl_run<=5 had 0,
+  # so the policy always started far and never reached → buf_pos=0 → decay).
+  expert_initial_steps: 28
+  # reverse-curriculum ANNEAL (rl_run9): slide the takeover window from a tight band
+  # right at the grasp (early: policy only does the reach-tail descent+close, earns
+  # reward, grows the critic's high-Q region) toward 0 (late: from scratch). The
+  # window each iter is [expert_initial_steps..expert_initial_end] linearly over
+  # anneal_iters, minus `window`. Set `expert_initial_anneal_iters` to ENABLE the
+  # anneal; omit it to keep the old uniform (0..expert_initial_steps) sampling.
+  # rl_run8 used the uniform form and stalled ~0.08 m: intermediate takeovers never
+  # mastered the endgame first, so they earned no reward and Q never grew past the
+  # last ~2 steps. Ramp over ~2/3 of the run so it ends with plenty of from-scratch.
+  # rl_run10: SLOWER + SOFTER than run9 (anneal 550, end 2, window 6). run9 peaked
+  # exactly at anneal completion (~iter 700) then declined, so extend the driver to
+  # ~iter 1000; and end at a WIDER band [0..8] (not the tight [0..2]) so late
+  # training keeps some near-grasp episodes = a live +reward anchor + more close-zone
+  # visits (which also counters the gripper open-drift that killed late run9 closes).
+  expert_initial_anneal_iters: 1000
+  expert_initial_end:   8       # final upper bound: band ends at [0..8], not [0..2]
+  expert_initial_window: 8      # width of the sampled band (hi-window .. hi)
+  # fraction of online episodes that are FULL-expert rollouts (GA-DDPG non-explore):
+  # play the whole OMG traj to the grasp + close + reward. A guaranteed fresh
+  # success into the ONLINE buffer every iter (the frozen demo pool goes stale
+  # relative to the drifting policy; this keeps a live +reward anchor).
+  expert_episode_frac:  0.25
+  # episode horizon (clock denominator + OMG plan length; also the worker's OMG
+  # planning horizon). Raised to 30: check C showed the from-scratch policy needs
+  # ~30 steps to approach (at step 20 it's still 0.18-0.34 m out, matching the RL
+  # eval's 0.25 m) AND the reverse curriculum needs room to place the policy near
+  # the grasp (ei up to 25) with steps left to settle+close. 0 = use cfg.RL_MAX_STEP.
+  # NOTE: the demo pool must be recollected at the SAME horizon (clock is normalized
+  # by max_steps, so a 20-step pool + 30-step online mixes inconsistent clocks).
+  rollout_max_steps:    30
+  # DAgger TAIL replans (GA-DDPG get_flags + expert_plan(step=remaining)): with
+  # this per-step prob, re-fit the REST of the committed plan to the policy's
+  # drifted state over the REMAINING steps and splice it in. Window:
+  # dagger_min_step < step < len(plan) - dagger_tail_guard. The tail guard keeps
+  # the standoff->grasp reach labels committed — the OLD per-step plan[0]-of-a-
+  # fresh-short-replan label never entered the reach tail and Zeno-decayed at the
+  # standoff (0.08 m short), teaching the policy to hover there (rl_run7 plateau,
+  # broken BC base). GA-DDPG values: ratio 0.5, min 5, guard 8.
+  dagger_ratio:         0.5
+  dagger_min_step:      5
+  dagger_tail_guard:    8
+  beta_start:           0.5     # mid-episode expert-execution prob at iter 0 (executes
+                                # the committed plan's CURRENT waypoint -> snaps the EE
+                                # back onto the plan)
+  beta_end:             0.0     # expert-execution prob at the end
+  beta_ramp_iters:      500
+  # eval / checkpoint
+  eval_every:           50
+  eval_episodes:        50      # 20 can't resolve a low single-digit success rate
+                                # (E[successes] < 1); 50 gives a usable eval_min_pos too
+  save_every:           50

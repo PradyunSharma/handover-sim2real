@@ -33,12 +33,23 @@ class PointListener:
             1.0 - self._cfg.POLICY.POINT_STATE_YCB_RATIO,
         ]
 
+        # Experimental freeze-pointcloud mode (see config.py): capture the cloud at
+        # step _freeze_at_step and hold it for the rest of the episode. Object is
+        # index 0 (ycb) in self._merge_ratios / acc_points; hand is index 1.
+        self._freeze_enabled = self._cfg.POLICY.FREEZE_PARTIAL_POINTCLOUD
+        self._freeze_at_step = self._cfg.POLICY.FREEZE_PARTIAL_POINTCLOUD_AT_STEP
+        self._object_index = 0
+
     @property
     def num_point_states(self):
         return len(self._merge_ratios)
 
     def reset(self):
         self._acc_points = [np.zeros((3, 0), dtype=np.float32) for _ in self._merge_ratios]
+
+        # Freeze-pointcloud state (per episode).
+        self._step_count = 0
+        self._frozen = False
 
         if self._seed is not None:
             np.random.seed(self._seed)
@@ -86,6 +97,13 @@ class PointListener:
         return point_states
 
     def _update_acc_points(self, point_states, ee_pose):
+        # Experimental: capture the cloud at step _freeze_at_step and hold it for
+        # the rest of the episode, instead of following the live (eventually
+        # partial) view (see config.py). Stored in world frame, so _process_pointcloud
+        # re-projects it into the current gripper frame each later step.
+        if self._freeze_enabled and self._frozen:
+            return
+
         for i, point_state in enumerate(point_states):
             if point_state.shape[1] == 0:
                 continue
@@ -96,6 +114,15 @@ class PointListener:
                 replace=False,
             )
             self.acc_points[i] = new_points[:, index]
+
+        if self._freeze_enabled:
+            # Freeze once we reach the target step AND the object is actually in
+            # view (so we never lock onto an empty cloud). This object-in-view check
+            # is a safety, not a degradation trigger.
+            object_in_view = point_states[self._object_index].shape[1] > 0
+            if self._step_count >= self._freeze_at_step and object_in_view:
+                self._frozen = True
+            self._step_count += 1
 
 
 class HandoverSim2RealPolicy:

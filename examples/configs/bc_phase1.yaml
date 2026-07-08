@@ -1,0 +1,56 @@
+# Phase-1 BC training config.
+#
+# Used by examples/train_bc.py. Every field is plumbed through to either
+# BCPolicy, BCDataset, or BCTrainer. Override DATA.train_h5 / DATA.val_h5 from
+# the CLI when running on different splits or dummy data.
+
+DATA:
+  train_h5: output/bc_dataset/train.h5
+  # No val_h5 default on purpose: pass --val-h5 explicitly each run so the
+  # train/val distributions can't silently mismatch (e.g. frozen vs live).
+  # Omitting --val-h5 now means no validation (no val_* metrics, best.pt=last).
+  val_h5:
+  # These four are fixed by the collection script's schema; here for sanity.
+  pc_channels:     5      # xyz + ycb_flag + hand_flag
+  robot_state_dim: 32     # joint_pos(9)+joint_vel(9)+ee_pose(7)+gripper(1)+prev_act(6)
+  action_dim:      7      # Δpos(3)+Δeuler(3)+gripper_cmd(1)
+
+MODEL:
+  feature_dim:        256  # D — scene and robot encoders both output this width
+  robot_hidden:       128
+  policy_hidden:      [256, 256]
+  pointnet_scale:     1     # multiplies all PointNet++ channel widths
+  pointnet_radius:    0.02  # first SA module ball-query radius (metres)
+  pointnet_nclusters: 32    # first SA module npoint
+  use_prev_act:       false # include the trailing prev_action(6) in the robot state?
+                            # false drops it (recommended): prev_act is ~0.9 correlated
+                            # with the target, so keeping it lets the policy copy it and
+                            # ignore the point cloud. Override with --use-prev-act/--no-prev-act.
+  # PointNet++ encoder init. Points at the handover-sim2real CVPR2023 model's
+  # state-feat checkpoint — a 5-channel (xyz+ycb+hand) encoder trained on this
+  # exact task, so all 68/68 encoder tensors transfer (first SA conv matches:
+  # (64,8)). The GA-DDPG grasp encoder is the weaker fallback: 4-channel
+  # (xyz+gripper-flag), only 67/68 transfer (first SA conv (64,7) reinit'd).
+  # freeze_pc=false => fine-tune the encoder; true => train only robot MLP + head.
+  pc_pretrained:      output/cvpr2023_models/2022-10-16_08-48-30_finetune_5_s0_train/DDPG_state_feat_PandaYCBEnv_latest
+  freeze_pc:          false
+
+OPTIM:
+  kind:         adamw       # adam | adamw
+  lr:           1.0e-3
+  weight_decay: 1.0e-4
+  scheduler:   cosine       # none | cosine | step
+
+LOSS:
+  gripper_weight: 1.0       # weight on BCE term vs SmoothL1 pose term
+
+TRAIN:
+  batch_size:      64
+  num_epochs:      100
+  num_workers:     4
+  device:          cuda
+  mixed_precision: false
+  val_every:       1
+  save_every:      5
+  grad_clip:       1.0      # 0 disables
+  seed:            0

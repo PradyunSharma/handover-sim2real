@@ -110,8 +110,18 @@ class HandoverSim2RealTrainEnv(HandoverHandCameraPointStateEnv):
 
         self._omg_planner = OMGPlanner(self._cfg.omg_config)
 
+        # Human-hand grasp filter (paper §: filter grasps that collide with the
+        # hand). Off by default so existing pipelines are unchanged; enable per
+        # run via set_hand_collision_filter(). Registered on the OMG scene env so
+        # OMG's setup_goal_set prunes hand-colliding grasps before it plans.
+        self._hand_collision_filter = False
+        self._hand_collision_thresh = 0.08   # m, gripper control point -> hand point
+        self._hand_points_radius = 0.35      # m, keep hand links within this of the object
+        self._omg_planner._scene.env.external_grasp_filter = self._hand_grasp_collision_mask
+
     def post_reset(self, env_ids, scene_id):
         self._omg_planner_goal_pose = None
+        self._omg_grasp_pose = None
 
         return super().post_reset(env_ids, scene_id)
 
@@ -184,6 +194,63 @@ class HandoverSim2RealTrainEnv(HandoverHandCameraPointStateEnv):
         ee_to_ycb_distance = np.linalg.norm(ee_pos - ycb_pos)
         return ee_to_ycb_distance
 
+    def _joint_to_world_ee_pose(self, joint_position):
+        """Packed world-frame panda_hand pose for a joint configuration."""
+        panda_base_to_ee = self._panda_kinematics.forward_kinematics_parallel(
+            joint_values=wrap_value(joint_position)[None], offset=False
+        )[0, 7]
+        return pack_pose(np.matmul(unpack_pose(self._panda_base_pose), panda_base_to_ee))
+
+    def set_hand_collision_filter(self, enable=True, thresh=0.08, points_radius=0.35):
+        """Enable/configure the human-hand grasp filter for OMG planning. When on,
+        OMG's goal set is pruned of grasps whose gripper geometry comes within
+        `thresh` (m) of the MANO hand, so the planner reaches a hand-free grasp
+        (the paper's collision-checking of grasp candidates against the hand).
+        `points_radius` (m) keeps only hand links within that distance of the
+        target object, dropping the MANO URDF's virtual floating-base links."""
+        self._hand_collision_filter = bool(enable)
+        self._hand_collision_thresh = float(thresh)
+        self._hand_points_radius = float(points_radius)
+
+    def _mano_hand_points_world(self):
+        """(M, 3) world-frame points sampling the human hand (MANO link origins),
+        or None if no hand is present. Restricted to links near the target object
+        so the floating-base virtual links (strung from the world origin to the
+        wrist) don't become spurious obstacles near the object."""
+        mano = getattr(self, "mano", None)
+        body = getattr(mano, "body", None) if mano is not None else None
+        if body is None or body.link_state is None:
+            return None
+        ls = body.link_state[0, :, 0:3]
+        pts = np.asarray(ls.cpu().numpy() if hasattr(ls, "cpu") else ls, dtype=np.float32)
+
+        obj = self.ycb.bodies[self.ycb.ids[0]].link_state[0, 6, 0:3]
+        obj = np.asarray(obj.cpu().numpy() if hasattr(obj, "cpu") else obj, dtype=np.float32)
+        pts = pts[np.linalg.norm(pts - obj[None], axis=1) < self._hand_points_radius]
+        return pts if len(pts) > 0 else None
+
+    def _hand_grasp_collision_mask(self, goal_set):
+        """Boolean [n] mask (True = keep) for OMG's IK'd goal-set joint configs:
+        rejects a grasp if any gripper control point (`hand_finger_point`, placed
+        at the grasp's world EE pose) comes within `_hand_collision_thresh` of a
+        MANO hand point. Registered as the OMG env's `external_grasp_filter`;
+        returns all-True (no-op) unless the filter is enabled and a hand exists."""
+        goal_set = np.asarray(goal_set)
+        n = len(goal_set)
+        if not self._hand_collision_filter or n == 0:
+            return np.ones(n, dtype=bool)
+        hand_pts = self._mano_hand_points_world()
+        if hand_pts is None:
+            return np.ones(n, dtype=bool)
+
+        keep = np.ones(n, dtype=bool)
+        for i, q in enumerate(goal_set):
+            ee = unpack_pose(self._joint_to_world_ee_pose(q))          # 4x4 world
+            gp = (np.matmul(ee[:3, :3], hand_finger_point) + ee[:3, 3:4]).T  # [6, 3]
+            dmin = np.linalg.norm(gp[:, None, :] - hand_pts[None, :, :], axis=-1).min()
+            keep[i] = dmin > self._hand_collision_thresh
+        return keep
+
     def run_omg_planner(self, num_steps, scene_idx, reset_scene=True):
         if reset_scene:
             names = []
@@ -206,15 +273,47 @@ class HandoverSim2RealTrainEnv(HandoverHandCameraPointStateEnv):
         if traj is None:
             print("Planning not run due to empty goal set.")
         else:
-            goal_joint_position = traj[-5]
-            panda_base_to_goal_pose = self._panda_kinematics.forward_kinematics_parallel(
-                joint_values=wrap_value(goal_joint_position)[None], offset=False
-            )[0, 7]
-            self._omg_planner_goal_pose = pack_pose(
-                np.matmul(unpack_pose(self._panda_base_pose), panda_base_to_goal_pose)
-            )
+            # traj[-5] is the pre-grasp standoff (reach_tail_length=5,
+            # standoff_dist=0.08 m) used as the RL goal; traj[-1] is the actual
+            # grasp the gripper closes at. Keep both: the standoff for the RL
+            # observation/reward, the grasp pose for visualization.
+            self._omg_planner_goal_pose = self._joint_to_world_ee_pose(traj[-5])
+            self._omg_grasp_pose = self._joint_to_world_ee_pose(traj[-1])
 
         return traj, info
+
+    def get_omg_goal_grasp_pose(self):
+        """4x4 world-frame pose of the grasp the OMG planner last planned to
+        reach — the *final* trajectory waypoint (the pose the gripper closes
+        at), not the pre-grasp standoff. None if the last run_omg_planner()
+        found no goal. Deterministic per scene, so for a static handover this is
+        the grasp the expert demonstrations aimed at — what the policy imitates."""
+        if self._omg_grasp_pose is None:
+            return None
+        return unpack_pose(self._omg_grasp_pose)
+
+    def get_omg_standoff_pose(self):
+        """4x4 world-frame pose of the pre-grasp standoff (traj[-5], 8 cm back
+        along the reach from the grasp) the OMG planner last planned to. None if
+        the last run_omg_planner() found no goal. Used by DAgger collection to
+        define the standoff plane: the approach phase the policy must imitate
+        ends here; the final straight reach + close come from the demonstrations."""
+        if self._omg_planner_goal_pose is None:
+            return None
+        return unpack_pose(self._omg_planner_goal_pose)
+
+    def get_grasp_poses_world(self):
+        """(N, 4, 4) world-frame poses of the filtered grasp candidates the OMG
+        planner selects its goal from: the object-frame grasps (object ->
+        panda_hand) placed at the live target-object pose. Requires
+        run_omg_planner() to have populated the grasp set first."""
+        grasps_obj = np.asarray(self._omg_planner.get_grasp_poses())
+        if grasps_obj.ndim != 3:
+            return np.empty((0, 4, 4))
+        pos = self.ycb.bodies[self.ycb.ids[0]].link_state[0, 6, 0:3].tolist()
+        orn = self.ycb.bodies[self.ycb.ids[0]].link_state[0, 6, 3:7].tolist()
+        ycb_pose = pos + orn[3:] + orn[:3]
+        return np.matmul(unpack_pose(ycb_pose), grasps_obj)
 
     def convert_target_joint_position_to_action(self, target_joint_position):
         current_joint_position = self.panda.body.dof_state[0, :, 0]
