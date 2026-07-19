@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import shutil
 import sys
 import time
@@ -51,6 +52,8 @@ from handover_sim2real.utils import add_sys_path_from_env
 from handover_sim2real.rl import RLActor, QNetwork, ReplayBuffer, TD3BCTrainer
 from handover_sim2real.rl.replay_buffer import load_demo_buffer
 from handover_sim2real.rl.rollout_worker import RolloutWorker
+from handover_sim2real.rl.parallel_rollout import (
+    ParallelRolloutManager, cpu_state_dict)
 
 add_sys_path_from_env("GADDPG_DIR")
 from experiments.config import cfg_from_file        # noqa: E402
@@ -127,30 +130,15 @@ def expert_initial_range(it: int, loop: dict) -> tuple[int, int]:
     return max(0, hi - win), hi
 
 
-def collect(worker, actor, buffer, n_eps, rng, num_scenes,
-            beta, noise_std, ei_lo, ei_hi, expert_episode_frac=0.0,
-            dagger_ratio=0.0):
-    """Collect n_eps episodes into the online buffer. A fraction
-    `expert_episode_frac` are FULL-expert rollouts (GA-DDPG non-explore): the OMG
-    trajectory is played to the grasp + closed → a guaranteed fresh success that
-    keeps buf_pos>0. The rest are policy (explore) episodes with a reverse-
-    curriculum warm start of a RANDOM `[ei_lo, ei_hi]` committed-OMG-playback
-    steps (see `expert_initial_range`), so the policy practices finishing from near
-    the grasp and can earn its own +1. roll_* aggregates the POLICY episodes only
-    (the progress signal); expert episodes are counted separately."""
+def _accumulate(results, buffer):
+    """Fold a list of (transitions, stats) into the online buffer + the roll_*
+    aggregate. Shared by the serial and the parallel collect paths so there is one
+    source of truth for the accounting (buffer add order is irrelevant to a replay
+    buffer, so gather-then-add == the old add-in-loop)."""
     succ = length = ret = kept = skipped = closed = 0
     exp_kept = exp_succ = 0
     minpos, reasons = [], Counter()
-    for _ in range(n_eps):
-        scene = int(rng.randint(num_scenes))
-        if expert_episode_frac > 0.0 and rng.uniform() < expert_episode_frac:
-            trans, st = worker.expert_rollout_episode(scene)
-        else:
-            ei = int(rng.randint(ei_lo, ei_hi + 1)) if ei_hi > 0 else 0
-            trans, st = worker.rollout_episode(
-                actor, scene, rng, beta=beta,
-                expert_initial_steps=ei, noise_std=noise_std,
-                dagger_ratio=dagger_ratio)
+    for trans, st in results:
         if st.get("skipped"):
             skipped += 1
             continue
@@ -170,13 +158,68 @@ def collect(worker, actor, buffer, n_eps, rng, num_scenes,
             "exp_kept": exp_kept, "exp_succ_rate": exp_succ / max(exp_kept, 1)}
 
 
-def evaluate(worker, actor, rng, n_eps, num_scenes):
+def collect(collector, actor, buffer, n_eps, rng, num_scenes,
+            beta, noise_std, ei_lo, ei_hi, expert_episode_frac=0.0,
+            dagger_ratio=0.0):
+    """Collect n_eps episodes into the online buffer. A fraction
+    `expert_episode_frac` are FULL-expert rollouts (GA-DDPG non-explore): the OMG
+    trajectory is played to the grasp + closed → a guaranteed fresh success that
+    keeps buf_pos>0. The rest are policy (explore) episodes with a reverse-
+    curriculum warm start of a RANDOM `[ei_lo, ei_hi]` committed-OMG-playback steps
+    (see `expert_initial_range`), so the policy practices finishing from near the
+    grasp and can earn its own +1. roll_* aggregates the POLICY episodes only (the
+    progress signal); expert episodes are counted separately.
+
+    `collector` is either a serial RolloutWorker (episodes run in-process) or a
+    ParallelRolloutManager (episodes fanned across worker processes). The rng draws
+    that pick the scene / expert-vs-policy / expert_initial_steps happen HERE either
+    way, so the episode mix is identical; the parallel path additionally stamps each
+    job with a per-episode rng seed for the in-rollout exploration noise."""
+    if isinstance(collector, ParallelRolloutManager):
+        jobs = []
+        for _ in range(n_eps):
+            scene = int(rng.randint(num_scenes))
+            if expert_episode_frac > 0.0 and rng.uniform() < expert_episode_frac:
+                job = {"kind": "expert", "scene": scene}
+            else:
+                ei = int(rng.randint(ei_lo, ei_hi + 1)) if ei_hi > 0 else 0
+                job = {"kind": "policy", "scene": scene, "beta": float(beta),
+                       "noise_std": float(noise_std),
+                       "expert_initial_steps": ei, "dagger_ratio": float(dagger_ratio)}
+            job["seed"] = int(rng.randint(1, 2**31 - 1))
+            jobs.append(job)
+        results = collector.rollout(cpu_state_dict(actor), jobs)
+        return _accumulate(results, buffer)
+
+    results = []
+    for _ in range(n_eps):
+        scene = int(rng.randint(num_scenes))
+        if expert_episode_frac > 0.0 and rng.uniform() < expert_episode_frac:
+            results.append(collector.expert_rollout_episode(scene))
+        else:
+            ei = int(rng.randint(ei_lo, ei_hi + 1)) if ei_hi > 0 else 0
+            results.append(collector.rollout_episode(
+                actor, scene, rng, beta=beta,
+                expert_initial_steps=ei, noise_std=noise_std,
+                dagger_ratio=dagger_ratio))
+    return _accumulate(results, buffer)
+
+
+def evaluate(collector, actor, rng, n_eps, num_scenes):
+    if isinstance(collector, ParallelRolloutManager):
+        # deterministic eval: fixed scene sweep, no noise (seed unused downstream).
+        jobs = [{"kind": "eval", "scene": i % num_scenes, "seed": 0}
+                for i in range(n_eps)]
+        results = collector.rollout(cpu_state_dict(actor), jobs)
+    else:
+        results = [collector.rollout_episode(
+                       actor, i % num_scenes, rng,
+                       beta=0.0, expert_initial_steps=0, noise_std=0.0)
+                   for i in range(n_eps)]
+
     succ = kept = closed = 0
     minpos, minrot, reasons = [], [], Counter()
-    for i in range(n_eps):
-        scene = i % num_scenes
-        _, st = worker.rollout_episode(
-            actor, scene, rng, beta=0.0, expert_initial_steps=0, noise_std=0.0)
+    for _, st in results:
         if st.get("skipped"):
             continue
         succ += st["success"]; kept += 1; closed += st.get("closed", 0)
@@ -236,6 +279,21 @@ def parse_args():
     p.add_argument("--render",   action="store_true")
     p.add_argument("--egl",      action="store_true")
     p.add_argument("--resume",   default=None, help="path to a checkpoint .pt to resume")
+    # ── cluster parallelism ────────────────────────────────────────────────
+    p.add_argument("--num-workers", type=int, default=1,
+                   help="parallel rollout worker PROCESSES (the paper's num_remotes). "
+                        "1 = the original single-process loop. Set ~ --cpus-per-task "
+                        "and match LOOP.episodes_per_iter so every worker is busy.")
+    p.add_argument("--worker-device", default="cpu", choices=["cpu", "cuda"],
+                   help="device for a rollout worker's actor inference. cpu (default) "
+                        "keeps the GPU for the learner and is the robust choice; cuda "
+                        "only if the GPU has headroom for N extra contexts.")
+    p.add_argument("--episodes-per-iter", type=int, default=None,
+                   help="override LOOP.episodes_per_iter (convenient from the sbatch "
+                        "so it can track --num-workers)")
+    p.add_argument("--updates-per-iter", type=int, default=None,
+                   help="override LOOP.updates_per_iter (keep the updates:episodes "
+                        "replay ratio when you scale episodes_per_iter)")
     return p.parse_args()
 
 
@@ -245,6 +303,17 @@ def main():
         rlcfg = yaml.safe_load(f)
     loop = rlcfg["LOOP"]
     num_iters = args.num_iters if args.num_iters is not None else int(loop["num_iters"])
+    episodes_per_iter = (args.episodes_per_iter if args.episodes_per_iter is not None
+                         else int(loop["episodes_per_iter"]))
+    updates_per_iter = (args.updates_per_iter if args.updates_per_iter is not None
+                        else int(loop["updates_per_iter"]))
+
+    # GPU throughput knobs (A100 & co): TF32 matmuls + autotuned convs. The nets
+    # are small so this mostly helps the dense update phase; harmless on CPU.
+    if str(args.device).startswith("cuda") and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
 
     # sim cfg
     cfg = get_cfg()
@@ -289,15 +358,41 @@ def main():
               f"{demo_frac_at(10**9, loop):.2f})")
 
     rollout_max_steps = int(loop.get("rollout_max_steps", 0)) or int(cfg.RL_MAX_STEP)
-    worker = RolloutWorker(
-        env, point_listener, cfg, normalizer, args.device,
+    # Shared RolloutWorker knobs — used for the in-process worker AND (identically)
+    # rebuilt inside every parallel worker process. gamma/act_limit are the same
+    # plain floats the trainer derives from rlcfg, so workers need no trainer.
+    rollout_kwargs = dict(
         max_steps=rollout_max_steps, gamma=trainer.gamma,
         act_limit=trainer.act_limit,
         reward_mode=str(rlcfg["RL"].get("reward_mode", "proximity")),
         hold_steps=int(rlcfg["RL"].get("hold_steps", 3)),
         dagger_min_step=int(loop.get("dagger_min_step", 5)),
         dagger_tail_guard=int(loop.get("dagger_tail_guard", 8)))
+    worker = RolloutWorker(env, point_listener, cfg, normalizer, args.device,
+                           **rollout_kwargs)
     dagger_ratio = float(loop.get("dagger_ratio", 0.5))
+
+    # ── parallel rollout collection (the paper's num_remotes) ───────────────
+    # collector is what collect()/evaluate() dispatch to: the single in-process
+    # worker, or a pool of worker processes. num_workers==1 → the original path.
+    collector = worker
+    manager = None
+    if int(args.num_workers) > 1:
+        manager = ParallelRolloutManager(
+            num_workers=int(args.num_workers),
+            sim_cfg=args.sim_cfg, rl_cfg=rlcfg, bc_run=str(args.bc_run),
+            split=args.split, base_seed=args.seed,
+            rollout_kwargs=rollout_kwargs, worker_device=args.worker_device,
+            egl=bool(args.egl and not args.render))
+        collector = manager
+        num_scenes = manager.num_scenes
+        print(f"[parallel] {args.num_workers} rollout workers "
+              f"(actor on {args.worker_device}); num_scenes={num_scenes}")
+        if episodes_per_iter < int(args.num_workers):
+            print(f"[parallel] NOTE episodes_per_iter={episodes_per_iter} < "
+                  f"num_workers={args.num_workers}: {int(args.num_workers) - episodes_per_iter} "
+                  f"worker(s) idle each iter. Raise LOOP.episodes_per_iter (and "
+                  f"updates_per_iter to match) to use them.")
 
     # run dir
     run_dir = Path(args.out_root) / args.run_name  
@@ -327,7 +422,7 @@ def main():
     print(f"Scenes       : {num_scenes}  split={args.split}  max_steps={rollout_max_steps}")
     print(f"Warm-start   : {args.bc_run}")
     print(f"Iters        : {start_iter} -> {num_iters}   "
-          f"(episodes/iter={loop['episodes_per_iter']}, updates/iter={loop['updates_per_iter']})")
+          f"(episodes/iter={episodes_per_iter}, updates/iter={updates_per_iter})")
 
     # ----- offline demo pre-training (calibrate critic + actor on the demo pool
     # BEFORE any rollout, so the PG term doesn't hit a random critic) -----
@@ -351,7 +446,7 @@ def main():
     if start_iter == 0 and int(loop["warmup_episodes"]) > 0:
         t0 = time.time()
         wlo, whi = expert_initial_range(0, loop)
-        w = collect(worker, trainer.actor, buffer, int(loop["warmup_episodes"]),
+        w = collect(collector, trainer.actor, buffer, int(loop["warmup_episodes"]),
                     rng, num_scenes, beta=float(loop["warmup_beta"]),
                     noise_std=float(loop["noise_std"]),
                     ei_lo=wlo, ei_hi=whi, dagger_ratio=dagger_ratio)
@@ -365,7 +460,7 @@ def main():
         beta = float(loop["beta_start"]) + (float(loop["beta_end"]) - float(loop["beta_start"])) * frac
 
         ei_lo, ei_hi = expert_initial_range(it, loop)   # reverse-curriculum window
-        c = collect(worker, trainer.actor, buffer, int(loop["episodes_per_iter"]),
+        c = collect(collector, trainer.actor, buffer, episodes_per_iter,
                     rng, num_scenes, beta=beta, noise_std=float(loop["noise_std"]),
                     ei_lo=ei_lo, ei_hi=ei_hi,
                     expert_episode_frac=float(loop.get("expert_episode_frac", 0.0)),
@@ -374,7 +469,7 @@ def main():
         df = demo_frac_at(it, loop)      # scheduled demo fraction this iter
         stats = {}
         astats = {}   # last update that included an actor step (policy_delay)
-        for _ in range(int(loop["updates_per_iter"])):
+        for _ in range(updates_per_iter):
             if len(buffer) < int(loop["batch_size"]) and demo_pool is None:
                 break
             batch = mix_batch(buffer, demo_pool, int(loop["batch_size"]),
@@ -404,7 +499,7 @@ def main():
         eval_succ = eval_min_pos = eval_min_rot = eval_close = ""
         eval_miss = eval_timeout = eval_fail = ""
         if int(loop["eval_every"]) > 0 and it % int(loop["eval_every"]) == 0 and it > start_iter:
-            ev = evaluate(worker, trainer.actor, rng,
+            ev = evaluate(collector, trainer.actor, rng,
                           int(loop["eval_episodes"]), num_scenes)
             succ = ev["succ"]
             eval_succ = round(succ, 4)
@@ -463,6 +558,8 @@ def main():
         if int(loop["save_every"]) > 0 and (it % int(loop["save_every"]) == 0 or it == num_iters - 1):
             _save(run_dir / "checkpoints" / "last.pt", trainer, it, best_succ)
 
+    if manager is not None:
+        manager.close()
     print(f"Done. Final policy: {run_dir}  best_eval_success={best_succ:.3f}")
 
 

@@ -1,0 +1,101 @@
+# Phase-3 RL config — CLUSTER variant of rl_phase1.yaml (parallel rollouts).
+#
+# Identical algorithm/hyperparameters to rl_phase1.yaml; ONLY the LOOP granularity
+# is rescaled so a pool of parallel rollout workers (train_rl.py --num-workers N)
+# stays busy. It is tuned for N = 16 workers (episodes_per_iter = N).
+#
+# The rescale is a pure change of "iter" units — it preserves the quantities the RL
+# dynamics actually depend on, so results should track the workstation run:
+#   • total episodes  : 16 * 250  = 4000   (== 2 * 2000 in rl_phase1.yaml)
+#   • total updates    : 800 * 250 = 200000 (== 100 * 2000)
+#   • replay ratio     : updates*batch / new-transitions-per-iter is UNCHANGED
+#                        (episodes and updates both scaled 8x), so gradient reuse
+#                        per fresh transition is the same.
+#   • batch_size / capacity are per-TRANSITION and stay put (same gradient noise,
+#     same FIFO horizon in transitions).
+#   • mix_ramp is per-UPDATE (50000) and stays put.
+#   • the per-ITER ramps (beta, demo_frac) and the eval/save cadence are
+#     re-expressed in the new iter units (each iter now = 8x the old work).
+#
+# To use a different worker count W: set episodes_per_iter = W, updates_per_iter =
+# 50 * W, num_iters = 4000 / W, and scale beta_ramp_iters / demo_frac_ramp /
+# eval_every / save_every by (old_episodes_per_iter=2)/W relative to rl_phase1.yaml.
+# (--episodes-per-iter / --updates-per-iter on train_rl.py can override the first
+# two from the sbatch so they track --num-workers.)
+
+DATA:
+  num_pts:         1024
+  pc_channels:     5
+
+MODEL:
+  q_hidden:  [256, 256]   # twin-critic head width
+  clock_dim: 1            # remaining-steps clock width (fed to actor + critic)
+
+RL:
+  gamma:        0.95      # discount (must be <1: finite-horizon, clock-in-state)
+  tau:          0.005     # Polyak soft-update rate for targets
+  policy_noise: 0.2       # TD3 target-smoothing noise std (normalized action units)
+  noise_clip:   0.5       # target-smoothing noise clamp
+  act_limit:    5.0       # normalized action clamp (|Δ| in std units)
+  policy_delay: 2         # TD3 delayed actor/target updates
+  mc_blend:     0.5       # critic target = (1-b)*Bellman + b*MC return (sparse-reward aid)
+  pose_loss:    smooth_l1 # pose-BC loss form (run9 config); see rl_phase1.yaml
+  bc_weight:    2.0       # weight on the actor pose-BC term; mirrors rl_phase1.yaml
+  gripper_bc_weight: 1.0  # weight on the actor gripper BCE term (proximity label)
+  gripper_close_weight_max: 10.0  # class-balance the gripper BCE (rare "close" label)
+  gripper_label_smooth: 0.1  # label-smooth the gripper BCE (run9's single change): keeps
+                          # the logit responsive so it doesn't saturate open. See rl_phase1.yaml
+  aux_weight:   0.5       # goal-auxiliary: regress the EE-relative grasp pose
+  reward_mode:  stable_grasp
+  hold_steps:   3
+  hand_collision_filter: true
+  hand_collision_thresh: 0.08   # m, gripper control point -> nearest hand point
+  hand_points_radius:    0.35   # m, keep MANO links within this of the object
+  pg_normalize: true
+  alpha:        0.1       # TD3+BC PG scale (run9; pg_normalize pins the PG term ~alpha)
+  mix_start:    0.1       # RL weight early (BC-dominated)
+  mix_end:      0.2       # RL weight late
+  mix_ramp:     50000     # updates to ramp mix_start->mix_end (per-UPDATE: unchanged)
+  actor_lr:     3.0e-4
+  critic_lr:    3.0e-4
+  grad_clip:    1.0
+
+LOOP:
+  capacity:             20000   # replay transitions — per-transition, UNCHANGED
+  pretrain_updates:     2000    # offline demo pre-train (GPU-bound; not parallelized)
+  demo_frac:            0.25    # fallback constant (used only if demo_frac_start unset)
+  demo_frac_start:      0.5     # demo-heavy early (offline->online transition)
+  demo_frac_end:        0.3     # permanent floor (keeps the +1 anchor)
+  demo_frac_ramp:       125     # iters to anneal start->end (rl_phase1: 1000 @ 2 ep/iter
+                                # = 2000 episodes; /16 ep-per-iter = 125)
+  warmup_episodes:      0       # online expert reaches 0 successes; demos + pretrain replace it
+  warmup_beta:          1.0
+  # ── parallel granularity: one episode per worker per iter ──────────────────
+  episodes_per_iter:    16      # == --num-workers (every worker rolls one episode)
+  updates_per_iter:     800     # 50 updates/episode — same replay ratio as 100/2
+  batch_size:           64      # per-transition — UNCHANGED (same gradient noise)
+  num_iters:            250     # 16 * 250 = 4000 episodes == rl_phase1's 2 * 2000
+  # exploration
+  noise_std:            0.1
+  expert_initial_steps: 28      # reverse-curriculum warm start upper bound (per-episode
+                                # step count — UNCHANGED across granularity)
+  # annealed reverse-curriculum (run9 config): the takeover window slides
+  # expert_initial_steps -> _end over _anneal_iters. The step counts (_steps/_end/_window)
+  # are per-EPISODE so they are copied verbatim from rl_phase1.yaml; only _anneal_iters is
+  # per-ITER -> rescaled (rl_phase1: 550 @ 2 ep/iter = 1100 episodes; /16 ep-per-iter ≈ 69).
+  expert_initial_anneal_iters: 69
+  expert_initial_end:   2       # final upper bound (near-from-scratch, matches eval)
+  expert_initial_window: 6      # width of the sampled band (hi-window .. hi)
+  expert_episode_frac:  0.25    # full-expert episodes (fresh +reward anchor)
+  rollout_max_steps:    30      # episode horizon (clock denom + OMG plan length)
+  # DAgger tail replans
+  dagger_ratio:         0.5
+  dagger_min_step:      5
+  dagger_tail_guard:    8
+  beta_start:           0.5
+  beta_end:             0.0
+  beta_ramp_iters:      63      # rl_phase1: 500 @ 2 ep/iter = 1000 episodes; /16 ≈ 63
+  # eval / checkpoint (parallel eval is cheap — bump episodes for a smoother curve)
+  eval_every:           7       # rl_phase1: 50 @ 2 ep/iter = 100 episodes; /16 ≈ 7
+  eval_episodes:        64      # 4 per worker at 16 workers
+  save_every:           7
