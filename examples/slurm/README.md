@@ -22,21 +22,42 @@ Speedup is ~linear in workers on the collection phase (the bottleneck), so ~10â€
 wall-clock on a 16-core allocation is the expectation; the GPU update phase is a
 small fraction either way.
 
+> **Workers run the actor on the GPU (`--worker-device cuda`), not CPU** â€” the
+> PointNet++ encoder's furthest-point-sampling op is CUDA-only. See Notes.
+
+## 0. First-time environment setup (once)
+
+The cluster's `pch2r_dev` env ships torch + nvcc but **not** a working C++/CUDA build
+toolchain, and a couple of native binaries were compiled on a newer OS (glibc 2.34)
+and won't load on DelftBlue's RHEL8 (glibc 2.28). Provision it once, on a **login
+node** (the compiles need nvcc, not a GPU):
+
+```bash
+conda activate pch2r_dev
+bash examples/slurm/setup_cluster_env.sh
+```
+
+This installs `sip`/`assimp`/`ninja`, creates a `pn2build` gcc-11 toolchain env, rebuilds
+`pointnet2_ops` / `omg_cuda` / `CppYCBRenderer` against torch 2.4.1 for the V100
+(`sm_70`), and repairs the table-mesh symlinks. It is re-runnable.
+
 ## 1. Smoke-test interactively first (2 min)
 
 Grab a short interactive GPU allocation
 ([docs](https://doc.dhpc.tudelft.nl/delftblue/Slurm-interactive-jobs/)) and run a
 tiny job to confirm the parallel path comes up on *your* env before burning a batch
-job:
+job (the `education-me-msc-ro` account gets V100s on `gpu-v100`, not `gpu-a100`):
 
 ```bash
-srun --partition=gpu-a100 --account=research-XX-YYY \
+srun --partition=gpu-v100 --account=education-me-msc-ro --qos=normal \
      --cpus-per-task=6 --gpus-per-task=1 --mem-per-cpu=4G --time=00:20:00 \
      --pty bash
 
-# inside the allocation:
-conda activate pch2r_dev
+# inside the allocation (the batch script sets these for you; interactive needs them):
+source "$(conda info --base)/etc/profile.d/conda.sh"; conda activate pch2r_dev
 export OMG_PLANNER_DIR=$PWD/OMG-Planner GADDPG_DIR=$PWD/GA-DDPG
+export PYTHONPATH="$PWD:$PWD/handover-sim:$PWD/handover-sim/mano_pybullet"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$PWD/OMG-Planner/orocos_kinematics_dynamics/orocos_kdl/release/lib"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 
 python examples/train_rl.py \
@@ -45,8 +66,8 @@ python examples/train_rl.py \
     --bc-run  output/bc_runs/dagger_iter_2_3 \
     --demos   output/rl_demos/train_h30.h5 \
     --run-name rl_smoke \
-    --num-workers 4 --episodes-per-iter 4 --updates-per-iter 40 \
-    --num-iters 3
+    --num-workers 4 --worker-device cuda \
+    --episodes-per-iter 4 --updates-per-iter 40 --num-iters 3
 ```
 
 You should see `[parallel] 4 rollout workers ...` then per-iter lines. If it hangs
