@@ -1,0 +1,2 @@
+# Keep slurm_logs/ in the repo so SLURM can open --output/--error at job launch.
+# (SLURM opens these paths BEFORE the job script runs, so an in-script mkdir is too late.)

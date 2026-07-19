@@ -15,14 +15,17 @@
 # request cpus-per-task = WORKERS + 2 (learner + main loop want a couple of cores).
 # ─────────────────────────────────────────────────────────────────────────────
 #SBATCH --job-name=h2r-rl
-#SBATCH --partition=gpu-a100          # A100 partition (see `sinfo`); or `gpu`
+#SBATCH --partition=gpu-v100          # V100 nodes. NOTE: the education-me-msc-ro
+                                      # account is NOT granted gpu-a100 (any GPU
+                                      # request there -> pending AssocMaxGRESPerJob);
+                                      # it CAN get a full V100S 32GB here with qos=normal.
 #SBATCH --account=education-me-msc-ro  # DelftBlue allocation (sacctmgr show assoc user=$USER)
-#SBATCH --qos=normal
-#SBATCH --time=24:00:00               # walltime cap; checkpoints let you --resume
+#SBATCH --qos=normal                  # account has normal,reservation (NOT gpu-a100-small)
+#SBATCH --time=24:00:00               # education GPU cap is 24h; checkpoints let you --resume
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=18            # 16 rollout workers + 2 for learner/main
-#SBATCH --gpus-per-task=1             # 1 A100 for the learner
+#SBATCH --cpus-per-task=18            # 16 rollout workers + 2 for learner/main (V100 node = 48 cores/4 GPUs)
+#SBATCH --gpus-per-task=1             # 1 V100S (32GB) for the learner
 #SBATCH --mem-per-cpu=4G              # 18 * 4G = 72G (envs are ~1.1G CPU-renderer each)
 #SBATCH --output=slurm_logs/rl_%j.out
 #SBATCH --error=slurm_logs/rl_%j.err
@@ -35,16 +38,36 @@ mkdir -p slurm_logs
 # ── environment ─────────────────────────────────────────────────────────────
 # Adjust to your setup. On DelftBlue conda usually comes from the miniconda3
 # module; if you installed your own miniconda, source that instead.
-module load 2023r1 || true
-module load miniconda3 || true
+module load miniconda3 2>/dev/null || true
 # module load cuda/11.7 || true       # only if your torch build needs system CUDA
 
-source activate pch2r_dev             # the project's conda env (README_MY.md)
+# conda's `activate` wrapper is gone in miniforge; source the hook, then `conda activate`.
+# `conda info --base` resolves once the module is on PATH; the literal path is a fallback.
+source "$(conda info --base 2>/dev/null || echo /apps/generic/miniforge3/25.11.0)/etc/profile.d/conda.sh"
+conda activate pch2r_dev              # the project's conda env (README_MY.md)
 
 # OMG-Planner / GA-DDPG locations (README_MY.md). If your conda activate.d already
 # exports these, these lines are harmless no-ops.
 export OMG_PLANNER_DIR="${OMG_PLANNER_DIR:-$PWD/OMG-Planner}"
 export GADDPG_DIR="${GADDPG_DIR:-$PWD/GA-DDPG}"
+
+# 'handover' (handover-sim/) and 'handover_sim2real' live in the repo and are NOT
+# pip-installed, so put the repo root and handover-sim on PYTHONPATH (README_MY.md).
+# A non-login batch shell does not inherit the PYTHONPATH your interactive shell sets.
+export PYTHONPATH="$PWD:$PWD/handover-sim:$PWD/handover-sim/mano_pybullet:${PYTHONPATH:-}"
+
+# Native shared libs the loader must find at runtime:
+#  - $CONDA_PREFIX/lib : libassimp.so (pyassimp mesh loader) + a modern libstdc++
+#    (GLIBCXX_3.4.29+) needed by the cluster-rebuilt CUDA/C++ extensions.
+#  - orocos_kdl/release/lib : liborocos-kdl.so.1.4, needed by OMG-Planner's PyKDL
+#    (also needs the `sip` pkg installed in the env).
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$PWD/OMG-Planner/orocos_kinematics_dynamics/orocos_kdl/release/lib:${LD_LIBRARY_PATH:-}"
+
+# pointnet2_ops (GA-DDPG PointNet++) JIT-compiles its CUDA _ext on first import via
+# torch.utils.cpp_extension.load (needs `ninja` + `nvcc`, both in pch2r_dev). Pin the
+# arch to the V100 (sm_70) so the build is deterministic and the compiled extension in
+# ~/.cache/torch_extensions is shared across the learner + all workers (compiled once).
+export TORCH_CUDA_ARCH_LIST="7.0"
 
 # One math thread per process — the manager sets these too, but exporting here
 # guarantees every child (and the OMG planner's numpy/scipy) is pinned.
