@@ -16,7 +16,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #SBATCH --job-name=h2r-rl
 #SBATCH --partition=gpu-a100          # A100 partition (see `sinfo`); or `gpu`
-#SBATCH --account=research-XX-YYY      # <-- SET THIS (run `sacctmgr show assoc user=$USER format=account`)
+#SBATCH --account=education-me-msc-ro  # DelftBlue allocation (sacctmgr show assoc user=$USER)
 #SBATCH --qos=normal
 #SBATCH --time=24:00:00               # walltime cap; checkpoints let you --resume
 #SBATCH --nodes=1
@@ -54,7 +54,9 @@ export OPENBLAS_NUM_THREADS=1
 
 # ── run ─────────────────────────────────────────────────────────────────────
 WORKERS=$(( SLURM_CPUS_PER_TASK - 2 ))     # leave 2 cores for learner + main loop
+RUN_NAME="${RUN_NAME:-rl_run11}"           # override: sbatch --export=ALL,RUN_NAME=rl_run12 ...
 
+echo "run=${RUN_NAME}"
 echo "host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
 echo "cpus-per-task=${SLURM_CPUS_PER_TASK}  rollout workers=${WORKERS}"
 
@@ -63,11 +65,11 @@ srun python examples/train_rl.py \
     --rl-cfg  examples/configs/rl_phase1_cluster.yaml \
     --bc-run  output/bc_runs/dagger_iter_2_3 \
     --demos   output/rl_demos/train_h30.h5 \
-    --run-name rl_run8 \
+    --run-name "${RUN_NAME}" \
     --num-workers "${WORKERS}" \
     --worker-device cpu \
     --episodes-per-iter "${WORKERS}" \
     --updates-per-iter "$(( WORKERS * 50 ))"
 
 # Resume after a walltime kill: add
-#   --resume output/rl_runs/rl_run8/checkpoints/last.pt
+#   --resume output/rl_runs/${RUN_NAME}/checkpoints/last.pt
