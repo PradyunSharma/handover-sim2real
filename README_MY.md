@@ -1159,17 +1159,19 @@ Key `rl_phase1.yaml` knobs (the scene/encoder/head dims are taken from
 | `RL.mc_blend` | `0.5` | critic target = `(1−b)·Bellman + b·MC-return` (propagates rare sparse successes) |
 | `RL.reward_mode` / `RL.hold_steps` | `stable_grasp` / `3` | close-scoring: `stable_grasp` (contact-hold — hold `hold_steps` policy-steps, require released + not dropped) or `proximity` (EE near the OMG grasp pose) |
 | `RL.hand_collision_filter` / `hand_collision_thresh` / `hand_points_radius` | `true` / `0.08` / `0.35` | filter OMG grasps that collide with the hand (see [Hand-collision grasp filter](#hand-collision-grasp-filter)); prune radius (m) at the final grasp / cutoff (m) that keeps MANO links near the object |
-| `RL.bc_weight` / `RL.gripper_bc_weight` | `2.0` / `1.0` | weight on the actor pose-BC term (plan-tracking online-DAgger labels, at the policy's OWN visited states) / gripper BCE. **NOTE:** the gripper logit is fed to the critic **detached**, so it's trained by BCE only (an unclamped near-binary logit rode `dQ/dlogit` into the critic's OOD region and blew up to ~5e4 in rl_run4) |
-| `RL.gripper_close_weight_max` | `10.0` | class-balance the gripper BCE: "close" (near-grasp) is the rare label per batch, so plain BCE learns only "open" and the gripper stays pinned open (`gprob≈1.0` the whole rollout) — upweight close examples to ~match the open mass, capped here |
+| `RL.pose_loss` | `smooth_l1` | actor pose-BC loss form. `smooth_l1` = L1 on raw normalized `[Δpos ‖ Δeuler]`. `pm` = point-matching on gripper control points (GA-DDPG). **rl_run10 tried `pm` and REVERTED:** at our sub-0.34-rad deltas PM weights rotation ~6× *less* than `smooth_l1` (the small rotation-channel std makes normalized-L1 a strong rotation weighter — rot/pos 6.6× at the success thresholds vs PM's 1.2×), so it regressed `eval_min_rot`. The "euler-L1 is a bad metric" argument only bites at large/wraparound angles |
+| `RL.bc_weight` / `RL.gripper_bc_weight` | `2.0` / `1.0` | weight on the actor pose-BC term (plan-tracking online-DAgger labels, at the policy's OWN visited states) / gripper BCE. **NOTE:** the gripper logit is fed to the critic **detached**, trained by BCE only (an unclamped logit rode `dQ/dlogit` into the critic's OOD region and blew up to ~5e4 in rl_run4) |
+| `RL.gripper_close_weight_max` | `10.0` | class-balance the gripper BCE: "close" (near-grasp) is the rare label per batch, so plain BCE learns only "open" and the gripper stays pinned open (`gprob≈1.0`) — upweight close examples to ~match the open mass, capped here |
+| `RL.gripper_label_smooth` | `0.1` | **gripper-drift fix (rl_run11)**: label-smooth the gripper BCE targets (1→1−ε open, 0→ε close). The "open" label dominates every batch (policy rarely reaches the close zone → `n_close≈0` online), so plain BCE drives the logit → +∞ until it saturates (`grip_logit` 14→33 over run9) — then `sigmoid≈1`, the gradient vanishes, and close states can't pull it back, so the gripper gets **stuck open** (run9 last.pt: close-rate 4%, all timeout). Smoothing gives it a finite anchor (`logit(0.9)≈+2.2`) so it stays bounded + responsive. `0` = off (run9 behaviour) |
 | `RL.aux_weight` | `0.5` | goal-auxiliary grasp-pose loss (both nets; `0` disables the aux head) |
-| `RL.pg_normalize` / `RL.alpha` | `true` / `0.1` | `true` = TD3+BC normalization (λ = α ÷ mean-abs-Q); **must** be `true` — a fixed λ diverges (rl_run1 hit Q≈1.6e5). `alpha` lowered `1.0→0.1` (**paper parity**): GA-DDPG's actor loss is `0.9·BC + 0.1·(−minQ)` on raw bounded Q — BC dominates 4.5–9× throughout; at `alpha=1.0` the PG term (pinned ≈α) still outweighed the small BC smooth-L1 → PG-dominated, the inverse of the paper (rl_run5–7) |
+| `RL.pg_normalize` / `RL.alpha` | `true` / `0.1` | `true` = TD3+BC normalization (λ = α ÷ mean-abs-Q); **must** be `true` — a fixed λ diverges (rl_run1 hit Q≈1.6e5). `alpha=0.1` is run9's value. (rl_run10 raised it `→0.25` to push the reach; it did *not* help and the run regressed — revisit only as an isolated single change, watching `q_pi` vs `q_mean`) |
 | `RL.mix_start` / `mix_end` / `mix_ramp` | `0.1` / `0.2` / `50000` | RL-weight ramp (BC-dominated early) |
 | `LOOP.capacity` | `20000` | online replay transitions (~0.8 GB at 1024×5 clouds) |
 | `LOOP.pretrain_updates` | `2000` | **offline** gradient updates on the demo pool only, before any rollout — calibrates the critic so PG doesn't hit a random Q-head (the rl_run1 divergence root). `0` disables; fresh runs only |
 | `LOOP.demo_frac_start` / `_end` / `_ramp` | `0.5` / `0.3` / `1000` | scheduled demo fraction per batch: anneal `start→end` over `_ramp` iters, then hold at `_end` (a permanent floor — the frozen demo pool is the strongest on-manifold signal). `_end` raised `0.1→0.3`: annealing it away let the policy drift toward its own zero-reward rollouts (rl_run5 decayed after pretrain). Falls back to constant `LOOP.demo_frac` (`0.25`) if `_start` unset |
 | `LOOP.expert_episode_frac` | `0.25` | fraction of online episodes that are **full-EXPERT rollouts** (GA-DDPG non-explore): play the whole OMG traj → close → reward, a guaranteed fresh `+1` into the **online** buffer (the frozen pool goes stale vs the drifting policy). This is what keeps `buf_pos>0`; `0` disables |
 | `LOOP.expert_initial_steps` | `28` | **reverse-curriculum warm start** (GA-DDPG `expert_initial`): each policy episode first follows the committed OMG plan BY INDEX for some steps, so the policy takes over NEAR the grasp and practises the settle+close (where it can earn `+1`). This is the STARTING upper bound of the takeover window; see the anneal knobs below |
-| `LOOP.expert_initial_anneal_iters` / `expert_initial_end` / `expert_initial_window` | `550` / `2` / `6` | **anneal the curriculum** (rl_run9): the takeover window `[hi−window .. hi]` slides `hi: expert_initial_steps→expert_initial_end` linearly over `anneal_iters`, so early episodes take over right at the grasp (master the reach-tail descent+close first → earn reward → grow the critic's high-Q region from the grasp outward) and late episodes are near-from-scratch. **Omit `_anneal_iters` to keep the old uniform `(0..expert_initial_steps)` sampling** — that never sequenced the mastery, so intermediate takeovers earned no reward and the policy stalled ~0.08 m from scratch (rl_run8: reach saturates by horizon 45, `buf_pos≈0.008`, weak PG had nothing to pull it in) |
+| `LOOP.expert_initial_anneal_iters` / `expert_initial_end` / `expert_initial_window` | `550` / `2` / `6` | **anneal the curriculum** (run9's winning values): the takeover window `[hi−window .. hi]` slides `hi: expert_initial_steps→expert_initial_end` linearly over `anneal_iters`, so early episodes take over right at the grasp (master the reach-tail descent+close first → earn reward → grow the critic's high-Q region from the grasp outward) and late episodes are near-from-scratch. **rl_run10 tried slower+wider (`1000`/`8`/`8`) and REGRESSED** — the wider final band `[0..8]` under-practiced the from-scratch eval (eval is always `ei=0`; `[0..2]` ≈ 1/3 from-scratch vs `[0..8]` ~1/9). **Omit `_anneal_iters` to keep the old uniform `(0..expert_initial_steps)` sampling** — that never sequenced the mastery, so the policy stalled ~0.08 m from scratch (rl_run8) |
 | `LOOP.rollout_max_steps` | `30` | episode horizon (clock denominator + the worker's OMG plan horizon); `0`=`cfg.RL_MAX_STEP` (`20`). Raised to `30`: the from-scratch policy needs ~30 steps to approach (at step 20 it's still 0.18–0.34 m out) AND the curriculum needs room to place the policy near the grasp with steps left to finish. **The demo pool must be recollected at the SAME horizon** (clock is `remain/max_steps`; `collect_rl_demos` reads this knob) — mixing a 20-step pool with 30-step online feeds the critic inconsistent clocks |
 | `LOOP.warmup_episodes` / `warmup_beta` | `0` / `1.0` | seed the online buffer expert-heavy before training (now `0` — demo pool + offline pretrain + expert episodes replace it) |
 | `LOOP.episodes_per_iter` / `updates_per_iter` | `2` / `100` | rollout ↔ update ratio per iter |
@@ -1376,20 +1378,38 @@ the val benchmark to make the real selection.)
 > to the last 8 cm), and there's no reward anywhere the from-scratch policy reaches
 > (`buf_pos≈0.008`) so the weak PG can't pull it in.
 >
-> **Fix implemented (rl_run9): a properly ANNEALED reverse curriculum.** rl_run8's
-> `expert_initial` was *uniform* `0..25` from iter 0 — it never sequenced the
-> mastery. Now the takeover window slides from a tight band at the grasp
-> (`ei 22–28` @ it 0: policy does only the reach-tail descent+close) out to
-> near-scratch (`ei 0–2` by it 550), so the endgame is mastered and rewarded
-> **first** and the high-Q region grows outward for PG to exploit as harder,
-> off-plan starts are introduced (`LOOP.expert_initial_anneal_iters/_end/_window`;
-> logs `ei_lo-ei_hi` per iter). Curriculum + schedule verified; 5-iter live smoke
-> passes (`ei` window slides, `roll_minpos 0.005` at the tight endgame band). Demo
-> pool unchanged. **Next: run rl_run9; watch `eval_min_pos` and `buf_pos` — the
-> high-Q region should extend outward as `ei_hi` decreases.** Fallbacks if it
-> reaches-but-runs-short: horizon 30→40 (recollect demos) or raise `alpha` once
-> `buf_pos>0`. Only after this exhausts should ACT be reconsidered — the
-> "single-frame can't settle" claim is now disproven (it settles at 0.007 m). If
-> re-running BC DAgger, port the committed-plan labeling to
-> `collect_dagger_dataset.py` first (still old-style). Watch any checkpoint live
-> with `rollout_rl_policy.py --render`.
+> **rl_run9 (annealed reverse curriculum): BREAKTHROUGH — 0 → 30%.** rl_run8's
+> `expert_initial` was *uniform* from iter 0 and never sequenced the mastery; run9
+> slides the takeover window from a tight band at the grasp (`ei 22–28` @ it 0) out
+> to near-scratch (`ei 0–2` by it 550), so the endgame is mastered and rewarded
+> **first** and the critic's high-Q region grows outward for PG to exploit as
+> harder starts are introduced. Result: **best `eval_succ 0.30` @ iter 700**
+> (`min_pos 0.057`, `close 0.35`), tracking `ei_hi` almost perfectly — reach broke
+> the 0.08 m stall (→0.05–0.07 m), closes fire. **`best.pt` (iter 700, 30% train)
+> is the current policy.** It peaked at anneal-completion then declined; a
+> best-vs-last head-to-head (60 scenes) showed last.pt at **4%** — the *approach*
+> stays clean but the **gripper drifts open** (`grip_logit` 14→33) and stops
+> closing. Note: 2000 iters ≈ **15 h** (not 7).
+>
+> **rl_run10 (PM loss + `alpha 0.25` + `bc_weight 80` + slower/wider curriculum):
+> NEGATIVE, reverted.** Worse on all three (`eval_succ 0.15`, `min_pos 0.072`,
+> `min_rot 0.378`). Root causes: **the PM-loss premise was backwards** — at our
+> sub-0.34-rad deltas the normalized `smooth_l1` already weights rotation ~6×
+> *more* than PM (small rotation std), so PM *regressed* rotation; the wider
+> curriculum band `[0..8]` under-practiced the from-scratch eval; `alpha 0.25`
+> didn't help reach. Process lesson: **changed four things at once → couldn't
+> isolate.** Config reverted to run9's exact values.
+>
+> **rl_run11 (IMPLEMENTED, ready): one isolated change on top of run9 — gripper
+> BCE label smoothing** (`gripper_label_smooth 0.1`) to fix the open-drift. The
+> "open" label dominates every batch, so plain BCE saturates the logit open until
+> its gradient vanishes and the gripper is stuck; smoothing gives it a finite
+> anchor (`logit(0.9)≈+2.2`) so it stays responsive. Smoke: the logit drops from
+> the warm-start ~14 to **+2.9 and declining** (not climbing to 33), and the
+> gripper **fires** (`close 0.50` on warm-started episodes). Touches only the
+> gripper BCE — clean single-variable vs run9. **Watch:** `grip_logit` staying
+> ~2–3 (not climbing) and `eval_close` holding up *late* (run9 decayed to 4%).
+> Caveat: the gripper shares the actor trunk with the pose head, so if it still
+> drifts the next step is a separate gripper head. **Remaining blocker after the
+> gripper: reach 0.05→0.02 m.** Watch any checkpoint live with
+> `rollout_rl_policy.py --render`.

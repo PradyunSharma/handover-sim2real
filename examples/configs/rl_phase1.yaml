@@ -21,23 +21,16 @@ RL:
   act_limit:    5.0       # normalized action clamp (|Δ| in std units)
   policy_delay: 2         # TD3 delayed actor/target updates
   mc_blend:     0.5       # critic target = (1-b)*Bellman + b*MC return (sparse-reward aid)
-  # pose-BC loss form (rl_run10): "pm" = point-matching on Panda gripper control
-  # points (proper SE(3) metric — weights wrist ROTATION by its real effect on the
-  # gripper, unlike the old L1 that summed metres+radians; targets the eval_min_rot
-  # ~0.4 rad plateau, GA-DDPG core/loss.py pose_bc_loss). "smooth_l1" = the old raw
-  # normalized L1. NOTE: PM is in metres so its magnitude is ~5-8x SMALLER than the
-  # normalized smooth_l1 — bc_weight is raised to compensate (calibrated so the BC
-  # term ~2x the pinned PG term |pg|~alpha; see the smoke calibration).
-  pose_loss:    pm
-  bc_weight:    80.0      # weight on the actor pose-BC term. Large because the PM loss
-                          # is small-valued (metres of control-point motion; smoke: raw
-                          # PM ~0.004-0.007 on warm-started states vs the pinned |pg|=
-                          # alpha=0.25). 80 puts the BC term ~1.3-2x the PG term EARLY
-                          # (BC leads while it learns the gross motion), and since PM
-                          # shrinks as the policy sharpens, PG naturally takes over to
-                          # refine the last-cm reach — a built-in BC->PG handoff. The
-                          # BC target is OMG at the policy's own visited states (online
-                          # DAgger): teaches the fine approach + the wrist rotation.
+  # pose-BC loss form. "smooth_l1" = L1 on the raw NORMALIZED [Δpos ‖ Δeuler].
+  # "pm" = point-matching on gripper control points (GA-DDPG core/loss.py). NOTE
+  # (rl_run10, REVERTED): PM sounded better (proper SE(3) metric) but at our small
+  # sub-0.34-rad deltas it actually WEIGHTED ROTATION ~6x LESS than smooth_l1 — the
+  # small rotation-channel std makes normalized-L1 a strong rotation weighter
+  # (rot/pos ~6.6x at the success thresholds vs PM's 1.2x), so PM regressed
+  # eval_min_rot. Keep smooth_l1 (run9's setting).
+  pose_loss:    smooth_l1
+  bc_weight:    2.0       # weight on the actor pose-BC term (plan-tracking online-
+                          # DAgger labels, at the policy's OWN visited states).
   gripper_bc_weight: 1.0  # weight on the actor gripper BCE term (proximity label:
                           # open far / close near). Agrees with the close reward;
                           # the policy still executes its own logit at deployment.
@@ -46,6 +39,15 @@ RL:
                           # only "open" and the gripper stays pinned open (BC base:
                           # gprob==1.0 the whole rollout, never fires). Upweight close
                           # examples to ~match the open mass, capped here.
+  # rl_run11 gripper-drift fix: label-smooth the gripper BCE (targets 1->1-eps,
+  # 0->eps). Root cause of the run9 late decline: the "open" label (=1, far from
+  # grasp) vastly outnumbers "close", so plain BCE drives the logit -> +inf; once it
+  # saturates (~+33) sigmoid=1 -> the gradient vanishes and the rare close states
+  # can't pull it back, so late checkpoints STOP closing (last.pt: close_rate 4%,
+  # all TIMEOUT). Smoothing caps the logit at a bounded, RESPONSIVE value (logit(0.9)
+  # ~= +2.2) so close states can always fire it. Touches only the gripper BCE. 0
+  # disables (run9 behaviour).
+  gripper_label_smooth: 0.1
   aux_weight:   0.5       # goal-auxiliary: regress the EE-relative grasp pose on both
                           # encoders (0 disables). Dense supervision that shapes the
                           # PointNet++ features for the sparse-reward regime.
@@ -76,15 +78,10 @@ RL:
   # ~15 iters: Q(s,pi(s)) hit 1.6e5, pg_loss -1.6e4, bc_loss 2e6, 0% success forever).
   # pg_normalize scales the PG term by 1/mean|Q| so it stays ~alpha and can't starve BC.
   pg_normalize: true
-  alpha:        0.25      # TD3+BC PG scale (pg_normalize pins the PG term ~alpha).
-                          # RAISED 0.1->0.25 for rl_run10: alpha=0.1 was for the
-                          # reward-STARVED regime (rl_run8, buf_pos~0 — PG had no
-                          # signal). rl_run9's curriculum made buf_pos>0 and the policy
-                          # now earns successes, so PG finally has signal to push the
-                          # last-cm reach (0.06->0.02 m) and refine the grasp. Kept
-                          # below the bc term early (bc_weight*PM ~1.3-2x this) so BC
-                          # still anchors; PG leads later as PM shrinks. Raising alpha
-                          # further risks the rl_run1 OOD blowup — watch q_pi vs q_mean.
+  alpha:        0.1       # TD3+BC PG scale (pg_normalize pins the PG term ~alpha).
+                          # run9's value. (rl_run10 raised it 0.1->0.25 to push the
+                          # reach; REVERTED — it did NOT help reach and the run
+                          # regressed. Revisit only as an isolated single change.)
   mix_start:    0.1       # RL weight early (BC-dominated)
   mix_end:      0.2       # RL weight late
   mix_ramp:     50000     # updates to ramp mix_start->mix_end
@@ -135,14 +132,13 @@ LOOP:
   # rl_run8 used the uniform form and stalled ~0.08 m: intermediate takeovers never
   # mastered the endgame first, so they earned no reward and Q never grew past the
   # last ~2 steps. Ramp over ~2/3 of the run so it ends with plenty of from-scratch.
-  # rl_run10: SLOWER + SOFTER than run9 (anneal 550, end 2, window 6). run9 peaked
-  # exactly at anneal completion (~iter 700) then declined, so extend the driver to
-  # ~iter 1000; and end at a WIDER band [0..8] (not the tight [0..2]) so late
-  # training keeps some near-grasp episodes = a live +reward anchor + more close-zone
-  # visits (which also counters the gripper open-drift that killed late run9 closes).
-  expert_initial_anneal_iters: 1000
-  expert_initial_end:   8       # final upper bound: band ends at [0..8], not [0..2]
-  expert_initial_window: 8      # width of the sampled band (hi-window .. hi)
+  # reverse-curriculum anneal (run9's winning values; rl_run10's slower+wider
+  # variant REGRESSED — the wider final band [0..8] under-practiced the from-scratch
+  # eval task, which is always ei=0). The window [hi-window .. hi] slides
+  # hi: expert_initial_steps -> expert_initial_end over anneal_iters, then holds.
+  expert_initial_anneal_iters: 550
+  expert_initial_end:   2       # final upper bound (near-from-scratch, matches eval)
+  expert_initial_window: 6      # width of the sampled band (hi-window .. hi)
   # fraction of online episodes that are FULL-expert rollouts (GA-DDPG non-explore):
   # play the whole OMG traj to the grasp + close + reward. A guaranteed fresh
   # success into the ONLINE buffer every iter (the frozen demo pool goes stale

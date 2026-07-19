@@ -86,6 +86,12 @@ class TD3BCTrainer:
         # rollout, never fires). Upweight close examples to ~match the open mass,
         # capped at this factor.
         self.gripper_close_weight_max = float(r.get("gripper_close_weight_max", 10.0))
+        # label-smooth the gripper BCE (targets 1->1-eps, 0->eps): the far/"open"
+        # label dominates so plain BCE drives the logit to +inf until it saturates
+        # (sigmoid=1, vanishing grad) and the gripper is STUCK open — the run9 late
+        # decline. Smoothing bounds the logit at ~logit(1-eps) so it stays responsive
+        # and close states can still fire it. 0 = off.
+        self.gripper_label_smooth = float(r.get("gripper_label_smooth", 0.0))
         self.aux_weight   = float(r.get("aux_weight", 0.0))  # goal-auxiliary grasp-pose loss
         # PG/BC blend: GA-DDPG mix schedule (default) or TD3+BC normalization.
         self.pg_normalize = bool(r.get("pg_normalize", False))
@@ -224,6 +230,12 @@ class TD3BCTrainer:
                         w_close = 1.0
                     w = torch.where(is_close, a_pi.new_tensor(w_close),
                                     a_pi.new_tensor(1.0))
+                    # label smoothing: 1->1-eps (open), 0->eps (close) so the logit
+                    # converges to a bounded, responsive value instead of saturating
+                    # open (the run9 gripper drift). eps=0 recovers hard targets.
+                    if self.gripper_label_smooth > 0.0:
+                        eps = self.gripper_label_smooth
+                        tgt = tgt * (1.0 - 2.0 * eps) + eps
                     grip_loss = F.binary_cross_entropy_with_logits(
                         a_pi[gmask][:, 6], tgt, weight=w)
 
