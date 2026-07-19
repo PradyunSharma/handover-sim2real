@@ -83,6 +83,11 @@ echo "run=${RUN_NAME}"
 echo "host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
 echo "cpus-per-task=${SLURM_CPUS_PER_TASK}  rollout workers=${WORKERS}"
 
+# NOTE: --worker-device MUST be cuda. The actor's PointNet++ encoder uses
+# pointnet2_ops furthest-point-sampling, which is CUDA-only (no CPU kernel), so a
+# cpu worker crashes on every POLICY episode and it's silently counted as skipped
+# (skip=N, buf=0, no learning). Workers share the one GPU (N small actor contexts +
+# the learner); fine on a 32GB V100 at 16 workers.
 srun python examples/train_rl.py \
     --sim-cfg examples/pretrain.yaml \
     --rl-cfg  examples/configs/rl_phase1_cluster.yaml \
@@ -90,7 +95,7 @@ srun python examples/train_rl.py \
     --demos   output/rl_demos/train_h30.h5 \
     --run-name "${RUN_NAME}" \
     --num-workers "${WORKERS}" \
-    --worker-device cpu \
+    --worker-device cuda \
     --episodes-per-iter "${WORKERS}" \
     --updates-per-iter "$(( WORKERS * 50 ))"
 

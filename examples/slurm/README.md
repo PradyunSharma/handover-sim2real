@@ -81,10 +81,13 @@ ramps in the config (or pass `--num-iters`).
 
 ## Notes
 
-- Workers run the actor on **CPU** by default (`--worker-device cpu`) so the GPU is
-  the learner's alone and there's no CUDA-in-subprocess fragility. `--worker-device
-  cuda` is available if the A100 has headroom for `N` extra contexts, but CPU is the
-  robust default and rarely the bottleneck.
+- **Use `--worker-device cuda` (required, not cpu).** The `--worker-device cpu`
+  default does NOT work here: the actor's PointNet++ encoder calls pointnet2_ops
+  furthest-point-sampling, which is **CUDA-only** (no CPU kernel). A cpu worker
+  therefore raises "CPU not supported" on every *policy* episode, which the manager
+  swallows as a skip — you get `skip=N`, `buf=0`, and no learning (expert episodes
+  still work, which masks it). With `cuda`, the `N` workers each hold a small actor
+  context on the shared GPU alongside the learner — fine on a 32 GB V100 at 16 workers.
 - Do **not** pass `--egl`: pybullet's EGL renderer leaks GPU memory per scene and
   will OOM a long run (the CPU renderer is leak-free). This matters more with many
   workers.
