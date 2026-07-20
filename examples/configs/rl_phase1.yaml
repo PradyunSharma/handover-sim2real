@@ -107,14 +107,14 @@ LOOP:
                                 # on-manifold signal; annealing it away let the
                                 # policy drift toward its own zero-reward rollouts
                                 # (rl_run5 decayed after pretrain). Keep it strong.
-  demo_frac_ramp:       1000    # iters to anneal start->end
+  demo_frac_ramp:       2000    # iters to anneal start->end (rl_run13: doubled with num_iters)
   warmup_episodes:      0       # online expert reaches 0 successes; demo pool + pretrain
                                 # replace it. >0 seeds the online buffer expert-heavy.
   warmup_beta:          1.0     # expert-heavy warmup (seed with successes)
   episodes_per_iter:    2
   updates_per_iter:     100
   batch_size:           64
-  num_iters:            2000
+  num_iters:            4000    # rl_run13: extended 2000->4000 (paired w/ slower curriculum)
   # exploration
   noise_std:            0.1     # rollout action noise (normalized units)
   # reverse-curriculum warm start (GA-DDPG expert_initial): each POLICY episode
@@ -136,7 +136,9 @@ LOOP:
   # variant REGRESSED — the wider final band [0..8] under-practiced the from-scratch
   # eval task, which is always ei=0). The window [hi-window .. hi] slides
   # hi: expert_initial_steps -> expert_initial_end over anneal_iters, then holds.
-  expert_initial_anneal_iters: 550
+  expert_initial_anneal_iters: 2800   # rl_run13: HIGHER-FRACTION curriculum (~70% of the
+                                      # 4000-iter run, vs 27% before) — more mastery per
+                                      # rung, shorter from-scratch tail. (cluster: 350.)
   expert_initial_end:   2       # final upper bound (near-from-scratch, matches eval)
   expert_initial_window: 6      # width of the sampled band (hi-window .. hi)
   # fraction of online episodes that are FULL-expert rollouts (GA-DDPG non-explore):
@@ -160,25 +162,16 @@ LOOP:
   # fresh-short-replan label never entered the reach tail and Zeno-decayed at the
   # standoff (0.08 m short), teaching the policy to hover there (rl_run7 plateau,
   # broken BC base). GA-DDPG values: ratio 0.5, min 5, guard 8.
-  # rl_run12 REACH experiment: RAISED ratio 0.5->1.0. At 0.5, half the mid-traj
-  # steps still label toward the COMMITTED plan[t], whose delta BALLOONS when the
-  # from-scratch policy falls behind -> BC trains ever-bigger actions -> |a_pose|
-  # inflates (run9 0.65->1.2, run11 0.78->1.7) -> overshoot -> endgame degrades
-  # (the shared post-curriculum decline in run9+run11, and part of the 0.05 m reach
-  # ceiling: the policy arrives at the reach tail OFF-plan). At 1.0 EVERY mid-traj
-  # step re-fits a FEASIBLE tail over the remaining horizon (no floor -> no Zeno),
-  # so labels stay ~2 cm and the policy tracks the plan -> arrives at the reach tail
-  # on-schedule where its fine-settle labels are in-distribution. Cost: ~2x OMG
-  # replans/episode (rollout-bound) -> ~2x rollout wall-clock; dial back toward 0.7
-  # if too slow. Grasp is static per scene so reset_scene=False replans don't jitter.
-  dagger_ratio:         1.0
+  # rl_run12 tried ratio 1.0 (feasible mid-traj labels) — NEGATIVE (didn't bound
+  # |a_pose|, didn't move the 0.05 m reach ceiling). Reverted to run9/run11's 0.5.
+  dagger_ratio:         0.5
   dagger_min_step:      5
   dagger_tail_guard:    8
   beta_start:           0.5     # mid-episode expert-execution prob at iter 0 (executes
                                 # the committed plan's CURRENT waypoint -> snaps the EE
                                 # back onto the plan)
   beta_end:             0.0     # expert-execution prob at the end
-  beta_ramp_iters:      500
+  beta_ramp_iters:      2520    # rl_run13: scaled to track the curriculum (cluster: 315)
   # eval / checkpoint
   eval_every:           50
   eval_episodes:        50      # 20 can't resolve a low single-digit success rate

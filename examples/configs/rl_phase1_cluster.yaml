@@ -66,40 +66,45 @@ LOOP:
   demo_frac:            0.25    # fallback constant (used only if demo_frac_start unset)
   demo_frac_start:      0.5     # demo-heavy early (offline->online transition)
   demo_frac_end:        0.3     # permanent floor (keeps the +1 anchor)
-  demo_frac_ramp:       125     # iters to anneal start->end (rl_phase1: 1000 @ 2 ep/iter
-                                # = 2000 episodes; /16 ep-per-iter = 125)
+  demo_frac_ramp:       250     # iters to anneal start->end. rl_run13 DOUBLED (125->250)
+                                # with num_iters, so the demo-heavy phase still covers the
+                                # (now much longer) curriculum. rl_phase1: 2000 @ 2 ep/iter.
   warmup_episodes:      0       # online expert reaches 0 successes; demos + pretrain replace it
   warmup_beta:          1.0
   # ── parallel granularity: one episode per worker per iter ──────────────────
   episodes_per_iter:    16      # == --num-workers (every worker rolls one episode)
   updates_per_iter:     800     # 50 updates/episode — same replay ratio as 100/2
   batch_size:           64      # per-transition — UNCHANGED (same gradient noise)
-  num_iters:            250     # 16 * 250 = 4000 episodes == rl_phase1's 2 * 2000
+  num_iters:            500     # rl_run13 EXTENDED 250->500 (16*500 = 8000 episodes, 2x).
+                                # Paired with the slower/higher-fraction curriculum below
+                                # so the reward-ladder-building phase (not the from-scratch
+                                # tail) gets the extra iters.
   # exploration
   noise_std:            0.1
   expert_initial_steps: 28      # reverse-curriculum warm start upper bound (per-episode
                                 # step count — UNCHANGED across granularity)
-  # annealed reverse-curriculum (run9 config): the takeover window slides
-  # expert_initial_steps -> _end over _anneal_iters. The step counts (_steps/_end/_window)
-  # are per-EPISODE so they are copied verbatim from rl_phase1.yaml; only _anneal_iters is
-  # per-ITER -> rescaled (rl_phase1: 550 @ 2 ep/iter = 1100 episodes; /16 ep-per-iter ≈ 69).
-  expert_initial_anneal_iters: 69
+  # annealed reverse-curriculum. rl_run13 HIGHER-FRACTION curriculum: 69->350, so the
+  # anneal now spans ~70% of the 500-iter run (vs 27% before) instead of finishing at
+  # iter 69 and leaving a long from-scratch tail that only ever declined (run9/11/12).
+  # Each rung (ei value) now gets ~5x the gradient updates before advancing -> more
+  # mastery per rung, and only ~30% of the run is the from-scratch consolidation tail.
+  # (rl_phase1 PC-units: 2800.)
+  expert_initial_anneal_iters: 350
   expert_initial_end:   2       # final upper bound (near-from-scratch, matches eval)
   expert_initial_window: 6      # width of the sampled band (hi-window .. hi)
   expert_episode_frac:  0.25    # full-expert episodes (fresh +reward anchor)
   rollout_max_steps:    30      # episode horizon (clock denom + OMG plan length)
-  # DAgger tail replans. rl_run12 REACH experiment: ratio 0.5->1.0 so EVERY mid-traj
-  # step re-fits a FEASIBLE tail (labels ~2cm) instead of half of them ballooning
-  # toward the committed plan when the from-scratch policy falls behind — that
-  # inflated |a_pose| (run9 0.65->1.2, run11 0.78->1.7) -> overshoot -> the shared
-  # late decline + part of the 0.05 m reach ceiling. Cost: ~2x OMG replans/episode
-  # (rollout-bound), but parallelized across the 16 workers. See rl_phase1.yaml.
-  dagger_ratio:         1.0
+  # DAgger tail replans. rl_run12 tried ratio 1.0 (feasible mid-traj labels) —
+  # NEGATIVE (no |a_pose| bound, no reach gain). Reverted to run9/run11's 0.5.
+  dagger_ratio:         0.5
   dagger_min_step:      5
   dagger_tail_guard:    8
   beta_start:           0.5
   beta_end:             0.0
-  beta_ramp_iters:      63      # rl_phase1: 500 @ 2 ep/iter = 1000 episodes; /16 ≈ 63
+  beta_ramp_iters:      315     # rl_run13: scaled 63->315 to TRACK the curriculum (they
+                                # finished together before: 63/69 ≈ 0.9; 0.9*350 ≈ 315), so
+                                # mid-episode expert correction weans off as the curriculum
+                                # completes rather than at iter 63. (rl_phase1 PC-units: 2520.)
   # eval / checkpoint (parallel eval is cheap — bump episodes for a smoother curve)
   eval_every:           7       # rl_phase1: 50 @ 2 ep/iter = 100 episodes; /16 ≈ 7
   eval_episodes:        64      # 4 per worker at 16 workers
