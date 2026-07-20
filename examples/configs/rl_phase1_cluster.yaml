@@ -88,8 +88,13 @@ LOOP:
   expert_initial_window: 6      # width of the sampled band (hi-window .. hi)
   expert_episode_frac:  0.25    # full-expert episodes (fresh +reward anchor)
   rollout_max_steps:    30      # episode horizon (clock denom + OMG plan length)
-  # DAgger tail replans
-  dagger_ratio:         0.5
+  # DAgger tail replans. rl_run12 REACH experiment: ratio 0.5->1.0 so EVERY mid-traj
+  # step re-fits a FEASIBLE tail (labels ~2cm) instead of half of them ballooning
+  # toward the committed plan when the from-scratch policy falls behind — that
+  # inflated |a_pose| (run9 0.65->1.2, run11 0.78->1.7) -> overshoot -> the shared
+  # late decline + part of the 0.05 m reach ceiling. Cost: ~2x OMG replans/episode
+  # (rollout-bound), but parallelized across the 16 workers. See rl_phase1.yaml.
+  dagger_ratio:         1.0
   dagger_min_step:      5
   dagger_tail_guard:    8
   beta_start:           0.5

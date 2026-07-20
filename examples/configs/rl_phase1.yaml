@@ -160,7 +160,18 @@ LOOP:
   # fresh-short-replan label never entered the reach tail and Zeno-decayed at the
   # standoff (0.08 m short), teaching the policy to hover there (rl_run7 plateau,
   # broken BC base). GA-DDPG values: ratio 0.5, min 5, guard 8.
-  dagger_ratio:         0.5
+  # rl_run12 REACH experiment: RAISED ratio 0.5->1.0. At 0.5, half the mid-traj
+  # steps still label toward the COMMITTED plan[t], whose delta BALLOONS when the
+  # from-scratch policy falls behind -> BC trains ever-bigger actions -> |a_pose|
+  # inflates (run9 0.65->1.2, run11 0.78->1.7) -> overshoot -> endgame degrades
+  # (the shared post-curriculum decline in run9+run11, and part of the 0.05 m reach
+  # ceiling: the policy arrives at the reach tail OFF-plan). At 1.0 EVERY mid-traj
+  # step re-fits a FEASIBLE tail over the remaining horizon (no floor -> no Zeno),
+  # so labels stay ~2 cm and the policy tracks the plan -> arrives at the reach tail
+  # on-schedule where its fine-settle labels are in-distribution. Cost: ~2x OMG
+  # replans/episode (rollout-bound) -> ~2x rollout wall-clock; dial back toward 0.7
+  # if too slow. Grasp is static per scene so reset_scene=False replans don't jitter.
+  dagger_ratio:         1.0
   dagger_min_step:      5
   dagger_tail_guard:    8
   beta_start:           0.5     # mid-episode expert-execution prob at iter 0 (executes
