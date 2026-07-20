@@ -1,0 +1,49 @@
+DATA:
+  num_pts: 1024
+  pc_channels: 5
+LOOP:
+  batch_size: 64
+  beta_end: 0.0
+  beta_ramp_iters: 500
+  beta_start: 0.5
+  capacity: 20000
+  demo_frac: 0.25
+  episodes_per_iter: 2
+  eval_episodes: 20
+  eval_every: 50
+  expert_initial_steps: 0
+  noise_std: 0.1
+  num_iters: 2000
+  save_every: 50
+  updates_per_iter: 100
+  warmup_beta: 1.0
+  warmup_episodes: 20
+MODEL:
+  clock_dim: 1
+  q_hidden:
+  - 256
+  - 256
+RL:
+  act_limit: 5.0
+  actor_lr: 0.0003
+  alpha: 2.5
+  aux_weight: 0.5
+  bc_weight: 1.0
+  critic_lr: 0.0003
+  gamma: 0.95
+  grad_clip: 1.0
+  gripper_bc_weight: 1.0
+  hand_collision_filter: true
+  hand_collision_thresh: 0.08
+  hand_points_radius: 0.35
+  hold_steps: 3
+  mc_blend: 0.5
+  mix_end: 0.2
+  mix_ramp: 50000
+  mix_start: 0.1
+  noise_clip: 0.5
+  pg_normalize: true
+  policy_delay: 2
+  policy_noise: 0.2
+  reward_mode: stable_grasp
+  tau: 0.005

@@ -6,3 +6,15 @@
 
 !fetch_cvpr2023_models.sh
 !fetch_grasp_trigger_PRE_2.sh
+
+# Track lightweight per-run metadata under rl_runs/ (training logs, plots, and
+# configs) so runs can be committed/pushed for record-keeping. The parent dirs
+# must be re-included first, then the specific files. The large checkpoints/
+# (100s of MB of .pt weights) stay ignored — do NOT commit those to git.
+!rl_runs/
+!rl_runs/*/
+!rl_runs/*/*.csv
+!rl_runs/*/*.png
+!rl_runs/*/*.yaml
+!rl_runs/*/*.npz
+rl_runs/*/checkpoints/

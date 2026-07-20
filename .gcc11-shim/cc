@@ -1,0 +1,2 @@
+#!/bin/bash
+exec /home/pradyunsharma/.conda/envs/pn2build/bin/x86_64-conda-linux-gnu-gcc "$@" -idirafter /usr/include
