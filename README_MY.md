@@ -1429,7 +1429,7 @@ export MPLBACKEND=Agg
 # 2. the env's Python by full path (bare `python` is system Python 2)
 export PLOT_PY=/home/pradyunsharma/.conda/envs/pch2r_dev/bin/python
 # 3. run the plotter
-$PLOT_PY examples/plot_rl_run.py output/rl_runs/rl_run13
+$PLOT_PY examples/plot_rl_run.py output/rl_runs/rl_run14
 # -> wrote output/rl_runs/rl_run13/curves.png   (open it in the VS Code file explorer)
 ```
 
@@ -1448,3 +1448,17 @@ Copy a run's best checkpoint down from DelftBlue with `scp -p` (preserves mtime)
 ```bash
 scp -p pradyunsharma@login.delftblue.tudelft.nl:/home/pradyunsharma/h2r/handover-sim2real/output/rl_runs/rl_run13/checkpoints/best.pt /home/pradyun/h2r/handover-sim2real/output/rl_runs/rl_run13/checkpoints
 ```
+
+## Live metrics dashboard (on the cluster)
+
+`log.csv` is flushed every iteration (the SLURM `.out` job log block-buffers, so it
+lags behind). `watch` is blocked on the login node, so use a `while` loop to tail the
+key columns live — Ctrl-C to stop, swap `rl_run14` for any run:
+
+```bash
+while true; do clear; awk -F, 'NR>1{printf "it %-4s buf %-6s roll_succ %-5s roll_minpos %-7s skip %-3s eval_succ %-7s best %-7s\n",$1,$2,$6,$20,$22,$38,$39}' output/rl_runs/rl_run14/log.csv | tail -10; sleep 30; done
+```
+
+Columns (1-indexed): `1`=iter `2`=buffer `6`=roll_succ `20`=roll_minpos `22`=skip
+`38`=eval_succ `39`=best. Watch `eval_succ`/`best` trend up; `roll_minpos` is the
+closest EE→grasp approach (the reach metric).
