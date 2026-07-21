@@ -37,6 +37,17 @@ byte-identical.
     target + the proximity gripper label: P(open)=1 when far from the grasp, 0
     within proximity — a training-only signal for the actor's gripper BCE, never
     an execution override).
+  • DART (GA-DDPG `env.random_perturb`): on a fraction `dart_ratio` of POLICY
+    steps inside [dart_min_step, dart_max_step) the executed action is REPLACED by
+    a random task-space jump (±dart_pos_mag m, ±dart_rot_mag rad, gripper open),
+    jolting the EE off-plan so the FOLLOWING steps' plan-tracking labels demonstrate
+    the RECOVERY. This manufactures the off-plan near-grasp coverage that warm-start
+    + DAgger never produce (both stay on-plan → the from-scratch policy that arrives
+    a few cm off LATERALLY has never seen a near-grasp lateral correction). The
+    window sits just BEFORE the reach tail and inside the DAgger window so a splice
+    can re-fit a feasible recovery. The perturbed transition carries `perturb_flag`
+    = 1 → the trainer DROPS it from the Bellman critic fit (its stored action is
+    artificial) but KEEPS it for the actor BC. `dart_ratio` 0 = disabled.
 
 Reward (no carry-to-goal / no benchmark SUCCESS): the episode is about reaching
 the grasp and committing the close at the right pose.
@@ -172,7 +183,9 @@ class RolloutWorker:
                  act_limit: float = 5.0,
                  close_pos_thresh: float = 0.02, close_rot_thresh: float = 0.34,
                  reward_mode: str = "proximity", hold_steps: int = 3,
-                 dagger_min_step: int = 5, dagger_tail_guard: int = 8):
+                 dagger_min_step: int = 5, dagger_tail_guard: int = 8,
+                 dart_min_step: int = 15, dart_max_step: int = 22,
+                 dart_pos_mag: float = 0.04, dart_rot_mag: float = 0.2):
         self.env = env
         self.point_listener = point_listener
         self.cfg = cfg
@@ -192,6 +205,18 @@ class RolloutWorker:
         # 5-step reach tail).
         self.dagger_min_step = int(dagger_min_step)
         self.dagger_tail_guard = int(dagger_tail_guard)
+        # DART (GA-DDPG random_perturb): on a fraction `dart_ratio` of POLICY steps
+        # inside [dart_min_step, dart_max_step) inject a random task-space jump
+        # (±dart_pos_mag m, ±dart_rot_mag rad) instead of the policy action. The
+        # jump lands the EE OFF-PLAN so the next step's plan-tracking label (and, if
+        # still warming, the by-index expert) demonstrates the RECOVERY — the one
+        # thing DAgger/warm-start never cover near the grasp (both stay on-plan).
+        # The window sits BEFORE the reach tail (last ~5 steps) on purpose: perturb
+        # around the standoff entry, recover+realign, THEN descend straight in.
+        self.dart_min_step = int(dart_min_step)
+        self.dart_max_step = int(dart_max_step)
+        self.dart_pos_mag  = float(dart_pos_mag)
+        self.dart_rot_mag  = float(dart_rot_mag)
 
         self.panda_base_inv_tf = pybullet.invertTransform(
             cfg.ENV.PANDA_BASE_POSITION, cfg.ENV.PANDA_BASE_ORIENTATION)
@@ -213,7 +238,8 @@ class RolloutWorker:
                         beta: float = 0.0, expert_initial_steps: int = 0,
                         noise_std: float = 0.1, on_grasp=None,
                         on_policy_grasp=None,
-                        dagger_ratio: float = 0.0) -> tuple[list[dict], dict]:
+                        dagger_ratio: float = 0.0,
+                        dart_ratio: float = 0.0) -> tuple[list[dict], dict]:
         """Roll out one episode. Returns (transitions, stats). transitions is
         empty (and stats['skipped']=True) if OMG can't plan on the first step.
         `dagger_ratio` is the per-step probability of a DAgger TAIL replan
@@ -243,6 +269,7 @@ class RolloutWorker:
         transitions: list[dict] = []
         n_omg_fail = 0
         n_replans = 0
+        n_perturb = 0
         status = 0
         done = False
         min_pos = float("inf")   # closest EE->grasp position (m) reached this episode
@@ -343,6 +370,7 @@ class RolloutWorker:
             # Executed gripper: OPEN (finger 0.04) iff logit ≥ 0, else CLOSE.
             warmup = step < expert_initial_steps
             use_expert = warmup or (beta > 0.0 and rng.uniform() < beta)
+            is_dart = False
             if use_expert:
                 # follow the COMMITTED plan BY INDEX: the reverse-curriculum warm
                 # start (GA-DDPG expert_initial) traverses the EE to the grasp so
@@ -355,6 +383,27 @@ class RolloutWorker:
                 stored_action = np.concatenate(
                     [expert_action_norm, [self.act_limit]]).astype(np.float32)
                 committed_close = False
+            elif (dart_ratio > 0.0
+                  and self.dart_min_step <= step < self.dart_max_step
+                  and rng.uniform() < dart_ratio):
+                # DART perturbation (GA-DDPG env.random_perturb): REPLACE the policy
+                # action with a random task-space jump so the EE lands off-plan and
+                # the following steps' plan-tracking labels demonstrate the recovery
+                # (the off-plan near-grasp coverage DAgger/warm-start never produce).
+                # Gripper stays OPEN (never close on a jolt). The stored action is
+                # this jump; perturb_flag=1 drops the row from the critic's Bellman
+                # fit (its Q(s,a) is meaningless) while the label still feeds BC.
+                is_dart = True
+                n_perturb += 1
+                exec_delta6 = np.concatenate([
+                    rng.uniform(-self.dart_pos_mag, self.dart_pos_mag, size=3),
+                    rng.uniform(-self.dart_rot_mag, self.dart_rot_mag, size=3),
+                ]).astype(np.float32)
+                committed_close = False
+                action7 = np.concatenate([exec_delta6, [1.0]]).astype(np.float32)
+                target_jp = action_to_target_joint(action7, obs)
+                stored_action = np.concatenate(
+                    [self._norm(exec_delta6), [self.act_limit]]).astype(np.float32)
             else:
                 exec_delta6 = self._denorm(a_norm[:6]).astype(np.float32)
                 committed_close = float(a_norm[6]) < 0.0
@@ -426,7 +475,8 @@ class RolloutWorker:
                 next_remain_norm=next_remain_norm, terminal=terminal,
                 mc_return=0.0, expert_action=expert_action_norm,
                 expert_flag=expert_flag, goal_pose=goal9, next_goal_pose=next_goal9,
-                expert_gripper=expert_gripper, gripper_flag=gripper_flag))
+                expert_gripper=expert_gripper, gripper_flag=gripper_flag,
+                perturb_flag=(1.0 if is_dart else 0.0)))
 
             pc, rs = next_pc, next_rs
             if ep_done:
@@ -448,6 +498,7 @@ class RolloutWorker:
             "reason": reason if transitions else "EMPTY",
             "n_omg_fail": n_omg_fail,
             "n_replans": n_replans,
+            "n_perturb": n_perturb,
             "min_pos": float(min_pos) if min_pos < float("inf") else float("nan"),
             "min_rot": float(min_rot) if min_rot < float("inf") else float("nan"),
             "closed": int(closed_any),
@@ -521,7 +572,8 @@ class RolloutWorker:
                 next_remain_norm=next_remain_norm, terminal=(1.0 if done else 0.0),
                 mc_return=0.0, expert_action=self._norm(exec_delta6).astype(np.float32),
                 expert_flag=1.0, goal_pose=goal9, next_goal_pose=next_goal9,
-                expert_gripper=(0.0 if near else 1.0), gripper_flag=1.0))
+                expert_gripper=(0.0 if near else 1.0), gripper_flag=1.0,
+                perturb_flag=0.0))
             pc, rs = next_pc, next_rs
             if done:
                 break
@@ -553,7 +605,7 @@ class RolloutWorker:
                 next_remain_norm=max(max_steps - step - 1, 0) / max_steps, terminal=1.0,
                 mc_return=0.0, expert_action=self._norm(np.zeros(6, dtype=np.float32)).astype(np.float32),
                 expert_flag=1.0, goal_pose=goal9, next_goal_pose=goal9,  # terminal: Φ(s') zeroed
-                expert_gripper=0.0, gripper_flag=1.0))
+                expert_gripper=0.0, gripper_flag=1.0, perturb_flag=0.0))
             reason = "GRASP_OK" if held else "GRASP_MISS"
 
         if not transitions:

@@ -180,6 +180,23 @@ LOOP:
   dagger_ratio:         0.5
   dagger_min_step:      5
   dagger_tail_guard:    8
+  # DART (GA-DDPG env.random_perturb): on a fraction `dart_ratio` of POLICY steps in
+  # [dart_min_step, dart_max_step) inject a random ±dart_pos_mag m / ±dart_rot_mag rad
+  # task-space JUMP instead of the policy action, landing the EE off-plan so the next
+  # steps' plan-tracking labels demonstrate the RECOVERY. This is the one thing DAgger
+  # + warm-start never cover near the grasp (both stay perfectly on-plan): the demo
+  # pool is 100% on-axis at the reach tail (measured), so the from-scratch policy that
+  # arrives ~5 cm off LATERALLY has never seen a near-grasp lateral correction. The
+  # window sits just BEFORE the ~5-step reach tail (standoff at ~step 25) AND inside
+  # the DAgger replan window (<22) so a spliced replan can re-fit a feasible recovery.
+  # Perturbed rows are DROPPED from the critic's Bellman fit (artificial action) but
+  # KEPT for the actor BC. 0 = OFF (run11 base). rl_run15: try dart_ratio≈0.15-0.25
+  # (~1-2 perturbations/episode). Window/mags are per-STEP — SAME in the cluster yaml.
+  dart_ratio:           0.0
+  dart_min_step:        15
+  dart_max_step:        22
+  dart_pos_mag:         0.04
+  dart_rot_mag:         0.2
   beta_start:           0.5     # mid-episode expert-execution prob at iter 0 (executes
                                 # the committed plan's CURRENT waypoint -> snaps the EE
                                 # back onto the plan)

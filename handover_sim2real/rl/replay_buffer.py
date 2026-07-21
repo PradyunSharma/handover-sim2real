@@ -22,6 +22,11 @@ Each transition carries the standard off-policy tuple plus three Phase-3 extras:
      proximity) + whether the grasp pose is known so the label is valid. Feeds
      the actor's gripper BCE term. Training-only supervision that AGREES with the
      reward; the policy still executes its OWN logit at deployment.
+  • `perturb_flag` — 1.0 on a DART-perturbed transition (a deliberately injected
+     random action that jolts the EE off-plan to force recovery coverage near the
+     grasp). The trainer DROPS these from the Bellman critic fit (the stored
+     action is artificial), but keeps them for the actor BC; the recovery is
+     taught by the NEXT step's plan-tracking label. 0.0 on all normal / demo rows.
 
 Actions are stored in **normalized** space (the actor's output space).
 """
@@ -64,6 +69,9 @@ class ReplayBuffer:
         # proximity-synthesized gripper label (P(open): 1 far / 0 near) + validity
         self.expert_gripper = np.zeros((c, 1), dtype=np.float32)
         self.gripper_flag   = np.zeros((c, 1), dtype=np.float32)
+        # DART: 1.0 on a deliberately-perturbed transition (artificial random
+        # action) — masked from the critic's Bellman fit, kept for the actor BC.
+        self.perturb_flag   = np.zeros((c, 1), dtype=np.float32)
 
         self._idx  = 0
         self._full = False
@@ -73,7 +81,8 @@ class ReplayBuffer:
 
     def add(self, *, pc, rs, remain_norm, action, reward, next_pc, next_rs,
             next_remain_norm, terminal, mc_return, expert_action, expert_flag,
-            goal_pose, next_goal_pose=None, expert_gripper=1.0, gripper_flag=0.0):
+            goal_pose, next_goal_pose=None, expert_gripper=1.0, gripper_flag=0.0,
+            perturb_flag=0.0):
         i = self._idx
         self.pc[i]          = pc
         self.rs[i]          = rs
@@ -91,6 +100,7 @@ class ReplayBuffer:
         self.next_goal_pose[i] = goal_pose if next_goal_pose is None else next_goal_pose
         self.expert_gripper[i, 0] = float(expert_gripper)
         self.gripper_flag[i, 0]   = float(gripper_flag)
+        self.perturb_flag[i, 0]   = float(perturb_flag)
 
         self._idx += 1
         if self._idx >= self.capacity:
@@ -125,6 +135,7 @@ class ReplayBuffer:
             "next_goal_pose": t(self.next_goal_pose),
             "expert_gripper": t(self.expert_gripper),
             "gripper_flag":   t(self.gripper_flag),
+            "perturb_flag":   t(self.perturb_flag),
         }
 
 
@@ -141,7 +152,7 @@ class ReplayBuffer:
 _DEMO_BUFFER_FIELDS = (
     "pc", "rs", "remain_norm", "action", "reward", "next_pc", "next_rs",
     "next_remain_norm", "terminal", "mc_return", "expert_action", "expert_flag",
-    "goal_pose", "next_goal_pose", "expert_gripper", "gripper_flag")
+    "goal_pose", "next_goal_pose", "expert_gripper", "gripper_flag", "perturb_flag")
 
 
 def save_demo_transitions(path: str, transitions: list[dict], extra: dict = None) -> None:

@@ -101,6 +101,18 @@ LOOP:
   dagger_ratio:         0.5
   dagger_min_step:      5
   dagger_tail_guard:    8
+  # DART (GA-DDPG env.random_perturb): inject a random task-space JUMP on a fraction
+  # dart_ratio of POLICY steps in [dart_min_step, dart_max_step) to manufacture the
+  # off-plan near-grasp RECOVERY data that DAgger + warm-start never produce (both
+  # stay on-plan → the ~5 cm LATERAL plateau). Perturbed rows are dropped from the
+  # critic's Bellman fit, kept for the actor BC. Window/mags are per-STEP (UNCHANGED
+  # across granularity — identical to rl_phase1.yaml). 0 = OFF (run11 base). See
+  # rl_phase1.yaml for the full rationale; rl_run15 try dart_ratio≈0.15-0.25.
+  dart_ratio:           0.0
+  dart_min_step:        15
+  dart_max_step:        22
+  dart_pos_mag:         0.04
+  dart_rot_mag:         0.2
   beta_start:           0.5
   beta_end:             0.0
   beta_ramp_iters:      63      # run9/11 value (tracks the 69-iter curriculum: 63/69 ≈ 0.9).

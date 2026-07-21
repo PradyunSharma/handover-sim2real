@@ -159,6 +159,7 @@ class TD3BCTrainer:
         goal_pose     = batch["goal_pose"]
         expert_gripper = batch.get("expert_gripper")   # proximity gripper label
         gripper_flag   = batch.get("gripper_flag")     # label validity
+        perturb_flag   = batch.get("perturb_flag")     # DART: artificial jump row
 
         # ----- critic -----
         with torch.no_grad():
@@ -186,8 +187,21 @@ class TD3BCTrainer:
         else:
             q1, q2 = self.critic(pc, rs, action, remain)
             aux_loss_c = torch.zeros((), device=q1.device)
-        critic_loss = (F.smooth_l1_loss(q1, y) + F.smooth_l1_loss(q2, y)
-                       + self.aux_weight * aux_loss_c)
+        # DART: exclude perturbed transitions from the Bellman fit — their stored
+        # action is an artificial random jump, so Q(s,a) → r+γQ(s') there is a
+        # meaningless target that would corrupt the critic. They are kept for the
+        # actor BC (the next-step plan-tracking label teaches the recovery). No-op
+        # when nothing is perturbed (DART off / demo batch): keep == all-ones, so
+        # the masked mean equals the plain mean.
+        if perturb_flag is not None:
+            keep  = (perturb_flag < 0.5).float()              # [B,1]
+            denom = keep.sum().clamp_min(1.0)
+            q_fit = (((F.smooth_l1_loss(q1, y, reduction="none")
+                       + F.smooth_l1_loss(q2, y, reduction="none")) * keep).sum()
+                     / denom)
+        else:
+            q_fit = F.smooth_l1_loss(q1, y) + F.smooth_l1_loss(q2, y)
+        critic_loss = q_fit + self.aux_weight * aux_loss_c
 
         self.critic_optim.zero_grad(set_to_none=True)
         critic_loss.backward()

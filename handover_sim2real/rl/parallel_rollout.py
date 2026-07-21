@@ -99,7 +99,8 @@ def _run_job(worker, actor, job: dict):
         beta=float(job.get("beta", 0.0)),
         noise_std=float(job.get("noise_std", 0.0)),
         expert_initial_steps=int(job.get("expert_initial_steps", 0)),
-        dagger_ratio=float(job.get("dagger_ratio", 0.0)))
+        dagger_ratio=float(job.get("dagger_ratio", 0.0)),
+        dart_ratio=float(job.get("dart_ratio", 0.0)))
 
 
 # ── worker process entry point ───────────────────────────────────────────────

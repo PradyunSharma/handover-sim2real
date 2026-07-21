@@ -135,7 +135,7 @@ def _accumulate(results, buffer):
     aggregate. Shared by the serial and the parallel collect paths so there is one
     source of truth for the accounting (buffer add order is irrelevant to a replay
     buffer, so gather-then-add == the old add-in-loop)."""
-    succ = length = ret = kept = skipped = closed = 0
+    succ = length = ret = kept = skipped = closed = perturb = 0
     exp_kept = exp_succ = 0
     minpos, reasons = [], Counter()
     for trans, st in results:
@@ -149,18 +149,19 @@ def _accumulate(results, buffer):
             continue                    # keep roll_* a policy-only progress signal
         succ += st["success"]; length += st["length"]; ret += st["return"]
         closed += st.get("closed", 0)
+        perturb += st.get("n_perturb", 0)
         minpos.append(st.get("min_pos", float("nan")))
         reasons[st.get("reason", "?")] += 1
     n = max(kept - exp_kept, 1)         # policy episodes only
     return {"succ_rate": succ / n, "mean_len": length / n, "mean_ret": ret / n,
             "kept": kept, "skipped": skipped, "close_rate": closed / n,
-            "min_pos": _mean(minpos), "reasons": reasons,
+            "min_pos": _mean(minpos), "reasons": reasons, "n_perturb": perturb,
             "exp_kept": exp_kept, "exp_succ_rate": exp_succ / max(exp_kept, 1)}
 
 
 def collect(collector, actor, buffer, n_eps, rng, num_scenes,
             beta, noise_std, ei_lo, ei_hi, expert_episode_frac=0.0,
-            dagger_ratio=0.0):
+            dagger_ratio=0.0, dart_ratio=0.0):
     """Collect n_eps episodes into the online buffer. A fraction
     `expert_episode_frac` are FULL-expert rollouts (GA-DDPG non-explore): the OMG
     trajectory is played to the grasp + closed → a guaranteed fresh success that
@@ -185,7 +186,8 @@ def collect(collector, actor, buffer, n_eps, rng, num_scenes,
                 ei = int(rng.randint(ei_lo, ei_hi + 1)) if ei_hi > 0 else 0
                 job = {"kind": "policy", "scene": scene, "beta": float(beta),
                        "noise_std": float(noise_std),
-                       "expert_initial_steps": ei, "dagger_ratio": float(dagger_ratio)}
+                       "expert_initial_steps": ei, "dagger_ratio": float(dagger_ratio),
+                       "dart_ratio": float(dart_ratio)}
             job["seed"] = int(rng.randint(1, 2**31 - 1))
             jobs.append(job)
         results = collector.rollout(cpu_state_dict(actor), jobs)
@@ -201,7 +203,7 @@ def collect(collector, actor, buffer, n_eps, rng, num_scenes,
             results.append(collector.rollout_episode(
                 actor, scene, rng, beta=beta,
                 expert_initial_steps=ei, noise_std=noise_std,
-                dagger_ratio=dagger_ratio))
+                dagger_ratio=dagger_ratio, dart_ratio=dart_ratio))
     return _accumulate(results, buffer)
 
 
@@ -367,10 +369,15 @@ def main():
         reward_mode=str(rlcfg["RL"].get("reward_mode", "proximity")),
         hold_steps=int(rlcfg["RL"].get("hold_steps", 3)),
         dagger_min_step=int(loop.get("dagger_min_step", 5)),
-        dagger_tail_guard=int(loop.get("dagger_tail_guard", 8)))
+        dagger_tail_guard=int(loop.get("dagger_tail_guard", 8)),
+        dart_min_step=int(loop.get("dart_min_step", 15)),
+        dart_max_step=int(loop.get("dart_max_step", 25)),
+        dart_pos_mag=float(loop.get("dart_pos_mag", 0.04)),
+        dart_rot_mag=float(loop.get("dart_rot_mag", 0.2)))
     worker = RolloutWorker(env, point_listener, cfg, normalizer, args.device,
                            **rollout_kwargs)
     dagger_ratio = float(loop.get("dagger_ratio", 0.5))
+    dart_ratio   = float(loop.get("dart_ratio", 0.0))   # DART off by default
 
     # ── parallel rollout collection (the paper's num_remotes) ───────────────
     # collector is what collect()/evaluate() dispatch to: the single in-process
@@ -464,7 +471,7 @@ def main():
                     rng, num_scenes, beta=beta, noise_std=float(loop["noise_std"]),
                     ei_lo=ei_lo, ei_hi=ei_hi,
                     expert_episode_frac=float(loop.get("expert_episode_frac", 0.0)),
-                    dagger_ratio=dagger_ratio)
+                    dagger_ratio=dagger_ratio, dart_ratio=dart_ratio)
 
         df = demo_frac_at(it, loop)      # scheduled demo fraction this iter
         stats = {}
@@ -488,7 +495,7 @@ def main():
                   f"ei={ei_lo}-{ei_hi} "
                   f"roll_succ={c['succ_rate']:.2f} roll_minpos={c['min_pos']:.3f} "
                   f"close={c['close_rate']:.2f} exp={c['exp_kept']}/{c['exp_succ_rate']:.2f} "
-                  f"skip={c['skipped']} "
+                  f"skip={c['skipped']} dart={c['n_perturb']} "
                   f"q={stats.get('q_mean', float('nan')):.3f} "
                   f"q_pi={astats.get('q_pi', float('nan')):.1f} "
                   f"bc={astats.get('bc_loss', float('nan')):.4f} "
