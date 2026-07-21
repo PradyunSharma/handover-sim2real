@@ -58,8 +58,8 @@ RL:
   # reach gradient the sparse reward lacks — targets the 0.05 m fine-approach ceiling.
   # BOTH 0 = DISABLED (run9/11/12/13 behaviour). rl_run14 experiment: try pos_w≈1.0,
   # rot_w≈0.3 (position is the harder constraint). Eval success stays the sparse
-  # policy-close metric (shaping is training-only, in the critic target). Do NOT
-  # enable for run13 (would confound the curriculum test).
+  # policy-close metric (shaping is training-only, in the critic target). Enable on
+  # THIS run11 base (isolated), NOT stacked on run13's reverted curriculum changes.
   shaping_pos_weight: 0.0
   shaping_rot_weight: 0.0
   # reward: how a committed close is scored (terminal either way).
@@ -118,14 +118,15 @@ LOOP:
                                 # on-manifold signal; annealing it away let the
                                 # policy drift toward its own zero-reward rollouts
                                 # (rl_run5 decayed after pretrain). Keep it strong.
-  demo_frac_ramp:       2000    # iters to anneal start->end (rl_run13: doubled with num_iters)
+  demo_frac_ramp:       1000    # iters to anneal start->end. (rl_run13 doubled to 2000; reverted.)
   warmup_episodes:      0       # online expert reaches 0 successes; demo pool + pretrain
                                 # replace it. >0 seeds the online buffer expert-heavy.
   warmup_beta:          1.0     # expert-heavy warmup (seed with successes)
   episodes_per_iter:    2
   updates_per_iter:     100
   batch_size:           64
-  num_iters:            4000    # rl_run13: extended 2000->4000 (paired w/ slower curriculum)
+  num_iters:            2000    # run9/11 value. rl_run13 extended to 4000 (+higher-fraction
+                                # curriculum) — NEGATIVE (lower peak 0.208, same decline); reverted.
   # exploration
   noise_std:            0.1     # rollout action noise (normalized units)
   # reverse-curriculum warm start (GA-DDPG expert_initial): each POLICY episode
@@ -147,9 +148,10 @@ LOOP:
   # variant REGRESSED — the wider final band [0..8] under-practiced the from-scratch
   # eval task, which is always ei=0). The window [hi-window .. hi] slides
   # hi: expert_initial_steps -> expert_initial_end over anneal_iters, then holds.
-  expert_initial_anneal_iters: 2800   # rl_run13: HIGHER-FRACTION curriculum (~70% of the
-                                      # 4000-iter run, vs 27% before) — more mastery per
-                                      # rung, shorter from-scratch tail. (cluster: 350.)
+  expert_initial_anneal_iters: 550    # run9/11 value (~27% of the 2000-iter run). rl_run13
+                                      # tried a higher-fraction 2800 (~70%) — did NOT raise the
+                                      # peak (curriculum COMPLETION gates it, not per-rung
+                                      # mastery) and left the same decline; reverted. (cluster: 69.)
   expert_initial_end:   2       # final upper bound (near-from-scratch, matches eval)
   expert_initial_window: 6      # width of the sampled band (hi-window .. hi)
   # fraction of online episodes that are FULL-expert rollouts (GA-DDPG non-explore):
@@ -182,7 +184,8 @@ LOOP:
                                 # the committed plan's CURRENT waypoint -> snaps the EE
                                 # back onto the plan)
   beta_end:             0.0     # expert-execution prob at the end
-  beta_ramp_iters:      2520    # rl_run13: scaled to track the curriculum (cluster: 315)
+  beta_ramp_iters:      500     # run9/11 value (tracks the 550-iter curriculum). rl_run13's
+                                # 2520 reverted. (cluster: 63.)
   # eval / checkpoint
   eval_every:           50
   eval_episodes:        50      # 20 can't resolve a low single-digit success rate

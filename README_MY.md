@@ -1261,7 +1261,7 @@ python examples/rollout_rl_policy.py \
 
 # WATCH it live in the pybullet GUI, stepping scenes BY HAND (best checkpoint):
 python examples/rollout_rl_policy.py \
-    --rl-run  output/rl_runs/rl_run7 \
+    --rl-run  output/rl_runs/rl_run11 \
     --sim-cfg examples/pretrain.yaml \
     --split   train --render --scene 0 --checkpoint best --max-steps 50
 #   focus the GUI window, then:  [n]/→ next scene   [p]/← prev   [r]eplay   [q]uit
@@ -1439,4 +1439,12 @@ Swap `rl_run13` for any run. Optional `~/.bashrc` helper so it's one word:
 plotrun() { MPLBACKEND=Agg /home/pradyunsharma/.conda/envs/pch2r_dev/bin/python \
     ~/h2r/handover-sim2real/examples/plot_rl_run.py "output/rl_runs/$1"; }
 #   usage (from the repo root):  plotrun rl_run13
+```
+
+## Pulling a checkpoint from the cluster (to the personal PC)
+
+Copy a run's best checkpoint down from DelftBlue with `scp -p` (preserves mtime):
+
+```bash
+scp -p pradyunsharma@login.delftblue.tudelft.nl:/home/pradyunsharma/h2r/handover-sim2real/output/rl_runs/rl_run13/checkpoints/best.pt /home/pradyun/h2r/handover-sim2real/output/rl_runs/rl_run13/checkpoints
 ```
