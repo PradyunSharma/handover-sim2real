@@ -99,6 +99,17 @@ class TD3BCTrainer:
         self.mix_start    = float(r.get("mix_start", 0.1))
         self.mix_end      = float(r.get("mix_end", 0.2))
         self.mix_ramp     = int(r.get("mix_ramp", 50000))
+        # potential-based reward shaping (Ng et al. 1999) on the DISTANCE to the OMG
+        # grasp — an ADDITIVE, provably policy-invariant learning aid on TOP of the
+        # sparse close reward. Φ(s) = −(w_pos·‖ee→grasp‖ + w_rot·angle(ee,grasp)),
+        # and the shaping term γ·Φ(s')·(1−term) − Φ(s) is added to the Bellman target
+        # (the (1−term) is the absorbing-Φ=0 convention). Both weights 0 = disabled
+        # (the run9/11/12/13 sparse reward). NOTE: shaping enters the BELLMAN target
+        # only; mc_return stays the sparse return-to-go, so with mc_blend>0 the target
+        # is a (bounded) mix — lower mc_blend for a purer shaping signal if desired.
+        self.shaping_pos_weight = float(r.get("shaping_pos_weight", 0.0))
+        self.shaping_rot_weight = float(r.get("shaping_rot_weight", 0.0))
+        self.shaping_on = (self.shaping_pos_weight > 0.0 or self.shaping_rot_weight > 0.0)
 
         self.actor_optim  = torch.optim.Adam(
             self.actor.parameters(),  lr=float(r.get("actor_lr", 3e-4)))
@@ -111,6 +122,20 @@ class TD3BCTrainer:
     # ----- helpers ---------------------------------------------------------
     def _norm_state(self, rs: torch.Tensor) -> torch.Tensor:
         return self.normalizer.normalize_state(rs) if self.normalizer is not None else rs
+
+    def _potential(self, goal_pose: torch.Tensor) -> torch.Tensor:
+        """Φ(s) = −(w_pos·pos_dist + w_rot·rot_angle) from the EE-relative grasp pose
+        `goal_pose` [B,9] = [pos(3) ‖ rot6d(6)]. pos_dist = ‖pos‖; rot_angle is the
+        geodesic angle of the rot6d (Gram-Schmidt → R, angle=arccos((tr R−1)/2))."""
+        pos = goal_pose[:, :3].norm(dim=1, keepdim=True)               # [B,1]
+        a1, a2 = goal_pose[:, 3:6], goal_pose[:, 6:9]
+        b1 = a1 / (a1.norm(dim=1, keepdim=True) + 1e-8)
+        a2 = a2 - (b1 * a2).sum(dim=1, keepdim=True) * b1
+        b2 = a2 / (a2.norm(dim=1, keepdim=True) + 1e-8)
+        b3 = torch.cross(b1, b2, dim=1)
+        trace = b1[:, 0] + b2[:, 1] + b3[:, 2]                         # diag of [b1 b2 b3]
+        rot = torch.arccos(((trace - 1.0) * 0.5).clamp(-1.0, 1.0)).unsqueeze(1)  # [B,1]
+        return -(self.shaping_pos_weight * pos + self.shaping_rot_weight * rot)
 
     def _mix_ratio(self) -> float:
         if self.mix_ramp <= 0:
@@ -143,7 +168,16 @@ class TD3BCTrainer:
             next_a = (next_a + noise).clamp(-self.act_limit, self.act_limit)
             q1_t, q2_t = self.critic_target(next_pc, next_rs, next_a, next_remain)
             min_q = torch.min(q1_t, q2_t)
-            y_bell = reward + self.gamma * (1.0 - terminal) * min_q
+            # potential-based shaping added to the immediate reward: F = γ·Φ(s')·
+            # (1−term) − Φ(s). Policy-invariant (telescopes to an endpoint constant),
+            # so it can't be farmed by hovering; the sparse +1 still makes closing
+            # optimal. Sparse reward untouched (buf_pos/success stay sparse).
+            if self.shaping_on:
+                shaping = (self.gamma * self._potential(batch["next_goal_pose"])
+                           * (1.0 - terminal) - self._potential(goal_pose))
+            else:
+                shaping = 0.0
+            y_bell = reward + shaping + self.gamma * (1.0 - terminal) * min_q
             y = (1.0 - self.mc_blend) * y_bell + self.mc_blend * mc_return
 
         if self.aux_weight > 0.0:

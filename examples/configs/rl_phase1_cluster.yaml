@@ -45,6 +45,11 @@ RL:
   gripper_close_weight_max: 10.0  # class-balance the gripper BCE (rare "close" label)
   gripper_label_smooth: 0.1  # label-smooth the gripper BCE (run9's single change): keeps
                           # the logit responsive so it doesn't saturate open. See rl_phase1.yaml
+  # potential-based reward shaping on EE->grasp distance (Ng et al.) — additive,
+  # policy-invariant, ON TOP of the sparse reward. BOTH 0 = disabled (run13); rl_run14
+  # try pos_w≈1.0 / rot_w≈0.3. Eval stays the sparse policy-close metric. See rl_phase1.yaml.
+  shaping_pos_weight: 0.0
+  shaping_rot_weight: 0.0
   aux_weight:   0.5       # goal-auxiliary: regress the EE-relative grasp pose
   reward_mode:  stable_grasp
   hold_steps:   3

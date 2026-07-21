@@ -415,13 +415,17 @@ class RolloutWorker:
             next_rs = _robot_state(obs, prev_act6d)
             next_remain = self.max_steps - (step + 1)
             next_remain_norm = max(next_remain, 0) / self.max_steps
+            # EE-relative grasp at the NEXT state — the potential-shaping term needs
+            # Φ(s') (zeroed at terminals via 1−terminal, so the value there is moot).
+            next_goal9 = (_ee_to_grasp_9d(obs, grasp_pose) if grasp_pose is not None
+                          else np.zeros(9, dtype=np.float32))
 
             transitions.append(dict(
                 pc=pc, rs=rs, remain_norm=remain_norm, action=stored_action,
                 reward=reward, next_pc=next_pc, next_rs=next_rs,
                 next_remain_norm=next_remain_norm, terminal=terminal,
                 mc_return=0.0, expert_action=expert_action_norm,
-                expert_flag=expert_flag, goal_pose=goal9,
+                expert_flag=expert_flag, goal_pose=goal9, next_goal_pose=next_goal9,
                 expert_gripper=expert_gripper, gripper_flag=gripper_flag))
 
             pc, rs = next_pc, next_rs
@@ -510,12 +514,13 @@ class RolloutWorker:
             next_pc = _point_cloud(obs, self.point_listener, self.panda_base_inv_tf)
             next_rs = _robot_state(obs, prev_act6)
             next_remain_norm = max(max_steps - (step + 1), 0) / max_steps
+            next_goal9 = _ee_to_grasp_9d(obs, grasp_pose)
             transitions.append(dict(
                 pc=pc, rs=rs, remain_norm=remain_norm, action=stored_action,
                 reward=0.0, next_pc=next_pc, next_rs=next_rs,
                 next_remain_norm=next_remain_norm, terminal=(1.0 if done else 0.0),
                 mc_return=0.0, expert_action=self._norm(exec_delta6).astype(np.float32),
-                expert_flag=1.0, goal_pose=goal9,
+                expert_flag=1.0, goal_pose=goal9, next_goal_pose=next_goal9,
                 expert_gripper=(0.0 if near else 1.0), gripper_flag=1.0))
             pc, rs = next_pc, next_rs
             if done:
@@ -547,7 +552,8 @@ class RolloutWorker:
                 reward=(1.0 if held else 0.0), next_pc=next_pc, next_rs=next_rs,
                 next_remain_norm=max(max_steps - step - 1, 0) / max_steps, terminal=1.0,
                 mc_return=0.0, expert_action=self._norm(np.zeros(6, dtype=np.float32)).astype(np.float32),
-                expert_flag=1.0, goal_pose=goal9, expert_gripper=0.0, gripper_flag=1.0))
+                expert_flag=1.0, goal_pose=goal9, next_goal_pose=goal9,  # terminal: Φ(s') zeroed
+                expert_gripper=0.0, gripper_flag=1.0))
             reason = "GRASP_OK" if held else "GRASP_MISS"
 
         if not transitions:

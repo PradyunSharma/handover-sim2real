@@ -51,6 +51,17 @@ RL:
   aux_weight:   0.5       # goal-auxiliary: regress the EE-relative grasp pose on both
                           # encoders (0 disables). Dense supervision that shapes the
                           # PointNet++ features for the sparse-reward regime.
+  # potential-based reward shaping (Ng et al. 1999) on the EE->grasp DISTANCE — an
+  # ADDITIVE, provably policy-invariant learning aid ON TOP of the sparse close
+  # reward (NOT a replacement): Φ(s)=−(pos_w·‖ee→grasp‖ + rot_w·angle), shaping term
+  # γΦ(s')(1−term)−Φ(s) added to the Bellman target. Gives the critic/PG a dense
+  # reach gradient the sparse reward lacks — targets the 0.05 m fine-approach ceiling.
+  # BOTH 0 = DISABLED (run9/11/12/13 behaviour). rl_run14 experiment: try pos_w≈1.0,
+  # rot_w≈0.3 (position is the harder constraint). Eval success stays the sparse
+  # policy-close metric (shaping is training-only, in the critic target). Do NOT
+  # enable for run13 (would confound the curriculum test).
+  shaping_pos_weight: 0.0
+  shaping_rot_weight: 0.0
   # reward: how a committed close is scored (terminal either way).
   #   stable_grasp = contact-hold grasp check — hold the close `hold_steps` policy-
   #     steps and require the object to be secured (handover-sim's release handshake

@@ -58,6 +58,9 @@ class ReplayBuffer:
         self.expert_action  = np.zeros((c, self.ea_dim), dtype=np.float32)
         self.expert_flag    = np.zeros((c, 1), dtype=np.float32)
         self.goal_pose      = np.zeros((c, self.goal_dim), dtype=np.float32)
+        # EE-relative grasp at the NEXT state — Φ(s') for potential-based reward
+        # shaping (trainer). Defaults to goal_pose when a caller omits it.
+        self.next_goal_pose = np.zeros((c, self.goal_dim), dtype=np.float32)
         # proximity-synthesized gripper label (P(open): 1 far / 0 near) + validity
         self.expert_gripper = np.zeros((c, 1), dtype=np.float32)
         self.gripper_flag   = np.zeros((c, 1), dtype=np.float32)
@@ -70,7 +73,7 @@ class ReplayBuffer:
 
     def add(self, *, pc, rs, remain_norm, action, reward, next_pc, next_rs,
             next_remain_norm, terminal, mc_return, expert_action, expert_flag,
-            goal_pose, expert_gripper=1.0, gripper_flag=0.0):
+            goal_pose, next_goal_pose=None, expert_gripper=1.0, gripper_flag=0.0):
         i = self._idx
         self.pc[i]          = pc
         self.rs[i]          = rs
@@ -85,6 +88,7 @@ class ReplayBuffer:
         self.expert_action[i] = expert_action
         self.expert_flag[i, 0] = float(expert_flag)
         self.goal_pose[i]   = goal_pose
+        self.next_goal_pose[i] = goal_pose if next_goal_pose is None else next_goal_pose
         self.expert_gripper[i, 0] = float(expert_gripper)
         self.gripper_flag[i, 0]   = float(gripper_flag)
 
@@ -118,6 +122,7 @@ class ReplayBuffer:
             "expert_action": t(self.expert_action),
             "expert_flag":   t(self.expert_flag),
             "goal_pose":     t(self.goal_pose),
+            "next_goal_pose": t(self.next_goal_pose),
             "expert_gripper": t(self.expert_gripper),
             "gripper_flag":   t(self.gripper_flag),
         }
@@ -136,7 +141,7 @@ class ReplayBuffer:
 _DEMO_BUFFER_FIELDS = (
     "pc", "rs", "remain_norm", "action", "reward", "next_pc", "next_rs",
     "next_remain_norm", "terminal", "mc_return", "expert_action", "expert_flag",
-    "goal_pose", "expert_gripper", "gripper_flag")
+    "goal_pose", "next_goal_pose", "expert_gripper", "gripper_flag")
 
 
 def save_demo_transitions(path: str, transitions: list[dict], extra: dict = None) -> None:
@@ -203,6 +208,22 @@ class DemoHDF5Writer:
         self._f.close()
 
 
+def _reconstruct_next_goal(arrs: dict, fields: list) -> list:
+    """Back-compat: demo pools collected before `next_goal_pose` existed only store
+    `goal_pose`. Reconstruct Φ(s')'s input by shifting: next_goal_pose[i] =
+    goal_pose[i+1] (the next transition in the episode; demos are stored in episode
+    order). At a terminal it's unused (the shaping zeroes Φ(s') there), so just keep
+    a valid value. No-op when the field is already present."""
+    if "next_goal_pose" in arrs or "goal_pose" not in arrs:
+        return fields
+    gp = np.asarray(arrs["goal_pose"], dtype=np.float32)
+    term = np.asarray(arrs["terminal"], dtype=np.float32).reshape(-1)
+    ngp = np.roll(gp, -1, axis=0)                 # next transition's goal_pose
+    ngp[term > 0.5] = gp[term > 0.5]              # terminal rows: unused, keep valid
+    arrs["next_goal_pose"] = ngp
+    return list(fields) + ["next_goal_pose"]
+
+
 def load_demo_buffer(path: str) -> "ReplayBuffer":
     """Load a demo pool (`.h5` streamed by DemoHDF5Writer, or `.npz` from
     save_demo_transitions) into a full, non-evicting ReplayBuffer (capacity ==
@@ -220,6 +241,7 @@ def load_demo_buffer(path: str) -> "ReplayBuffer":
                 goal_dim=int(f["goal_pose"].shape[1]))
             fields = [k for k in f.keys() if k in _DEMO_BUFFER_FIELDS]
             arrs = {k: f[k][:] for k in fields}     # one bulk read per field
+        fields = _reconstruct_next_goal(arrs, fields)
         for i in range(int(M)):
             buf.add(**{k: arrs[k][i] for k in fields})
         return buf
@@ -233,6 +255,8 @@ def load_demo_buffer(path: str) -> "ReplayBuffer":
         expert_action_dim=int(data["expert_action"].shape[1]),
         goal_dim=int(data["goal_pose"].shape[1]))
     fields = [k for k in data.files if k in _DEMO_BUFFER_FIELDS]
+    arrs = {k: data[k] for k in fields}
+    fields = _reconstruct_next_goal(arrs, fields)
     for i in range(int(M)):
-        buf.add(**{k: data[k][i] for k in fields})
+        buf.add(**{k: arrs[k][i] for k in fields})
     return buf
