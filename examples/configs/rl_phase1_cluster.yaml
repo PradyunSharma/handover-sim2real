@@ -46,10 +46,12 @@ RL:
   gripper_label_smooth: 0.1  # label-smooth the gripper BCE (run9's single change): keeps
                           # the logit responsive so it doesn't saturate open. See rl_phase1.yaml
   # potential-based reward shaping on EE->grasp distance (Ng et al.) — additive,
-  # policy-invariant, ON TOP of the sparse reward. BOTH 0 = disabled (run13); rl_run14
-  # try pos_w≈1.0 / rot_w≈0.3. Eval stays the sparse policy-close metric. See rl_phase1.yaml.
-  shaping_pos_weight: 0.0
-  shaping_rot_weight: 0.0
+  # policy-invariant, ON TOP of the sparse reward. BOTH 0 = disabled (run13). rl_run14
+  # turns it ON (pos 1.0 / rot 0.3 — position is the harder constraint), ISOLATED on the
+  # run11 base (NOT stacked on run13's curriculum). Eval stays the sparse policy-close
+  # metric. See rl_phase1.yaml.
+  shaping_pos_weight: 1.0
+  shaping_rot_weight: 0.3
   aux_weight:   0.5       # goal-auxiliary: regress the EE-relative grasp pose
   reward_mode:  stable_grasp
   hold_steps:   3
@@ -71,30 +73,24 @@ LOOP:
   demo_frac:            0.25    # fallback constant (used only if demo_frac_start unset)
   demo_frac_start:      0.5     # demo-heavy early (offline->online transition)
   demo_frac_end:        0.3     # permanent floor (keeps the +1 anchor)
-  demo_frac_ramp:       250     # iters to anneal start->end. rl_run13 DOUBLED (125->250)
-                                # with num_iters, so the demo-heavy phase still covers the
-                                # (now much longer) curriculum. rl_phase1: 2000 @ 2 ep/iter.
+  demo_frac_ramp:       125     # iters to anneal start->end (run11 base; rl_run13's 250 was
+                                # for its 500-iter run — reverted). rl_phase1: 2000 @ 2 ep/iter.
   warmup_episodes:      0       # online expert reaches 0 successes; demos + pretrain replace it
   warmup_beta:          1.0
   # ── parallel granularity: one episode per worker per iter ──────────────────
   episodes_per_iter:    16      # == --num-workers (every worker rolls one episode)
   updates_per_iter:     800     # 50 updates/episode — same replay ratio as 100/2
   batch_size:           64      # per-transition — UNCHANGED (same gradient noise)
-  num_iters:            500     # rl_run13 EXTENDED 250->500 (16*500 = 8000 episodes, 2x).
-                                # Paired with the slower/higher-fraction curriculum below
-                                # so the reward-ladder-building phase (not the from-scratch
-                                # tail) gets the extra iters.
+  num_iters:            250     # run11 base (16*250 = 4000 episodes). rl_run14 keeps run11's
+                                # length so reward shaping is the ONLY change vs the run11 base.
   # exploration
   noise_std:            0.1
   expert_initial_steps: 28      # reverse-curriculum warm start upper bound (per-episode
                                 # step count — UNCHANGED across granularity)
-  # annealed reverse-curriculum. rl_run13 HIGHER-FRACTION curriculum: 69->350, so the
-  # anneal now spans ~70% of the 500-iter run (vs 27% before) instead of finishing at
-  # iter 69 and leaving a long from-scratch tail that only ever declined (run9/11/12).
-  # Each rung (ei value) now gets ~5x the gradient updates before advancing -> more
-  # mastery per rung, and only ~30% of the run is the from-scratch consolidation tail.
-  # (rl_phase1 PC-units: 2800.)
-  expert_initial_anneal_iters: 350
+  # annealed reverse-curriculum (run11/run9 base): anneal expert_initial_steps -> _end over
+  # _anneal_iters. rl_run13's 350 was its stretched curriculum — reverted to run11's 69 so
+  # rl_run14 isolates reward shaping. (rl_phase1: 550 @ 2 ep/iter = 1100 eps; /16 ≈ 69.)
+  expert_initial_anneal_iters: 69
   expert_initial_end:   2       # final upper bound (near-from-scratch, matches eval)
   expert_initial_window: 6      # width of the sampled band (hi-window .. hi)
   expert_episode_frac:  0.25    # full-expert episodes (fresh +reward anchor)
@@ -106,10 +102,8 @@ LOOP:
   dagger_tail_guard:    8
   beta_start:           0.5
   beta_end:             0.0
-  beta_ramp_iters:      315     # rl_run13: scaled 63->315 to TRACK the curriculum (they
-                                # finished together before: 63/69 ≈ 0.9; 0.9*350 ≈ 315), so
-                                # mid-episode expert correction weans off as the curriculum
-                                # completes rather than at iter 63. (rl_phase1 PC-units: 2520.)
+  beta_ramp_iters:      63      # run11 base (rl_run13's 315 tracked its 350-iter curriculum —
+                                # reverted). rl_phase1: 500 @ 2 ep/iter = 1000 eps; /16 ≈ 63.
   # eval / checkpoint (parallel eval is cheap — bump episodes for a smoother curve)
   eval_every:           7       # rl_phase1: 50 @ 2 ep/iter = 100 episodes; /16 ≈ 7
   eval_episodes:        64      # 4 per worker at 16 workers
