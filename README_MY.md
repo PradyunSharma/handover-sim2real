@@ -1413,3 +1413,29 @@ the val benchmark to make the real selection.)
 > drifts the next step is a separate gripper head. **Remaining blocker after the
 > gripper: reach 0.05→0.02 m.** Watch any checkpoint live with
 > `rollout_rl_policy.py --render`.
+
+## Plotting the training curves (on the cluster)
+
+`examples/plot_rl_run.py <run_dir>` reads the run's `log.csv` and writes
+`<run_dir>/curves.png`. On DelftBlue there are two gotchas: the login node's bare
+`python` is the system Python 2 (the script needs 3.7+), and `conda` isn't on the
+PATH unless you source its hook — so call the env's Python by full path. The login
+node is also headless, so force the Agg backend (no display):
+
+```bash
+# 1. headless plotting backend (no display on the login node)
+export MPLBACKEND=Agg
+# 2. the env's Python by full path (bare `python` is system Python 2)
+export PLOT_PY=/home/pradyunsharma/.conda/envs/pch2r_dev/bin/python
+# 3. run the plotter
+$PLOT_PY examples/plot_rl_run.py output/rl_runs/rl_run13
+# -> wrote output/rl_runs/rl_run13/curves.png   (open it in the VS Code file explorer)
+```
+
+Swap `rl_run13` for any run. Optional `~/.bashrc` helper so it's one word:
+
+```bash
+plotrun() { MPLBACKEND=Agg /home/pradyunsharma/.conda/envs/pch2r_dev/bin/python \
+    ~/h2r/handover-sim2real/examples/plot_rl_run.py "output/rl_runs/$1"; }
+#   usage (from the repo root):  plotrun rl_run13
+```
