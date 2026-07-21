@@ -1262,7 +1262,7 @@ python examples/rollout_rl_policy.py \
 python examples/rollout_rl_policy.py \
     --rl-run  output/rl_runs/rl_run7 \
     --sim-cfg examples/pretrain.yaml \
-    --split   train --render --scene 0 --checkpoint best
+    --split   train --render --scene 0 --checkpoint best --max-steps 50
 #   focus the GUI window, then:  [n]/→ next scene   [p]/← prev   [r]eplay   [q]uit
 #   the OMG goal grasp is drawn as a GREEN gripper wireframe each scene, so you can
 #   watch the policy converge to (or miss) it. Swap --checkpoint best|last.

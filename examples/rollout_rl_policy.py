@@ -17,7 +17,8 @@ and `test` for the final number.
     python examples/rollout_rl_policy.py --rl-run output/rl_runs/rl_run7 \\
         --sim-cfg examples/pretrain.yaml --split train --render --scene 0
     #   [n]/→ next scene, [p]/← prev, [r]eplay, [q]uit; green wireframe = OMG goal
-    #   grasp. Swap --checkpoint best|last to compare.
+    #   grasp, blue = the policy's OWN predicted grasp (goal-aux head, updates live
+    #   as it converges; --no-policy-grasp hides it). Swap --checkpoint best|last.
 
 Reuses the training rollout worker (same gripper heuristic + observation
 builders), so eval matches how the policy was trained. The actor is the only
@@ -57,9 +58,11 @@ from experiments.config import cfg_from_file   # noqa: E402
 from rollout_bc_policy import draw_gripper      # noqa: E402  (GUI grasp overlay)
 
 
-def _draw_grasp(grasp_world, marker_ids):
-    """Overlay the OMG goal grasp as a green Panda-gripper wireframe. Clears the
-    previous scene's markers first (world-frame debug lines persist across steps)."""
+def _draw_grasp(grasp_world, marker_ids, colour=(0.0, 1.0, 0.0), width=3.0):
+    """Overlay a grasp pose as a Panda-gripper wireframe (default green = OMG goal
+    grasp; the policy's predicted grasp is drawn blue). Clears this overlay's own
+    previous markers first (world-frame debug lines persist across steps); each
+    overlay keeps its own `marker_ids` list so they don't clobber each other."""
     for mid in marker_ids:
         try:
             pybullet.removeUserDebugItem(mid)
@@ -67,7 +70,14 @@ def _draw_grasp(grasp_world, marker_ids):
             pass
     marker_ids.clear()
     if grasp_world is not None:
-        draw_gripper(grasp_world, [0.0, 1.0, 0.0], marker_ids, 3.0)
+        draw_gripper(grasp_world, list(colour), marker_ids, width)
+
+
+def _actor_has_aux_head(actor) -> bool:
+    """True if the loaded checkpoint actually supplied the goal-aux head weights
+    (set in `load_rl_actor`). A checkpoint trained with aux_weight=0 leaves the
+    aux head randomly initialized, so its 'predicted grasp' would be meaningless."""
+    return bool(getattr(actor, "_aux_loaded", False))
 
 
 # key -> action for interactive GUI navigation
@@ -115,7 +125,11 @@ def load_rl_actor(rl_run: Path, checkpoint: str, device: str):
     if not ckpt_path.exists():
         ckpt_path = rl_run / "checkpoints" / "last.pt"
     payload = torch.load(ckpt_path, map_location=device)
-    missing, unexpected = actor.load_state_dict(payload["trainer"]["actor"], strict=False)
+    actor_sd = payload["trainer"]["actor"]
+    missing, unexpected = actor.load_state_dict(actor_sd, strict=False)
+    # did the checkpoint actually carry aux-head weights? (aux_weight=0 runs don't
+    # train it, so it stays random — the viewer uses this to skip drawing noise.)
+    actor._aux_loaded = any(k.startswith("aux_head") for k in actor_sd)
     actor.eval()
     normalizer = Normalizer.load(str(rl_run / "normalization.npz"))
     print(f"Loaded actor from {ckpt_path} (iter {payload.get('iter', '?')}, "
@@ -141,9 +155,14 @@ def parse_args():
     p.add_argument("--render",    action="store_true",
                    help="open the pybullet GUI and step scenes INTERACTIVELY (does "
                         "NOT auto-advance): [n]/→ next, [p]/← prev, [r]eplay, [q]uit. "
-                        "The OMG goal grasp is drawn as a green gripper each scene.")
+                        "The OMG goal grasp is drawn green each scene; the policy's "
+                        "own predicted grasp (goal-aux head) is drawn blue, live.")
     p.add_argument("--scene",     type=int, default=None,
                    help="scene index to START on (default 0) — handy with --render")
+    p.add_argument("--no-policy-grasp", action="store_true",
+                   help="(--render only) don't overlay the policy's own predicted "
+                        "grasp (blue) from its goal-aux head; only the green OMG "
+                        "goal grasp is shown.")
     p.add_argument("--max-steps", type=int, default=None,
                    help="policy steps per episode (default = the run's training "
                         "horizon, rollout_max_steps=30). NOTE: this is also the "
@@ -210,14 +229,29 @@ def main():
     if args.render:
         print("Controls (focus the GUI window):  [n]/→ next   [p]/← prev   "
               "[r]eplay   [q]uit")
-        marker_ids: list = []
+        omg_marker_ids: list = []       # green: the true OMG goal grasp (once/scene)
+        pol_marker_ids: list = []       # blue: the policy's goal-aux prediction (live)
+        # Draw the policy's predicted grasp unless suppressed, and only if the
+        # actor actually carries a trained aux head (a checkpoint without one
+        # would draw noise). --no-policy-grasp forces it off.
+        show_pol = (not args.no_policy_grasp) and _actor_has_aux_head(actor)
+        if not args.no_policy_grasp and not show_pol:
+            print("  (checkpoint has no trained goal-aux head — policy grasp hidden)")
         i = start
         while True:
-            print(f"\n--- scene {i} ---  (green wireframe = OMG goal grasp)")
-            _draw_grasp(None, marker_ids)          # clear last scene's overlay
+            legend = "green = OMG goal grasp"
+            if show_pol:
+                legend += "  |  blue = policy's predicted grasp (goal-aux head)"
+            print(f"\n--- scene {i} ---  ({legend})")
+            _draw_grasp(None, omg_marker_ids)      # clear last scene's overlays
+            _draw_grasp(None, pol_marker_ids)
+            on_policy_grasp = (
+                (lambda g: _draw_grasp(g, pol_marker_ids, (0.1, 0.4, 1.0), 2.0))
+                if show_pol else None)
             _, st = worker.rollout_episode(
                 actor, i, rng, beta=0.0, expert_initial_steps=0, noise_std=0.0,
-                on_grasp=lambda g: _draw_grasp(g, marker_ids))
+                on_grasp=lambda g: _draw_grasp(g, omg_marker_ids),
+                on_policy_grasp=on_policy_grasp)
             if st.get("skipped"):
                 print("  OMG skip — no hand-free grasp for this scene")
             else:

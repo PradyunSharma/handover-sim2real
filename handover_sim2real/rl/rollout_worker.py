@@ -105,6 +105,30 @@ def _ee_to_grasp_9d(obs, grasp_world) -> np.ndarray:
     return np.concatenate([T_rel[:3, 3], R[:, 0], R[:, 1]]).astype(np.float32)
 
 
+def _rot6d_to_matrix(col0, col1) -> np.ndarray:
+    """Invert the rot6d encoding of `_ee_to_grasp_9d`: Gram-Schmidt the two
+    predicted columns back into an orthonormal rotation matrix (Zhou et al.)."""
+    a1 = np.asarray(col0, dtype=np.float64)
+    a2 = np.asarray(col1, dtype=np.float64)
+    b1 = a1 / (np.linalg.norm(a1) + 1e-8)
+    a2 = a2 - np.dot(b1, a2) * b1
+    b2 = a2 / (np.linalg.norm(a2) + 1e-8)
+    b3 = np.cross(b1, b2)
+    return np.stack([b1, b2, b3], axis=1)
+
+
+def grasp_9d_to_world(obs, goal9) -> np.ndarray:
+    """Turn an EE-relative grasp pose (pos+rot6d — the goal-aux head's output, or
+    an `_ee_to_grasp_9d` target) into a world-frame 4x4, so the policy's PREDICTED
+    grasp can be drawn alongside the true OMG goal grasp. Inverse of
+    `_ee_to_grasp_9d`: `grasp_world = EE_world @ T_rel`."""
+    goal9 = np.asarray(goal9, dtype=np.float64)
+    T_rel = np.eye(4)
+    T_rel[:3, :3] = _rot6d_to_matrix(goal9[3:6], goal9[6:9])
+    T_rel[:3, 3] = goal9[:3]
+    return _ee_world_mat(obs) @ T_rel
+
+
 def _grasp_reached(obs, grasp_pose, pos_thresh, rot_thresh) -> bool:
     """True if the EE is within (pos, rot) tolerance of the OMG grasp pose —
     i.e. a close committed here is a *correct* grasp (the `proximity` reward)."""
@@ -188,6 +212,7 @@ class RolloutWorker:
     def rollout_episode(self, actor, scene_idx, rng,
                         beta: float = 0.0, expert_initial_steps: int = 0,
                         noise_std: float = 0.1, on_grasp=None,
+                        on_policy_grasp=None,
                         dagger_ratio: float = 0.0) -> tuple[list[dict], dict]:
         """Roll out one episode. Returns (transitions, stats). transitions is
         empty (and stats['skipped']=True) if OMG can't plan on the first step.
@@ -196,7 +221,12 @@ class RolloutWorker:
         scored against the step-0 goal grasp and no OMG time is spent).
         `on_grasp(grasp_pose_world_4x4)`, if given, is called once the OMG goal
         grasp is known (step 0, before the robot moves) — used by the GUI viewer
-        to overlay the target grasp."""
+        to overlay the target grasp.
+        `on_policy_grasp(grasp_pose_world_4x4)`, if given, is called EVERY step
+        with the actor's own goal-aux prediction (the EE-relative grasp pose it
+        regresses from the point cloud, decoded to world) — the GUI viewer draws
+        it so you can watch the policy's estimate converge to the true grasp. It
+        costs one extra aux-head forward, so leave it None off the viewer path."""
         actor.eval()
         obs = self.env.reset(idx=scene_idx)
         self.point_listener.reset()
@@ -296,7 +326,15 @@ class RolloutWorker:
                     if self.normalizer is not None else rs_t)
             remain_t = torch.tensor([[remain_norm]], dtype=torch.float32,
                                     device=self.device)
-            a_norm = actor(pc_t, rs_n, remain_t)[0].cpu().numpy()  # [7]
+            if on_policy_grasp is not None:
+                # viewer path: also pull the goal-aux head's grasp-pose estimate
+                # and hand it back (decoded to a world 4x4) for overlay. `obs` is
+                # still the CURRENT state, so the EE frame matches the prediction.
+                a_out, aux_out = actor(pc_t, rs_n, remain_t, return_aux=True)
+                a_norm = a_out[0].cpu().numpy()  # [7]
+                on_policy_grasp(grasp_9d_to_world(obs, aux_out[0].cpu().numpy()))
+            else:
+                a_norm = actor(pc_t, rs_n, remain_t)[0].cpu().numpy()  # [7]
             if noise_std > 0.0:
                 a_norm = a_norm + rng.normal(0.0, noise_std, size=7).astype(np.float32)
             a_norm = np.clip(a_norm, -self.act_limit, self.act_limit).astype(np.float32)
