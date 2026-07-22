@@ -507,7 +507,8 @@ class RolloutWorker:
         return transitions, stats
 
     @torch.no_grad()
-    def expert_rollout_episode(self, scene_idx) -> tuple[list[dict], dict]:
+    def expert_rollout_episode(self, scene_idx, rng=None,
+                               dart_ratio: float = 0.0) -> tuple[list[dict], dict]:
         """Full-EXPERT episode (GA-DDPG's non-explore rollout, `train_online.py`):
         play the ENTIRE OMG trajectory by index so the EE actually reaches the
         grasp (the online replan-first-waypoint expert Zeno-stalls and never
@@ -519,7 +520,19 @@ class RolloutWorker:
         decays. Transition format is byte-identical to `rollout_episode` (and to
         the offline demo pool, which now calls this same method), so they mix
         freely. Returns (transitions, stats); empty + stats['skipped']=True if OMG
-        can't plan / no grasp pose on this scene."""
+        can't plan / no grasp pose on this scene.
+
+        DART (`dart_ratio>0`, GA-DDPG's FAITHFUL non-explore DART): with per-step
+        prob `dart_ratio` inside [dart_min_step, dart_max_step), JOLT the EE off-plan
+        by a random task-space step (±dart_pos_mag m / ±dart_rot_mag rad) — an
+        OUT-OF-BAND perturbation, NOT a recorded transition — then REPLAN the OMG
+        tail from the perturbed state and let the EXPERT drive the recovery by index.
+        The recorded steps are thus the expert's CLEAN correction from an off-plan
+        state (consistent dynamics → no critic masking needed, unlike the policy-side
+        variant). This is canonical DART: noise-injected expert demonstrations that
+        SHOW the recovery, manufacturing the off-plan near-grasp coverage the on-plan
+        by-index playback never has. Needs `rng`; leave dart_ratio=0 for the offline
+        demo pool (collect_rl_demos) so that permanent +1 anchor stays clean."""
         obs = self.env.reset(idx=scene_idx)
         self.point_listener.reset()
         plan, _ = self.env.run_omg_planner(int(self.max_steps), scene_idx,
@@ -531,6 +544,7 @@ class RolloutWorker:
             return [], {"skipped": True, "scene_idx": scene_idx}
 
         max_steps = int(self.max_steps)
+        plan = np.asarray(plan)
         prev_act6 = np.zeros(6, dtype=np.float32)
         pc = _point_cloud(obs, self.point_listener, self.panda_base_inv_tf)
         rs = _robot_state(obs, prev_act6)
@@ -539,8 +553,47 @@ class RolloutWorker:
         done = False
         min_pos = float("inf")
         min_rot = float("inf")
-        n_approach = min(len(plan), max_steps)
-        for step in range(n_approach):
+        n_perturb = 0
+        n_omg_fail = 0
+        for step in range(max_steps):
+            if step >= len(plan):
+                break                       # played through the grasp waypoint
+
+            # ----- DART (GA-DDPG faithful, non-explore path): JOLT off-plan, REPLAN
+            # the tail, EXPERT recovers by index. The jolt is OUT-OF-BAND (extra sim
+            # step, NOT recorded); the recorded steps below are the expert's clean
+            # recovery from the perturbed state (consistent dynamics → no masking).
+            if (dart_ratio > 0.0 and rng is not None
+                    and self.dart_min_step <= step < self.dart_max_step
+                    and rng.uniform() < dart_ratio):
+                n_perturb += 1
+                pdelta = np.concatenate([
+                    rng.uniform(-self.dart_pos_mag, self.dart_pos_mag, size=3),
+                    rng.uniform(-self.dart_rot_mag, self.dart_rot_mag, size=3),
+                ]).astype(np.float32)
+                pjp = action_to_target_joint(
+                    np.concatenate([pdelta, [1.0]]).astype(np.float32), obs)  # open
+                for _ in range(self.steps_action_repeat):
+                    obs, _, done, info = self.env.step(pjp)
+                    if done:
+                        break
+                if done:
+                    break                   # jolt ended the episode (collision) — abort
+                rest, _ = self.env.run_omg_planner(int(max_steps - step), scene_idx,
+                                                   reset_scene=False)
+                if rest is None:
+                    n_omg_fail += 1         # keep old plan; expert recovers toward it
+                else:
+                    plan = np.concatenate([plan[:step], np.asarray(rest)])
+                    g = self.env.get_omg_goal_grasp_pose()
+                    if g is not None:
+                        grasp_pose = g
+                prev_act6 = pdelta.copy()    # the jolt is the last executed action
+                pc = _point_cloud(obs, self.point_listener, self.panda_base_inv_tf)
+                rs = _robot_state(obs, prev_act6)
+                if step >= len(plan):
+                    break
+
             remain_norm = (max_steps - step) / max_steps
             goal9 = _ee_to_grasp_9d(obs, grasp_pose)
             near = _grasp_reached(obs, grasp_pose,
@@ -624,7 +677,8 @@ class RolloutWorker:
             "success": success,
             "return": float(sum(tr["reward"] for tr in transitions)),
             "reason": reason,
-            "n_omg_fail": 0,
+            "n_omg_fail": n_omg_fail,
+            "n_perturb": n_perturb,
             "min_pos": float(min_pos) if min_pos < float("inf") else float("nan"),
             "min_rot": float(min_rot) if min_rot < float("inf") else float("nan"),
             "closed": 1,

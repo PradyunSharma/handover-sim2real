@@ -144,12 +144,12 @@ def _accumulate(results, buffer):
             continue
         buffer.add_episode(trans)
         kept += 1
+        perturb += st.get("n_perturb", 0)   # count DART jolts in BOTH modes
         if st.get("expert_episode"):
             exp_kept += 1; exp_succ += st["success"]
             continue                    # keep roll_* a policy-only progress signal
         succ += st["success"]; length += st["length"]; ret += st["return"]
         closed += st.get("closed", 0)
-        perturb += st.get("n_perturb", 0)
         minpos.append(st.get("min_pos", float("nan")))
         reasons[st.get("reason", "?")] += 1
     n = max(kept - exp_kept, 1)         # policy episodes only
@@ -161,7 +161,7 @@ def _accumulate(results, buffer):
 
 def collect(collector, actor, buffer, n_eps, rng, num_scenes,
             beta, noise_std, ei_lo, ei_hi, expert_episode_frac=0.0,
-            dagger_ratio=0.0, dart_ratio=0.0):
+            dagger_ratio=0.0, dart_ratio=0.0, dart_mode="policy"):
     """Collect n_eps episodes into the online buffer. A fraction
     `expert_episode_frac` are FULL-expert rollouts (GA-DDPG non-explore): the OMG
     trajectory is played to the grasp + closed → a guaranteed fresh success that
@@ -176,18 +176,25 @@ def collect(collector, actor, buffer, n_eps, rng, num_scenes,
     that pick the scene / expert-vs-policy / expert_initial_steps happen HERE either
     way, so the episode mix is identical; the parallel path additionally stamps each
     job with a per-episode rng seed for the in-rollout exploration noise."""
+    # route DART to the active mode's rollout path: "policy" perturbs POLICY steps in
+    # rollout_episode (run15/16 variant); "expert" perturbs the EXPERT episodes and
+    # replans so the expert executes the recovery (GA-DDPG-faithful). The inactive
+    # path gets 0. Both share the window/magnitudes (worker ctor).
+    pol_dart = dart_ratio if dart_mode == "policy" else 0.0
+    exp_dart = dart_ratio if dart_mode == "expert" else 0.0
     if isinstance(collector, ParallelRolloutManager):
         jobs = []
         for _ in range(n_eps):
             scene = int(rng.randint(num_scenes))
             if expert_episode_frac > 0.0 and rng.uniform() < expert_episode_frac:
-                job = {"kind": "expert", "scene": scene}
+                job = {"kind": "expert", "scene": scene,
+                       "dart_ratio": float(exp_dart)}
             else:
                 ei = int(rng.randint(ei_lo, ei_hi + 1)) if ei_hi > 0 else 0
                 job = {"kind": "policy", "scene": scene, "beta": float(beta),
                        "noise_std": float(noise_std),
                        "expert_initial_steps": ei, "dagger_ratio": float(dagger_ratio),
-                       "dart_ratio": float(dart_ratio)}
+                       "dart_ratio": float(pol_dart)}
             job["seed"] = int(rng.randint(1, 2**31 - 1))
             jobs.append(job)
         results = collector.rollout(cpu_state_dict(actor), jobs)
@@ -197,13 +204,14 @@ def collect(collector, actor, buffer, n_eps, rng, num_scenes,
     for _ in range(n_eps):
         scene = int(rng.randint(num_scenes))
         if expert_episode_frac > 0.0 and rng.uniform() < expert_episode_frac:
-            results.append(collector.expert_rollout_episode(scene))
+            results.append(collector.expert_rollout_episode(
+                scene, rng, dart_ratio=exp_dart))
         else:
             ei = int(rng.randint(ei_lo, ei_hi + 1)) if ei_hi > 0 else 0
             results.append(collector.rollout_episode(
                 actor, scene, rng, beta=beta,
                 expert_initial_steps=ei, noise_std=noise_std,
-                dagger_ratio=dagger_ratio, dart_ratio=dart_ratio))
+                dagger_ratio=dagger_ratio, dart_ratio=pol_dart))
     return _accumulate(results, buffer)
 
 
@@ -378,6 +386,8 @@ def main():
                            **rollout_kwargs)
     dagger_ratio = float(loop.get("dagger_ratio", 0.5))
     dart_ratio   = float(loop.get("dart_ratio", 0.0))   # DART off by default
+    dart_mode    = str(loop.get("dart_mode", "policy"))  # "policy" (run15/16) |
+                                                         # "expert" (GA-DDPG faithful)
 
     # ── parallel rollout collection (the paper's num_remotes) ───────────────
     # collector is what collect()/evaluate() dispatch to: the single in-process
@@ -471,7 +481,8 @@ def main():
                     rng, num_scenes, beta=beta, noise_std=float(loop["noise_std"]),
                     ei_lo=ei_lo, ei_hi=ei_hi,
                     expert_episode_frac=float(loop.get("expert_episode_frac", 0.0)),
-                    dagger_ratio=dagger_ratio, dart_ratio=dart_ratio)
+                    dagger_ratio=dagger_ratio, dart_ratio=dart_ratio,
+                    dart_mode=dart_mode)
 
         df = demo_frac_at(it, loop)      # scheduled demo fraction this iter
         stats = {}

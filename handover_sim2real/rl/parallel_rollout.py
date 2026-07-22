@@ -89,7 +89,8 @@ def _run_job(worker, actor, job: dict):
     kind = job["kind"]
     rng = np.random.RandomState(int(job.get("seed", 0)))
     if kind == "expert":
-        return worker.expert_rollout_episode(scene)
+        return worker.expert_rollout_episode(
+            scene, rng, dart_ratio=float(job.get("dart_ratio", 0.0)))
     if kind == "eval":
         return worker.rollout_episode(actor, scene, rng, beta=0.0,
                                       expert_initial_steps=0, noise_std=0.0)

@@ -158,7 +158,9 @@ LOOP:
   # play the whole OMG traj to the grasp + close + reward. A guaranteed fresh
   # success into the ONLINE buffer every iter (the frozen demo pool goes stale
   # relative to the drifting policy; this keeps a live +reward anchor).
-  expert_episode_frac:  0.25
+  # rl_run16: 0.25->0.5 so expert-mode DART (which only perturbs expert episodes) covers
+  # HALF the online data. (run15/base value was 0.25.)
+  expert_episode_frac:  0.5
   # episode horizon (clock denominator + OMG plan length; also the worker's OMG
   # planning horizon). Raised to 30: check C showed the from-scratch policy needs
   # ~30 steps to approach (at step 20 it's still 0.18-0.34 m out, matching the RL
@@ -180,21 +182,27 @@ LOOP:
   dagger_ratio:         0.5
   dagger_min_step:      5
   dagger_tail_guard:    8
-  # DART (GA-DDPG env.random_perturb): on a fraction `dart_ratio` of POLICY steps in
-  # [dart_min_step, dart_max_step) inject a random ±dart_pos_mag m / ±dart_rot_mag rad
-  # task-space JUMP instead of the policy action, landing the EE off-plan so the next
-  # steps' plan-tracking labels demonstrate the RECOVERY. This is the one thing DAgger
-  # + warm-start never cover near the grasp (both stay perfectly on-plan): the demo
-  # pool is 100% on-axis at the reach tail (measured), so the from-scratch policy that
-  # arrives ~5 cm off LATERALLY has never seen a near-grasp lateral correction. The
-  # window sits just BEFORE the ~5-step reach tail (standoff at ~step 25) AND inside
-  # the DAgger replan window (<22) so a spliced replan can re-fit a feasible recovery.
-  # Perturbed rows are DROPPED from the critic's Bellman fit (artificial action) but
-  # KEPT for the actor BC. 0 = OFF (run11 base). rl_run15: try dart_ratio≈0.15-0.25
-  # (~1-2 perturbations/episode). Window/mags are per-STEP — SAME in the cluster yaml.
-  dart_ratio:           0.0
-  dart_min_step:        15
-  dart_max_step:        22
+  # DART (GA-DDPG DART): manufacture the off-plan near-grasp RECOVERY data that on-plan
+  # warm-start + DAgger never produce (the demo pool is 100% on-axis at the reach tail,
+  # measured — so the policy that arrives ~5 cm off LATERALLY has never seen a near-grasp
+  # correction). TWO mechanisms, chosen by `dart_mode`:
+  #   "policy"  = perturb POLICY steps in rollout_episode: a random ±dart_pos_mag m /
+  #               ±dart_rot_mag rad JUMP replaces the policy action, and the NEXT steps'
+  #               plan-tracking labels teach the recovery. Perturbed rows are DROPPED from
+  #               the critic Bellman fit, kept for actor BC. (run15/16 variant — VALIDATED:
+  #               run15@0.2 peak 0.458 vs run11 0.25, MISS=0 at peak = 100% close->success.)
+  #   "expert"  = GA-DDPG FAITHFUL non-explore DART: perturb the EXPERT episodes off-plan,
+  #               REPLAN the OMG tail, and the EXPERT drives the recovery by index → clean
+  #               expert demonstrations (consistent dynamics, no masking). Applies to the
+  #               expert_episode_frac(0.25) episodes; each jolt is a replan → OMG-heavy.
+  # 0 = OFF (run11 base). Window/mags are per-STEP — SAME in the cluster yaml.
+  # rl_run16: the paper's way — dart_mode expert, ratio 0.5, window [5,24) (~9-10 jolts/
+  # expert-ep, each a REPLAN → OMG-heavy). Paired with expert_episode_frac 0.5 so expert
+  # DART covers HALF the online episodes. (Earlier policy-mode run16@0.3 was never run.)
+  dart_mode:            expert
+  dart_ratio:           0.5
+  dart_min_step:        5
+  dart_max_step:        24
   dart_pos_mag:         0.04
   dart_rot_mag:         0.2
   beta_start:           0.5     # mid-episode expert-execution prob at iter 0 (executes
