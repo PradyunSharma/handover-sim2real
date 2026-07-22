@@ -1449,6 +1449,32 @@ Copy a run's best checkpoint down from DelftBlue with `scp -p` (preserves mtime)
 scp -p pradyunsharma@login.delftblue.tudelft.nl:/home/pradyunsharma/h2r/handover-sim2real/output/rl_runs/rl_run13/checkpoints/best.pt /home/pradyun/h2r/handover-sim2real/output/rl_runs/rl_run13/checkpoints
 ```
 
+## Watching a submitted run start (on the cluster)
+
+**Stage 1 — waiting for a GPU.** After `sbatch`, the job sits in the queue until a
+V100 frees up (the education account has a 2-GPU quota):
+
+```bash
+squeue --me     # PD = queued, R + a node name (e.g. gpu010) = running
+```
+
+`PENDING` with reason `(None)` or `(AssocMaxGRESPerJob)` both just mean "no free
+V100 yet" — the AssocMaxGRESPerJob label is a DelftBlue quirk, not a real limit
+violation. A concrete `StartTime` in `scontrol show job <jobid>` = it's scheduled.
+
+**Stage 2 — first ~5–10 min after it starts** (16 workers spawn + ~220 s pretrain;
+`log.csv` doesn't exist yet). Check the job log headers and watch for errors:
+
+```bash
+head -5 slurm_logs/rl_<jobid>.out    # run name / node / gpu — confirms the right run
+tail -f slurm_logs/rl_<jobid>.err    # tracebacks show up here promptly (Ctrl-C to stop)
+```
+
+(A fresh/cold node can take much longer to spawn workers — first observed start took
+~37 min of mesh/lib cold-reads; a warm node comes up in ~1 min. Not fatal, just slow.)
+
+Once `output/rl_runs/<run>/log.csv` appears, switch to the live dashboard below.
+
 ## Live metrics dashboard (on the cluster)
 
 `log.csv` is flushed every iteration (the SLURM `.out` job log block-buffers, so it
@@ -1456,7 +1482,7 @@ lags behind). `watch` is blocked on the login node, so use a `while` loop to tai
 key columns live — Ctrl-C to stop, swap `rl_run14` for any run:
 
 ```bash
-while true; do clear; awk -F, 'NR>1{printf "it %-4s buf %-6s roll_succ %-5s roll_minpos %-7s skip %-3s eval_succ %-7s best %-7s\n",$1,$2,$6,$20,$22,$38,$39}' output/rl_runs/rl_run14/log.csv | tail -10; sleep 30; done
+while true; do clear; awk -F, 'NR>1{printf "it %-4s buf %-6s roll_succ %-5s roll_minpos %-7s skip %-3s eval_succ %-7s best %-7s\n",$1,$2,$6,$20,$22,$38,$39}' output/rl_runs/rl_run16/log.csv | tail -10; sleep 30; done
 ```
 
 Columns (1-indexed): `1`=iter `2`=buffer `6`=roll_succ `20`=roll_minpos `22`=skip
