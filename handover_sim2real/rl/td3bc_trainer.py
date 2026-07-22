@@ -93,6 +93,13 @@ class TD3BCTrainer:
         # and close states can still fire it. 0 = off.
         self.gripper_label_smooth = float(r.get("gripper_label_smooth", 0.0))
         self.aux_weight   = float(r.get("aux_weight", 0.0))  # goal-auxiliary grasp-pose loss
+        # action-magnitude regularizer on the actor's POSE output: L2 penalty
+        # w·mean(a_pose²) added to the actor loss. Bounds the post-curriculum |a_pose|
+        # DRIFT that inflates ~0.7→2.0 in EVERY run (→ overshooting/aggressive closes
+        # that collide/drop and collapse the peak). Quadratic so it self-targets the
+        # large drifted actions and is gentle in the healthy ~0.7 regime; the strong
+        # BC term keeps legitimate motion. 0 = off. First isolated test of the drift.
+        self.action_reg_weight = float(r.get("action_reg_weight", 0.0))
         # PG/BC blend: GA-DDPG mix schedule (default) or TD3+BC normalization.
         self.pg_normalize = bool(r.get("pg_normalize", False))
         self.alpha        = float(r.get("alpha", 2.5))
@@ -287,10 +294,15 @@ class TD3BCTrainer:
                     grip_loss = F.binary_cross_entropy_with_logits(
                         a_pi[gmask][:, 6], tgt, weight=w)
 
+            # bound the |a_pose| drift (quadratic → self-targets the large actions)
+            action_reg = (self.action_reg_weight * a_pi[:, :6].pow(2).mean()
+                          if self.action_reg_weight > 0.0
+                          else torch.zeros((), device=a_pi.device))
             actor_loss = (pg_loss
                           + bc_scale * self.bc_weight * bc_loss
                           + bc_scale * self.gripper_bc_weight * grip_loss
-                          + self.aux_weight * aux_loss_a)
+                          + self.aux_weight * aux_loss_a
+                          + action_reg)
 
             self.actor_optim.zero_grad(set_to_none=True)
             actor_loss.backward()
@@ -305,6 +317,7 @@ class TD3BCTrainer:
                         "pg_loss":   float(pg_loss.detach()),
                         "bc_loss":   float(bc_loss.detach()) if torch.is_tensor(bc_loss) else 0.0,
                         "grip_loss": float(grip_loss.detach()),
+                        "action_reg": float(action_reg.detach()),
                         "aux_loss_a": float(aux_loss_a.detach()),
                         "lam":       float(lam),
                         "n_expert":  int(mask.sum()),
