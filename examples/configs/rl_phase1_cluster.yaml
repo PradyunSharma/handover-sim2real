@@ -108,7 +108,8 @@ LOOP:
   # critic's Bellman fit, kept for the actor BC. Window/mags are per-STEP (UNCHANGED
   # across granularity — identical to rl_phase1.yaml). 0 = OFF (run11 base). See
   # rl_phase1.yaml for the full rationale; rl_run15 try dart_ratio≈0.15-0.25.
-  dart_ratio:           0.0
+  dart_ratio:           0.2     # rl_run15: DART ON (isolated on run11 base) — fills the
+                                # off-plan near-grasp recovery gap. Only change vs run11.
   dart_min_step:        15
   dart_max_step:        22
   dart_pos_mag:         0.04
