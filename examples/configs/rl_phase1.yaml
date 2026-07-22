@@ -194,7 +194,8 @@ LOOP:
   #   "expert"  = GA-DDPG FAITHFUL non-explore DART: perturb the EXPERT episodes off-plan,
   #               REPLAN the OMG tail, and the EXPERT drives the recovery by index → clean
   #               expert demonstrations (consistent dynamics, no masking). Applies to the
-  #               expert_episode_frac(0.25) episodes; each jolt is a replan → OMG-heavy.
+  #               expert_episode_frac episodes; each jolt is a replan → OMG-heavy.
+  #   "both"    = enable BOTH at once (policy eps → policy-DART, expert eps → expert-DART).
   # 0 = OFF (run11 base). Window/mags are per-STEP — SAME in the cluster yaml.
   # rl_run16: the paper's way — dart_mode expert, ratio 0.5, window [5,24) (~9-10 jolts/
   # expert-ep, each a REPLAN → OMG-heavy). Paired with expert_episode_frac 0.5 so expert

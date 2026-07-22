@@ -177,11 +177,12 @@ def collect(collector, actor, buffer, n_eps, rng, num_scenes,
     way, so the episode mix is identical; the parallel path additionally stamps each
     job with a per-episode rng seed for the in-rollout exploration noise."""
     # route DART to the active mode's rollout path: "policy" perturbs POLICY steps in
-    # rollout_episode (run15/16 variant); "expert" perturbs the EXPERT episodes and
-    # replans so the expert executes the recovery (GA-DDPG-faithful). The inactive
-    # path gets 0. Both share the window/magnitudes (worker ctor).
-    pol_dart = dart_ratio if dart_mode == "policy" else 0.0
-    exp_dart = dart_ratio if dart_mode == "expert" else 0.0
+    # rollout_episode (run15 variant); "expert" perturbs the EXPERT episodes and replans
+    # so the expert executes the recovery (GA-DDPG-faithful); "both" enables BOTH at once
+    # (policy episodes get policy-DART, expert episodes get expert-DART). The inactive
+    # path gets 0. All modes share the window/magnitudes (worker ctor).
+    pol_dart = dart_ratio if dart_mode in ("policy", "both") else 0.0
+    exp_dart = dart_ratio if dart_mode in ("expert", "both") else 0.0
     if isinstance(collector, ParallelRolloutManager):
         jobs = []
         for _ in range(n_eps):

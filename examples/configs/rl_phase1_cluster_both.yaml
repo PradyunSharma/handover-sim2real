@@ -116,8 +116,12 @@ LOOP:
   # index (clean expert demos → no critic masking). "both" = enable BOTH at once
   # (policy eps → policy-DART, expert eps → expert-DART). Switchable for a clean A/B;
   # all modes share the window/magnitudes below.
-  dart_mode:            expert  # rl_run16 = the paper's non-explore DART (the earlier
-                                # policy-mode run16@0.3 was NEVER run; run16 is now this). The other dart mode is "policy"
+  dart_mode:            both    # rl_run17: BOTH DART mechanisms at once — policy episodes
+                                # get policy-DART (perturb policy step, label teaches
+                                # recovery, critic-masked), expert episodes get expert-DART
+                                # (perturb+replan, expert recovers by index). = rl_run16's
+                                # expert config + policy-DART added (isolates that addition).
+                                # Dedicated file so run16's --resume keeps reading "expert".
   dart_ratio:           0.5     # rl_run16: GA-DDPG's value (run15 policy-DART used 0.2)
   dart_min_step:        5       # rl_run16: window [5,24) — nearly the whole approach,
   dart_max_step:        24      # up to just before the standoff (~step 25). ~0.5 over the
