@@ -118,7 +118,25 @@ def expert_initial_range(it: int, loop: dict) -> tuple[int, int]:
     (the OLD behavior) never sequenced this — the intermediate takeovers failed for
     lack of a mastered endgame, so they never earned reward and the high-Q region
     never extended past the last ~2 steps (rl_run8: eval stalls ~0.08 m, buf_pos≈0).
-    Falls back to the old uniform window when `expert_initial_anneal_iters` unset."""
+    Falls back to the old uniform window when `expert_initial_anneal_iters` unset.
+
+    WIDENING mode (rl_run23): if `expert_initial_lo_start` is set, HOLD the upper
+    bound `expert_initial_hi` fixed and anneal only the LOWER bound from
+    `expert_initial_lo_start` -> `expert_initial_lo_end`. The sampled band therefore
+    WIDENS ([hi-tight] -> [lo_end, hi]) instead of sliding: a thin tail of near-grasp
+    (endgame) takeovers is RETAINED throughout training while progressively harder
+    off-plan starts are added. This keeps the reach-close skill from decaying once
+    the sliding window drops past it (the run15/21 post-curriculum decline)."""
+    if "expert_initial_lo_start" in loop:
+        hi = int(loop.get("expert_initial_hi", loop.get("expert_initial_steps", 0)))
+        if hi <= 0:
+            return 0, 0
+        lo0 = int(loop["expert_initial_lo_start"])
+        lo1 = int(loop.get("expert_initial_lo_end", 0))
+        ramp = max(int(loop.get("expert_initial_anneal_iters", 1)), 1)
+        f = min(max(it, 0) / ramp, 1.0)
+        lo = int(round(lo0 + (lo1 - lo0) * f))
+        return max(0, min(lo, hi)), hi
     hi0 = int(loop.get("expert_initial_steps", 0))
     if hi0 <= 0 or "expert_initial_anneal_iters" not in loop:
         return 0, hi0

@@ -82,6 +82,10 @@ RUN_NAME="${RUN_NAME:-rl_run11}"           # override: sbatch --export=ALL,RUN_N
 # the shared file (a --resume re-reads --rl-cfg, so editing it mid-run would change the
 # resumed run's behavior). Override: sbatch --export=ALL,RUN_NAME=rl_run17,RL_CFG=examples/configs/rl_phase1_cluster_both.yaml ...
 RL_CFG="${RL_CFG:-examples/configs/rl_phase1_cluster.yaml}"
+# Demo pool — overridable like RL_CFG so a run can pair its hand-filter with the
+# matching demos WITHOUT editing this file. run15 (0.08 m runtime filter): train_h30.h5.
+# run21/run23 (paper valid_grasp_dict): train_h30_vgd.h5.
+DEMOS="${DEMOS:-output/rl_demos/train_h30.h5}"
 
 echo "run=${RUN_NAME}"
 echo "host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
@@ -93,11 +97,12 @@ echo "cpus-per-task=${SLURM_CPUS_PER_TASK}  rollout workers=${WORKERS}"
 # (skip=N, buf=0, no learning). Workers share the one GPU (N small actor contexts +
 # the learner); fine on a 32GB V100 at 16 workers.
 echo "rl-cfg=${RL_CFG}"
+echo "demos=${DEMOS}"
 srun python examples/train_rl.py \
     --sim-cfg examples/pretrain.yaml \
     --rl-cfg  "${RL_CFG}" \
     --bc-run  output/bc_runs/dagger_iter_2_3 \
-    --demos   output/rl_demos/train_h30_vgd.h5 \
+    --demos   "${DEMOS}" \
     --run-name "${RUN_NAME}" \
     --num-workers "${WORKERS}" \
     --worker-device cuda \
