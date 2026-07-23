@@ -97,7 +97,7 @@ srun python examples/train_rl.py \
     --sim-cfg examples/pretrain.yaml \
     --rl-cfg  "${RL_CFG}" \
     --bc-run  output/bc_runs/dagger_iter_2_3 \
-    --demos   output/rl_demos/train_h30.h5 \
+    --demos   output/rl_demos/train_h30_vgd.h5 \
     --run-name "${RUN_NAME}" \
     --num-workers "${WORKERS}" \
     --worker-device cuda \

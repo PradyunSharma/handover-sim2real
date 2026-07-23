@@ -1429,7 +1429,7 @@ export MPLBACKEND=Agg
 # 2. the env's Python by full path (bare `python` is system Python 2)
 export PLOT_PY=/home/pradyunsharma/.conda/envs/pch2r_dev/bin/python
 # 3. run the plotter
-$PLOT_PY examples/plot_rl_run.py output/rl_runs/rl_run17
+$PLOT_PY examples/plot_rl_run.py output/rl_runs/rl_run21
 # -> wrote output/rl_runs/rl_run13/curves.png   (open it in the VS Code file explorer)
 ```
 
@@ -1441,13 +1441,25 @@ plotrun() { MPLBACKEND=Agg /home/pradyunsharma/.conda/envs/pch2r_dev/bin/python 
 #   usage (from the repo root):  plotrun rl_run13
 ```
 
-## Pulling a checkpoint from the cluster (to the personal PC)
+## Transferring files from the cluster (to the personal PC)
 
-Copy a run's best checkpoint down from DelftBlue with `scp -p` (preserves mtime):
+General form — run this ON THE PC (not on DelftBlue; the login nodes can't reach
+your laptop, so the PC always initiates), `scp -p` preserves mtime:
+
+```bash
+# user@laptop:~$
+scp -p pradyunsharma@login.delftblue.tudelft.nl:~/origin_folder_on_DelftBlue/remotefile ./
+```
+
+Concrete example — pull a run's best checkpoint down into the PC's repo:
 
 ```bash
 scp -p pradyunsharma@login.delftblue.tudelft.nl:/home/pradyunsharma/h2r/handover-sim2real/output/rl_runs/rl_run13/checkpoints/best.pt /home/pradyun/h2r/handover-sim2real/output/rl_runs/rl_run13/checkpoints
 ```
+
+For a whole directory add `-r` (e.g. a full run dir); for many/large files `rsync`
+resumes where scp restarts: `rsync -avP <netid>@login.delftblue.tudelft.nl:SRC DST`.
+PC→cluster is the same commands with the two paths swapped.
 
 ## Watching a submitted run start (on the cluster)
 
