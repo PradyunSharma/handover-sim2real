@@ -47,7 +47,7 @@ import handover_sim2real   # noqa: F401  registers envs
 from handover.benchmark_wrapper import HandoverBenchmarkWrapper
 from handover_sim2real.config import get_cfg
 from handover_sim2real.policy import PointListener
-from handover_sim2real.utils import add_sys_path_from_env
+from handover_sim2real.utils import add_sys_path_from_env, resolve_valid_grasp_dict_path
 
 from handover_sim2real.rl import RLActor, QNetwork, ReplayBuffer, TD3BCTrainer
 from handover_sim2real.rl.replay_buffer import load_demo_buffer
@@ -341,8 +341,18 @@ def main():
     torch.manual_seed(args.seed)
     rng = np.random.RandomState(args.seed)
 
+    # paper's OFFLINE hand-collision grasp filter (valid_grasp_dict). Must be set on
+    # cfg.omg_config BEFORE the env (hence OMGPlanner/OMG Planner) is built so the
+    # planner loads it; OMG then subsets each scene's ACRONYM grasps by their kept
+    # indices. Mirrors the original examples/train.py. Alternative to (and normally
+    # used instead of) the aggressive runtime filter below.
+    _vgd = resolve_valid_grasp_dict_path(rlcfg["RL"], cfg.BENCHMARK.SETUP)
+    if _vgd is not None:
+        cfg.omg_config["valid_grasp_dict_path"] = _vgd
+        print("[valid_grasp_dict] paper hand-collision filter ON: {}".format(_vgd))
     env            = HandoverBenchmarkWrapper(gym.make(cfg.ENV.ID, cfg=cfg))
-    # hand-collision grasp filter for the online OMG/DAgger expert (match demos).
+    # our aggressive runtime hand-collision grasp filter (0.08 m). Off in configs that
+    # use valid_grasp_dict; leaving both on would double-filter. See README_MY.
     if bool(rlcfg["RL"].get("hand_collision_filter", True)):
         env.set_hand_collision_filter(
             enable=True,

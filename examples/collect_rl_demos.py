@@ -50,7 +50,7 @@ import handover_sim2real   # noqa: F401  registers envs
 from handover.benchmark_wrapper import HandoverBenchmarkWrapper
 from handover_sim2real.config import get_cfg
 from handover_sim2real.policy import PointListener
-from handover_sim2real.utils import add_sys_path_from_env
+from handover_sim2real.utils import add_sys_path_from_env, resolve_valid_grasp_dict_path
 
 from handover_sim2real.rl.replay_buffer import DemoHDF5Writer
 # The demo pool is produced by the SAME code path as the online full-expert
@@ -103,10 +103,17 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
+    # paper's offline hand-collision filter (valid_grasp_dict): set on omg_config
+    # BEFORE the env is built. Recollect demos with this when training with it, so the
+    # demo pool and online rollouts share the same (~716-scene) grasp distribution.
+    _vgd = resolve_valid_grasp_dict_path(r, cfg.BENCHMARK.SETUP)
+    if _vgd is not None:
+        cfg.omg_config["valid_grasp_dict_path"] = _vgd
+        print("[valid_grasp_dict] paper hand-collision filter ON: {}".format(_vgd))
     env            = HandoverBenchmarkWrapper(gym.make(cfg.ENV.ID, cfg=cfg))
-    # paper-faithful hand-collision grasp filter: OMG prunes grasps whose gripper
-    # would collide with the human hand, so demos don't drive into the hand
-    # (scenes where every grasp collides are skipped when OMG's goal set empties).
+    # our aggressive runtime hand-collision grasp filter (0.08 m): OMG prunes grasps
+    # whose gripper would collide with the human hand. Off in valid_grasp_dict configs
+    # (leaving both on would double-filter). Scenes with an empty goal set are skipped.
     if bool(r.get("hand_collision_filter", True)):
         env.set_hand_collision_filter(
             enable=True,

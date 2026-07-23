@@ -120,7 +120,8 @@ def _worker_main(worker_id, sim_cfg, rlcfg, bc_run, split, seed,
         from handover.benchmark_wrapper import HandoverBenchmarkWrapper
         from handover_sim2real.config import get_cfg
         from handover_sim2real.policy import PointListener
-        from handover_sim2real.utils import add_sys_path_from_env
+        from handover_sim2real.utils import (
+            add_sys_path_from_env, resolve_valid_grasp_dict_path)
         from handover_sim2real.rl.rollout_worker import RolloutWorker
 
         add_sys_path_from_env("GADDPG_DIR")
@@ -137,8 +138,14 @@ def _worker_main(worker_id, sim_cfg, rlcfg, bc_run, split, seed,
         if egl:
             cfg.SIM.BULLET.USE_EGL = True
 
-        env = HandoverBenchmarkWrapper(gym.make(cfg.ENV.ID, cfg=cfg))
         rl = rlcfg["RL"]
+        # paper's offline hand-collision filter (valid_grasp_dict): set on omg_config
+        # BEFORE the env is built (see examples/train_rl.py for the rationale).
+        _vgd = resolve_valid_grasp_dict_path(rl, cfg.BENCHMARK.SETUP)
+        if _vgd is not None:
+            cfg.omg_config["valid_grasp_dict_path"] = _vgd
+        env = HandoverBenchmarkWrapper(gym.make(cfg.ENV.ID, cfg=cfg))
+        # our aggressive runtime filter (0.08 m); off in valid_grasp_dict configs.
         if bool(rl.get("hand_collision_filter", True)):
             env.set_hand_collision_filter(
                 enable=True,

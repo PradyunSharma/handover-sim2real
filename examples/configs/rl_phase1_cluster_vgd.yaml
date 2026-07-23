@@ -1,0 +1,142 @@
+# Phase-3 RL config — CLUSTER variant of rl_phase1.yaml (parallel rollouts).
+#
+# Identical algorithm/hyperparameters to rl_phase1.yaml; ONLY the LOOP granularity
+# is rescaled so a pool of parallel rollout workers (train_rl.py --num-workers N)
+# stays busy. It is tuned for N = 16 workers (episodes_per_iter = N).
+#
+# The rescale is a pure change of "iter" units — it preserves the quantities the RL
+# dynamics actually depend on, so results should track the workstation run:
+#   • total episodes  : 16 * 250  = 4000   (== 2 * 2000 in rl_phase1.yaml)
+#   • total updates    : 800 * 250 = 200000 (== 100 * 2000)
+#   • replay ratio     : updates*batch / new-transitions-per-iter is UNCHANGED
+#                        (episodes and updates both scaled 8x), so gradient reuse
+#                        per fresh transition is the same.
+#   • batch_size / capacity are per-TRANSITION and stay put (same gradient noise,
+#     same FIFO horizon in transitions).
+#   • mix_ramp is per-UPDATE (50000) and stays put.
+#   • the per-ITER ramps (beta, demo_frac) and the eval/save cadence are
+#     re-expressed in the new iter units (each iter now = 8x the old work).
+#
+# To use a different worker count W: set episodes_per_iter = W, updates_per_iter =
+# 50 * W, num_iters = 4000 / W, and scale beta_ramp_iters / demo_frac_ramp /
+# eval_every / save_every by (old_episodes_per_iter=2)/W relative to rl_phase1.yaml.
+# (--episodes-per-iter / --updates-per-iter on train_rl.py can override the first
+# two from the sbatch so they track --num-workers.)
+
+DATA:
+  num_pts:         1024
+  pc_channels:     5
+
+MODEL:
+  q_hidden:  [256, 256]   # twin-critic head width
+  clock_dim: 1            # remaining-steps clock width (fed to actor + critic)
+
+RL:
+  gamma:        0.95      # discount (must be <1: finite-horizon, clock-in-state)
+  tau:          0.005     # Polyak soft-update rate for targets
+  policy_noise: 0.2       # TD3 target-smoothing noise std (normalized action units)
+  noise_clip:   0.5       # target-smoothing noise clamp
+  act_limit:    5.0       # normalized action clamp (|Δ| in std units)
+  policy_delay: 2         # TD3 delayed actor/target updates
+  mc_blend:     0.5       # critic target = (1-b)*Bellman + b*MC return (sparse-reward aid)
+  pose_loss:    smooth_l1 # pose-BC loss form (run9 config); see rl_phase1.yaml
+  bc_weight:    2.0       # weight on the actor pose-BC term; mirrors rl_phase1.yaml
+  gripper_bc_weight: 1.0  # weight on the actor gripper BCE term (proximity label)
+  gripper_close_weight_max: 10.0  # class-balance the gripper BCE (rare "close" label)
+  gripper_label_smooth: 0.1  # label-smooth the gripper BCE (run9's single change): keeps
+                          # the logit responsive so it doesn't saturate open. See rl_phase1.yaml
+  # potential-based reward shaping on EE->grasp distance (Ng et al.) — additive,
+  # policy-invariant, ON TOP of the sparse reward. BOTH 0 = disabled (run9-13); rl_run14
+  # try pos_w≈1.0 / rot_w≈0.3 on THIS run11 base (isolated). Eval stays the sparse
+  # policy-close metric. See rl_phase1.yaml.
+  shaping_pos_weight: 0.0
+  shaping_rot_weight: 0.0
+  aux_weight:   0.5       # goal-auxiliary: regress the EE-relative grasp pose
+  reward_mode:  stable_grasp
+  hold_steps:   3
+  # HAND-COLLISION FILTER — this run uses the PAPER'S offline filter, NOT our runtime one.
+  # valid_grasp_dict_005.pkl = the CVPR2023 paper's per-scene hand-collision-free ACRONYM
+  # grasp indices (OMG subsets each scene's grasps by them). Retains ~716/720 s0 scenes vs
+  # our aggressive 0.08 m runtime filter's ~351 → ~2x the usable training scenes, and is the
+  # paper-faithful mechanism. hand_collision_filter=false disables the runtime filter so the
+  # two don't stack (double-filtering). See README_MY / [[project_handover_rl]].
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false  # our 0.08 m runtime filter OFF (valid_grasp_dict replaces it)
+  hand_collision_thresh: 0.08   # (unused while hand_collision_filter=false)
+  hand_points_radius:    0.35   # (unused while hand_collision_filter=false)
+  pg_normalize: true
+  alpha:        0.1       # TD3+BC PG scale (run9; pg_normalize pins the PG term ~alpha)
+  mix_start:    0.1       # RL weight early (BC-dominated)
+  mix_end:      0.2       # RL weight late
+  mix_ramp:     50000     # updates to ramp mix_start->mix_end (per-UPDATE: unchanged)
+  actor_lr:     3.0e-4
+  critic_lr:    3.0e-4
+  grad_clip:    1.0
+
+LOOP:
+  capacity:             20000   # replay transitions — per-transition, UNCHANGED
+  pretrain_updates:     2000    # offline demo pre-train (GPU-bound; not parallelized)
+  demo_frac:            0.25    # fallback constant (used only if demo_frac_start unset)
+  demo_frac_start:      0.5     # demo-heavy early (offline->online transition)
+  demo_frac_end:        0.3     # permanent floor (keeps the +1 anchor)
+  demo_frac_ramp:       125     # iters to anneal start->end. (rl_run13 doubled to 250;
+                                # reverted to run11's 125.) rl_phase1: 1000 @ 2 ep/iter.
+  warmup_episodes:      0       # online expert reaches 0 successes; demos + pretrain replace it
+  warmup_beta:          1.0
+  # ── parallel granularity: one episode per worker per iter ──────────────────
+  episodes_per_iter:    16      # == --num-workers (every worker rolls one episode)
+  updates_per_iter:     800     # 50 updates/episode — same replay ratio as 100/2
+  batch_size:           64      # per-transition — UNCHANGED (same gradient noise)
+  num_iters:            250     # run11 value (16*250 = 4000 episodes). rl_run13 extended to
+                                # 500 (+higher-fraction curriculum) — NEGATIVE (peak dropped
+                                # to 0.208, same post-curriculum decline); reverted.
+  # exploration
+  noise_std:            0.1
+  expert_initial_steps: 28      # reverse-curriculum warm start upper bound (per-episode
+                                # step count — UNCHANGED across granularity)
+  # annealed reverse-curriculum. run9/11 value (~27% of the 250-iter run). rl_run13 tried
+  # a higher-fraction 350 (~70%) — did NOT raise the peak (the peak is gated by curriculum
+  # COMPLETION, not per-rung mastery; more updates/rung gave a LOWER peak 0.208) and left
+  # the same post-curriculum decline; reverted. (rl_phase1 PC-units: 550.)
+  expert_initial_anneal_iters: 69
+  expert_initial_end:   2       # final upper bound (near-from-scratch, matches eval)
+  expert_initial_window: 6      # width of the sampled band (hi-window .. hi)
+  expert_episode_frac:  0.25    # run15 base value (this run = run15 base + paper valid_grasp_dict)
+  rollout_max_steps:    30      # episode horizon (clock denom + OMG plan length)
+  # DAgger tail replans. rl_run12 tried ratio 1.0 (feasible mid-traj labels) —
+  # NEGATIVE (no |a_pose| bound, no reach gain). Reverted to run9/run11's 0.5.
+  dagger_ratio:         0.5
+  dagger_min_step:      5
+  dagger_tail_guard:    8
+  # DART (GA-DDPG env.random_perturb): inject a random task-space JUMP on a fraction
+  # dart_ratio of POLICY steps in [dart_min_step, dart_max_step) to manufacture the
+  # off-plan near-grasp RECOVERY data that DAgger + warm-start never produce (both
+  # stay on-plan → the ~5 cm LATERAL plateau). Perturbed rows are dropped from the
+  # critic's Bellman fit, kept for the actor BC. Window/mags are per-STEP (UNCHANGED
+  # across granularity — identical to rl_phase1.yaml). 0 = OFF (run11 base). See
+  # rl_phase1.yaml for the full rationale; rl_run15 try dart_ratio≈0.15-0.25.
+  # dart_mode: "policy" = perturb POLICY steps, the plan-tracking label teaches the
+  # recovery (run15 variant, VALIDATED: peak 0.458). "expert" = GA-DDPG FAITHFUL:
+  # perturb the EXPERT episodes, REPLAN the tail, expert executes the recovery by
+  # index (clean expert demos → no critic masking). "both" = enable BOTH at once
+  # (policy eps → policy-DART, expert eps → expert-DART). Switchable for a clean A/B;
+  # all modes share the window/magnitudes below.
+  # rl_run21 (VGD) = run15's WINNING policy-DART config (peak 0.458) UNCHANGED; the ONLY
+  # difference vs run15 is the HAND FILTER: paper valid_grasp_dict (~716 scenes) instead of
+  # our 0.08 m runtime filter (~351). Tests whether ~2x the usable training scenes lifts the
+  # peak / cures the post-curriculum decay (the diversity-ceiling hypothesis). All DART knobs
+  # = run15's exact values below.
+  dart_mode:            policy  # run15 variant (validated best)
+  dart_ratio:           0.2     # run15 value (UNCHANGED — this run only swaps the hand filter)
+  dart_min_step:        15      # run15 window [15,22)
+  dart_max_step:        22
+  dart_pos_mag:         0.04
+  dart_rot_mag:         0.2
+  beta_start:           0.5
+  beta_end:             0.0
+  beta_ramp_iters:      63      # run9/11 value (tracks the 69-iter curriculum: 63/69 ≈ 0.9).
+                                # rl_run13's 315 reverted. (rl_phase1 PC-units: 500.)
+  # eval / checkpoint (parallel eval is cheap — bump episodes for a smoother curve)
+  eval_every:           7       # rl_phase1: 50 @ 2 ep/iter = 100 episodes; /16 ≈ 7
+  eval_episodes:        64      # 4 per worker at 16 workers
+  save_every:           7
