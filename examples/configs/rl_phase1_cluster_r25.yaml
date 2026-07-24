@@ -1,0 +1,95 @@
+# Phase-3 RL config — rl_run25 (CLUSTER, 16 workers). IDENTICAL to rl_run23 except
+# num_iters 250 -> 700 (a much longer run).
+#
+# NOTE: the widening curriculum anneal stays at 150 iters (same as run23 — "same as
+# 23"), so the band widens [22,24] -> [2,24] over iters 0..150 and then HOLDS [2,24]
+# for the remaining 550 iters. This deliberately gives a long POST-curriculum phase
+# to test whether extra training consolidates the peak or re-exposes the decline.
+# beta_ramp (63) and demo_frac_ramp (125) are per-ITER and also unchanged (they track
+# the 150-iter curriculum onset, not the run length). mix_ramp is per-UPDATE, unchanged.
+#
+# 700 * 16 = 11200 episodes, 700 * 800 = 560000 updates (~2.8x run23). Likely exceeds
+# the 24h walltime cap -> resume from checkpoints/last.pt (see the sbatch footer).
+# Pair with the vgd demos:  --demos output/rl_demos/train_h30_vgd.h5
+
+DATA:
+  num_pts:         1024
+  pc_channels:     5
+
+MODEL:
+  q_hidden:  [256, 256]
+  clock_dim: 1
+
+RL:
+  gamma:        0.95
+  tau:          0.005
+  policy_noise: 0.2
+  noise_clip:   0.5
+  act_limit:    5.0
+  policy_delay: 2
+  mc_blend:     0.5
+  pose_loss:    smooth_l1
+  bc_weight:    2.0
+  gripper_bc_weight: 1.0
+  gripper_close_weight_max: 10.0
+  gripper_label_smooth: 0.1
+  shaping_pos_weight: 0.0
+  shaping_rot_weight: 0.0
+  aux_weight:   0.5
+  reward_mode:  stable_grasp
+  hold_steps:   3
+  # HAND-COLLISION FILTER — PAPER'S offline valid_grasp_dict (run21/vgd), NOT run15's
+  # runtime 0.08 m filter. hand_collision_filter=false so our runtime filter is OFF.
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08   # (unused while hand_collision_filter=false)
+  hand_points_radius:    0.35   # (unused while hand_collision_filter=false)
+  pg_normalize: true
+  alpha:        0.1
+  mix_start:    0.1
+  mix_end:      0.2
+  mix_ramp:     50000
+  actor_lr:     3.0e-4
+  critic_lr:    3.0e-4
+  grad_clip:    1.0
+
+LOOP:
+  capacity:             20000
+  pretrain_updates:     2000
+  demo_frac:            0.25
+  demo_frac_start:      0.5
+  demo_frac_end:        0.3
+  demo_frac_ramp:       125
+  warmup_episodes:      0
+  warmup_beta:          1.0
+  episodes_per_iter:    16
+  updates_per_iter:     800
+  batch_size:           64
+  num_iters:            700     # CHANGE vs run23: was 250
+  # exploration
+  noise_std:            0.03
+  # ── WIDENING reverse curriculum (same as run23) ───────────────────────────
+  expert_initial_hi:            24    # FIXED upper takeover bound
+  expert_initial_lo_start:      22    # band [22,24] at iter 0
+  expert_initial_lo_end:        2     # band [2,24] after anneal
+  expert_initial_anneal_iters:  150   # unchanged: anneal 0..150, then hold [2,24]
+  expert_episode_frac:  0.5
+  rollout_max_steps:    30
+  # DAgger tail replans (run15 values)
+  dagger_ratio:         0.5
+  dagger_min_step:      5
+  dagger_tail_guard:    8
+  # DART — run23 values (policy-DART, ratio 0.2)
+  dart_mode:            policy
+  dart_ratio:           0.2
+  dart_min_step:        15
+  dart_max_step:        22
+  dart_pos_mag:         0.04
+  dart_rot_mag:         0.2
+  beta_start:           0.5
+  beta_end:             0.0
+  beta_ramp_iters:      63
+  # eval / checkpoint
+  eval_every:           7
+  eval_episodes:        64
+  save_every:           7
