@@ -231,6 +231,47 @@ window to give it keyboard focus, then:
 
 `Ctrl-C` in the terminal also works.
 
+#### Overlaying the OMG grasp (which grasp the expert aimed at)
+
+The saved rollout only stores the point cloud + expert action deltas — it
+doesn't say which of the object's many candidate grasps OMG actually planned
+to. These flags re-run OMG once at reset (from the same config the data was
+collected under) and draw the grasp poses as Panda-gripper wireframes that
+stay up for the whole session:
+
+```bash
+# green = the grasp OMG used, cyan = its pre-grasp standoff
+python examples/visualize_bc_dataset.py \
+    --dataset output/bc_dataset/train.h5 --mode replay \
+    --cfg-file examples/pretrain.yaml --episode 0 --show-goal-grasp
+
+# ALSO draw every grasp OMG chose from (thin grey), goal still green
+python examples/visualize_bc_dataset.py \
+    --dataset output/bc_dataset/train.h5 --mode replay \
+    --cfg-file examples/pretrain.yaml --episode 0 --show-grasp-set
+```
+
+| flag | default | meaning |
+|---|---|---|
+| `--show-goal-grasp` | off | green = goal grasp (`traj[-1]`, where the gripper closes), cyan = pre-grasp standoff (`traj[-5]`, where approach-only DAgger labels stop) |
+| `--show-grasp-set` | off | thin grey = the whole set of candidate grasps OMG chose from for this scene (the object grasps at the live target pose), with the one it used highlighted green |
+| `--max-grasp-set` | `40` | random subsample cap for `--show-grasp-set` (keeps the GUI light) |
+| `--valid-grasp-dict` | `examples/valid_grasp_dict_005.pkl` | per-scene hand-collision-filtered grasp dict OMG loads so the overlay matches how **vgd** demo pools (`*_vgd.h5`) were collected; pass `''`/`none` to use the full ACRONYM set |
+
+Both are **replay-only** (static mode never loads the sim).
+
+> **Which grasp set OMG sees, matters.** OMG picks its goal as `argmin(potential
+> + dist·‖start−grasp‖)` over the *candidate set* — so the grasp it lands on
+> depends on **which set you give it**. By default this tool loads
+> `valid_grasp_dict` (the paper's hand-collision-filtered grasps), matching how
+> `*_vgd.h5` pools were collected — so the green overlay is the grasp the episode
+> actually aimed at, and the same one `rollout_rl_policy.py` targets. Drop the
+> filter (`--valid-grasp-dict ''`) and OMG re-plans over the full ACRONYM set: it
+> may pick a **different, hand-colliding grasp** and fail (`FAILURE_HUMAN_CONTACT`)
+> — exactly why the filter exists. The grey set is still *before* OMG's per-scene
+> IK/reachability pruning, so a few grey grippers may be ones OMG later dropped;
+> the green one is the true planned goal.
+
 ---
 
 ## Visualizing YCB object grasps

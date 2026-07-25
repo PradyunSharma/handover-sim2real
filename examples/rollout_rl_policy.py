@@ -48,7 +48,7 @@ import handover_sim2real   # noqa: F401  registers envs
 from handover.benchmark_wrapper import HandoverBenchmarkWrapper
 from handover_sim2real.config import get_cfg
 from handover_sim2real.policy import PointListener
-from handover_sim2real.utils import add_sys_path_from_env
+from handover_sim2real.utils import add_sys_path_from_env, resolve_valid_grasp_dict_path
 
 from handover_sim2real.rl import RLActor
 from handover_sim2real.rl.rollout_worker import RolloutWorker
@@ -186,10 +186,23 @@ def main():
     torch.manual_seed(args.seed)
     rng = np.random.RandomState(args.seed)
 
+    # Load the run's config/actor FIRST: the paper's OFFLINE hand-collision grasp
+    # filter (valid_grasp_dict) must be wired into cfg.omg_config BEFORE the env
+    # (and its OMG planner) is built — exactly as train_rl.py does. Without it OMG
+    # here plans over the FULL ACRONYM grasp set, so it finds hand-free grasps on
+    # scenes that demo collection / in-training eval SKIPPED (no valid grasp) and
+    # scores the policy on them — i.e. the benchmark would skip a different, smaller
+    # scene set than training did, and could even aim at grasps the policy never saw.
+    actor, normalizer, rlcfg = load_rl_actor(Path(args.rl_run), args.checkpoint, args.device)
+    _vgd = resolve_valid_grasp_dict_path(rlcfg["RL"], cfg.BENCHMARK.SETUP)
+    if _vgd is not None:
+        cfg.omg_config["valid_grasp_dict_path"] = _vgd
+        print("[valid_grasp_dict] paper hand-collision filter ON: {}".format(_vgd))
+
     env            = HandoverBenchmarkWrapper(gym.make(cfg.ENV.ID, cfg=cfg))
     point_listener = PointListener(cfg, seed=args.seed)
-    actor, normalizer, rlcfg = load_rl_actor(Path(args.rl_run), args.checkpoint, args.device)
-    # hand-collision grasp filter for the OMG expert — match the training run.
+    # our aggressive RUNTIME hand-collision grasp filter — only when the run used it
+    # (mutually exclusive with valid_grasp_dict; enabling both would double-filter).
     if bool(rlcfg["RL"].get("hand_collision_filter", True)):
         env.set_hand_collision_filter(
             enable=True,

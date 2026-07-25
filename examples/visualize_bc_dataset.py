@@ -43,6 +43,8 @@ Usage — simulator replay:
         --cfg-file examples/pretrain.yaml \
         --episode 0 \
         [--show-goal-grasp]   # overlay the grasp (green) + standoff (cyan) gripper
+        [--show-grasp-set]    # overlay ALL candidate grasps OMG chose from (grey) +
+                              #   highlight the one it used (green)
 
 Also accepts an RL demo pool (examples/collect_rl_demos.py) — a streamed `.h5` or
 a legacy `.npz`: episodes are split at terminal==1, the normalized pose is
@@ -242,7 +244,9 @@ def visualize_static(dataset_path, ep_idx):
 # ── simulator replay ──────────────────────────────────────────────────────────
 
 def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
-                     show_expert=True, arrow_scale=3.0, show_goal_grasp=False):
+                     show_expert=True, arrow_scale=3.0, show_goal_grasp=False,
+                     show_grasp_set=False, max_grasp_set=40,
+                     valid_grasp_dict="examples/valid_grasp_dict_005.pkl"):
     import gym
     import pybullet
     import time
@@ -252,7 +256,7 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
 
     from handover.benchmark_wrapper import HandoverBenchmarkWrapper
     from handover_sim2real.config import get_cfg
-    from handover_sim2real.utils import add_sys_path_from_env
+    from handover_sim2real.utils import add_sys_path_from_env, resolve_valid_grasp_dict_path
 
     add_sys_path_from_env("GADDPG_DIR")
     from experiments.config import cfg_from_file
@@ -277,6 +281,19 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
     cfg_from_file(filename=cfg_file, dict=cfg, merge_to_cn_dict=True)
     cfg.SIM.RENDER = True  # open PyBullet GUI
 
+    # Match the demo pool's grasp distribution: vgd pools (*_vgd.h5) were collected
+    # with OMG loading the paper's per-scene hand-collision-filtered grasp dict
+    # (collect_rl_demos.py). Without it, the --show-goal-grasp/--show-grasp-set
+    # overlay re-plans OMG over the FULL ACRONYM set and can pick a DIFFERENT (often
+    # hand-colliding) grasp than the episode actually aimed at. Set on cfg.omg_config
+    # BEFORE the env (and its OMG planner) is built. Pass ''/'none' for a non-vgd pool.
+    if valid_grasp_dict and str(valid_grasp_dict).lower() != "none":
+        _vgd = resolve_valid_grasp_dict_path(
+            {"valid_grasp_dict_path": valid_grasp_dict}, cfg.BENCHMARK.SETUP)
+        if _vgd is not None:
+            cfg.omg_config["valid_grasp_dict_path"] = _vgd
+            print(f"[valid_grasp_dict] OMG grasp overlay uses the vgd subset: {_vgd}")
+
     env = HandoverBenchmarkWrapper(gym.make(cfg.ENV.ID, cfg=cfg))
 
     obs = env.reset(idx=scene_idx)
@@ -285,9 +302,10 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
     # the OFFLINE expert dataset). 'states' mode drives the sim through the stored
     # robot_states, faithfully reproducing whatever rollout was recorded. We also
     # run OMG (once, from the reset config = same grasp the data aimed at) when
-    # --show-goal-grasp is set, just to read back the goal grasp / standoff poses.
+    # --show-goal-grasp / --show-grasp-set is set, just to read back the goal grasp /
+    # standoff poses and the full candidate grasp set OMG chose from.
     expert_plan = None
-    if source == "omg" or show_goal_grasp:
+    if source == "omg" or show_goal_grasp or show_grasp_set:
         expert_plan, _ = env.run_omg_planner(cfg.RL_MAX_STEP, scene_idx)
         if expert_plan is None:
             if source == "omg":
@@ -321,18 +339,37 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
 
     # Goal-grasp overlay (static per scene → drawn once, kept up the whole session).
     goal_ids = []
-    if show_goal_grasp:
+    if show_goal_grasp or show_grasp_set:
         goal_mat     = env.get_omg_goal_grasp_pose()   # traj[-1], the grasp pose
         standoff_mat = env.get_omg_standoff_pose()     # traj[-5], the pre-grasp pose
+
+        # Full candidate set first (thin grey) so the highlighted goal draws on top:
+        # every grasp OMG could pick from for this scene — the valid_grasp_dict-
+        # filtered object grasps placed at the live target pose (get_grasp_poses_world).
+        if show_grasp_set:
+            grasps_world = env.get_grasp_poses_world()   # (N, 4, 4) world frame
+            n = len(grasps_world)
+            if n == 0:
+                print("  --show-grasp-set: OMG loaded no candidate grasps — nothing "
+                      "to draw.")
+            else:
+                sel = np.arange(n)
+                if n > max_grasp_set:
+                    sel = np.random.choice(n, size=max_grasp_set, replace=False)
+                for gmat in grasps_world[sel]:
+                    draw_gripper(gmat, [0.55, 0.55, 0.55], goal_ids, 1.0)  # thin grey
+                print(f"  candidate grasp set (grey): drew {len(sel)}/{n} — the poses "
+                      f"OMG chose its goal from")
+
         if goal_mat is not None:
             draw_gripper(goal_mat, [0.0, 1.0, 0.0], goal_ids, 3.0)        # green
-            print(f"  goal grasp (green)    pos={goal_mat[:3, 3].round(3)}")
-        if standoff_mat is not None:
+            print(f"  goal grasp (green, the one OMG used) pos={goal_mat[:3, 3].round(3)}")
+        if show_goal_grasp and standoff_mat is not None:
             draw_gripper(standoff_mat, [0.0, 1.0, 1.0], goal_ids, 2.0)    # cyan
             print(f"  pre-grasp standoff (cyan) pos={standoff_mat[:3, 3].round(3)}"
                   f"  — where approach-only DAgger labels stop")
         if goal_mat is None and standoff_mat is None:
-            print("  --show-goal-grasp: OMG found no goal grasp — nothing to draw.")
+            print("  OMG found no goal grasp — nothing to draw.")
 
     # Expert-action arrows live in the enclosing scope so they stay on screen
     # after playback ends; they're wiped only when a new replay (R) starts.
@@ -496,6 +533,19 @@ def parse_args():
                    help="overlay the gripper pose OMG planned to reach — green = "
                         "goal grasp (traj[-1]), cyan = pre-grasp standoff (traj[-5], "
                         "where approach-only DAgger labels stop). Runs OMG once.")
+    p.add_argument("--show-grasp-set", action="store_true",
+                   help="overlay the whole set of candidate grasp poses OMG chose "
+                        "from for this scene (thin grey grippers, the valid_grasp_dict-"
+                        "filtered object grasps at the live target pose) and highlight "
+                        "the one it actually used (green). Runs OMG once.")
+    p.add_argument("--max-grasp-set", type=int, default=40,
+                   help="max candidate grasps to draw with --show-grasp-set (random "
+                        "subsample to keep the GUI light; default 40).")
+    p.add_argument("--valid-grasp-dict", default="examples/valid_grasp_dict_005.pkl",
+                   help="per-scene hand-collision-filtered grasp dict OMG loads so the "
+                        "--show-goal-grasp/--show-grasp-set overlay matches how vgd demo "
+                        "pools (*_vgd.h5) were collected (default). Pass '' or 'none' to "
+                        "use the FULL ACRONYM grasp set instead (non-vgd pools).")
     p.add_argument("--seed",     type=int, default=None)
     return p.parse_args()
 
@@ -512,7 +562,8 @@ def main():
             print("Error: --cfg-file is required for --mode replay")
             sys.exit(1)
         visualize_replay(args.dataset, args.episode, args.cfg_file, args.replay_source,
-                         args.show_expert, args.arrow_scale, args.show_goal_grasp)
+                         args.show_expert, args.arrow_scale, args.show_goal_grasp,
+                         args.show_grasp_set, args.max_grasp_set, args.valid_grasp_dict)
 
 
 if __name__ == "__main__":
