@@ -45,16 +45,28 @@ class RLActor(nn.Module):
                  pointnet_nclusters: int = 32,
                  use_prev_act: bool = False,
                  prev_act_dim: int = 6,
+                 drop_joint_state: bool = False,
+                 joint_state_dim: int = 18,
                  clock_dim: int = 1,
                  aux_dim: int = 9):
         super().__init__()
         self.use_prev_act         = bool(use_prev_act)
         self.prev_act_dim         = int(prev_act_dim)
+        # drop_joint_state: strip the LEADING joint_pos(9)+joint_vel(9) block from
+        # the robot-state vector before the robot MLP (the action is EE-frame, so the
+        # EE pose already in the vector carries the kinematics; joint-space is redundant
+        # + scene-correlated). Only valid FROM SCRATCH (warm_start=false): it changes
+        # the robot-encoder in_dim so BC weights can't be loaded. joint_state_dim is the
+        # width of that leading block in _robot_state's layout (9 pos + 9 vel = 18).
+        self.drop_joint_state     = bool(drop_joint_state)
+        self.joint_state_dim      = int(joint_state_dim)
         self.full_robot_state_dim = int(robot_state_dim)
         self.clock_dim            = int(clock_dim)
         self.aux_dim              = int(aux_dim)
-        effective_robot_dim = (self.full_robot_state_dim if self.use_prev_act
-                               else self.full_robot_state_dim - self.prev_act_dim)
+        _tail = (self.full_robot_state_dim if self.use_prev_act
+                 else self.full_robot_state_dim - self.prev_act_dim)
+        _lead = self.joint_state_dim if self.drop_joint_state else 0
+        effective_robot_dim = _tail - _lead
 
         self.pc_encoder = PointCloudEncoder(
             in_channels=pc_channels, model_scale=pointnet_scale,
@@ -93,9 +105,10 @@ class RLActor(nn.Module):
 
     # ----- robot-state channel selection (mirrors BCPolicy) ----------------
     def _select_robot_state(self, rs: torch.Tensor) -> torch.Tensor:
-        if self.use_prev_act:
-            return rs
-        return rs[..., : self.full_robot_state_dim - self.prev_act_dim]
+        hi = (self.full_robot_state_dim if self.use_prev_act
+              else self.full_robot_state_dim - self.prev_act_dim)
+        lo = self.joint_state_dim if self.drop_joint_state else 0
+        return rs[..., lo:hi]
 
     def forward(self, pc: torch.Tensor, rs_norm: torch.Tensor,
                 remain_norm: torch.Tensor, return_aux: bool = False):

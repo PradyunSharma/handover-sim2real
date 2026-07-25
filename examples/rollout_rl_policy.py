@@ -118,6 +118,7 @@ def load_rl_actor(rl_run: Path, checkpoint: str, device: str):
         pointnet_radius    = float(m["pointnet_radius"]),
         pointnet_nclusters = int(m["pointnet_nclusters"]),
         use_prev_act       = bool(m.get("use_prev_act", False)),
+        drop_joint_state   = bool(rlm.get("drop_joint_state", False)),
         clock_dim          = int(rlm["clock_dim"]),
     ).to(device)
 

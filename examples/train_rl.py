@@ -69,6 +69,12 @@ def build_networks(bc_run: Path, rlcfg: dict, device: str):
     m, d = rcfg["MODEL"], rcfg["DATA"]
     rlm = rlcfg["MODEL"]
 
+    drop_joint_state = bool(rlm.get("drop_joint_state", False))
+    if drop_joint_state and bool(rlcfg.get("warm_start", True)):
+        raise ValueError(
+            "MODEL.drop_joint_state=true changes the robot-encoder input dim, so the "
+            "BC robot_encoder weights cannot be warm-started. Set warm_start: false "
+            "(train the actor/critic from scratch) to use drop_joint_state.")
     common = dict(
         pc_channels        = int(d["pc_channels"]),
         robot_state_dim    = int(d["robot_state_dim"]),
@@ -78,6 +84,7 @@ def build_networks(bc_run: Path, rlcfg: dict, device: str):
         pointnet_radius    = float(m["pointnet_radius"]),
         pointnet_nclusters = int(m["pointnet_nclusters"]),
         use_prev_act       = bool(m.get("use_prev_act", False)),
+        drop_joint_state   = drop_joint_state,
         clock_dim          = int(rlm["clock_dim"]),
     )
     actor = RLActor(policy_hidden=tuple(m["policy_hidden"]), **common)
