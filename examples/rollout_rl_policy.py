@@ -108,19 +108,34 @@ def load_rl_actor(rl_run: Path, checkpoint: str, device: str):
         bccfg = yaml.safe_load(f)
     m, d, rlm = bccfg["MODEL"], bccfg["DATA"], rlcfg["MODEL"]
 
-    actor = RLActor(
+    common = dict(
         pc_channels        = int(d["pc_channels"]),
         robot_state_dim    = int(d["robot_state_dim"]),
         feature_dim        = int(m["feature_dim"]),
         robot_hidden       = int(m["robot_hidden"]),
-        policy_hidden      = tuple(m["policy_hidden"]),
         pointnet_scale     = int(m["pointnet_scale"]),
         pointnet_radius    = float(m["pointnet_radius"]),
         pointnet_nclusters = int(m["pointnet_nclusters"]),
         use_prev_act       = bool(m.get("use_prev_act", False)),
         drop_joint_state   = bool(rlm.get("drop_joint_state", False)),
         clock_dim          = int(rlm["clock_dim"]),
-    ).to(device)
+    )
+    if str(rlm.get("arch", "mlp")).lower() == "act":
+        from handover_sim2real.rl import RLActorACT
+        actor = RLActorACT(
+            history_len     = int(rlm.get("history_len", 4)),
+            chunk_len       = int(rlm.get("chunk_len", 1)),
+            d_model         = int(rlm.get("d_model", 256)),
+            n_heads         = int(rlm.get("n_heads", 4)),
+            enc_layers      = int(rlm.get("enc_layers", 3)),
+            dec_layers      = int(rlm.get("dec_layers", 3)),
+            cvae_enc_layers = int(rlm.get("cvae_enc_layers", 2)),
+            latent_dim      = int(rlm.get("latent_dim", 32)),
+            use_cvae        = bool(rlm.get("use_cvae", False)),
+            dropout         = float(rlm.get("dropout", 0.1)),
+            **common).to(device)
+    else:
+        actor = RLActor(policy_hidden=tuple(m["policy_hidden"]), **common).to(device)
 
     ckpt_path = rl_run / "checkpoints" / f"{checkpoint}.pt"
     if not ckpt_path.exists():

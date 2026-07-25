@@ -37,10 +37,27 @@ import numpy as np
 import torch
 
 
+def _history_before(pcs: list, rss: list, h1: int):
+    """Given a single episode's (pc, rs) frames in temporal order, return the
+    per-transition stacks of the `h1` frames BEFORE each one, left-padded with
+    frame 0 at the episode start. hp[i] = [pc[max(i-h1+k,0)] for k in 0..h1-1].
+    Returns (hp[M,h1,...], hr[M,h1,...]) as float32 arrays."""
+    M = len(pcs)
+    hp = np.zeros((M, h1, *pcs[0].shape), dtype=np.float32)
+    hr = np.zeros((M, h1, *rss[0].shape), dtype=np.float32)
+    for i in range(M):
+        for k in range(h1):
+            j = max(i - h1 + k, 0)
+            hp[i, k] = pcs[j]
+            hr[i, k] = rss[j]
+    return hp, hr
+
+
 class ReplayBuffer:
     def __init__(self, capacity: int, num_pts: int, pc_channels: int,
                  robot_state_dim: int = 32, action_dim: int = 7,
-                 expert_action_dim: int = 6, goal_dim: int = 9):
+                 expert_action_dim: int = 6, goal_dim: int = 9,
+                 history_len: int = 1):
         self.capacity = int(capacity)
         self.num_pts  = int(num_pts)
         self.pc_ch    = int(pc_channels)
@@ -48,10 +65,21 @@ class ReplayBuffer:
         self.a_dim    = int(action_dim)             # executed action: pose(6)+gripper(1)
         self.ea_dim   = int(expert_action_dim)      # OMG pose label for the BC term (6)
         self.goal_dim = int(goal_dim)
+        # history_len (Phase-3 ACT actor, Design A): the actor consumes T frames of
+        # (pc, rs). We store the T-1 frames BEFORE the current one; sample() then
+        # assembles the s / s' T-frame histories from [hist ‖ pc ‖ next_pc] (no
+        # duplication: the union of hist(T-1)+pc+next_pc is exactly T+1 distinct
+        # frames). history_len==1 (default, MLP actor) allocates nothing and sample()
+        # returns the single-frame dict unchanged.
+        self.history_len = int(history_len)
+        self._h1 = max(self.history_len - 1, 0)     # frames stored before current
 
         c, N, C = self.capacity, self.num_pts, self.pc_ch
         self.pc        = np.zeros((c, N, C), dtype=np.float32)
         self.rs        = np.zeros((c, self.rs_dim), dtype=np.float32)
+        if self._h1 > 0:
+            self.hist_pc = np.zeros((c, self._h1, N, C), dtype=np.float32)
+            self.hist_rs = np.zeros((c, self._h1, self.rs_dim), dtype=np.float32)
         self.remain    = np.zeros((c, 1), dtype=np.float32)
         self.action    = np.zeros((c, self.a_dim), dtype=np.float32)
         self.reward    = np.zeros((c, 1), dtype=np.float32)
@@ -82,8 +110,16 @@ class ReplayBuffer:
     def add(self, *, pc, rs, remain_norm, action, reward, next_pc, next_rs,
             next_remain_norm, terminal, mc_return, expert_action, expert_flag,
             goal_pose, next_goal_pose=None, expert_gripper=1.0, gripper_flag=0.0,
-            perturb_flag=0.0):
+            perturb_flag=0.0, hist_pc=None, hist_rs=None):
         i = self._idx
+        # history frames (T-1 before the current); only when history_len>1. If a
+        # caller omits them (single-frame add), left-pad by repeating the current
+        # frame so the assembled history degrades gracefully to "all current".
+        if self._h1 > 0:
+            self.hist_pc[i] = (hist_pc if hist_pc is not None
+                               else np.broadcast_to(pc, self.hist_pc[i].shape))
+            self.hist_rs[i] = (hist_rs if hist_rs is not None
+                               else np.broadcast_to(rs, self.hist_rs[i].shape))
         self.pc[i]          = pc
         self.rs[i]          = rs
         self.remain[i, 0]   = remain_norm
@@ -108,8 +144,21 @@ class ReplayBuffer:
             self._full = True
 
     def add_episode(self, transitions: list[dict]) -> None:
-        for t in transitions:
-            self.add(**t)
+        # transitions are one episode in temporal order. For an ACT buffer
+        # (history_len>1) reconstruct each transition's T-1 preceding frames from
+        # the episode's own (pc, rs) sequence, left-padded with frame 0 at the
+        # start. This is computed here (not carried in the transition dict) so the
+        # rollout worker / demo collector formats stay single-frame.
+        if self._h1 > 0 and transitions:
+            hp, hr = _history_before(
+                [np.asarray(t["pc"], np.float32) for t in transitions],
+                [np.asarray(t["rs"], np.float32) for t in transitions],
+                self._h1)
+            for i, t in enumerate(transitions):
+                self.add(hist_pc=hp[i], hist_rs=hr[i], **t)
+        else:
+            for t in transitions:
+                self.add(**t)
 
     def sample(self, batch_size: int, device: str = "cuda") -> dict:
         n = len(self)
@@ -118,7 +167,7 @@ class ReplayBuffer:
         def t(a, dt=torch.float32):
             return torch.as_tensor(a[idx], dtype=dt, device=device)
 
-        return {
+        out = {
             "pc":            t(self.pc),
             "rs":            t(self.rs),
             "remain":        t(self.remain),
@@ -137,6 +186,22 @@ class ReplayBuffer:
             "gripper_flag":   t(self.gripper_flag),
             "perturb_flag":   t(self.perturb_flag),
         }
+        # ACT actor (history_len>1): assemble the T-frame s / s' histories. The full
+        # window [hist(T-1) ‖ pc ‖ next_pc] is T+1 distinct frames; s-history = the
+        # first T (drop next_pc), s'-history = the last T (drop the oldest). This is
+        # correct for T=1 too (hist empty → pc_hist=pc, next_pc_hist=next_pc).
+        if self._h1 > 0:
+            hpc, hrs = t(self.hist_pc), t(self.hist_rs)         # [B,T-1,...]
+            win_pc = torch.cat([hpc, out["pc"].unsqueeze(1),
+                                out["next_pc"].unsqueeze(1)], dim=1)   # [B,T+1,N,C]
+            win_rs = torch.cat([hrs, out["rs"].unsqueeze(1),
+                                out["next_rs"].unsqueeze(1)], dim=1)   # [B,T+1,rs]
+            T = self.history_len
+            out["pc_hist"]      = win_pc[:, :T]
+            out["next_pc_hist"] = win_pc[:, 1:]
+            out["rs_hist"]      = win_rs[:, :T]
+            out["next_rs_hist"] = win_rs[:, 1:]
+        return out
 
 
 # ── offline demo pool (npz) ──────────────────────────────────────────────────
@@ -235,11 +300,47 @@ def _reconstruct_next_goal(arrs: dict, fields: list) -> list:
     return list(fields) + ["next_goal_pose"]
 
 
-def load_demo_buffer(path: str) -> "ReplayBuffer":
+def _history_before_segmented(pcs: np.ndarray, rss: np.ndarray,
+                              terms: np.ndarray, h1: int):
+    """Like _history_before but for a whole episode-ordered pool: the left-pad
+    resets at each episode boundary (terms[i]>0.5 = last transition of an episode)
+    so a transition never borrows frames from the previous episode."""
+    M = pcs.shape[0]
+    hp = np.zeros((M, h1, *pcs.shape[1:]), dtype=np.float32)
+    hr = np.zeros((M, h1, *rss.shape[1:]), dtype=np.float32)
+    ep_start = 0
+    for i in range(M):
+        for k in range(h1):
+            j = max(i - h1 + k, ep_start)
+            hp[i, k] = pcs[j]
+            hr[i, k] = rss[j]
+        if terms[i] > 0.5:
+            ep_start = i + 1
+    return hp, hr
+
+
+def _fill_demo_buffer(buf: "ReplayBuffer", arrs: dict, fields: list, M: int) -> None:
+    """Add M episode-ordered demo transitions to `buf`, reconstructing the ACT
+    history windows (respecting episode boundaries) when buf.history_len>1."""
+    if buf._h1 > 0:
+        terms = np.asarray(arrs["terminal"], np.float32).reshape(-1)
+        hp, hr = _history_before_segmented(
+            np.asarray(arrs["pc"], np.float32),
+            np.asarray(arrs["rs"], np.float32), terms, buf._h1)
+        for i in range(M):
+            buf.add(hist_pc=hp[i], hist_rs=hr[i],
+                    **{k: arrs[k][i] for k in fields})
+    else:
+        for i in range(M):
+            buf.add(**{k: arrs[k][i] for k in fields})
+
+
+def load_demo_buffer(path: str, history_len: int = 1) -> "ReplayBuffer":
     """Load a demo pool (`.h5` streamed by DemoHDF5Writer, or `.npz` from
     save_demo_transitions) into a full, non-evicting ReplayBuffer (capacity ==
     number of demos). Dims are inferred; non-buffer keys (scene_idx,
-    action_mean/std) are ignored."""
+    action_mean/std) are ignored. `history_len>1` reconstructs the ACT actor's
+    T-frame histories from the (single-frame) demos in place — no re-collection."""
     if str(path).endswith((".h5", ".hdf5")):
         import h5py
         with h5py.File(path, "r") as f:
@@ -249,12 +350,12 @@ def load_demo_buffer(path: str) -> "ReplayBuffer":
                 robot_state_dim=int(f["rs"].shape[1]),
                 action_dim=int(f["action"].shape[1]),
                 expert_action_dim=int(f["expert_action"].shape[1]),
-                goal_dim=int(f["goal_pose"].shape[1]))
+                goal_dim=int(f["goal_pose"].shape[1]),
+                history_len=history_len)
             fields = [k for k in f.keys() if k in _DEMO_BUFFER_FIELDS]
             arrs = {k: f[k][:] for k in fields}     # one bulk read per field
         fields = _reconstruct_next_goal(arrs, fields)
-        for i in range(int(M)):
-            buf.add(**{k: arrs[k][i] for k in fields})
+        _fill_demo_buffer(buf, arrs, fields, int(M))
         return buf
 
     data = np.load(path)
@@ -264,10 +365,10 @@ def load_demo_buffer(path: str) -> "ReplayBuffer":
         robot_state_dim=int(data["rs"].shape[1]),
         action_dim=int(data["action"].shape[1]),
         expert_action_dim=int(data["expert_action"].shape[1]),
-        goal_dim=int(data["goal_pose"].shape[1]))
+        goal_dim=int(data["goal_pose"].shape[1]),
+        history_len=history_len)
     fields = [k for k in data.files if k in _DEMO_BUFFER_FIELDS]
     arrs = {k: data[k] for k in fields}
     fields = _reconstruct_next_goal(arrs, fields)
-    for i in range(int(M)):
-        buf.add(**{k: arrs[k][i] for k in fields})
+    _fill_demo_buffer(buf, arrs, fields, int(M))
     return buf

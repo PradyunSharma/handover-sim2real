@@ -49,7 +49,7 @@ from handover_sim2real.config import get_cfg
 from handover_sim2real.policy import PointListener
 from handover_sim2real.utils import add_sys_path_from_env, resolve_valid_grasp_dict_path
 
-from handover_sim2real.rl import RLActor, QNetwork, ReplayBuffer, TD3BCTrainer
+from handover_sim2real.rl import RLActor, RLActorACT, QNetwork, ReplayBuffer, TD3BCTrainer
 from handover_sim2real.rl.replay_buffer import load_demo_buffer
 from handover_sim2real.rl.rollout_worker import RolloutWorker
 from handover_sim2real.rl.parallel_rollout import (
@@ -87,8 +87,40 @@ def build_networks(bc_run: Path, rlcfg: dict, device: str):
         drop_joint_state   = drop_joint_state,
         clock_dim          = int(rlm["clock_dim"]),
     )
-    actor = RLActor(policy_hidden=tuple(m["policy_hidden"]), **common)
     critic = QNetwork(q_hidden=tuple(rlm["q_hidden"]), **common)
+
+    arch = str(rlm.get("arch", "mlp")).lower()
+    if arch == "act":
+        # Phase-2 ACT actor (Design A): temporal transformer over history_len frames,
+        # single-action RL. Cannot warm-start from the single-frame BC MLP (different
+        # architecture), so it is from-scratch only; the critic stays the single-frame
+        # QNetwork above. Transformer hyperparameters come from the RL config's MODEL.
+        if bool(rlcfg.get("warm_start", True)):
+            raise ValueError(
+                "MODEL.arch=act cannot warm-start from the single-frame BC policy "
+                "(different architecture). Set warm_start: false.")
+        actor = RLActorACT(
+            history_len     = int(rlm.get("history_len", 4)),
+            chunk_len       = int(rlm.get("chunk_len", 1)),
+            d_model         = int(rlm.get("d_model", 256)),
+            n_heads         = int(rlm.get("n_heads", 4)),
+            enc_layers      = int(rlm.get("enc_layers", 3)),
+            dec_layers      = int(rlm.get("dec_layers", 3)),
+            cvae_enc_layers = int(rlm.get("cvae_enc_layers", 2)),
+            latent_dim      = int(rlm.get("latent_dim", 32)),
+            use_cvae        = bool(rlm.get("use_cvae", False)),
+            dropout         = float(rlm.get("dropout", 0.1)),
+            **common)
+        pcp = rlm.get("pc_pretrained")   # optional: warm the encoder (still from-scratch head)
+        if pcp:
+            actor.load_pretrained_pc_encoder(pcp)
+        print(f"[act] Phase-2 ACT actor (history_len={actor.history_len}, "
+              f"chunk_len={int(rlm.get('chunk_len', 1))}, use_cvae="
+              f"{bool(rlm.get('use_cvae', False))}) FROM SCRATCH; single-frame critic; "
+              f"dims + normalizer from {bc_run}")
+        return actor, critic, bc_model.normalizer
+
+    actor = RLActor(policy_hidden=tuple(m["policy_hidden"]), **common)
 
     # warm_start (default True): copy the BC policy's weights into the actor (pose +
     # gripper head) and the BC encoder into the critic. Set `warm_start: false` in the
@@ -398,16 +430,20 @@ def main():
     actor, critic, normalizer = build_networks(Path(args.bc_run), rlcfg, args.device)
     trainer = TD3BCTrainer(actor, critic, normalizer, rlcfg, args.device)
 
+    # ACT actor → the online buffer + demo pool must store/serve T-frame histories.
+    history_len = int(getattr(actor, "history_len", 1))
+
     buffer = ReplayBuffer(
         capacity=int(loop["capacity"]),
         num_pts=int(rlcfg["DATA"]["num_pts"]),
-        pc_channels=int(rlcfg["DATA"]["pc_channels"]))
+        pc_channels=int(rlcfg["DATA"]["pc_channels"]),
+        history_len=history_len)
 
     # permanent demo pool (optional): pure-OMG close-at-grasp successes, sampled
     # at a fixed fraction so the +1 transitions are never evicted or drowned.
     demo_pool = None
     if args.demos:
-        demo_pool = load_demo_buffer(args.demos)
+        demo_pool = load_demo_buffer(args.demos, history_len=history_len)
         print(f"[demos] loaded {len(demo_pool)} transitions from {args.demos} "
               f"(demo_frac {demo_frac_at(0, loop):.2f} -> "
               f"{demo_frac_at(10**9, loop):.2f})")

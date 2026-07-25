@@ -8,10 +8,12 @@ single-process synchronous loop, optional permanent demo pool.
 """
 
 from handover_sim2real.rl.actor import RLActor, clamp_action
+from handover_sim2real.rl.actor_act import RLActorACT
 from handover_sim2real.rl.critic import QNetwork
 from handover_sim2real.rl.replay_buffer import ReplayBuffer
 from handover_sim2real.rl.td3bc_trainer import TD3BCTrainer
 
 __all__ = [
-    "RLActor", "clamp_action", "QNetwork", "ReplayBuffer", "TD3BCTrainer",
+    "RLActor", "RLActorACT", "clamp_action", "QNetwork", "ReplayBuffer",
+    "TD3BCTrainer",
 ]

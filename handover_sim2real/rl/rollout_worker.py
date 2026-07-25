@@ -64,6 +64,7 @@ After the episode, discounted Monte-Carlo returns are filled in per transition
 from __future__ import annotations
 
 import sys
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -266,6 +267,19 @@ class RolloutWorker:
         pc = _point_cloud(obs, self.point_listener, self.panda_base_inv_tf)
         rs = _robot_state(obs, prev_act6d)
 
+        # ACT actor (history_len>1): keep a rolling window of the T-1 frames BEFORE
+        # the current one so the actor call sees the last T = [hist ‖ current]
+        # frames. Left-padded with frame 0 at the episode start. A plain (single-
+        # frame) RLActor reports history_len 1 → these stay empty and the actor is
+        # called with the single frame exactly as before. The buffer reconstructs
+        # the SAME windows independently (add_episode), so train/rollout match.
+        hist_len = int(getattr(actor, "history_len", 1))
+        if hist_len > 1:
+            frame_hist_pc = deque([pc.copy() for _ in range(hist_len - 1)],
+                                  maxlen=hist_len - 1)
+            frame_hist_rs = deque([rs.copy() for _ in range(hist_len - 1)],
+                                  maxlen=hist_len - 1)
+
         transitions: list[dict] = []
         n_omg_fail = 0
         n_replans = 0
@@ -347,21 +361,30 @@ class RolloutWorker:
             gripper_flag = 1.0
 
             # ----- actor action (normalized) + exploration noise -----
-            pc_t = torch.from_numpy(pc).float().unsqueeze(0).to(self.device)
-            rs_t = torch.from_numpy(rs).float().unsqueeze(0).to(self.device)
-            rs_n = (self.normalizer.normalize_state(rs_t)
-                    if self.normalizer is not None else rs_t)
             remain_t = torch.tensor([[remain_norm]], dtype=torch.float32,
                                     device=self.device)
+            if hist_len > 1:
+                # actor input = [1, T, ...] history ([hist(T-1) ‖ current frame]).
+                pcs = list(frame_hist_pc) + [pc]
+                rss = list(frame_hist_rs) + [rs]
+                pc_in = torch.from_numpy(np.stack(pcs)).float().unsqueeze(0).to(self.device)
+                rs_raw = torch.from_numpy(np.stack(rss)).float().unsqueeze(0).to(self.device)
+                rs_in = (self.normalizer.normalize_state(rs_raw)
+                         if self.normalizer is not None else rs_raw)   # [1,T,32]
+            else:
+                pc_in = torch.from_numpy(pc).float().unsqueeze(0).to(self.device)
+                rs_t  = torch.from_numpy(rs).float().unsqueeze(0).to(self.device)
+                rs_in = (self.normalizer.normalize_state(rs_t)
+                         if self.normalizer is not None else rs_t)
             if on_policy_grasp is not None:
                 # viewer path: also pull the goal-aux head's grasp-pose estimate
                 # and hand it back (decoded to a world 4x4) for overlay. `obs` is
                 # still the CURRENT state, so the EE frame matches the prediction.
-                a_out, aux_out = actor(pc_t, rs_n, remain_t, return_aux=True)
+                a_out, aux_out = actor(pc_in, rs_in, remain_t, return_aux=True)
                 a_norm = a_out[0].cpu().numpy()  # [7]
                 on_policy_grasp(grasp_9d_to_world(obs, aux_out[0].cpu().numpy()))
             else:
-                a_norm = actor(pc_t, rs_n, remain_t)[0].cpu().numpy()  # [7]
+                a_norm = actor(pc_in, rs_in, remain_t)[0].cpu().numpy()  # [7]
             if noise_std > 0.0:
                 a_norm = a_norm + rng.normal(0.0, noise_std, size=7).astype(np.float32)
             a_norm = np.clip(a_norm, -self.act_limit, self.act_limit).astype(np.float32)
@@ -478,6 +501,11 @@ class RolloutWorker:
                 expert_gripper=expert_gripper, gripper_flag=gripper_flag,
                 perturb_flag=(1.0 if is_dart else 0.0)))
 
+            # push the CURRENT frame into the rolling window, THEN advance to the
+            # next frame — so next step's window ends at this step's frame.
+            if hist_len > 1:
+                frame_hist_pc.append(pc.copy())
+                frame_hist_rs.append(rs.copy())
             pc, rs = next_pc, next_rs
             if ep_done:
                 break

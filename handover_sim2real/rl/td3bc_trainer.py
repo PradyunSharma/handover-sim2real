@@ -48,6 +48,10 @@ class TD3BCTrainer:
     def __init__(self, actor, critic, normalizer, cfg: dict, device: str = "cuda"):
         self.actor  = actor.to(device)
         self.critic = critic.to(device)
+        # ACT actor (Design A): the actor consumes a T-frame history, the critic
+        # stays single-frame (current frame). When true, actor/actor_target get the
+        # batch's *_hist tensors; the critic always gets the current-frame pc/rs.
+        self._use_hist = int(getattr(self.actor, "history_len", 1)) > 1
         self.actor_target  = copy.deepcopy(self.actor).eval()
         self.critic_target = copy.deepcopy(self.critic).eval()
         for p in self.actor_target.parameters():
@@ -168,9 +172,20 @@ class TD3BCTrainer:
         gripper_flag   = batch.get("gripper_flag")     # label validity
         perturb_flag   = batch.get("perturb_flag")     # DART: artificial jump row
 
+        # actor sees the T-frame history (ACT) or the single frame (MLP); the critic
+        # always sees the current frame (pc/rs, next_pc/next_rs above).
+        if self._use_hist:
+            act_pc      = batch["pc_hist"]
+            act_rs      = self._norm_state(batch["rs_hist"])
+            act_next_pc = batch["next_pc_hist"]
+            act_next_rs = self._norm_state(batch["next_rs_hist"])
+        else:
+            act_pc, act_rs           = pc, rs
+            act_next_pc, act_next_rs = next_pc, next_rs
+
         # ----- critic -----
         with torch.no_grad():
-            next_a = self.actor_target(next_pc, next_rs, next_remain)
+            next_a = self.actor_target(act_next_pc, act_next_rs, next_remain)
             noise  = (torch.randn_like(next_a) * self.policy_noise
                       ).clamp(-self.noise_clip, self.noise_clip)
             next_a = (next_a + noise).clamp(-self.act_limit, self.act_limit)
@@ -224,10 +239,10 @@ class TD3BCTrainer:
         # ----- delayed actor + target soft-update -----
         if self.update_step % self.policy_delay == 0:
             if self.aux_weight > 0.0:
-                a_pi, aux_a = self.actor(pc, rs, remain, return_aux=True)
+                a_pi, aux_a = self.actor(act_pc, act_rs, remain, return_aux=True)
                 aux_loss_a = F.smooth_l1_loss(aux_a, goal_pose)
             else:
-                a_pi = self.actor(pc, rs, remain)
+                a_pi = self.actor(act_pc, act_rs, remain)
                 aux_loss_a = torch.zeros((), device=a_pi.device)
             # PG drives the POSE channels only. The gripper logit a_pi[:, 6] is
             # fed to the critic detached so the deterministic policy-gradient

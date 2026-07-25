@@ -70,6 +70,9 @@ class ACTPolicy(nn.Module):
                  use_cvae: bool = True,
                  use_prev_act: bool = False,
                  prev_act_dim: int = 6,
+                 drop_joint_state: bool = False,
+                 joint_state_dim: int = 18,
+                 clock_dim: int = 0,
                  pointnet_scale: int = 1,
                  pointnet_radius: float = 0.02,
                  pointnet_nclusters: int = 32,
@@ -84,12 +87,22 @@ class ACTPolicy(nn.Module):
         self.use_cvae     = bool(use_cvae)
         ff = int(dim_feedforward) if dim_feedforward else 4 * self.d_model
 
-        # ----- robot-state channel selection (mirrors BCPolicy) -------------
+        # ----- robot-state channel selection (mirrors BCPolicy / RLActor) ---
+        # clock_dim/drop_joint_state default to the BC-inert values (0 / False), so
+        # Phase-2 BC is byte-identical. They are the Phase-3 RL hooks (see
+        # rl.actor_act.RLActorACT): clock_dim>0 appends the remaining-steps clock to
+        # every per-frame token; drop_joint_state strips the leading joint_pos(9)+
+        # joint_vel(9) block (EE-frame action → joint-space is redundant).
         self.use_prev_act         = bool(use_prev_act)
         self.prev_act_dim         = int(prev_act_dim)
+        self.drop_joint_state     = bool(drop_joint_state)
+        self.joint_state_dim      = int(joint_state_dim)
+        self.clock_dim            = int(clock_dim)
         self.full_robot_state_dim = int(robot_state_dim)
-        effective_robot_dim = (self.full_robot_state_dim if self.use_prev_act
-                               else self.full_robot_state_dim - self.prev_act_dim)
+        _tail = (self.full_robot_state_dim if self.use_prev_act
+                 else self.full_robot_state_dim - self.prev_act_dim)
+        _lead = self.joint_state_dim if self.drop_joint_state else 0
+        effective_robot_dim = _tail - _lead
 
         # ----- per-frame encoders (reused verbatim from Phase-1) ------------
         self.pc_encoder = PointCloudEncoder(
@@ -100,7 +113,8 @@ class ACTPolicy(nn.Module):
         self.robot_encoder = RobotEncoder(
             in_dim=effective_robot_dim, hidden_dim=robot_hidden, feature_dim=feature_dim,
         )
-        self.obs_proj = nn.Linear(2 * feature_dim, self.d_model)
+        # obs token = Linear([scene ⊕ robot (⊕ clock)] → d_model). clock_dim=0 for BC.
+        self.obs_proj = nn.Linear(2 * feature_dim + self.clock_dim, self.d_model)
 
         # ----- temporal encoder --------------------------------------------
         self.temporal_pos = nn.Parameter(torch.zeros(1, self.history_len, self.d_model))
@@ -169,14 +183,20 @@ class ACTPolicy(nn.Module):
         return self
 
     def _select_robot_state(self, rs: torch.Tensor) -> torch.Tensor:
-        """Drop trailing prev_action(6) channels unless use_prev_act (copycat guard)."""
-        if self.use_prev_act:
-            return rs
-        return rs[..., : self.full_robot_state_dim - self.prev_act_dim]
+        """Drop trailing prev_action(6) (copycat guard) and, if drop_joint_state,
+        the leading joint_pos(9)+joint_vel(9) block. Mirrors RLActor/BCPolicy."""
+        hi = (self.full_robot_state_dim if self.use_prev_act
+              else self.full_robot_state_dim - self.prev_act_dim)
+        lo = self.joint_state_dim if self.drop_joint_state else 0
+        return rs[..., lo:hi]
 
     # ----- per-frame encoding shared by forward/predict --------------------
-    def _encode_history(self, pc_hist: torch.Tensor, rs_hist: torch.Tensor):
-        """pc_hist[B,T,N,5], rs_hist[B,T,32] -> memory[B,T,D], robot_feat_last[B,F]."""
+    def _encode_history(self, pc_hist: torch.Tensor, rs_hist: torch.Tensor,
+                        remain_norm: torch.Tensor | None = None):
+        """pc_hist[B,T,N,5], rs_hist[B,T,32] -> (memory[B,T,D], robot_last[B,F],
+        scene_last[B,F]). `remain_norm` (Phase-3 RL, clock_dim>0) is the remaining-
+        steps clock [B,1]; it is broadcast to every history token before obs_proj.
+        Ignored when clock_dim==0 (BC)."""
         B, T = pc_hist.shape[:2]
         pc_flat = pc_hist.reshape(B * T, *pc_hist.shape[2:])         # [B*T, N, 5]
         rs_flat = self._select_robot_state(rs_hist.reshape(B * T, rs_hist.shape[-1]))
@@ -188,12 +208,21 @@ class ACTPolicy(nn.Module):
         with torch.cuda.amp.autocast(enabled=False):
             scene = self.pc_encoder(pc_flat.float())               # [B*T, F] fp32
         robot = self.robot_encoder(rs_flat)                        # [B*T, F]
-        obs = self.obs_proj(torch.cat([scene.to(robot.dtype), robot], dim=-1))
+        fused = torch.cat([scene.to(robot.dtype), robot], dim=-1)   # [B*T, 2F]
+        if self.clock_dim > 0:
+            if remain_norm is None:
+                raise ValueError("clock_dim>0 requires remain_norm (the RL clock)")
+            rn = remain_norm if remain_norm.dim() > 1 else remain_norm.unsqueeze(-1)
+            rn = (rn.reshape(B, 1, -1).expand(B, T, self.clock_dim)
+                    .reshape(B * T, self.clock_dim).to(fused.dtype))
+            fused = torch.cat([fused, rn], dim=-1)                  # [B*T, 2F+clock]
+        obs = self.obs_proj(fused)
         obs = obs.reshape(B, T, self.d_model) + self.temporal_pos   # [B, T, D]
         memory = self.temporal_encoder(obs)                         # [B, T, D]
 
         robot_last = robot.reshape(B, T, -1)[:, -1]                 # [B, F] current frame
-        return memory, robot_last
+        scene_last = scene.reshape(B, T, -1)[:, -1]                 # [B, F] current frame
+        return memory, robot_last, scene_last
 
     # ----- CVAE posterior (training) ---------------------------------------
     def _encode_latent(self, action_chunk: torch.Tensor, robot_last: torch.Tensor):
@@ -220,8 +249,9 @@ class ACTPolicy(nn.Module):
 
     # ----- forward (training) ----------------------------------------------
     def forward(self, pc_hist: torch.Tensor, rs_hist: torch.Tensor,
-                action_chunk: torch.Tensor | None = None):
-        memory, robot_last = self._encode_history(pc_hist, rs_hist)
+                action_chunk: torch.Tensor | None = None,
+                remain_norm: torch.Tensor | None = None):
+        memory, robot_last, _ = self._encode_history(pc_hist, rs_hist, remain_norm)
 
         if self.use_cvae and action_chunk is not None:
             z, mu, logvar = self._encode_latent(action_chunk, robot_last)
