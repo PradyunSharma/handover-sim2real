@@ -1,5 +1,6 @@
-# Phase-3 RL config — rl_run26 (CLUSTER, 16 workers). IDENTICAL to rl_run25 except
-# the demo fraction is a FLAT CONSTANT 0.05 (the ramp is disabled).
+# Phase-3 RL config — rl_run26 (CLUSTER, 16 workers). Same as rl_run25 except TWO
+# changes: (1) the demo fraction is a FLAT CONSTANT 0.05 (ramp disabled), and
+# (2) num_iters 700 -> 250 (run23 length).
 #
 # run25 ramped demo_frac 0.5 -> 0.3 over 125 iters (demo-heavy early bridge, then a
 # 0.3 floor). This run instead mixes a constant 5% demos every iter for the whole
@@ -8,13 +9,15 @@
 # LEANER demo reliance (5% vs run25's 30-50%) — both the early bridge and the
 # steady-state floor drop to 0.05.
 #
-# Everything else matches run25: num_iters 700, the widening curriculum anneal at
-# 150 iters (band [22,24] -> [2,24] over 0..150, then HOLDS [2,24] for 550 iters),
-# beta_ramp 63, mix_ramp 50000, vgd hand-collision filter, stable_grasp reward.
+# Curriculum unchanged from run25/run23: widening reverse curriculum, upper bound
+# expert_initial_hi=24 FIXED, lower bound annealed 22 -> 2 over 150 iters (band
+# [22,24] -> [2,24] over iters 0..150, then HELD [2,24]). With num_iters 250 the
+# post-curriculum hold is only 100 iters (250-150) instead of run25's 550.
+# beta_ramp 63, mix_ramp 50000, vgd hand-collision filter, stable_grasp all unchanged.
 #
-# 700 * 16 = 11200 episodes, 700 * 800 = 560000 updates. Likely exceeds the 24h
-# walltime cap -> resume from checkpoints/last.pt (see the sbatch footer).
-# Pair with the vgd demos:  --demos output/rl_demos/train_h30_vgd.h5
+# 250 * 16 = 4000 episodes, 250 * 800 = 200000 updates — comfortably inside the 24h
+# walltime cap (no resume expected). Pair with the vgd demos:
+#   --demos output/rl_demos/train_h30_vgd.h5
 
 DATA:
   num_pts:         1024
@@ -70,7 +73,7 @@ LOOP:
   episodes_per_iter:    16
   updates_per_iter:     800
   batch_size:           64
-  num_iters:            700     # same as run25
+  num_iters:            250     # run23 length (CHANGE vs run25's 700)
   # exploration
   noise_std:            0.03
   # ── WIDENING reverse curriculum (same as run25) ───────────────────────────
