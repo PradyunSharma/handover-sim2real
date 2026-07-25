@@ -83,10 +83,19 @@ def build_networks(bc_run: Path, rlcfg: dict, device: str):
     actor = RLActor(policy_hidden=tuple(m["policy_hidden"]), **common)
     critic = QNetwork(q_hidden=tuple(rlm["q_hidden"]), **common)
 
-    actor.warm_start_from_bc(bc_model)
-    critic.warm_start_encoders_from_bc(bc_model)
-    print(f"[warm-start] actor reproduces BC head (pose + gripper); critic "
-          f"encoders copied from {bc_run}")
+    # warm_start (default True): copy the BC policy's weights into the actor (pose +
+    # gripper head) and the BC encoder into the critic. Set `warm_start: false` in the
+    # RL config to train the actor/critic FROM SCRATCH (random init) — the BC run is
+    # still used for the network DIMS and the action NORMALIZER (both independent of
+    # the weights), but no BC weights are loaded.
+    if bool(rlcfg.get("warm_start", True)):
+        actor.warm_start_from_bc(bc_model)
+        critic.warm_start_encoders_from_bc(bc_model)
+        print(f"[warm-start] actor reproduces BC head (pose + gripper); critic "
+              f"encoders copied from {bc_run}")
+    else:
+        print(f"[from-scratch] warm_start=false -> actor + critic RANDOM-INIT "
+              f"(no BC weights loaded); dims + action normalizer still from {bc_run}")
     return actor, critic, bc_model.normalizer
 
 
