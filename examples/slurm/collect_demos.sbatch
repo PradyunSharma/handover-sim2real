@@ -47,18 +47,19 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 
 # ── parameters (override via sbatch --export=ALL,...) ───────────────────────
+SIM_CFG="${SIM_CFG:-examples/pretrain.yaml}"   # pretrain_multicam.yaml for the fixed-camera 6-ch cloud
 RL_CFG="${RL_CFG:-examples/configs/rl_phase1_cluster_vgd.yaml}"
 OUT="${OUT:-output/rl_demos/train_h30_vgd.h5}"
-BC_RUN="${BC_RUN:-output/bc_runs/dagger_iter_2_3}"
+BC_RUN="${BC_RUN:-output/bc_runs/dagger_iter_2_3}"   # supplies the (camera-independent) action/state normalizer
 SPLIT="${SPLIT:-train}"
 EXTRA="${EXTRA:-}"                    # e.g. EXTRA="--num-scenes 20" for a smoke run
 
 echo "host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
-echo "rl-cfg=${RL_CFG}  out=${OUT}  split=${SPLIT}  extra=${EXTRA:-none}"
+echo "sim-cfg=${SIM_CFG}  rl-cfg=${RL_CFG}  out=${OUT}  split=${SPLIT}  extra=${EXTRA:-none}"
 mkdir -p "$(dirname "${OUT}")"
 
 srun python examples/collect_rl_demos.py \
-    --sim-cfg examples/pretrain.yaml \
+    --sim-cfg "${SIM_CFG}" \
     --bc-run  "${BC_RUN}" \
     --rl-cfg  "${RL_CFG}" \
     --out     "${OUT}" \
