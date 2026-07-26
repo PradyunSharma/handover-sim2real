@@ -86,6 +86,11 @@ RL_CFG="${RL_CFG:-examples/configs/rl_phase1_cluster.yaml}"
 # matching demos WITHOUT editing this file. run15 (0.08 m runtime filter): train_h30.h5.
 # run21/run23 (paper valid_grasp_dict): train_h30_vgd.h5.
 DEMOS="${DEMOS:-output/rl_demos/train_h30.h5}"
+# Simulator config — overridable. Default = egocentric wrist cloud (pretrain.yaml).
+# For the fixed-camera 6-ch cloud (run33) pass SIM_CFG=examples/pretrain_multicam.yaml
+# (and an RL config with DATA.pc_channels: 6). MUST match the cloud the DEMOS were
+# collected with (a 6-ch multicam demo pool needs the multicam sim cfg, and vice-versa).
+SIM_CFG="${SIM_CFG:-examples/pretrain.yaml}"
 
 echo "run=${RUN_NAME}"
 echo "host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
@@ -97,9 +102,10 @@ echo "cpus-per-task=${SLURM_CPUS_PER_TASK}  rollout workers=${WORKERS}"
 # (skip=N, buf=0, no learning). Workers share the one GPU (N small actor contexts +
 # the learner); fine on a 32GB V100 at 16 workers.
 echo "rl-cfg=${RL_CFG}"
+echo "sim-cfg=${SIM_CFG}"
 echo "demos=${DEMOS}"
 srun python examples/train_rl.py \
-    --sim-cfg examples/pretrain.yaml \
+    --sim-cfg "${SIM_CFG}" \
     --rl-cfg  "${RL_CFG}" \
     --bc-run  output/bc_runs/dagger_iter_2_3 \
     --demos   "${DEMOS}" \
