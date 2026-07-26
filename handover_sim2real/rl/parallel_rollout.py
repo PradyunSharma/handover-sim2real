@@ -60,7 +60,7 @@ def build_actor_and_normalizer(bc_run: Path, rlcfg: dict, device: str):
     normalizer = Normalizer.load(norm_path) if norm_path.exists() else None
 
     common = dict(
-        pc_channels        = int(d["pc_channels"]),
+        pc_channels        = int(rlcfg.get("DATA", {}).get("pc_channels", d["pc_channels"])),
         robot_state_dim    = int(d["robot_state_dim"]),
         feature_dim        = int(m["feature_dim"]),
         robot_hidden       = int(m["robot_hidden"]),

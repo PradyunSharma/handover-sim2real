@@ -28,10 +28,16 @@ class PointListener:
         self._cfg = cfg
         self._seed = seed
 
-        self._merge_ratios = [
-            self._cfg.POLICY.POINT_STATE_YCB_RATIO,
-            1.0 - self._cfg.POLICY.POINT_STATE_YCB_RATIO,
-        ]
+        # >2-class (object/hand/robot, fixed-camera pipeline) uses POINT_STATE_RATIOS;
+        # otherwise the classic 2-class object/hand split (egocentric, unchanged).
+        ratios = list(getattr(self._cfg.POLICY, "POINT_STATE_RATIOS", []) or [])
+        if len(ratios) > 2:
+            self._merge_ratios = ratios
+        else:
+            self._merge_ratios = [
+                self._cfg.POLICY.POINT_STATE_YCB_RATIO,
+                1.0 - self._cfg.POLICY.POINT_STATE_YCB_RATIO,
+            ]
 
         # Experimental freeze-pointcloud mode (see config.py): capture the cloud at
         # step _freeze_at_step and hold it for the rest of the episode. Object is
@@ -60,17 +66,36 @@ class PointListener:
 
     def point_states_to_state(self, point_states, ee_pose):
         point_states = self._process_pointcloud(point_states, ee_pose)
+        num_pts = self._cfg.RL_TRAIN.uniform_num_pts
 
-        if all(point_state.shape[1] > 0 for point_state in point_states[1:]):
-            point_states_to_merge = []
-            for point_state, merge_ratio in zip(point_states, self._merge_ratios):
-                point_state = point_state[
-                    :, : int(self._cfg.RL_TRAIN.uniform_num_pts * merge_ratio)
-                ]
-                point_states_to_merge.append(point_state)
-            point_state = np.concatenate(point_states_to_merge, axis=-1)
+        if len(self._merge_ratios) <= 2:
+            # ---- classic 2-class (object/hand) path — UNCHANGED ----
+            if all(point_state.shape[1] > 0 for point_state in point_states[1:]):
+                point_states_to_merge = []
+                for point_state, merge_ratio in zip(point_states, self._merge_ratios):
+                    point_state = point_state[:, : int(num_pts * merge_ratio)]
+                    point_states_to_merge.append(point_state)
+                point_state = np.concatenate(point_states_to_merge, axis=-1)
+            else:
+                point_state = point_states[0]
         else:
-            point_state = point_states[0]
+            # ---- >2-class (object/hand/robot) path: empty-safe merge, then resample to
+            # EXACTLY num_pts so the buffer's fixed [num_pts, C] always fits (an empty
+            # class — e.g. robot with wrist-only, or hand out of frame — is skipped, not
+            # a drop-everything fallback). Each class was already regularized to num_pts
+            # in _process_pointcloud; we take its ratio share, concat, then regularize. ----
+            merge = []
+            for point_state, merge_ratio in zip(point_states, self._merge_ratios):
+                if point_state.shape[1] == 0:
+                    continue
+                n = int(num_pts * merge_ratio)
+                if n > 0:
+                    merge.append(point_state[:, :n])
+            if merge:
+                point_state = np.concatenate(merge, axis=-1)
+                point_state = regularize_pc_point_count(point_state.T, num_pts).T
+            else:
+                point_state = point_states[0]   # nothing in view (rare) — object slot
 
         return [(point_state, np.array([])), None, None, None]
 

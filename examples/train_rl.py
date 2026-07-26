@@ -76,7 +76,10 @@ def build_networks(bc_run: Path, rlcfg: dict, device: str):
             "BC robot_encoder weights cannot be warm-started. Set warm_start: false "
             "(train the actor/critic from scratch) to use drop_joint_state.")
     common = dict(
-        pc_channels        = int(d["pc_channels"]),
+        # pc_channels comes from the RL config's DATA when set (the point-cloud pipeline
+        # can differ from the BC run — e.g. 6-ch object/hand/robot for fixed cameras),
+        # else the BC run's value. robot_state/action dims stay camera-independent.
+        pc_channels        = int(rlcfg.get("DATA", {}).get("pc_channels", d["pc_channels"])),
         robot_state_dim    = int(d["robot_state_dim"]),
         feature_dim        = int(m["feature_dim"]),
         robot_hidden       = int(m["robot_hidden"]),

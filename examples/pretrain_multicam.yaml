@@ -1,0 +1,44 @@
+# Simulator config for the FIXED-CAMERA point-cloud pipeline (run33).
+# = examples/pretrain.yaml + fixed external cameras (LEFT + RIGHT) that see the whole
+# handover, a 3rd "robot" point class, and 3-class merge ratios. The point cloud
+# becomes 6-ch (xyz + object + hand + robot one-hots), in the EE/hand frame as before.
+# Pass with:  --sim-cfg examples/pretrain_multicam.yaml
+# CAMERAS/COMPUTE_ROBOT + POINT_STATE_RATIOS must be consistent with the RL config's
+# DATA.pc_channels (=6 for 3 classes). Camera poses default in handover config
+# (CAMERA_LEFT/RIGHT_POSITION/TARGET) — TUNE after a viz render (examples of override
+# below, commented).
+ENV:
+  ID: HandoverSim2RealTrainEnv-v1
+  YCB_MANO_START_FRAME: last
+  YCB_LOAD_MODE: grasp_only
+  MANO_SIMULATION_MODE: disable_control_and_move_by_reset
+  HANDOVER_HAND_CAMERA_POINT_STATE_ENV:
+    COMPUTE_MANO_POINT_STATE: True
+    COMPUTE_ROBOT_POINT_STATE: True     # add the 3rd 'robot' class (panda body)
+    CAMERAS: ["left", "right"]          # two fixed side cameras (no wrist)
+    # --- override the default poses here after inspecting a render, e.g.: ---
+    # CAMERA_LEFT_POSITION: (1.00, 0.20, 1.50)
+    # CAMERA_LEFT_TARGET:   (0.10, 0.20, 1.15)
+    # CAMERA_RIGHT_POSITION: (-0.80, 0.20, 1.50)
+    # CAMERA_RIGHT_TARGET:   (0.10, 0.20, 1.15)
+BENCHMARK:
+  SPLIT: train
+POLICY:
+  POINT_STATE_RATIOS: [0.7, 0.15, 0.15]  # object / hand / robot (order = env class order)
+RL_MEMORY_SIZE: 500000
+RL_TRAIN:
+  batch_size: 128
+  updates_per_step: 20
+  mix_policy_ratio_list: [0.1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
+  dagger: True
+  online_buffer_ratio: 0.7
+  onpolicy: True
+  max_epoch: 200000
+  num_remotes: 3
+  init_distance_low: 0.25
+  explore_ratio_list: [0.5]
+  DAGGER_MAX_STEP: 12
+  EXPERT_INIT_MIN_STEP: 3
+  fill_data_step: 30
+  HANDOVER_SIM2REAL:
+    stage: pretrain

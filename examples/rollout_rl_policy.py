@@ -109,7 +109,7 @@ def load_rl_actor(rl_run: Path, checkpoint: str, device: str):
     m, d, rlm = bccfg["MODEL"], bccfg["DATA"], rlcfg["MODEL"]
 
     common = dict(
-        pc_channels        = int(d["pc_channels"]),
+        pc_channels        = int(rlcfg.get("DATA", {}).get("pc_channels", d["pc_channels"])),
         robot_state_dim    = int(d["robot_state_dim"]),
         feature_dim        = int(m["feature_dim"]),
         robot_hidden       = int(m["robot_hidden"]),

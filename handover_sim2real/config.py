@@ -25,6 +25,14 @@ _C.POLICY.BACK_STEP_SIZE = 0.03
 
 _C.POLICY.POINT_STATE_YCB_RATIO = 0.875
 
+# Per-class merge ratios for the point cloud when there are MORE than 2 classes
+# (object / hand / robot — the fixed-external-camera pipeline). Length must equal the
+# number of point-state classes the env returns; sums ~1 (the merged cloud is
+# resampled to exactly num_pts). Empty list [] => classic 2-class behavior driven by
+# POINT_STATE_YCB_RATIO above (egocentric pipeline unchanged). Order matches the env's
+# _get_point_states class order: [object, hand, robot].
+_C.POLICY.POINT_STATE_RATIOS = []
+
 # ---------------------------------------------------------------------------- #
 # Experimental: freeze the eye-in-hand point cloud to an early frame and hold it
 # for the whole episode, instead of using the live cloud (which degrades to a

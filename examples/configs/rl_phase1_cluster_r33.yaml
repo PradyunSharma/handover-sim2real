@@ -1,0 +1,102 @@
+# Phase-3 RL config — rl_run33 (CLUSTER, 16 workers). Base = rl_run28 (from-scratch,
+# drop_joint_state, stable loss) with ONE RL-side change: DATA.pc_channels 5 -> 6, for
+# the FIXED-CAMERA point cloud (xyz + object + hand + robot one-hots). The camera change
+# itself lives in the SIM cfg, NOT here:
+#     --sim-cfg examples/pretrain_multicam.yaml   (CAMERAS [left,right] + robot class)
+# so LAUNCH must pass that sim cfg. pc_channels here MUST match the sim cfg's class count
+# (3 classes -> 6). The network reads pc_channels from THIS DATA block (train_rl
+# build_networks), the buffer too — so 6 flows to the from-scratch PointNet++ encoder.
+#
+# WHY from scratch: the observation distribution changed (external cams see the whole
+# object+hand+arm, in EE frame), so BC weights (egocentric 5-ch) don't transfer — the
+# BC run is used only for the camera-independent action/state NORMALIZER + net dims.
+# DEMOS: recollect with the NEW cloud first (collect_rl_demos shares the cloud path):
+#   python examples/collect_rl_demos.py --sim-cfg examples/pretrain_multicam.yaml \
+#     --rl-cfg examples/configs/rl_phase1_cluster_r33.yaml --out output/rl_demos/train_h30_mc.h5
+# then train with --demos output/rl_demos/train_h30_mc.h5 (6-ch demos).
+# Keeps run28's drop_joint_state:true (orthogonal to the camera change) + all else.
+
+warm_start: false   # from scratch — do NOT borrow the BC policy/critic weights
+
+DATA:
+  num_pts:         1024
+  pc_channels:     6     # run33: xyz + object + hand + robot one-hots (fixed-camera 3-class)
+
+MODEL:
+  q_hidden:  [256, 256]
+  clock_dim: 1
+  drop_joint_state: true   # drop joint_pos(9)+joint_vel(9) from the robot MLP input
+
+RL:
+  gamma:        0.95
+  tau:          0.005
+  policy_noise: 0.2
+  noise_clip:   0.5
+  act_limit:    5.0
+  policy_delay: 2
+  mc_blend:     0.5
+  pose_loss:    smooth_l1
+  bc_weight:    2.0
+  gripper_bc_weight: 1.0
+  gripper_close_weight_max: 10.0
+  gripper_label_smooth: 0.1
+  shaping_pos_weight: 0.0
+  shaping_rot_weight: 0.0
+  aux_weight:   0.5
+  reward_mode:  stable_grasp
+  hold_steps:   3
+  # HAND-COLLISION FILTER — PAPER'S offline valid_grasp_dict (run21/vgd), NOT run15's
+  # runtime 0.08 m filter. hand_collision_filter=false so our runtime filter is OFF.
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08   # (unused while hand_collision_filter=false)
+  hand_points_radius:    0.35   # (unused while hand_collision_filter=false)
+  pg_normalize: true
+  alpha:        0.1
+  mix_start:    0.1
+  mix_end:      0.2
+  mix_ramp:     50000
+  actor_lr:     3.0e-4
+  critic_lr:    3.0e-4
+  grad_clip:    1.0
+
+LOOP:
+  capacity:             20000
+  pretrain_updates:     2000
+  demo_frac:            0.25
+  demo_frac_start:      0.5
+  demo_frac_end:        0.3
+  demo_frac_ramp:       125
+  warmup_episodes:      0
+  warmup_beta:          1.0
+  episodes_per_iter:    16
+  updates_per_iter:     800
+  batch_size:           64
+  num_iters:            250     # run28: back to 250 (run25 used 700)
+  # exploration
+  noise_std:            0.03
+  # ── WIDENING reverse curriculum (same as run23) ───────────────────────────
+  expert_initial_hi:            24    # FIXED upper takeover bound
+  expert_initial_lo_start:      22    # band [22,24] at iter 0
+  expert_initial_lo_end:        2     # band [2,24] after anneal
+  expert_initial_anneal_iters:  150   # unchanged: anneal 0..150, then hold [2,24]
+  expert_episode_frac:  0.5
+  rollout_max_steps:    30
+  # DAgger tail replans (run15 values)
+  dagger_ratio:         0.5
+  dagger_min_step:      5
+  dagger_tail_guard:    8
+  # DART — run23 values (policy-DART, ratio 0.2)
+  dart_mode:            policy
+  dart_ratio:           0.2
+  dart_min_step:        15
+  dart_max_step:        22
+  dart_pos_mag:         0.04
+  dart_rot_mag:         0.2
+  beta_start:           0.5
+  beta_end:             0.0
+  beta_ramp_iters:      63
+  # eval / checkpoint
+  eval_every:           7
+  eval_episodes:        64
+  save_every:           7
