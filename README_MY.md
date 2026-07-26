@@ -1470,7 +1470,7 @@ export MPLBACKEND=Agg
 # 2. the env's Python by full path (bare `python` is system Python 2)
 export PLOT_PY=/home/pradyunsharma/.conda/envs/pch2r_dev/bin/python
 # 3. run the plotter
-$PLOT_PY examples/plot_rl_run.py output/rl_runs/rl_run28
+$PLOT_PY examples/plot_rl_run.py output/rl_runs/rl_run30
 # -> wrote output/rl_runs/rl_run13/curves.png   (open it in the VS Code file explorer)
 ```
 
