@@ -1,0 +1,113 @@
+# Phase-3 RL config — rl_run31 (CLUSTER, 16 workers). Base = rl_run29 with the SINGLE
+# bare-minimum change that makes it STABLE:  pg_normalize false -> true.
+#
+# WHY: run29 DIVERGED (raw-PG critic exploitation, the run1/run4 failure mode). The
+# log is unambiguous — the ACTOR blew up while the critic stayed fine:
+#     iter  9: q_pi 0.30   a_absmean 0.65      (healthy)
+#     iter 18: q_pi 3.7    a_absmean 2.71      (starting to run)
+#     iter 27: q_pi 1.9e4  a_absmean 3.7e5     (BLOWUP)  <-- lam ~= 0.20
+#     iter 45: q_pi 1.6e5  a_absmean 9.5e7     (dead; a_absmean pinned ~1e8 to the end)
+#   eval_succ = 0 for the whole run. critic_loss stayed ~0.001-0.03 (critic never
+#   unstable) -> pure actor exploitation of Q on OOD actions.
+# CRUCIAL: it blew up at lam ~= 0.17-0.20, i.e. AT/BELOW the paper's 0.2 mix cap. So
+# dialing mix_end 0.3 -> 0.2 would NOT have saved it — the RAW-PG regime itself
+# (pg_normalize=false) is the culprit, not the 0.3 overshoot.
+#
+# THE FIX (pg_normalize=true): lam = alpha/mean|Q| -> the effective PG magnitude is
+# BOUNDED to ~alpha (0.1) no matter how large Q gets, so the actor structurally cannot
+# run away. This is the self-normalizing regime that produced the best-ever result
+# (run15 = 0.458) and ran stably in run25.
+#
+# CONSEQUENCES of pg_normalize=true (no action needed): mix_start/mix_end/mix_ramp go
+# INERT (lam comes from alpha/mean|Q|, not the ramp); bc_scale becomes 1.0 (so the BC
+# term = bc_weight * bc_loss). alpha (0.1) is now LIVE and sets the PG magnitude.
+#
+# EVERYTHING ELSE IS run29, UNCHANGED (single-variable test): pose_loss pm, aux_weight
+# 1.0, mc_blend 0.0 (1-step Bellman), bc_weight 1.0, warm-started, full 32-D robot
+# state, widening curriculum, vgd. Pair with:  --demos output/rl_demos/train_h30_vgd.h5
+# CAVEAT (NOT fixed here, to keep it single-variable): pm loss + bc_weight 1.0 under the
+# alpha-normalized PG may UNDER-ANCHOR (run10 needed bc_weight ~80 to balance pm against
+# the pinned-alpha PG). If run31 is STABLE but eval stays flat (a_absmean healthy, no
+# learning), the next lever is bc_weight up — but see run31 clean first.
+
+DATA:
+  num_pts:         1024
+  pc_channels:     5
+
+MODEL:
+  q_hidden:  [256, 256]
+  clock_dim: 1
+
+RL:
+  gamma:        0.95
+  tau:          0.005
+  policy_noise: 0.2
+  noise_clip:   0.5
+  act_limit:    5.0
+  policy_delay: 2
+  mc_blend:     0.0       # run29: 1-step Bellman (paper); was 0.5 (MC-return blend)
+  pose_loss:    pm        # run29: point-matching BC (paper); was smooth_l1
+  bc_weight:    1.0       # run29: paper BC coeff; under pg_normalize=true this = the BC term weight
+  gripper_bc_weight: 1.0
+  gripper_close_weight_max: 10.0
+  gripper_label_smooth: 0.1
+  shaping_pos_weight: 0.0
+  shaping_rot_weight: 0.0
+  aux_weight:   1.0       # run29: paper's unit goal-aux weight; was 0.5
+  reward_mode:  stable_grasp
+  hold_steps:   3
+  # HAND-COLLISION FILTER — PAPER'S offline valid_grasp_dict (run21/vgd), NOT run15's
+  # runtime 0.08 m filter. hand_collision_filter=false so our runtime filter is OFF.
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08   # (unused while hand_collision_filter=false)
+  hand_points_radius:    0.35   # (unused while hand_collision_filter=false)
+  pg_normalize: true      # run31 FIX: lambda = alpha/mean|Q| (bounded PG). run29 had false (DIVERGED)
+  alpha:        0.1        # run31: NOW LIVE — sets the (bounded) PG magnitude (run15/run25 value)
+  mix_start:    0.1        # (INERT under pg_normalize=true)
+  mix_end:      0.3        # (INERT under pg_normalize=true — left as run29's value, unused)
+  mix_ramp:     50000      # (INERT under pg_normalize=true)
+  actor_lr:     3.0e-4
+  critic_lr:    3.0e-4
+  grad_clip:    1.0
+
+LOOP:
+  capacity:             20000
+  pretrain_updates:     2000
+  demo_frac:            0.25
+  demo_frac_start:      0.5
+  demo_frac_end:        0.3
+  demo_frac_ramp:       125
+  warmup_episodes:      0
+  warmup_beta:          1.0
+  episodes_per_iter:    16
+  updates_per_iter:     800
+  batch_size:           64
+  num_iters:            250     # probe length (run25 used 700)
+  # exploration
+  noise_std:            0.03
+  # ── WIDENING reverse curriculum (same as run23) ───────────────────────────
+  expert_initial_hi:            24    # FIXED upper takeover bound
+  expert_initial_lo_start:      22    # band [22,24] at iter 0
+  expert_initial_lo_end:        2     # band [2,24] after anneal
+  expert_initial_anneal_iters:  150   # unchanged: anneal 0..150, then hold [2,24]
+  expert_episode_frac:  0.5
+  rollout_max_steps:    30
+  # DAgger tail replans (run15 values)
+  dagger_ratio:         0.5
+  dagger_min_step:      5
+  dagger_tail_guard:    8
+  # DART — run23 values (policy-DART, ratio 0.2)
+  dart_mode:            policy
+  dart_ratio:           0.2
+  dart_min_step:        15
+  dart_max_step:        22
+  dart_pos_mag:         0.04
+  dart_rot_mag:         0.2
+  beta_start:           0.5
+  beta_end:             0.0
+  beta_ramp_iters:      63
+  # eval / checkpoint
+  eval_every:           7
+  eval_episodes:        64
+  save_every:           7
