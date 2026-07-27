@@ -59,12 +59,14 @@ def build_actor_and_normalizer(bc_run: Path, rlcfg: dict, device: str):
     norm_path = bc_run / "normalization.npz"
     normalizer = Normalizer.load(norm_path) if norm_path.exists() else None
 
+    # dims default to the BC run's; a from-scratch run may override them from the RL
+    # config (must MATCH the learner's build_networks, or the pushed state_dict won't load).
     common = dict(
         pc_channels        = int(rlcfg.get("DATA", {}).get("pc_channels", d["pc_channels"])),
         robot_state_dim    = int(d["robot_state_dim"]),
-        feature_dim        = int(m["feature_dim"]),
-        robot_hidden       = int(m["robot_hidden"]),
-        pointnet_scale     = int(m["pointnet_scale"]),
+        feature_dim        = int(rlm.get("feature_dim", m["feature_dim"])),
+        robot_hidden       = int(rlm.get("robot_hidden", m["robot_hidden"])),
+        pointnet_scale     = int(rlm.get("pointnet_scale", m["pointnet_scale"])),
         pointnet_radius    = float(m["pointnet_radius"]),
         pointnet_nclusters = int(m["pointnet_nclusters"]),
         use_prev_act       = bool(m.get("use_prev_act", False)),
@@ -85,7 +87,7 @@ def build_actor_and_normalizer(bc_run: Path, rlcfg: dict, device: str):
             dropout         = float(rlm.get("dropout", 0.1)),
             **common).to(device)
     else:
-        actor = RLActor(policy_hidden=tuple(m["policy_hidden"]), **common).to(device)
+        actor = RLActor(policy_hidden=tuple(rlm.get("policy_hidden", m["policy_hidden"])), **common).to(device)
     actor.eval()
     return actor, normalizer
 

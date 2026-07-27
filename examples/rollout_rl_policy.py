@@ -108,12 +108,15 @@ def load_rl_actor(rl_run: Path, checkpoint: str, device: str):
         bccfg = yaml.safe_load(f)
     m, d, rlm = bccfg["MODEL"], bccfg["DATA"], rlcfg["MODEL"]
 
+    # dims default to the BC run's; override from the RL config so an actor trained with a
+    # capacity ablation (feature_dim/robot_hidden/policy_hidden/pointnet_scale) rebuilds at
+    # the SAME size (strict=False below would otherwise silently drop mismatched weights).
     common = dict(
         pc_channels        = int(rlcfg.get("DATA", {}).get("pc_channels", d["pc_channels"])),
         robot_state_dim    = int(d["robot_state_dim"]),
-        feature_dim        = int(m["feature_dim"]),
-        robot_hidden       = int(m["robot_hidden"]),
-        pointnet_scale     = int(m["pointnet_scale"]),
+        feature_dim        = int(rlm.get("feature_dim", m["feature_dim"])),
+        robot_hidden       = int(rlm.get("robot_hidden", m["robot_hidden"])),
+        pointnet_scale     = int(rlm.get("pointnet_scale", m["pointnet_scale"])),
         pointnet_radius    = float(m["pointnet_radius"]),
         pointnet_nclusters = int(m["pointnet_nclusters"]),
         use_prev_act       = bool(m.get("use_prev_act", False)),
@@ -135,7 +138,7 @@ def load_rl_actor(rl_run: Path, checkpoint: str, device: str):
             dropout         = float(rlm.get("dropout", 0.1)),
             **common).to(device)
     else:
-        actor = RLActor(policy_hidden=tuple(m["policy_hidden"]), **common).to(device)
+        actor = RLActor(policy_hidden=tuple(rlm.get("policy_hidden", m["policy_hidden"])), **common).to(device)
 
     ckpt_path = rl_run / "checkpoints" / f"{checkpoint}.pt"
     if not ckpt_path.exists():

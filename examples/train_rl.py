@@ -75,15 +75,26 @@ def build_networks(bc_run: Path, rlcfg: dict, device: str):
             "MODEL.drop_joint_state=true changes the robot-encoder input dim, so the "
             "BC robot_encoder weights cannot be warm-started. Set warm_start: false "
             "(train the actor/critic from scratch) to use drop_joint_state.")
+    # Network-capacity dims default to the BC run's (so a warm-start loads 1:1). A
+    # FROM-SCRATCH run may OVERRIDE them from the RL config's MODEL for a capacity
+    # ablation (deeper/smaller actor+critic). warm-start runs must keep the BC dims —
+    # the weight copy below requires an exact match — so we refuse the override there.
+    _dim_overrides = [k for k in ("feature_dim", "robot_hidden", "policy_hidden",
+                                  "pointnet_scale") if k in rlm]
+    if _dim_overrides and bool(rlcfg.get("warm_start", True)):
+        raise ValueError(
+            f"RL MODEL overrides {_dim_overrides} but warm_start=true — the actor is copied "
+            f"from the BC policy so the dims must match. Set warm_start:false to change "
+            f"network capacity.")
     common = dict(
         # pc_channels comes from the RL config's DATA when set (the point-cloud pipeline
         # can differ from the BC run — e.g. 6-ch object/hand/robot for fixed cameras),
         # else the BC run's value. robot_state/action dims stay camera-independent.
         pc_channels        = int(rlcfg.get("DATA", {}).get("pc_channels", d["pc_channels"])),
         robot_state_dim    = int(d["robot_state_dim"]),
-        feature_dim        = int(m["feature_dim"]),
-        robot_hidden       = int(m["robot_hidden"]),
-        pointnet_scale     = int(m["pointnet_scale"]),
+        feature_dim        = int(rlm.get("feature_dim", m["feature_dim"])),
+        robot_hidden       = int(rlm.get("robot_hidden", m["robot_hidden"])),
+        pointnet_scale     = int(rlm.get("pointnet_scale", m["pointnet_scale"])),
         pointnet_radius    = float(m["pointnet_radius"]),
         pointnet_nclusters = int(m["pointnet_nclusters"]),
         use_prev_act       = bool(m.get("use_prev_act", False)),
@@ -123,7 +134,7 @@ def build_networks(bc_run: Path, rlcfg: dict, device: str):
               f"dims + normalizer from {bc_run}")
         return actor, critic, bc_model.normalizer
 
-    actor = RLActor(policy_hidden=tuple(m["policy_hidden"]), **common)
+    actor = RLActor(policy_hidden=tuple(rlm.get("policy_hidden", m["policy_hidden"])), **common)
 
     # warm_start (default True): copy the BC policy's weights into the actor (pose +
     # gripper head) and the BC encoder into the critic. Set `warm_start: false` in the
