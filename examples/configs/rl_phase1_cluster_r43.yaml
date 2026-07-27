@@ -1,0 +1,100 @@
+# Phase-3 RL config — rl_run43 (CLUSTER, 16 workers). EXTEND THE WINNER: rl_run37
+# (wrist+left multicam) was the best fixed-camera run — eval_succ peaked 0.271 and did
+# NOT collapse (vs run33 left+right which died to 0), and was still RISING when logged.
+# This run extends run37 along the two axes that evidence supports, holding everything
+# else (incl. the camera set + curriculum) constant:
+#   (1) capacity 20k -> 100000 (retention — run38 showed the decay is buffer-eviction, and
+#       a 500-iter run collects ~240k transitions, so a 20k FIFO would evict almost all);
+#   (2) num_iters 250 -> 500 (run37 hadn't plateaued — give it room to keep climbing).
+# = rl_phase1_cluster_r37.yaml (from-scratch, drop_joint, 6-ch wrist+left cloud, vgd, run28
+# decay curriculum) with ONLY those two changes. Camera set lives in the SIM cfg:
+#     --sim-cfg examples/pretrain_multicam_wl.yaml   (CAMERAS [wrist, left])
+# DEMOS: reuse run37's wrist+left pool (already collected): output/rl_demos/train_h30_mc_wl.h5
+# CURRICULUM unchanged from run37 (anneal 150, demo_frac_ramp 125) — isolates buffer+iters.
+# Launch: sbatch --export=ALL,RUN_NAME=rl_run43,SIM_CFG=examples/pretrain_multicam_wl.yaml,\
+#   RL_CFG=examples/configs/rl_phase1_cluster_r43.yaml,DEMOS=output/rl_demos/train_h30_mc_wl.h5 \
+#   examples/slurm/train_rl.sbatch
+# WALL-CLOCK: ~20h at run37's pace (~25 iters/h) — should fit the 24h cap, but it's close;
+# checkpoints every save_every(7), --resume output/rl_runs/rl_run43/checkpoints/last.pt if it hits.
+
+warm_start: false   # from scratch — do NOT borrow the BC policy/critic weights
+
+DATA:
+  num_pts:         1024
+  pc_channels:     6     # xyz + object + hand + robot one-hots (3-class; wrist+left fused)
+
+MODEL:
+  q_hidden:  [256, 256]
+  clock_dim: 1
+  drop_joint_state: true   # drop joint_pos(9)+joint_vel(9) from the robot MLP input
+
+RL:
+  gamma:        0.95
+  tau:          0.005
+  policy_noise: 0.2
+  noise_clip:   0.5
+  act_limit:    5.0
+  policy_delay: 2
+  mc_blend:     0.5
+  pose_loss:    smooth_l1
+  bc_weight:    2.0
+  gripper_bc_weight: 1.0
+  gripper_close_weight_max: 10.0
+  gripper_label_smooth: 0.1
+  shaping_pos_weight: 0.0
+  shaping_rot_weight: 0.0
+  aux_weight:   0.5
+  reward_mode:  stable_grasp
+  hold_steps:   3
+  # HAND-COLLISION FILTER — PAPER'S offline valid_grasp_dict (run21/vgd), NOT run15's
+  # runtime 0.08 m filter. hand_collision_filter=false so our runtime filter is OFF.
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08   # (unused while hand_collision_filter=false)
+  hand_points_radius:    0.35   # (unused while hand_collision_filter=false)
+  pg_normalize: true
+  alpha:        0.1
+  mix_start:    0.1
+  mix_end:      0.2
+  mix_ramp:     50000
+  actor_lr:     3.0e-4
+  critic_lr:    3.0e-4
+  grad_clip:    1.0
+
+LOOP:
+  capacity:             100000   # run37 20k -> 100k (retention over the longer run)
+  pretrain_updates:     2000
+  demo_frac:            0.25
+  demo_frac_start:      0.5
+  demo_frac_end:        0.3
+  demo_frac_ramp:       125      # run37 default (unchanged)
+  warmup_episodes:      0
+  warmup_beta:          1.0
+  episodes_per_iter:    16
+  updates_per_iter:     800
+  batch_size:           64
+  num_iters:            500      # run37 250 -> 500 (was still rising at the log tail)
+  # exploration
+  noise_std:            0.03
+  # ── WIDENING reverse curriculum (same as run37/run28) ─────────────────────
+  expert_initial_hi:            24
+  expert_initial_lo_start:      22
+  expert_initial_lo_end:        2
+  expert_initial_anneal_iters:  150   # run37 default (unchanged — isolates buffer+iters)
+  expert_episode_frac:  0.5
+  rollout_max_steps:    30
+  dagger_ratio:         0.5
+  dagger_min_step:      5
+  dagger_tail_guard:    8
+  dart_mode:            policy
+  dart_ratio:           0.2
+  dart_min_step:        15
+  dart_max_step:        22
+  dart_pos_mag:         0.04
+  dart_rot_mag:         0.2
+  beta_start:           0.5
+  beta_end:             0.0
+  beta_ramp_iters:      63
+  eval_every:           7
+  eval_episodes:        64
+  save_every:           7
