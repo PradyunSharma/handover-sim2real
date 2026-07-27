@@ -190,6 +190,74 @@ with h5py.File("output/bc_dataset/train_frozen_pc.h5", "r") as f:
 
 ---
 
+## Fixed external cameras (multi-view point cloud)
+
+The default point cloud is a single **wrist eye-in-hand** frame (5-ch: xyz + ycb + hand),
+whose worst view is at contact (the object leaves the FOV). The **fixed-camera** pipeline
+instead uses external scene cameras (left / right / back) that see the whole object + hand
++ robot arm, still transformed into the EE frame, with a 3rd **robot** point class →
+**6-ch cloud** (xyz + object + hand + robot one-hots). Config-gated: default is the
+original egocentric behavior; nothing changes unless you opt in.
+
+Turn it on via the **sim** config (which cameras + the robot class + the 3-class ratios):
+
+```yaml
+# examples/pretrain_multicam.yaml  (pass with --sim-cfg)
+ENV:
+  HANDOVER_HAND_CAMERA_POINT_STATE_ENV:
+    COMPUTE_MANO_POINT_STATE: True
+    COMPUTE_ROBOT_POINT_STATE: True     # adds the 3rd 'robot' class
+    CAMERAS: ["left", "right"]          # any subset of wrist/left/right/back
+POLICY:
+  POINT_STATE_RATIOS: [0.7, 0.15, 0.15] # object / hand / robot (must match the class count)
+```
+
+and set `DATA.pc_channels: 6` in the RL config (e.g. `rl_phase1_cluster_r33.yaml`). Camera
+poses are `ENV.HANDOVER_HAND_CAMERA_POINT_STATE_ENV.CAMERA_{LEFT,RIGHT,BACK}_{POSITION,TARGET}`
+(defaults aim at the measured handover point `(0.52, 0.25, 1.23)`, ~straight in front of the
+robot base). Collect demos with `--sim-cfg examples/pretrain_multicam.yaml` (the cloud
+becomes 6-ch automatically; sanity-check with `f['pc'].shape == (M, 1024, 6)` and non-zero
+per-class label sums ≈ 717/153/154).
+
+### Visualize the camera placement — matplotlib (no sim, no GPU)
+
+`examples/viz_external_cameras.py` reads the camera poses + scene geometry from the config
+and draws a 3D view + top-down + side projections with each camera's position, view ray and
+FOV frustum, plus the **measured handover region** (object mean ±2σ) the cameras must cover.
+Fast, runs anywhere, opens an interactive matplotlib window (TkAgg):
+
+```bash
+# opens a window (rotate the 3D panel with the mouse)
+python examples/viz_external_cameras.py --sim-cfg examples/pretrain_multicam.yaml
+
+python examples/viz_external_cameras.py                       # config defaults
+python examples/viz_external_cameras.py --cameras left right  # subset
+python examples/viz_external_cameras.py --save cams.png       # headless: write a PNG instead
+```
+
+Use it to iterate on placement: edit the `CAMERA_*` poses in the sim yaml (or the handover
+config), re-run, repeat. It prints per-camera distance / height-above-table / elevation.
+
+### Visualize the cameras in the real scene — PyBullet (needs GPU + display)
+
+`examples/viz_cameras_pybullet.py` builds the actual sim (table + robot + posed object +
+hand), draws each camera's frustum as debug lines **in the 3D world**, and renders **what
+each camera sees**. Run on the workstation (not the cluster login node):
+
+```bash
+# interactive PyBullet GUI with the frustums drawn in the live scene
+python examples/viz_cameras_pybullet.py --cameras left right back
+
+# headless montage: overview (scene + projected frustums) + each camera's view -> PNG
+python examples/viz_cameras_pybullet.py --cameras left right back --snapshot output/cameras_pybullet.png
+```
+
+The per-camera views are the definitive check that the cameras are aimed right and that the
+object/hand/arm are actually visible (e.g. the `back` view shows the arm occluding the
+object — why side cameras are preferred). `--scene N` picks a different handover scene.
+
+---
+
 ## Visualizing a BC dataset episode
 
 `examples/visualize_bc_dataset.py` supports two modes.
