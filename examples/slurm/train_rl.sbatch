@@ -91,6 +91,9 @@ DEMOS="${DEMOS:-output/rl_demos/train_h30.h5}"
 # (and an RL config with DATA.pc_channels: 6). MUST match the cloud the DEMOS were
 # collected with (a 6-ch multicam demo pool needs the multicam sim cfg, and vice-versa).
 SIM_CFG="${SIM_CFG:-examples/pretrain.yaml}"
+# Overfit / capability probe — cap rollouts+eval to the FIRST N scenes. 0 = all scenes.
+# Pair with a demo pool collected on the same first-N scenes (collect_demos EXTRA=--num-scenes N).
+NUM_SCENES="${NUM_SCENES:-0}"
 
 echo "run=${RUN_NAME}"
 echo "host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
@@ -104,6 +107,7 @@ echo "cpus-per-task=${SLURM_CPUS_PER_TASK}  rollout workers=${WORKERS}"
 echo "rl-cfg=${RL_CFG}"
 echo "sim-cfg=${SIM_CFG}"
 echo "demos=${DEMOS}"
+echo "num-scenes=${NUM_SCENES} (0=all)"
 srun python examples/train_rl.py \
     --sim-cfg "${SIM_CFG}" \
     --rl-cfg  "${RL_CFG}" \
@@ -113,7 +117,8 @@ srun python examples/train_rl.py \
     --num-workers "${WORKERS}" \
     --worker-device cuda \
     --episodes-per-iter "${WORKERS}" \
-    --updates-per-iter "$(( WORKERS * 50 ))"
+    --updates-per-iter "$(( WORKERS * 50 ))" \
+    --num-scenes "${NUM_SCENES}"
 
 # Resume after a walltime kill: add
 #   --resume output/rl_runs/${RUN_NAME}/checkpoints/last.pt

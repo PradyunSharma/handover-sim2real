@@ -356,6 +356,10 @@ def parse_args():
     p.add_argument("--device",   default="cuda")
     p.add_argument("--seed",     type=int, default=0)
     p.add_argument("--num-iters", type=int, default=None, help="override LOOP.num_iters")
+    p.add_argument("--num-scenes", type=int, default=None,
+                   help="cap the scene set to the FIRST N scenes for BOTH rollouts and "
+                        "eval (overfit / capability probe). Pair with a demo pool "
+                        "collected on the same first-N scenes. Default/0 = all scenes.")
     p.add_argument("--render",   action="store_true")
     p.add_argument("--egl",      action="store_true")
     p.add_argument("--resume",   default=None, help="path to a checkpoint .pt to resume")
@@ -495,8 +499,16 @@ def main():
                   f"worker(s) idle each iter. Raise LOOP.episodes_per_iter (and "
                   f"updates_per_iter to match) to use them.")
 
+    # Overfit / capability probe: cap the scene set so BOTH rollouts (rng.randint) and
+    # eval (i % num_scenes) only ever touch the first N scenes. Pair with a demo pool
+    # collected on the same first-N scenes for a clean overfit test.
+    if args.num_scenes is not None and 0 < int(args.num_scenes) < num_scenes:
+        print(f"[num-scenes] capping scene set {num_scenes} -> {int(args.num_scenes)} "
+              f"(overfit probe: rollouts+eval use scenes 0..{int(args.num_scenes)-1})")
+        num_scenes = int(args.num_scenes)
+
     # run dir
-    run_dir = Path(args.out_root) / args.run_name  
+    run_dir = Path(args.out_root) / args.run_name
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     with (run_dir / "rl_config.yaml").open("w") as f:
         yaml.safe_dump(rlcfg, f)

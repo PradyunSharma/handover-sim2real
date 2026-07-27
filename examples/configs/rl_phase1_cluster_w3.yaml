@@ -1,0 +1,105 @@
+# Phase-3 RL config — rl_run39 (CLUSTER, 3 workers). WORKER-COUNT TEST vs rl_run28.
+# Hypothesis: 16 workers -> 16 episodes/iter + 800 updates/iter commits too much learning
+# per rollout batch (the policy drifts far from the data-generating policy between
+# rollouts). This run drops to 3 workers -> 3 episodes/iter + 150 updates/iter (finer,
+# more on-policy feedback), and SCALES iterations x16/3 so the TOTAL training is identical
+# to run28: episodes 3*1333 ~= 4000 (= 16*250), updates 150*1333 ~= 200k (= 800*250).
+# The updates-per-EPISODE ratio (50) is unchanged; only the granularity differs.
+#
+# = rl_phase1_cluster_r28.yaml (from-scratch, drop_joint, wrist 5-ch, vgd, run28 decay
+# curriculum) with ONLY the iteration/parallelism knobs changed. Every iter-based schedule
+# is scaled x16/3 (~5.33) so the curriculum has the SAME SHAPE over the (longer) run.
+#
+# LAUNCH must force 3 workers by overriding the sbatch's cpus-per-task (WORKERS = cpus-2):
+#   sbatch --cpus-per-task=5 --export=ALL,RUN_NAME=rl_run39,\
+#     RL_CFG=examples/configs/rl_phase1_cluster_w3.yaml,DEMOS=output/rl_demos/train_h30_vgd.h5 \
+#     examples/slurm/train_rl.sbatch
+# (cpus-per-task=5 -> WORKERS=3 -> the sbatch passes --episodes-per-iter 3 --updates-per-iter 150,
+#  which OVERRIDE the episodes_per_iter/updates_per_iter below; those are set to match for docs.)
+# WALL-CLOCK: 3-way rollout parallelism over 1333 iters is ~5x slower than run28 — likely
+# exceeds the 24h cap. Checkpoints save every save_every(37) iters; --resume last.pt to continue.
+
+warm_start: false   # from scratch — do NOT borrow the BC policy/critic weights
+
+DATA:
+  num_pts:         1024
+  pc_channels:     5
+
+MODEL:
+  q_hidden:  [256, 256]
+  clock_dim: 1
+  drop_joint_state: true   # drop joint_pos(9)+joint_vel(9) from the robot MLP input
+
+RL:
+  gamma:        0.95
+  tau:          0.005
+  policy_noise: 0.2
+  noise_clip:   0.5
+  act_limit:    5.0
+  policy_delay: 2
+  mc_blend:     0.5
+  pose_loss:    smooth_l1
+  bc_weight:    2.0
+  gripper_bc_weight: 1.0
+  gripper_close_weight_max: 10.0
+  gripper_label_smooth: 0.1
+  shaping_pos_weight: 0.0
+  shaping_rot_weight: 0.0
+  aux_weight:   0.5
+  reward_mode:  stable_grasp
+  hold_steps:   3
+  # HAND-COLLISION FILTER — PAPER'S offline valid_grasp_dict (run21/vgd), NOT run15's
+  # runtime 0.08 m filter. hand_collision_filter=false so our runtime filter is OFF.
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08   # (unused while hand_collision_filter=false)
+  hand_points_radius:    0.35   # (unused while hand_collision_filter=false)
+  pg_normalize: true
+  alpha:        0.1
+  mix_start:    0.1
+  mix_end:      0.2
+  mix_ramp:     50000
+  actor_lr:     3.0e-4
+  critic_lr:    3.0e-4
+  grad_clip:    1.0
+
+LOOP:
+  capacity:             20000
+  pretrain_updates:     2000
+  demo_frac:            0.25
+  demo_frac_start:      0.5
+  demo_frac_end:        0.3
+  demo_frac_ramp:       667     # run28 125 x 16/3 (~5.33) — same anneal shape over the longer run
+  warmup_episodes:      0
+  warmup_beta:          1.0
+  episodes_per_iter:    3       # = 3 workers (sbatch overrides via WORKERS; here for docs)
+  updates_per_iter:     150     # = 3 * 50 (sbatch overrides via WORKERS*50)
+  batch_size:           64
+  num_iters:            1333    # run28 250 x 16/3 — total episodes/updates match run28
+  # exploration
+  noise_std:            0.03
+  # ── WIDENING reverse curriculum (same as run28, anneal window x16/3) ───────
+  expert_initial_hi:            24    # FIXED upper takeover bound
+  expert_initial_lo_start:      22    # band [22,24] at iter 0
+  expert_initial_lo_end:        2     # band [2,24] after anneal
+  expert_initial_anneal_iters:  800   # run28 150 x 16/3 — same schedule shape
+  expert_episode_frac:  0.5
+  rollout_max_steps:    30
+  # DAgger tail replans (run15 values)
+  dagger_ratio:         0.5
+  dagger_min_step:      5
+  dagger_tail_guard:    8
+  # DART — run23 values (policy-DART, ratio 0.2)
+  dart_mode:            policy
+  dart_ratio:           0.2
+  dart_min_step:        15
+  dart_max_step:        22
+  dart_pos_mag:         0.04
+  dart_rot_mag:         0.2
+  beta_start:           0.5
+  beta_end:             0.0
+  beta_ramp_iters:      336     # run28 63 x 16/3 — same beta schedule shape
+  # eval / checkpoint
+  eval_every:           37      # run28 7 x 16/3 — ~same number of evals over the run
+  eval_episodes:        64
+  save_every:           37      # run28 7 x 16/3
