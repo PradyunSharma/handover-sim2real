@@ -1,0 +1,112 @@
+# Phase-3 RL config — rl_run32 (CLUSTER, 16 workers). Base = rl_run28 (from-scratch,
+# drop_joint_state, STABLE run15/run25-family loss: pg_normalize true, bc_weight 2.0,
+# aux 0.5, mc_blend 0.5, smooth_l1). This REDEFINES rl_run32 (the earlier run31-loss
+# draft was never launched) as a targeted attack on run28's POST-CURRICULUM DECAY.
+#
+# run28 PEAKED at iter 133 (eval_succ 0.375, self-rollout) then decayed to ~0.06 and
+# never recovered. Diagnosis (see log): NOT instability (a_absmean healthy ~0.6-1.0) —
+# catastrophic forgetting / distribution shift as the curriculum widened. Three
+# mechanisms, one lever each (ONLY these 3 changes vs run28):
+#   (1) BUFFER 20k -> 100k. Our 20k FIFO holds only ~40-50 iters of transitions (16 eps
+#       x ~25 steps ~= 400/iter); the good near-grasp transitions built up before the
+#       peak were EVICTED by ~iter 180 — exactly when eval collapsed. 100k (= the
+#       GA-DDPG/paper RL_MEMORY_SIZE) retains them ~5x longer (~200 iters). ~4 GB RAM.
+#   (2) DEMO_FRAC fixed 0.7 (was ramp 0.5 -> 0.3, floored at iter 125 right before the
+#       peak). Holds a STRONG fixed success anchor in every batch so the +1/near-grasp
+#       signal doesn't thin as the curriculum widens. (Trade-off: 0.7 is aggressive —
+#       70% of each batch is the fixed demo set; risks over-anchoring to the demo scenes
+#       / less online exploration. Deliberate, per the anti-decay goal.)
+#   (3) ei_lo end 2 -> 10. The reverse curriculum now anneals ei_lo 22 -> 10 (not 2), so
+#       the band never widens past [10,24]: EVERY episode keeps >=10 expert-playback
+#       steps -> near-grasp expert states keep flowing into the buffer, instead of the
+#       policy self-poisoning it with from-far mediocre rollouts.
+# Together: keep the good states (1), keep the success anchor (2), keep feeding near-grasp
+# states (3) — directly countering all three arms of the decay.
+#
+# EVERYTHING ELSE = run28, UNCHANGED. Pair with:  --demos output/rl_demos/train_h30_vgd.h5
+# NOTE: ei_lo min 10 means eval (ei=0) is testing FURTHER from the training band than in
+# run28 — watch that the policy still generalizes the last 10 cold-start steps.
+
+warm_start: false   # from-scratch (run28) — no BC weights borrowed
+
+DATA:
+  num_pts:         1024
+  pc_channels:     5
+
+MODEL:
+  q_hidden:  [256, 256]
+  clock_dim: 1
+  drop_joint_state: true   # run28: drop joint_pos(9)+joint_vel(9) from the robot MLP
+
+RL:
+  gamma:        0.95
+  tau:          0.005
+  policy_noise: 0.2
+  noise_clip:   0.5
+  act_limit:    5.0
+  policy_delay: 2
+  mc_blend:     0.5
+  pose_loss:    smooth_l1
+  bc_weight:    2.0
+  gripper_bc_weight: 1.0
+  gripper_close_weight_max: 10.0
+  gripper_label_smooth: 0.1
+  shaping_pos_weight: 0.0
+  shaping_rot_weight: 0.0
+  aux_weight:   0.5
+  reward_mode:  stable_grasp
+  hold_steps:   3
+  # HAND-COLLISION FILTER — PAPER'S offline valid_grasp_dict (run21/vgd), runtime filter OFF.
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08   # (unused while hand_collision_filter=false)
+  hand_points_radius:    0.35   # (unused while hand_collision_filter=false)
+  pg_normalize: true
+  alpha:        0.1
+  mix_start:    0.1
+  mix_end:      0.2
+  mix_ramp:     50000
+  actor_lr:     3.0e-4
+  critic_lr:    3.0e-4
+  grad_clip:    1.0
+
+LOOP:
+  capacity:             100000   # run32 CHANGE 1: 20k -> 100k (GA-DDPG RL_MEMORY_SIZE); stop evicting the good near-grasp states (~4 GB RAM)
+  pretrain_updates:     2000
+  demo_frac:            0.25     # (unused; demo_frac_start present)
+  demo_frac_start:      0.5      # run32 CHANGE 2: FIXED 0.7 success anchor (was ramp 0.5 -> 0.3)
+  demo_frac_end:        0.3      # run32 CHANGE 2: held at 0.7 (start == end -> constant)
+  demo_frac_ramp:       125      # (irrelevant when start == end)
+  warmup_episodes:      0
+  warmup_beta:          1.0
+  episodes_per_iter:    16
+  updates_per_iter:     800
+  batch_size:           64
+  num_iters:            500
+  # exploration
+  noise_std:            0.03
+  # ── WIDENING reverse curriculum (run28) with ei_lo floor RAISED ───────────
+  expert_initial_hi:            24    # FIXED upper takeover bound
+  expert_initial_lo_start:      22    # band [22,24] at iter 0
+  expert_initial_lo_end:        2    # run32 CHANGE 3: 2 -> 10 (band never widens past [10,24]; keep feeding near-grasp states)
+  expert_initial_anneal_iters:  150   # anneal 0..150, then hold [10,24]
+  expert_episode_frac:  0.5
+  rollout_max_steps:    30
+  # DAgger tail replans (run15 values)
+  dagger_ratio:         0.5
+  dagger_min_step:      5
+  dagger_tail_guard:    8
+  # DART — policy-DART, ratio 0.2
+  dart_mode:            policy
+  dart_ratio:           0.2
+  dart_min_step:        15
+  dart_max_step:        22
+  dart_pos_mag:         0.04
+  dart_rot_mag:         0.2
+  beta_start:           0.5
+  beta_end:             0.0
+  beta_ramp_iters:      63
+  # eval / checkpoint
+  eval_every:           7
+  eval_episodes:        64
+  save_every:           7
