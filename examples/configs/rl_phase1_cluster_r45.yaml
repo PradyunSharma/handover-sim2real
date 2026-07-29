@@ -1,0 +1,96 @@
+# Phase-3 RL config — rl_run45 (CLUSTER, 16 workers). AUX-WEIGHT probe.
+# Base = rl_run28 (from-scratch, drop_joint, wrist 5-ch, vgd, decay curriculum, 250 iters)
+# with TWO changes only:
+#   (1) capacity 20k -> 100000 (retention);
+#   (2) aux_weight 0.5 -> 5.0 (10x) — the goal-auxiliary head regresses the FINAL grasp
+#       pose (pos3+rot6d) relative to the current EE from the shared PointNet++ features.
+#       At 0.5 it was only ~0.4% of the actor loss (avg aux_loss_a ~0.004) — negligible,
+#       and the PREDICTED grasp pose is visibly OFF from ground truth early in rollouts
+#       (far states, under-represented in the near-grasp-dominated buffer). 5.0 makes aux
+#       ~4% of the loss and concentrates gradient on those high-error far states, pushing
+#       the encoder to encode grasp-relevant geometry from farther away. aux_weight applies
+#       to BOTH the actor head (aux_loss_a) and the critic head (aux_loss_c).
+# HYPOTHESIS: better grasp-pose features -> better reach/approach from far -> maybe lifts
+# the pipeline. Tried BEFORE the gripper-commit fix (user's call). WATCH: does the blue
+# predicted-grasp marker track the green OMG goal earlier in rollouts, and does eval move?
+# RISK: aux is a REGULARIZER on the shared encoder; if it over-pulls toward grasp-pose
+# regression it could trade off the control features — watch aux_loss vs bc_loss/eval.
+# Launch: sbatch --export=ALL,RUN_NAME=rl_run45,RL_CFG=examples/configs/rl_phase1_cluster_r45.yaml,DEMOS=output/rl_demos/train_h30_vgd.h5 examples/slurm/train_rl.sbatch
+
+warm_start: false   # from scratch — do NOT borrow the BC policy/critic weights
+
+DATA:
+  num_pts:         1024
+  pc_channels:     5
+
+MODEL:
+  q_hidden:  [256, 256]
+  clock_dim: 1
+  drop_joint_state: true   # drop joint_pos(9)+joint_vel(9) from the robot MLP input
+
+RL:
+  gamma:        0.95
+  tau:          0.005
+  policy_noise: 0.2
+  noise_clip:   0.5
+  act_limit:    5.0
+  policy_delay: 2
+  mc_blend:     0.5
+  pose_loss:    smooth_l1
+  bc_weight:    2.0
+  gripper_bc_weight: 1.0
+  gripper_close_weight_max: 10.0
+  gripper_label_smooth: 0.1
+  shaping_pos_weight: 0.0
+  shaping_rot_weight: 0.0
+  aux_weight:   5.0   # run28 0.5 -> 5.0 (10x): make the grasp-pose aux actually bite
+  reward_mode:  stable_grasp
+  hold_steps:   3
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08
+  hand_points_radius:    0.35
+  pg_normalize: true
+  alpha:        0.1
+  mix_start:    0.1
+  mix_end:      0.2
+  mix_ramp:     50000
+  actor_lr:     3.0e-4
+  critic_lr:    3.0e-4
+  grad_clip:    1.0
+
+LOOP:
+  capacity:             100000   # run28 20k -> 100k
+  pretrain_updates:     2000
+  demo_frac:            0.25
+  demo_frac_start:      0.5
+  demo_frac_end:        0.3
+  demo_frac_ramp:       125
+  warmup_episodes:      0
+  warmup_beta:          1.0
+  episodes_per_iter:    16
+  updates_per_iter:     800
+  batch_size:           64
+  num_iters:            250      # same as run28
+  noise_std:            0.03
+  expert_initial_hi:            24
+  expert_initial_lo_start:      22
+  expert_initial_lo_end:        2
+  expert_initial_anneal_iters:  150
+  expert_episode_frac:  0.5
+  rollout_max_steps:    30
+  dagger_ratio:         0.5
+  dagger_min_step:      5
+  dagger_tail_guard:    8
+  dart_mode:            policy
+  dart_ratio:           0.2
+  dart_min_step:        15
+  dart_max_step:        22
+  dart_pos_mag:         0.04
+  dart_rot_mag:         0.2
+  beta_start:           0.5
+  beta_end:             0.0
+  beta_ramp_iters:      63
+  eval_every:           7
+  eval_episodes:        64
+  save_every:           7
