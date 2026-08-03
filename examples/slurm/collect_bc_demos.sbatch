@@ -32,20 +32,23 @@
 # (false), or the DAgger policy sees a different input distribution than it trained on.
 # ─────────────────────────────────────────────────────────────────────────────
 #SBATCH --job-name=h2r-bcdemos
-# CPU partition, NO GPU: collection is expert-only (OMG + PyBullet, both
-# CPU-bound) and the cloud comes from PyBullet's DIRECT-mode CPU renderer — no
-# neural network runs here. Asking for a GPU only burns quota the DAgger training
-# needs, and on gpu-v100 it hit AssocMaxGRESPerJob. compute also allows 5 days vs
-# the GPU partitions' 2, which suits a serial sweep over ~720 scenes.
-#SBATCH --partition=compute
+# A GPU IS MANDATORY — not for a neural network (the expert is OMG, the cloud
+# comes from PyBullet's CPU renderer), but for OMG ITSELF: importing omg.config
+# calls .cuda() at module scope (config.py:222) and the SDF collision cost is
+# CUDA throughout. A CPU partition dies at import with "Found no NVIDIA driver".
+#SBATCH --partition=gpu-v100          # see train_rl.sbatch for why not gpu-a100
 #SBATCH --account=education-me-msc-ro
 #SBATCH --qos=normal
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00               # education GPU cap is 24h (gpu-v100 hard
+                                      # limit is 2 days); the h5 is incremental,
+                                      # so resubmitting resumes nothing but also
+                                      # loses nothing already collected
 # No --nodes: compute-p1 rejects a per-node request that is not --exclusive
 # ("Specify '--ntasks' and '--cpus-per-task' instead"). --ntasks=1 already lands
 # this on a single node, so --nodes was redundant on the GPU partitions too.
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4             # serial script — a few cores for PyBullet/python
+#SBATCH --gpus-per-task=1
 #SBATCH --mem-per-cpu=3968M           # 15.5G total. NOT 4G: compute-p1 caps
                                       # mem-per-cpu at 190464MB/48 = 3968MB and
                                       # rejects the job outright. 3968 is under
@@ -69,6 +72,10 @@ export TORCH_CUDA_ARCH_LIST="7.0"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
+# Unbuffered: without this, python's stdout is block-buffered when redirected to
+# a file, so a 48 h collection shows no progress until it exits — and a crash
+# leaves a truncated log that stops at an arbitrary point.
+export PYTHONUNBUFFERED=1
 
 # ── parameters (override via sbatch --export=ALL,...) ───────────────────────
 SIM_CFG="${SIM_CFG:-examples/pretrain.yaml}"   # MUST match SIM.cfg_file in dagger_phase4.yaml

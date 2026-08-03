@@ -28,12 +28,13 @@
 # those change which grasp candidates exist.
 # ─────────────────────────────────────────────────────────────────────────────
 #SBATCH --job-name=h2r-pintable
-# CPU partition, NO GPU: this job runs no neural network at all — it is OMG
-# planning + PyBullet, both CPU-bound, and never computes a point cloud. Asking
-# for a GPU only burns quota the DAgger training needs, and on gpu-v100 it hit
-# AssocMaxGRESPerJob. Add `--gpus-per-task=1 --partition=gpu-v100` on the sbatch
-# command line if you ever need the GPU environment back.
-#SBATCH --partition=compute
+# A GPU IS MANDATORY — not for a neural network, but for OMG itself. Importing
+# `omg.config` runs get_global_param() at module scope, which calls .cuda()
+# (config.py:222); and the planner's SDF collision cost (sdf_tools.py, cost.py)
+# is CUDA throughout, ~15 unconditional .cuda() calls on the hot path. A CPU
+# partition dies at import with "Found no NVIDIA driver". Do not "fix" this by
+# moving to `compute` — that was tried, and it is the planner, not the policy.
+#SBATCH --partition=gpu-v100          # see train_rl.sbatch for why not gpu-a100
 #SBATCH --account=education-me-msc-ro
 #SBATCH --qos=normal
 #SBATCH --time=04:00:00
@@ -42,6 +43,7 @@
 # this on a single node, so --nodes was redundant on the GPU partitions too.
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
+#SBATCH --gpus-per-task=1
 #SBATCH --mem-per-cpu=3968M           # 15.5G total. NOT 4G: compute-p1 caps
                                       # mem-per-cpu at 190464MB/48 = 3968MB and
                                       # rejects the job outright. 3968 is under
@@ -65,6 +67,10 @@ export TORCH_CUDA_ARCH_LIST="7.0"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
+# Unbuffered: without this, python's stdout is block-buffered when redirected to
+# a file, so a job that dies mid-run shows a truncated log that stops at an
+# arbitrary point and looks like a hang at the wrong line.
+export PYTHONUNBUFFERED=1
 
 # ── parameters (override via sbatch --export=ALL,...) ───────────────────────
 CFG="${CFG:-examples/configs/dagger_phase4.yaml}"   # its SIM block defines the grasp set
