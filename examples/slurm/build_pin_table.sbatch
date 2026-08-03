@@ -36,7 +36,11 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gpus-per-task=1
-#SBATCH --mem-per-cpu=4G              # 16G total
+#SBATCH --mem-per-cpu=3968M           # 15.5G total. NOT 4G: compute-p1 caps
+                                      # mem-per-cpu at 190464MB/48 = 3968MB and
+                                      # rejects the job outright. 3968 is under
+                                      # the gpu-v100 cap (5333) too, so this one
+                                      # value works on either partition.
 #SBATCH --output=slurm_logs/pintable_%j.out
 #SBATCH --error=slurm_logs/pintable_%j.err
 
