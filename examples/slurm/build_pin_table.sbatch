@@ -28,7 +28,12 @@
 # those change which grasp candidates exist.
 # ─────────────────────────────────────────────────────────────────────────────
 #SBATCH --job-name=h2r-pintable
-#SBATCH --partition=gpu-v100          # see train_rl.sbatch for why not gpu-a100
+# CPU partition, NO GPU: this job runs no neural network at all — it is OMG
+# planning + PyBullet, both CPU-bound, and never computes a point cloud. Asking
+# for a GPU only burns quota the DAgger training needs, and on gpu-v100 it hit
+# AssocMaxGRESPerJob. Add `--gpus-per-task=1 --partition=gpu-v100` on the sbatch
+# command line if you ever need the GPU environment back.
+#SBATCH --partition=compute
 #SBATCH --account=education-me-msc-ro
 #SBATCH --qos=normal
 #SBATCH --time=04:00:00
@@ -37,7 +42,6 @@
 # this on a single node, so --nodes was redundant on the GPU partitions too.
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --gpus-per-task=1
 #SBATCH --mem-per-cpu=3968M           # 15.5G total. NOT 4G: compute-p1 caps
                                       # mem-per-cpu at 190464MB/48 = 3968MB and
                                       # rejects the job outright. 3968 is under
