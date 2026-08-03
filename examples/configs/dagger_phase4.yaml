@@ -129,8 +129,14 @@ TRAIN:
   #   bc_phase1.yaml  -> single-frame MLP policy (default)
   #   act_phase2.yaml -> temporal transformer + action chunking
   train_cfg: examples/configs/bc_phase1.yaml
-  base_train_h5: output/bc_dataset/train.h5   # the expert demonstrations (D_0)
-  val_h5: output/bc_dataset/val.h5            # held-out expert data -> best.pt within a run
+  # D_0. The *_pinned.h5 pair was collected with SIM's grasp set AND the pin
+  # table, so the demonstrations aim at the same grasp DAgger will. The older
+  # train.h5/val.h5 had NEITHER filter: measured over 72 scenes, 21% aimed at a
+  # different grasp than DAgger picks (median 10.7 cm), and aggregating those two
+  # label sets is the one inconsistency DAgger cannot average away.
+  # 623 episodes (720 scenes - 97 OMG "empty goal set" failures), vs 656 unfiltered.
+  base_train_h5: output/bc_dataset/train_pinned.h5
+  val_h5: output/bc_dataset/val_pinned.h5     # held-out expert data -> best.pt within a run
   base_run: null           # path to an existing run of the SAME policy kind to
                            # start from. null => train the base policy here as
                            # iteration 0.
