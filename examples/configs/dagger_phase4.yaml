@@ -1,0 +1,193 @@
+# Phase-4 DAgger config — Algorithm 3.1 of Ross et al. (2011), driven by
+# examples/train_dagger_phase4.py.
+#
+# The learner is the Phase-1 SINGLE-FRAME policy by default. The loop is
+# policy-agnostic: point TRAIN.train_cfg at act_phase2.yaml and the same DAgger
+# loop drives the Phase-2 chunking policy instead.
+#
+# The model architecture / optimizer / loss are NOT duplicated here:
+# TRAIN.train_cfg points at the phase config, so there is a single source of
+# truth. Only the epoch counts, the data paths and num_workers are overridden.
+
+SIM:
+  cfg_file: examples/pretrain.yaml   # GA-DDPG-style simulator config
+  split: train                       # BENCHMARK.SPLIT (one env => one split)
+  egl: false                         # EGL GPU renderer for the hand camera.
+                                     # MUST match how the base dataset was
+                                     # collected — the renderer changes the cloud.
+
+  # Grasp filtering: the SAME setup Phase-3 used from run 21 onward — the paper's
+  # OFFLINE hand-collision-filtered grasp dict (~716/720 s0 scenes usable) rather
+  # than our aggressive runtime 0.08 m filter (~351). Wired into cfg.omg_config
+  # before the env is built. Leave hand_collision_filter false: stacking both
+  # filters double-prunes the goal set.
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08        # (unused while hand_collision_filter=false)
+  hand_points_radius:    0.35        # (unused while hand_collision_filter=false)
+
+  # OMG plans to the pre-grasp standoff AND the reach beyond it: traj[-5] is the
+  # standoff, traj[-1] is the pose the gripper closes at. Phase 4 labels the whole
+  # trajectory, so the reach segment has to be in the plan.
+  use_standoff: true
+  standoff_dist: 0.08
+
+  # ---- one committed grasp per scene ----
+  # OMG re-decides its goal every plan (argmin ||traj.start - goal_set[i]|| in
+  # JOINT space, planner.py `ol_alg='Proj'`). With the policy driving and a replan
+  # every step, the target grasp moves mid-episode: measured over 90 replans under
+  # +-15 cm perturbation, 32 switched grasp, one scene cycled through four, and the
+  # target shifted by up to 10 cm. The table pins one grasp per scene and is shared
+  # with the demonstration collector, so every phase aims at the same pose.
+  # Build with: python examples/build_grasp_pin_table.py --out output/grasp_pin_table.json
+  # REBUILD it whenever valid_grasp_dict_path / hand_collision_filter change --
+  # those change which candidates exist. null disables pinning.
+  # Named per split: scene indices are SPLIT-RELATIVE, so a train table applied
+  # to val pins the wrong grasps. Loading one built for another split is a hard
+  # error, not a warning.
+  grasp_pin_table: output/grasp_pin_table_train.json
+  grasp_pin_match_tol: 0.02   # reject a pinned pose further than this from any
+                              # current candidate (catches a stale table loudly)
+
+DAGGER:
+  num_iters: 20            # N — DAgger iterations after the base run
+  episodes_per_iter: 20    # m — trajectories sampled per iteration. The paper uses
+                           # m = O(1) with N large (Super Tux Kart: ONE lap per
+                           # iteration, 20 iterations); prefer more iterations over
+                           # bigger batches — each iteration is a new state
+                           # distribution, more episodes is just more samples of
+                           # the same one.
+  max_steps: 50            # policy steps per collected trajectory. NOT 30:
+                           # measured, the EE moves ~0.02 m/step (IK tracking
+                           # realises ~60% of a commanded ~0.035 m delta) and a
+                           # far-start scene is ~0.78 m out, so the standoff is
+                           # ~36 steps away. The demos need only 20 because they
+                           # follow the plan BY INDEX, not by replanning.
+  scene_sampling: random   # random | sequential (cycles the pool deterministically)
+  seed: 0
+
+  # beta_i: per-step probability of executing the EXPERT action instead of the
+  # policy's (pi_i = beta_i*pi* + (1-beta_i)*pi_hat_i). The paper's beta_1 = 1
+  # iteration is the base run trained on the expert demonstrations, so DAgger
+  # iteration 1 here is the paper's iteration 2.
+  #   indicator   beta = 0 for every DAgger iteration (paper's beta_i = I(i=1),
+  #               reported as the best-performing choice in Section 5)
+  #   exponential beta_i = beta_p^i
+  #   linear      beta_start -> beta_end over num_iters
+  #   constant    beta_start
+  beta_schedule: indicator
+  beta_start: 0.5
+  beta_end:   0.0
+  beta_p:     0.5
+
+  # Gripper-close label: once the EE is within BOTH tolerances of the grasp pose
+  # the current plan aims at, the label becomes the closure command
+  # [0,0,0, 0,0,0, 0.0] instead of another approach delta.
+  close_pos_thresh: 0.02   # metres
+  close_rot_thresh: 0.34   # radians (~19.5 deg)
+  stop_on_close_label: true    # end the episode at the close label (mirrors the
+                               # single terminal close transition in the demos)
+  stop_on_policy_close: true   # the policy commanded a close: execute it and end
+                               # the episode. false overrides the gripper bit and
+                               # keeps approaching (more labels, less faithful to
+                               # "follow the learner's own policy")
+
+  # Distance-proportional OMG horizon: free = round(||ee - standoff|| / ee_step)
+  # waypoints for the approach, + reach_tail for the standoff->grasp reach OMG
+  # folds into the tail. Keeps the recorded plan[0] delta at the demonstrations'
+  # per-step scale at every distance.
+  ee_step: 0.04
+  reach_tail: 5
+  min_free: 3
+  max_horizon: 40
+  first_horizon: null      # horizon of the step-0 plan, before the standoff is
+                           # known. null => cfg.RL_MAX_STEP (20), i.e. the same
+                           # horizon collect_bc_dataset.py planned the demos with.
+
+  # ---- the endgame: committed reach ----
+  # plan[0] labelling CANNOT express the final reach. OMG puts the standoff ramp
+  # in its goal set, so once the EE is at the standoff the plan's free portion is
+  # stationary and plan[0] decays to 0 while the reach sits in the LAST
+  # reach_tail waypoints. Measured with beta=1 (pure expert): the EE parks 6.6 cm
+  # short of the grasp forever and every further label is ~0.
+  # Fix: on arrival at the standoff, freeze that plan's last `reach_tail`
+  # waypoints and follow them BY INDEX (no more replanning, so no retreat and no
+  # oscillation). The delta is still recomputed from the CURRENT EE each step, so
+  # the labels stay corrective under drift; only the target stops moving.
+  # 0.05, not 0.02: min_free floors the free portion at 3 steps, so
+  # ||plan[0]|| ~ d_standoff/3 and the approach labels decay near the standoff
+  # (0.040 at d=0.12, 0.011 at d=0.05, 0.004 at d=0.018). Handing off at 0.05
+  # keeps every recorded approach label at ~the demonstrations' per-step scale.
+  reach_commit_dist: 0.05  # ||ee - standoff|| at which the reach is committed
+  reach_skip_eps:    0.01  # drop leading tail waypoints closer than this to the
+                           # EE (the tail's first entry IS the standoff)
+
+TRAIN:
+  # Which learner DAgger wraps. The policy kind is inferred from this file
+  # (MODEL.chunk_len present => Phase-2 ACT; otherwise Phase-1 single frame), so
+  # there is no separate switch to keep in sync.
+  #   bc_phase1.yaml  -> single-frame MLP policy (default)
+  #   act_phase2.yaml -> temporal transformer + action chunking
+  train_cfg: examples/configs/bc_phase1.yaml
+  base_train_h5: output/bc_dataset/train.h5   # the expert demonstrations (D_0)
+  val_h5: output/bc_dataset/val.h5            # held-out expert data -> best.pt within a run
+  base_run: null           # path to an existing run of the SAME policy kind to
+                           # start from. null => train the base policy here as
+                           # iteration 0.
+  base_epochs: 100         # epochs for the base run
+  iter_epochs: 50          # epochs per DAgger iteration
+  train_from_scratch: true # paper-faithful Follow-The-Leader: refit on the whole
+                           # aggregate each iteration. false warm-starts from the
+                           # previous iteration (cheaper, reuses its normalizer,
+                           # no longer FTL).
+  num_workers: 2           # DataLoader workers. This process also holds PyBullet
+                           # + the OMG SDF cache, which the workers inherit on fork.
+  device: cuda
+
+EVAL:
+  # Eval set size vs cadence. 100 scenes resolve 1 percentage point and give a
+  # ~+-8 pt 95% CI on a mid-range rate; 40 resolved only 2.5 pt with a ~+-12 pt
+  # CI, which is wider than the differences between adjacent iterations — and
+  # `select_on` decides which checkpoint ships, so that noise lands in the
+  # deliverable. Phase 3 hit the same wall and raised eval_episodes 20 -> 50.
+  # `every: 2` pays for the bigger set: ~6.3 s/scene (no OMG calls under
+  # stable_grasp) => ~10.5 min per eval, ~1.8 h over 20 iterations, about the
+  # same total as 40-every-1 but each measurement is worth reading.
+  # The last iteration is ALWAYS evaluated regardless of `every`, so the final
+  # policy is never selected on a stale score.
+  every: 2                 # evaluate every N DAgger iterations (0 disables)
+  num_scenes: 100          # scenes in the eval set
+  holdout: true            # exclude the eval scenes from the collection pool.
+                           # NOTE this shrinks the collection pool by exactly
+                           # num_scenes — irrelevant at 720 scenes, but recheck
+                           # if a re-collection leaves a much smaller usable set.
+  max_steps: 50            # must match DAGGER.max_steps — same reach budget
+  ckpt: best               # which checkpoint of the iteration's run to evaluate
+                           # and then deploy for the next collection round
+
+  # SUCCESS = THE PHASE-3 CRITERION, imported from rl/rollout_worker.py. Phase 4
+  # has no carry-to-goal, so the handover-sim benchmark's own EpisodeStatus.SUCCESS
+  # (hand dwelling inside a 15 cm ball at GOAL_CENTER) can never fire and would
+  # score every episode 0. The episode is about reaching the grasp and committing
+  # the close at the right pose, and it is scored there.
+  #   stable_grasp  after the close, hold the gripper shut for hold_steps policy
+  #                 steps, then require the object SECURED: handover-sim's release
+  #                 handshake fired AND no drop AND no human contact. Physics-based
+  #                 outcome; this is the mode every recent Phase-3 run uses.
+  #   proximity     the EE is within (close_pos_thresh, close_rot_thresh) of the
+  #                 grasp pose at the close. Pure geometry — the SAME predicate
+  #                 the collector uses to emit its CLOSE label, so it measures
+  #                 label agreement rather than task outcome. Needs a grasp pose:
+  #                 free from the pin table, else one OMG plan per eval episode.
+  success_mode: stable_grasp
+  hold_steps: 3            # stable_grasp: policy-steps held shut before scoring
+                           # (matches Phase-3's RL.hold_steps)
+
+  # Reported every iteration, ordered by how much each demands — reading them
+  # left to right localises where episodes are being lost:
+  #   close_rate    the policy committed a close at all
+  #   near_rate     ...within the CLOSE-label tolerances of the pinned grasp
+  #   grasp_rate    ...and both fingers ended the hold on the object
+  #   success_rate  ...and the object was secured (released, not dropped)
+  select_on: success_rate  # success_rate | grasp_rate | near_rate | close_rate
+  verbose: false

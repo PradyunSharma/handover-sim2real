@@ -1,0 +1,840 @@
+"""
+Phase-4: DAgger (Ross et al., 2011, Algorithm 3.1) as a single Python loop.
+
+Phase 1/2 drove DAgger from bash (`run_dagger.sh` / `run_dagger_act.sh`) over
+one-shot collector + trainer scripts. Phase 4 runs the whole algorithm in one
+process: collect -> aggregate -> refit -> evaluate -> repeat, with the env, the
+planner and the model all held in memory across iterations.
+
+The learner is the Phase-1 SINGLE-FRAME policy by default. The loop itself is
+policy-agnostic — point TRAIN.train_cfg at act_phase2.yaml and the same loop
+drives the Phase-2 chunking policy; the kind is inferred from that config.
+
+    D   <- expert demonstrations (TRAIN.base_train_h5)     # the beta_1 = 1 iteration
+    pi_1 <- train(D)                                       # iteration 0, the "base run"
+    for i = 1..N:
+        pi_i^mix = beta_i*pi* + (1-beta_i)*pi_i
+        sample m = episodes_per_iter T-step trajectories with pi_i^mix
+        D_i = {(s, pi*(s)) : s visited by pi_i^mix}
+        D <- D u D_i                                       # aggregate; nothing is dropped
+        pi_{i+1} <- train(D)                               # fresh fit on the union (FTL)
+        evaluate pi_{i+1} on the held-out eval scenes
+    keep the BEST-on-eval policy and the LAST policy
+
+Phase-4-specific collection rules (see handover_sim2real/dagger/collector.py):
+  * OMG is re-planned from the CURRENT drifted config at EVERY step; the label is
+    that plan's first waypoint.
+  * The plan runs to the pre-grasp standoff AND the reach beyond it.
+  * No standoff-plane cutoff — the whole approach is labelled.
+  * A gripper-CLOSE label is emitted once the EE is within
+    (close_pos_thresh, close_rot_thresh) of the plan's grasp pose.
+  * Grasp candidates come from Phase-3's filtered grasp dict.
+
+Usage:
+    python examples/train_dagger_phase4.py \\
+        --cfg-file examples/configs/dagger_phase4.yaml \\
+        --run-name dagger4_run1
+
+    # resume: re-run the SAME command. Completed iterations are skipped, a
+    # finished-but-untrained collection is reused, and an interrupted training
+    # continues from its last.pt.
+
+Run dir (output/dagger_runs/<run_name>/):
+    config.yaml       the resolved Phase-4 config
+    state.json        completed iterations + best-so-far (drives resume)
+    dagger_log.csv    one row per iteration (data + eval metrics)
+    data/             dagger_iter_NN.h5  — D_i, in the Phase-1/2 BC schema
+    iters/iter_NN/    a full policy run dir per iteration
+    best/  last/      standalone snapshots, loadable by rollout_bc_policy.py
+                      (or rollout_act_policy.py for an ACT learner)
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import json
+import os
+import random
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling example modules
+
+import h5py
+import numpy as np
+import torch
+import yaml
+from torch.utils.data import DataLoader
+
+from handover_sim2real.bc import (
+    ACTTrainer,
+    BCDataset,
+    BCSequenceDataset,
+    BCTrainer,
+    Normalizer,
+    compute_normalization_stats,
+)
+from handover_sim2real.dagger import (
+    CollectParams,
+    EvalParams,
+    build_policy,
+    build_sim_cfg,
+    build_sim_context,
+    collect_iteration,
+    evaluate_policy,
+    export_run_dir,
+    GraspRegistry,
+    load_grasp_pin_table,
+    load_policy_runner,
+    policy_kind,
+)
+
+
+# ── config plumbing ──────────────────────────────────────────────────────────
+
+def load_yaml(path) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def beta_at(i: int, d: dict, num_iters: int) -> float:
+    """beta for DAgger iteration `i` (1-based).
+
+    The paper's beta_1 = 1 iteration is the base run on the expert
+    demonstrations, so iteration i here is the paper's iteration i+1 — hence the
+    exponential schedule starts at p^1, not p^0.
+    """
+    schedule = str(d.get("beta_schedule", "indicator")).lower()
+    if schedule == "indicator":
+        return 0.0
+    if schedule == "constant":
+        return float(d.get("beta_start", 0.0))
+    if schedule == "exponential":
+        return float(d.get("beta_p", 0.5)) ** i
+    if schedule == "linear":
+        lo, hi = float(d.get("beta_start", 0.5)), float(d.get("beta_end", 0.0))
+        if num_iters <= 1:
+            return hi
+        return lo + (hi - lo) * (i - 1) / (num_iters - 1)
+    raise ValueError(f"Unknown DAGGER.beta_schedule '{schedule}'")
+
+
+def scene_pools(num_scenes: int, ev: dict) -> tuple[list[int], list[int]]:
+    """(collection pool, eval scenes).
+
+    The eval scenes are taken evenly spread across the split rather than as a
+    trailing block, so they cover the same object/pose variety as the collection
+    pool. With EVAL.holdout they are removed from the collection pool — the
+    "best on validation" selection is then measured on scenes DAgger never
+    labelled, which is the point of a validation set.
+    """
+    n_eval = min(int(ev.get("num_scenes", 0)), num_scenes)
+    if n_eval <= 0:
+        return list(range(num_scenes)), []
+    eval_scenes = sorted(set(np.linspace(0, num_scenes - 1, n_eval).astype(int).tolist()))
+    if bool(ev.get("holdout", True)):
+        pool = [s for s in range(num_scenes) if s not in set(eval_scenes)]
+    else:
+        pool = list(range(num_scenes))
+    return pool, eval_scenes
+
+
+def sample_scenes(pool: list[int], m: int, mode: str, rng, cursor: int) -> tuple[list[int], int]:
+    """m scenes for one iteration. Returns (scenes, new cursor)."""
+    m = min(int(m), len(pool))
+    if mode == "sequential":
+        idx = [(cursor + j) % len(pool) for j in range(m)]
+        return [pool[j] for j in idx], (cursor + m) % len(pool)
+    return [int(s) for s in rng.choice(pool, size=m, replace=False)], cursor
+
+
+# ── per-iteration training (a fresh fit on the whole aggregate) ──────────────
+
+def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | None,
+                       run_dir: Path, *, epochs: int, device: str,
+                       num_workers: int, init_from: Path | None = None,
+                       seed: int = 0) -> Path:
+    """Train one model on D = base_train_h5 u all D_i collected so far.
+
+    Works for either learner: the Phase-1 single-frame policy (BCDataset +
+    BCTrainer) or the Phase-2 ACT policy (windowed BCSequenceDataset +
+    ACTTrainer). Which one is decided by the config, not by a separate flag.
+
+    `init_from` (a previous iteration's run dir) warm-starts the weights AND
+    reuses that run's normalizer — the network's output scale is defined by the
+    normalizer, so warm-starting under freshly recomputed stats would silently
+    reinterpret the head. Pass None for the paper-faithful fresh fit.
+
+    Returns the run dir. Resumes automatically from checkpoints/last.pt.
+    """
+    cfg = copy.deepcopy(train_cfg)
+    cfg["DATA"]["train_h5"] = train_files if len(train_files) > 1 else train_files[0]
+    cfg["DATA"]["val_h5"] = val_h5
+    cfg["TRAIN"]["num_epochs"] = int(epochs)
+    cfg["TRAIN"]["device"] = device
+    cfg["TRAIN"]["num_workers"] = int(num_workers)
+    cfg["TRAIN"]["seed"] = int(seed)
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "checkpoints").mkdir(exist_ok=True)
+    with (run_dir / "config.yaml").open("w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+
+    set_seed(seed)
+
+    resume_ckpt = run_dir / "checkpoints" / "last.pt"
+    resume = resume_ckpt.exists()
+    norm_path = run_dir / "normalization.npz"
+
+    if resume and norm_path.exists():
+        normalizer = Normalizer.load(norm_path)
+        print(f"[train] resuming {run_dir.name} from {resume_ckpt.name}")
+    elif init_from is not None:
+        normalizer = Normalizer.load(Path(init_from) / "normalization.npz")
+        print(f"[train] warm start from {init_from} (reusing its normalizer)")
+    else:
+        print(f"[train] computing normalization over {len(train_files)} file(s) ...")
+        normalizer = compute_normalization_stats(cfg["DATA"]["train_h5"])
+    normalizer.save(norm_path)
+
+    kind = policy_kind(cfg)
+    if kind == "bc":
+        train_ds = BCDataset(cfg["DATA"]["train_h5"], normalizer=normalizer)
+        val_ds = (BCDataset(val_h5, normalizer=normalizer)
+                  if val_h5 and os.path.exists(val_h5) else None)
+    else:
+        T = int(cfg["MODEL"]["history_len"])
+        k = int(cfg["MODEL"]["chunk_len"])
+        train_ds = BCSequenceDataset(cfg["DATA"]["train_h5"], history_len=T,
+                                     chunk_len=k, normalizer=normalizer)
+        val_ds = (BCSequenceDataset(val_h5, history_len=T, chunk_len=k,
+                                    normalizer=normalizer)
+                  if val_h5 and os.path.exists(val_h5) else None)
+    print(f"[train] {kind} policy | D = {len(train_ds)} steps / "
+          f"{train_ds.num_episodes} episodes")
+    for path, ne in train_ds.episode_counts():
+        print(f"          {path}: {ne} episodes")
+
+    pin = device != "cpu"
+    train_dl = DataLoader(train_ds, batch_size=int(cfg["TRAIN"]["batch_size"]),
+                          shuffle=True, num_workers=int(num_workers),
+                          pin_memory=pin, drop_last=True)
+    val_dl = (DataLoader(val_ds, batch_size=int(cfg["TRAIN"]["batch_size"]),
+                         shuffle=False, num_workers=int(num_workers),
+                         pin_memory=pin, drop_last=False)
+              if val_ds is not None else None)
+
+    model = build_policy(cfg, normalizer)
+
+    if not resume:
+        if init_from is not None:
+            payload = torch.load(Path(init_from) / "checkpoints" / "last.pt",
+                                 map_location="cpu")
+            model.load_state_dict(payload["model"])
+        else:
+            pc_pre = cfg.get("MODEL", {}).get("pc_pretrained")
+            if pc_pre and os.path.exists(pc_pre):
+                model.load_pretrained_pc_encoder(pc_pre)
+            elif pc_pre:
+                print(f"[train] WARNING pc_pretrained not found, PC encoder from "
+                      f"scratch: {pc_pre}")
+
+    trainer_cls = BCTrainer if kind == "bc" else ACTTrainer
+    trainer = trainer_cls(model, train_dl, val_dl, cfg, run_dir=str(run_dir))
+    if resume:
+        trainer.resume_from(str(resume_ckpt))
+    trainer.train()
+
+    del trainer, model, train_dl, val_dl, train_ds, val_ds
+    if device != "cpu":
+        torch.cuda.empty_cache()
+    return run_dir
+
+
+# ── state / logging ─────────────────────────────────────────────────────────
+
+def score_tuple(m: dict, select_on: str) -> list[float]:
+    """Lexicographic selection score for "return best pi_i on validation".
+
+    Primary is EVAL.select_on. Early in training every iteration scores 0
+    success, so the tie-breaks matter, ordered by how much they demand:
+    grasp_rate separates "closed on the object" from "closed on air", near_rate
+    separates "closed at the right pose" from "closed anywhere", and the negated
+    final EE->object distance separates "got close" from "never approached".
+    Strictly-greater comparison keeps the EARLIEST iteration on a full tie.
+    """
+    dist = float(m.get("mean_dist", float("nan")))
+    return [
+        float(m.get(select_on, 0.0)),
+        float(m.get("grasp_rate", 0.0)),
+        float(m.get("near_rate", 0.0)),
+        -(dist if np.isfinite(dist) else 1e9),
+    ]
+
+
+def maybe_update_best(state: dict, run_root: Path, run_dir: Path, iteration: int,
+                      metrics: dict | None, select_on: str, ckpt: str) -> bool:
+    """Publish `run_dir` as best/ if it beats the incumbent. Returns True if so."""
+    if metrics is None:
+        return False
+    score = score_tuple(metrics, select_on)
+    incumbent = (state.get("best") or {}).get("score_tuple")
+    # A stored tuple of a different length is from a run made before the metric
+    # set changed; its numbers are not comparable, so ignore it rather than let
+    # Python's shorter-list-is-smaller rule silently decide the comparison.
+    if incumbent is not None and len(incumbent) == len(score) and score <= list(incumbent):
+        return False
+    state["best"] = {"iter": iteration, "metric": select_on,
+                     "score": score[0], "score_tuple": score,
+                     "run_dir": str(run_dir)}
+    export_run_dir(run_dir, run_root / "best", ckpt=ckpt,
+                   note=f"DAgger iteration {iteration} — best {select_on}={score[0]:.4f}")
+    print(f"  [best] new best {select_on}={score[0]:.4f} (iteration {iteration})")
+    return True
+
+
+def load_state(path: Path) -> dict:
+    if path.exists():
+        with path.open() as f:
+            return json.load(f)
+    return {"iterations": [], "best": None, "cursor": 0}
+
+
+def save_state(path: Path, state: dict) -> None:
+    tmp = path.with_suffix(".json.tmp")
+    with tmp.open("w") as f:
+        json.dump(state, f, indent=2)
+    tmp.replace(path)
+
+
+# Fixed column set. Rows are written by two call sites (the base iteration and
+# the DAgger iterations) whose natural key sets differ; deriving fieldnames from
+# whichever row lands first silently mis-aligns every later row against the
+# header, so pin the columns here and let missing keys blank out.
+#
+# Grouped by the question each group answers — see examples/plot_dagger_run.py,
+# which renders exactly these:
+#   1. did it learn        eval rates + pose errors on held-out scenes
+#   2. why did it fail     eval outcome breakdown (fractions, stack to 1)
+#   3. is DAgger working   collection stats: how far the LEARNER got on its own
+#   4. are labels sane     expert-label scale + coverage of the endgame
+#   5. is the fit healthy  train/val loss of the refit on the growing aggregate
+#   6. what did it cost    wall time split by phase
+LOG_FIELDS = [
+    # -- identity / schedule
+    "iter", "beta", "m",
+    # -- (3) collection: what the learner's own rollouts looked like
+    "episodes", "steps", "skipped", "pinned",
+    "reached_standoff", "reached_grasp", "reach_steps",
+    "omg_fail", "goal_switch", "expert_steps", "policy_closed",
+    "mean_min_pos", "mean_min_rot", "mean_policy_close_step",
+    "c_close_label", "c_policy_close", "c_max_steps", "c_env_done", "c_no_labels",
+    "c_omg_fail0",
+    # -- did a revisited scene still aim at the same grasp (pin verification)
+    "revisits", "grasp_mismatch", "max_grasp_drift",
+    # -- (4) labels
+    "close_labels", "approach_labels", "mean_label_pos", "tiny_labels",
+    # -- aggregate D the refit sees
+    "aggregate_files", "D_episodes", "D_steps", "D_dagger_frac",
+    # -- (5) the refit itself
+    "epochs", "train_loss", "train_grip_acc", "val_loss", "val_grip_acc",
+    "best_val_loss",
+    # -- (1) eval
+    "success_rate", "grasp_rate", "near_rate", "close_rate",
+    "close_success_rate", "chance_rate", "missed_rate", "miss_given_chance",
+    "eval_min_pos", "eval_min_rot",
+    "mean_dist", "mean_pos_err", "mean_rot_err", "mean_close_step",
+    # -- (2) eval outcome breakdown, fractions of the eval set
+    "f_grasp_ok", "f_grasp_miss", "f_no_release", "f_drop", "f_timeout",
+    "f_human_contact",
+    # -- (6)
+    "is_best", "collect_s", "train_s", "eval_s", "wall_s",
+]
+
+# collector `reason` -> column, and evaluator `reason` -> column. Anything not
+# listed is dropped from the CSV rather than silently mis-filed, so a new reason
+# string shows up as a gap in the stack plot instead of a wrong count.
+COLLECT_REASONS = {"CLOSE_LABEL": "c_close_label", "POLICY_CLOSE": "c_policy_close",
+                   "MAX_STEPS": "c_max_steps", "ENV_DONE": "c_env_done",
+                   "NO_LABELS": "c_no_labels", "OMG_FAIL_STEP0": "c_omg_fail0"}
+EVAL_REASONS = {"GRASP_OK": "f_grasp_ok", "GRASP_MISS": "f_grasp_miss",
+                "NO_RELEASE": "f_no_release", "DROP": "f_drop",
+                "TIMEOUT": "f_timeout", "HUMAN_CONTACT": "f_human_contact"}
+
+
+def reason_columns(reasons: dict, mapping: dict, denom: int | None = None) -> dict:
+    """Spread a {reason: count} dict over its fixed columns.
+
+    `denom` converts to fractions (eval, so the categories stack to 1.0); None
+    keeps raw counts (collection, where `m` varies with the config).
+    """
+    out = {v: 0 for v in mapping.values()}
+    for reason, count in (reasons or {}).items():
+        # `_status_name` can OR two failures into "DROP|HUMAN_CONTACT"; charge
+        # the episode to each so no episode goes missing from the breakdown.
+        for part in str(reason).split("|"):
+            col = mapping.get(part)
+            if col is not None:
+                out[col] += count
+    if denom:
+        out = {k: round(v / denom, 4) for k, v in out.items()}
+    return out
+
+
+def _r(value, nd: int = 4):
+    """Round for the CSV, but leave a missing/NaN value BLANK rather than writing
+    'nan' — a blank cell plots as a gap, 'nan' can parse as a data point."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return round(v, nd) if np.isfinite(v) else ""
+
+
+def eval_columns(m: dict | None) -> dict:
+    """The eval half of a log row: rates, pose errors, outcome breakdown."""
+    if not m:
+        return {}
+    out = {k: _r(m.get(k)) for k in (
+        "success_rate", "grasp_rate", "near_rate", "close_rate",
+        "close_success_rate", "chance_rate", "missed_rate", "miss_given_chance",
+        "eval_min_pos", "eval_min_rot",
+        "mean_dist", "mean_pos_err", "mean_rot_err", "mean_close_step")}
+    out.update(reason_columns(m.get("reasons"), EVAL_REASONS, denom=m.get("n") or None))
+    return out
+
+
+def collect_columns(c: dict) -> dict:
+    """The collection half: how far the LEARNER's own rollouts got, and whether
+    the expert labels on them are still usable."""
+    return {
+        "episodes": c["episodes"], "steps": c["steps"], "skipped": c["skipped"],
+        "pinned": c.get("pinned", -1),
+        "reached_standoff": c.get("reached_standoff", -1),
+        "reached_grasp": c.get("reached_grasp", -1),
+        "reach_steps": c.get("n_reach_steps", -1),
+        "omg_fail": c["n_omg_fail"], "goal_switch": c["n_goal_switch"],
+        "expert_steps": c["n_expert_steps"], "policy_closed": c["policy_closed"],
+        "mean_min_pos": _r(c.get("mean_min_pos")),
+        "mean_min_rot": _r(c.get("mean_min_rot")),
+        "mean_policy_close_step": _r(c.get("mean_policy_close_step"), 2),
+        "close_labels": c.get("n_close_labels", -1),
+        "approach_labels": c.get("n_approach_labels", -1),
+        "mean_label_pos": _r(c.get("mean_label_pos")),
+        "tiny_labels": c.get("n_tiny_labels", -1),
+        "revisits": c.get("n_revisits", -1),
+        "grasp_mismatch": c.get("n_grasp_mismatch", -1),
+        "max_grasp_drift": _r(c.get("max_grasp_drift")),
+        **reason_columns(c.get("reasons"), COLLECT_REASONS),
+    }
+
+
+def dataset_size(files: list[str]) -> tuple[int, int]:
+    """(episodes, steps) across the HDF5 files the refit will train on."""
+    n_ep = n_steps = 0
+    for path in files:
+        if not path or not os.path.exists(path):
+            continue
+        with h5py.File(path, "r") as f:
+            for name in f:
+                grp = f[name]
+                if isinstance(grp, h5py.Group) and "num_steps" in grp.attrs:
+                    n_ep += 1
+                    n_steps += int(grp.attrs["num_steps"])
+    return n_ep, n_steps
+
+
+def read_train_log(run_dir: Path) -> dict:
+    """Last-epoch and best metrics from an iteration's own per-epoch log.csv.
+
+    Read back from disk rather than returned by the trainer so the columns are
+    filled on RESUME too, when training is skipped entirely.
+    """
+    path = Path(run_dir) / "log.csv"
+    if not path.exists():
+        return {}
+    with path.open() as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return {}
+
+    def get(row, key):
+        try:
+            return float(row.get(key, ""))
+        except (TypeError, ValueError):
+            return float("nan")
+
+    last = rows[-1]
+    vals = [get(r, "val_total") for r in rows]
+    finite = [v for v in vals if np.isfinite(v)]
+    return {
+        "epochs": len(rows),
+        "train_loss": _r(get(last, "train_total")),
+        "train_grip_acc": _r(get(last, "train_gripper_acc")),
+        "val_loss": _r(get(last, "val_total")),
+        "val_grip_acc": _r(get(last, "val_gripper_acc")),
+        "best_val_loss": _r(min(finite)) if finite else "",
+    }
+
+
+def log_row(path: Path, row: dict) -> None:
+    write_header = not path.exists()
+    with path.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore")
+        if write_header:
+            w.writeheader()
+        w.writerow({k: row.get(k, "") for k in LOG_FIELDS})
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--cfg-file", default="examples/configs/dagger_phase4.yaml")
+    p.add_argument("--run-name", default=None,
+                   help="subdir of --out-root; default: timestamped")
+    p.add_argument("--out-root", default="output/dagger_runs")
+    p.add_argument("--num-iters", type=int, default=None, help="override DAGGER.num_iters")
+    p.add_argument("--episodes-per-iter", type=int, default=None,
+                   help="override DAGGER.episodes_per_iter (m in the paper)")
+    p.add_argument("--base-run", default=None,
+                   help="override TRAIN.base_run: start from an existing ACT run")
+    p.add_argument("--device", default=None, help="override TRAIN.device")
+    p.add_argument("--seed", type=int, default=None, help="override DAGGER.seed")
+    p.add_argument("--no-eval", action="store_true", help="disable evaluation (EVAL.every=0)")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    cfg4 = load_yaml(args.cfg_file)
+    sim_cfg_d, dag, trn, ev = cfg4["SIM"], cfg4["DAGGER"], cfg4["TRAIN"], cfg4["EVAL"]
+
+    if args.num_iters is not None:
+        dag["num_iters"] = args.num_iters
+    if args.episodes_per_iter is not None:
+        dag["episodes_per_iter"] = args.episodes_per_iter
+    if args.base_run is not None:
+        trn["base_run"] = args.base_run
+    if args.device is not None:
+        trn["device"] = args.device
+    if args.seed is not None:
+        dag["seed"] = args.seed
+    if args.no_eval:
+        ev["every"] = 0
+
+    device = str(trn.get("device", "cuda"))
+    seed = int(dag.get("seed", 0))
+    num_iters = int(dag["num_iters"])
+    set_seed(seed)
+
+    run_name = args.run_name or time.strftime("dagger4_%Y%m%d_%H%M%S")
+    run_root = Path(args.out_root) / run_name
+    (run_root / "data").mkdir(parents=True, exist_ok=True)
+    (run_root / "iters").mkdir(exist_ok=True)
+    with (run_root / "config.yaml").open("w") as f:
+        yaml.safe_dump(cfg4, f, sort_keys=False)
+
+    state = load_state(run_root / "state.json")
+    done_iters = {int(r["iter"]): r for r in state["iterations"]}
+
+    # ----- simulator (one env: OMG for collection, benchmark for eval) -----
+    sim_cfg = build_sim_cfg(sim_cfg_d)
+    sim = build_sim_context(sim_cfg, sim_cfg_d, seed=seed)
+    pool, eval_scenes = scene_pools(sim.num_scenes, ev)
+
+    train_cfg = load_yaml(trn["train_cfg"])
+    learner = policy_kind(train_cfg)   # "bc" (single frame) | "act" (chunking)
+
+    collect_params = CollectParams(
+        max_steps=int(dag.get("max_steps", 30)),
+        close_pos_thresh=float(dag.get("close_pos_thresh", 0.02)),
+        close_rot_thresh=float(dag.get("close_rot_thresh", 0.34)),
+        stop_on_close_label=bool(dag.get("stop_on_close_label", True)),
+        stop_on_policy_close=bool(dag.get("stop_on_policy_close", True)),
+        ee_step=float(dag.get("ee_step", 0.04)),
+        reach_tail=int(dag.get("reach_tail", 5)),
+        min_free=int(dag.get("min_free", 3)),
+        max_horizon=int(dag.get("max_horizon", 40)),
+        # The step-0 plan has no standoff to size a distance-proportional horizon
+        # from, so it falls back to the horizon the demonstrations were planned
+        # with (collect_bc_dataset.py uses cfg.RL_MAX_STEP).
+        first_horizon=int(dag.get("first_horizon") or sim_cfg.RL_MAX_STEP),
+        reach_commit_dist=float(dag.get("reach_commit_dist", 0.05)),
+        reach_skip_eps=float(dag.get("reach_skip_eps", 0.01)),
+    )
+    # One committed grasp per scene, shared with the demonstrations. Without it
+    # OMG re-selects its goal on every replan and the target can move mid-episode.
+    pin_table = load_grasp_pin_table(
+        sim_cfg_d.get("grasp_pin_table"),
+        match_tol=float(sim_cfg_d.get("grasp_pin_match_tol", 0.02)),
+        sim_cfg_block=sim_cfg_d)
+    # Verification, not enforcement: the pin can silently fail to apply (scene
+    # missing from the table, stale pose, OMG failure at step 0), and a scene
+    # revisited in a later iteration would then be labelled towards a DIFFERENT
+    # grasp. `goal_switch` cannot see that — it is per-episode.
+    registry = GraspRegistry(run_root / "grasp_registry.json",
+                             tol=float(sim_cfg_d.get("grasp_pin_match_tol", 0.02)))
+
+    # Success is the PHASE-3 criterion (hold the close, object secured), not the
+    # benchmark's carry-to-GOAL_CENTER SUCCESS — Phase 4 has no retreat, so the
+    # benchmark's flag could never fire. The proximity thresholds are taken from
+    # the DAgger block so `proximity` mode scores exactly the predicate the
+    # collector uses to emit its CLOSE label.
+    eval_params = EvalParams(
+        max_steps=int(ev.get("max_steps", 30)),
+        success_mode=str(ev.get("success_mode", "stable_grasp")),
+        hold_steps=int(ev.get("hold_steps", 3)),
+        close_pos_thresh=collect_params.close_pos_thresh,
+        close_rot_thresh=collect_params.close_rot_thresh,
+        verbose=bool(ev.get("verbose", False)))
+    eval_every = int(ev.get("every", 1))
+    eval_ckpt = str(ev.get("ckpt", "best"))
+    select_on = str(ev.get("select_on", "success_rate"))
+
+    print("=" * 78)
+    print(f"Phase-4 DAgger   run={run_name}")
+    print(f"  scenes        : {sim.num_scenes} (split={sim_cfg.BENCHMARK.SPLIT})  "
+          f"pool={len(pool)}  eval={len(eval_scenes)}"
+          f"{' [held out]' if ev.get('holdout', True) else ''}")
+    print(f"  learner       : {learner}"
+          f"{' (single frame)' if learner == 'bc' else ' (temporal + chunking)'}"
+          f"   <- {trn['train_cfg']}")
+    print(f"  iterations    : {num_iters}  x  m={dag['episodes_per_iter']} episodes")
+    print(f"  beta schedule : {dag.get('beta_schedule')}  "
+          f"(iter1={beta_at(1, dag, num_iters):.3f}, "
+          f"iter{num_iters}={beta_at(num_iters, dag, num_iters):.3f})")
+    print(f"  grasp pinning : "
+          f"{pin_table.describe() if pin_table else 'OFF (OMG re-selects every replan)'}")
+    print(f"  close label   : pos<={collect_params.close_pos_thresh} m  "
+          f"rot<={collect_params.close_rot_thresh} rad")
+    print(f"  eval success  : {eval_params.success_mode}"
+          + (f" (hold {eval_params.hold_steps} steps, then released & not dropped)"
+             if eval_params.success_mode == "stable_grasp"
+             else " (EE within the CLOSE tolerances of the grasp pose)")
+          + "  [Phase-3 criterion; no carry-to-goal]")
+    print(f"  refit         : {'from scratch (FTL)' if trn.get('train_from_scratch', True) else 'warm start'}")
+    print(f"  run dir       : {run_root}")
+    print("=" * 78)
+
+    log_path = run_root / "dagger_log.csv"
+    dagger_files: list[str] = []
+
+    # ----- iteration 0: the base policy (the paper's beta_1 = 1 iteration) -----
+    if trn.get("base_run"):
+        base_dir = Path(trn["base_run"])
+        print(f"[iter 00] using existing base run {base_dir}")
+    elif 0 in done_iters:
+        base_dir = Path(done_iters[0]["run_dir"])
+        print(f"[iter 00] already trained: {base_dir}")
+    else:
+        print(f"[iter 00] training the base policy on {trn['base_train_h5']} "
+              f"({trn['base_epochs']} epochs)")
+        base_dir = train_on_aggregate(
+            train_cfg, [trn["base_train_h5"]], trn.get("val_h5"),
+            run_root / "iters" / "iter_00", epochs=int(trn["base_epochs"]),
+            device=device, num_workers=int(trn.get("num_workers", 2)), seed=seed)
+
+    if 0 not in done_iters:
+        rec = {"iter": 0, "run_dir": str(base_dir), "dagger_h5": None,
+               "beta": 1.0, "eval": None}
+        state["iterations"].append(rec)
+        done_iters[0] = rec
+        save_state(run_root / "state.json", state)
+
+    # The paper returns the best policy over the WHOLE sequence pi_1..pi_N, and
+    # pi_1 (the base run on expert data alone) is part of that sequence — so it
+    # has to be scored too, or a DAgger iteration wins the comparison by default.
+    if eval_every > 0 and eval_scenes and done_iters[0].get("eval") is None:
+        runner, _ = load_policy_runner(base_dir, device, ckpt=eval_ckpt)
+        print(f"[iter 00] evaluating the base policy on {len(eval_scenes)} held-out scenes ...")
+        base_metrics = evaluate_policy(sim, runner, eval_scenes, params=eval_params,
+                                       pin_table=pin_table)
+        base_metrics.pop("rows")
+        del runner
+        if device != "cpu":
+            torch.cuda.empty_cache()
+        print(f"[iter 00] success={base_metrics['success_rate']:.3f} "
+              f"grasp={base_metrics['grasp_rate']:.3f} "
+              f"near={base_metrics['near_rate']:.3f} "
+              f"close={base_metrics['close_rate']:.3f} "
+              f"chance={base_metrics['chance_rate']:.3f} "
+              f"min_pos={base_metrics['eval_min_pos']:.3f} m "
+              f"min_rot={base_metrics['eval_min_rot']:.3f} rad")
+        done_iters[0]["eval"] = base_metrics
+        best0 = maybe_update_best(state, run_root, base_dir, 0, base_metrics,
+                                  select_on, eval_ckpt)
+        done_iters[0]["is_best"] = best0
+        export_run_dir(base_dir, run_root / "last", ckpt=eval_ckpt,
+                       note="DAgger iteration 0 (base policy)")
+        save_state(run_root / "state.json", state)
+        d_ep, d_steps = dataset_size([trn["base_train_h5"]])
+        row0 = {
+            "iter": 0, "beta": 1.0, "m": 0, "episodes": 0, "steps": 0,
+            "skipped": 0, "aggregate_files": 1,
+            "D_episodes": d_ep, "D_steps": d_steps, "D_dagger_frac": 0.0,
+            "is_best": int(best0), "wall_s": 0.0,
+        }
+        row0.update(read_train_log(base_dir))
+        row0.update(eval_columns(base_metrics))
+        log_row(log_path, row0)
+
+    cur_run_dir = Path(done_iters[max(done_iters)]["run_dir"])
+    dagger_files = [r["dagger_h5"] for r in state["iterations"] if r.get("dagger_h5")]
+
+    # ----- DAgger iterations -----
+    for i in range(1, num_iters + 1):
+        if i in done_iters:
+            cur_run_dir = Path(done_iters[i]["run_dir"])
+            print(f"[iter {i:02d}] already complete -> {cur_run_dir}")
+            continue
+
+        t0 = time.time()
+        beta = beta_at(i, dag, num_iters)
+        rng = np.random.RandomState(seed * 10_000 + i)
+        scenes, state["cursor"] = sample_scenes(
+            pool, int(dag["episodes_per_iter"]),
+            str(dag.get("scene_sampling", "random")), rng, int(state.get("cursor", 0)))
+
+        print(f"\n{'='*78}\n[iter {i:02d}/{num_iters}]  beta={beta:.3f}  "
+              f"m={len(scenes)} scenes  policy={cur_run_dir}\n{'='*78}")
+
+        # --- D_i: roll out the CURRENT policy, label every visited state ---
+        t_collect = time.time()
+        h5_path = run_root / "data" / f"dagger_iter_{i:02d}.h5"
+        if h5_path.exists():
+            with h5py.File(h5_path, "r") as f:
+                n_ep = int(f.attrs.get("num_episodes", 0))
+            print(f"  [collect] reusing existing {h5_path.name} ({n_ep} episodes)")
+            cstats = {"episodes": n_ep, "steps": -1, "skipped": -1,
+                      "reached_standoff": -1, "n_reach_steps": -1,
+                      "reached_grasp": -1, "n_omg_fail": -1, "n_goal_switch": -1,
+                      "n_expert_steps": -1, "policy_closed": -1,
+                      "mean_min_pos": float("nan"), "mean_min_rot": float("nan"),
+                      "mean_policy_close_step": float("nan"),
+                      "n_close_labels": -1, "n_approach_labels": -1,
+                      "mean_label_pos": float("nan"), "n_tiny_labels": -1,
+                      "n_revisits": -1, "n_grasp_mismatch": -1,
+                      "max_grasp_drift": float("nan"),
+                      "reasons": {}, "path": str(h5_path)}
+        else:
+            runner, _ = load_policy_runner(cur_run_dir, device, ckpt=eval_ckpt)
+            print(f"  [collect] {len(scenes)} episodes -> {h5_path.name}")
+            cstats = collect_iteration(
+                sim, runner, scenes, h5_path, rng=rng,
+                beta=beta, params=collect_params, pin_table=pin_table,
+                registry=registry, iteration=i)
+            del runner
+            if device != "cpu":
+                torch.cuda.empty_cache()
+            print(f"  [collect] episodes={cstats['episodes']} steps={cstats['steps']} "
+                  f"standoff={cstats.get('reached_standoff', -1)} "
+                  f"grasp={cstats['reached_grasp']} pinned={cstats.get('pinned', -1)} "
+                  f"skipped={cstats['skipped']} "
+                  f"omg_fail={cstats['n_omg_fail']} reasons={cstats['reasons']}")
+
+        collect_s = time.time() - t_collect
+
+        if cstats["episodes"] == 0:
+            print(f"  [iter {i:02d}] no episodes collected — stopping.")
+            break
+        dagger_files.append(str(h5_path))
+
+        # --- refit on the aggregate D = base u D_1 u ... u D_i ---
+        t_train = time.time()
+        iter_dir = run_root / "iters" / f"iter_{i:02d}"
+        init_from = None if bool(trn.get("train_from_scratch", True)) else cur_run_dir
+        train_on_aggregate(
+            train_cfg, [trn["base_train_h5"]] + dagger_files, trn.get("val_h5"),
+            iter_dir, epochs=int(trn["iter_epochs"]), device=device,
+            num_workers=int(trn.get("num_workers", 2)), init_from=init_from,
+            seed=seed + i)
+        cur_run_dir = iter_dir
+        train_s = time.time() - t_train
+
+        # --- evaluate: DAgger returns the BEST policy over the sequence ---
+        t_eval = time.time()
+        eval_s = 0.0          # stays 0 on the iterations EVAL.every skips
+        emetrics = None
+        if eval_every > 0 and eval_scenes and (i % eval_every == 0 or i == num_iters):
+            runner, _ = load_policy_runner(iter_dir, device, ckpt=eval_ckpt)
+            print(f"  [eval] {len(eval_scenes)} held-out scenes ...")
+            emetrics = evaluate_policy(sim, runner, eval_scenes, params=eval_params,
+                                       pin_table=pin_table)
+            emetrics.pop("rows")
+            del runner
+            if device != "cpu":
+                torch.cuda.empty_cache()
+            print(f"  [eval] success={emetrics['success_rate']:.3f} "
+                  f"grasp={emetrics['grasp_rate']:.3f} "
+                  f"near={emetrics['near_rate']:.3f} "
+                  f"close={emetrics['close_rate']:.3f} "
+                  f"(success|close={emetrics['close_success_rate']:.3f})")
+            print(f"  [eval] chance={emetrics['chance_rate']:.3f} "
+                  f"missed={emetrics['missed_rate']:.3f} "
+                  f"min_pos={emetrics['eval_min_pos']:.3f} m "
+                  f"min_rot={emetrics['eval_min_rot']:.3f} rad "
+                  f"ee->ycb={emetrics['mean_dist']:.3f} m")
+        eval_s = time.time() - t_eval
+
+        # --- best / last snapshots ---
+        export_run_dir(iter_dir, run_root / "last", ckpt=eval_ckpt,
+                       note=f"DAgger iteration {i} (last)")
+        is_best = maybe_update_best(state, run_root, iter_dir, i, emetrics,
+                                    select_on, eval_ckpt)
+
+        wall = time.time() - t0
+        rec = {"iter": i, "run_dir": str(iter_dir), "dagger_h5": str(h5_path),
+               "beta": beta, "scenes": scenes, "collect": cstats,
+               "eval": emetrics, "is_best": is_best, "wall_s": round(wall, 1)}
+        state["iterations"].append(rec)
+        done_iters[i] = rec
+        save_state(run_root / "state.json", state)
+
+        # D as the refit actually saw it: demonstrations + every D_j so far.
+        # `D_dagger_frac` is the axis that separates "DAgger helps" from "more
+        # data helps" — success against |D| with the on-policy share alongside.
+        d_ep, d_steps = dataset_size([trn["base_train_h5"]] + dagger_files)
+        _, dag_steps = dataset_size(dagger_files)
+
+        row = {
+            "iter": i, "beta": round(beta, 4), "m": len(scenes),
+            "aggregate_files": len(dagger_files) + 1,
+            "D_episodes": d_ep, "D_steps": d_steps,
+            "D_dagger_frac": _r(dag_steps / d_steps if d_steps else float("nan")),
+            "is_best": int(is_best),
+            "collect_s": round(collect_s, 1), "train_s": round(train_s, 1),
+            "eval_s": round(eval_s, 1), "wall_s": round(wall, 1),
+        }
+        row.update(collect_columns(cstats))
+        row.update(read_train_log(iter_dir))
+        row.update(eval_columns(emetrics))
+        log_row(log_path, row)
+
+    print("\n" + "=" * 78)
+    print(f"Done. {len(dagger_files)} DAgger iterations aggregated.")
+    if (run_root / "last").exists():
+        print(f"  last : {run_root / 'last'}")
+    if state["best"]:
+        b = state["best"]
+        print(f"  best : {run_root / 'best'}  "
+              f"(iteration {b['iter']}, {b['metric']}={b['score']:.4f})")
+    else:
+        print("  best : not selected (evaluation was disabled)")
+    print(f"  log  : {log_path}")
+    print("=" * 78)
+
+
+if __name__ == "__main__":
+    main()

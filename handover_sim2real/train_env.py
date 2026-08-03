@@ -229,6 +229,137 @@ class HandoverSim2RealTrainEnv(HandoverHandCameraPointStateEnv):
         pts = pts[np.linalg.norm(pts - obj[None], axis=1) < self._hand_points_radius]
         return pts if len(pts) > 0 else None
 
+    def _effective_goal_set(self):
+        """(n, 9) the joint configs OMG actually selects among.
+
+        Mirrors `setup_goal_set`: `target_obj.grasps` holds the STANDOFF configs
+        (== `reach_grasps[:, 0]`, 6.4 cm back along the approach), and under
+        `use_standoff` the goal set is `reach_grasps[:, -1]` — the pose the
+        gripper closes at. OMG's own hand filter is careful about this
+        (planner.py: "Check the FINAL grasp ... not the standoff configs ...
+        which sit 8 cm back and never collide"), and so must anything that ranks
+        or pins grasps: a clearance measured at the standoff is not the clearance
+        that matters. Both arrays are parallel, so an index is valid for either.
+        """
+        scene_env = self._omg_planner._scene.env
+        obj = scene_env.objects[scene_env.target_idx]
+        reach = np.asarray(obj.reach_grasps)
+        if omg_cfg.use_standoff and reach.ndim == 3 and len(reach) > 0:
+            return reach[:, -1]
+        return np.asarray(obj.grasps)
+
+    def grasp_hand_clearances(self, goal_set=None):
+        """(n,) metres: for each goal-set joint config, the minimum distance from
+        the gripper's control points (`hand_finger_point` placed at that grasp's
+        world EE pose) to the MANO hand.
+
+        This is the same geometry `_hand_grasp_collision_mask` thresholds, exposed
+        as a continuous score so a grasp can be *selected* by hand clearance
+        rather than merely rejected. Independent of `_hand_collision_filter`:
+        clearances are defined whether or not the filter is enabled.
+
+        `goal_set` defaults to the planner's effective goal set (the FINAL grasp
+        configs, not the standoff ones — see `_effective_goal_set`). Returns None
+        when no hand is present.
+        """
+        if goal_set is None:
+            goal_set = self._effective_goal_set()
+        goal_set = np.asarray(goal_set)
+        if len(goal_set) == 0:
+            return np.zeros(0)
+        hand_pts = self._mano_hand_points_world()
+        if hand_pts is None:
+            return None
+
+        out = np.empty(len(goal_set))
+        for i, q in enumerate(goal_set):
+            ee = unpack_pose(self._joint_to_world_ee_pose(q))              # 4x4 world
+            gp = (np.matmul(ee[:3, :3], hand_finger_point) + ee[:3, 3:4]).T  # [6, 3]
+            out[i] = np.linalg.norm(gp[:, None, :] - hand_pts[None, :, :], axis=-1).min()
+        return out
+
+    def goal_set_ee_poses(self):
+        """(n, 4, 4) world-frame EE poses of the planner's current goal set.
+
+        These are the FINAL grasp poses (where the gripper closes), not the
+        standoff poses — see `_effective_goal_set`. Used to match a stored grasp
+        back to an index: the goal set is rebuilt per episode and its ordering is
+        an IK artifact, so a pose is a far more durable key than an index."""
+        gs = self._effective_goal_set()
+        if len(gs) == 0:
+            return np.zeros((0, 4, 4))
+        return np.stack([unpack_pose(self._joint_to_world_ee_pose(q)) for q in gs])
+
+    def get_omg_goal_idx(self):
+        """Index of the grasp OMG selected in the last plan (`traj.goal_idx`).
+
+        The selection is `argmin ||traj.start - goal_set[i]||` in JOINT space,
+        recomputed on EVERY plan (omg/planner.py, `ol_alg='Proj'`), so it can move
+        as the robot drifts. Track THIS rather than comparing grasp poses:
+        `flip_grasp` augments the set with wrist-flipped duplicates that share an
+        EE position, so a pose comparison misses those switches entirely."""
+        return int(self._omg_planner._scene.traj.goal_idx)
+
+    def select_goal_grasp(self, mode="furthest_from_hand", tol=0.0):
+        """Index into the current goal set of the grasp to commit to.
+
+        mode:
+          "furthest_from_hand"  argmax of `grasp_hand_clearances()` — the grasp
+                                whose gripper geometry stays furthest from the
+                                human hand.
+          "omg"                 whatever OMG's own argmin picked (`traj.goal_idx`).
+
+        `tol` (metres) breaks near-ties in favour of OMG's pick: among grasps
+        within `tol` of the best clearance, keep OMG's choice if it qualifies.
+        With tol=0 this is a pure argmax. Measured, a pure argmax can move the
+        grasp 8.5 cm to gain 0.1 mm of clearance, so a tol of ~0.01 is usually
+        what you want; the default stays 0 so the rule is exactly as stated.
+
+        Returns None when the goal set is empty or no hand is present.
+        """
+        clr = self.grasp_hand_clearances()
+        if clr is None or len(clr) == 0:
+            return None
+        if mode == "omg":
+            return self.get_omg_goal_idx()
+        if mode != "furthest_from_hand":
+            raise ValueError("mode must be 'furthest_from_hand' or 'omg'")
+        best = int(np.argmax(clr))
+        if tol > 0.0:
+            omg_i = self.get_omg_goal_idx()
+            if 0 <= omg_i < len(clr) and clr[best] - clr[omg_i] <= tol:
+                return omg_i
+        return best
+
+    def pin_goal_grasp(self, index):
+        """Prune the planner's goal set to the single grasp `index`.
+
+        OMG re-decides `goal_idx = argmin ||traj.start - goal_set[i]||` on every
+        plan, so with the policy driving, the goal grasp can switch mid-episode
+        (measured: 32/90 replans under +-15 cm perturbation, up to 4 distinct
+        grasps on one scene, shifting the target by up to 10 cm). Labels that
+        point at grasp A for ten steps and grasp B for the next ten are exactly
+        the kind of inconsistency DAgger cannot average away. With one element in
+        the goal set the argmin is constant by construction.
+
+        Two things this must get right, both found the hard way:
+          * `grasp_potentials` is NOT parallel to `grasps` under `ol_alg='Proj'`
+            (it is unused there) — indexing it raises IndexError. Leave it.
+          * `traj.goal_idx` MUST be reset. `goal_set_projection` indexes
+            `reach_grasps[traj.goal_idx]` during optimization, before
+            `setup_goal_set` recomputes the index, so a stale index blows up on
+            the pruned array.
+
+        Call after a successful `run_omg_planner`; `reset_scene=True` rebuilds the
+        goal set, so re-pin once per episode.
+        """
+        scene = self._omg_planner._scene
+        obj = scene.env.objects[scene.env.target_idx]
+        i = int(index)
+        obj.reach_grasps = np.asarray(obj.reach_grasps)[[i]]
+        obj.grasps = np.asarray(obj.grasps)[[i]]
+        scene.traj.goal_idx = 0
+
     def _hand_grasp_collision_mask(self, goal_set):
         """Boolean [n] mask (True = keep) for OMG's IK'd goal-set joint configs:
         rejects a grasp if any gripper control point (`hand_finger_point`, placed

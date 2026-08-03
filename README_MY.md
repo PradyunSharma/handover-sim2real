@@ -1609,3 +1609,132 @@ while true; do clear; awk -F, 'NR>1{printf "it %-4s buf %-6s roll_succ %-5s roll
 Columns (1-indexed): `1`=iter `2`=buffer `6`=roll_succ `20`=roll_minpos `22`=skip
 `38`=eval_succ `39`=best. Watch `eval_succ`/`best` trend up; `roll_minpos` is the
 closest EE→grasp approach (the reach metric).
+
+---
+
+## Phase-4: DAgger the way the paper states it (Python loop)
+
+`examples/train_dagger_phase4.py` runs **Algorithm 3.1 of Ross et al. (2011)**
+as a single Python loop — no shell driver. The simulator, the OMG planner and
+the model stay resident across iterations.
+
+The learner is the **Phase-1 single-frame policy** by default. The loop is
+policy-agnostic: point `TRAIN.train_cfg` at `act_phase2.yaml` and the same loop
+drives the Phase-2 chunking policy instead (the kind is inferred from that
+config, so there is no second switch to keep in sync).
+
+```bash
+export GADDPG_DIR=$PWD/GA-DDPG OMG_PLANNER_DIR=$PWD/OMG-Planner
+
+# from an existing base run of the SAME policy kind
+# (recommended — that base run IS the paper's beta=1 iteration)
+python examples/train_dagger_phase4.py \
+    --cfg-file examples/configs/dagger_phase4.yaml \
+    --run-name dagger4_run1 \
+    --base-run output/bc_runs/run2
+
+# or let it train the base policy itself (TRAIN.base_run: null in the yaml)
+python examples/train_dagger_phase4.py --cfg-file examples/configs/dagger_phase4.yaml \
+    --run-name dagger4_run1
+```
+
+What changed versus `run_dagger_act.sh`:
+
+| | `run_dagger_act.sh` | Phase 4 |
+|---|---|---|
+| batch size `m` | all ~700 scenes per round, 3 rounds | `episodes_per_iter: 20`, `num_iters: 20` — the paper's `m = O(1)`, large `N` |
+| expert query | every recorded step, **approach only** (cut at the standoff plane) | every step, **whole episode** |
+| gripper label | always OPEN | **CLOSE once `pos_err <= 0.02 m` and `rot_err <= 0.34 rad`** from the plan's grasp pose |
+| plan | to the standoff | to the standoff **and the reach beyond it** (`use_standoff`) |
+| grasp set | OMG default | **Phase-3's `valid_grasp_dict_005.pkl`**, plus **one pinned grasp per scene** (`SIM.grasp_pin_table`) |
+| policy kept | last round | **`best/` (held-out eval) and `last/`** |
+| eval success | benchmark carry-to-`GOAL_CENTER` | **the Phase-3 criterion**, imported from `rl/rollout_worker.py` |
+| endgame | n/a (recording stopped at the standoff) | **committed reach tail at the standoff, then CLOSE** |
+| horizon | `MAX_STEPS=25` | **`max_steps: 50`** (the EE realises only ~60% of a commanded delta) |
+
+**One grasp per scene.** OMG re-decides its goal on every plan
+(`argmin ‖traj.start − goal_set[i]‖` in *joint* space), so with a replan every
+step the target can move mid-episode — and need not match what the demonstrations
+aimed at. `examples/build_grasp_pin_table.py` commits one grasp per scene (default
+rule: furthest from the hand) keyed on its **world pose**, and both
+`collect_bc_dataset.py --grasp-pin-table` and Phase 4 load it. Rebuild it whenever
+`valid_grasp_dict_path` / `hand_collision_filter` change — those change which
+candidates exist.
+
+**Success is the Phase-3 criterion, not the benchmark's.** Phase 4 ends the
+episode at the committed close; there is no carry-to-goal, so the benchmark's
+`EpisodeStatus.SUCCESS` (hand dwelling in a 15 cm ball at `GOAL_CENTER`) can never
+fire. `EVAL.success_mode`:
+
+- **`stable_grasp`** (default, what every recent Phase-3 run uses) — hold the
+  gripper shut `hold_steps` policy-steps, then require the object *secured*:
+  handover-sim's release handshake fired ∧ not dropped ∧ no human contact. No OMG
+  calls, so an eval sweep is cheap.
+- **`proximity`** — EE within (`close_pos_thresh`, `close_rot_thresh`) of the
+  grasp pose at the close: the *same* predicate the collector uses for its CLOSE
+  label, so it scores label agreement rather than task outcome.
+
+Both are imported from `rl/rollout_worker.py`, so Phase 4's number and Phase 3's
+reward cannot drift apart. Four rates are logged, ordered by how much each demands
+— `close_rate` → `near_rate` → `grasp_rate` → `success_rate` — and the gaps
+localise the failure: closing in the wrong place, closing right but not gripping,
+gripping then losing it.
+
+Run dir `output/dagger_runs/<name>/`: `state.json`, `dagger_log.csv`,
+`data/dagger_iter_NN.h5`, `iters/iter_NN/`, and `best/` + `last/` — the last two
+are standalone run dirs, so:
+
+```bash
+python examples/rollout_bc_policy.py --run-dir output/dagger_runs/dagger4_run1/best \
+    --cfg-file examples/pretrain.yaml --benchmark --no-render
+# (rollout_act_policy.py instead, if train_cfg pointed at act_phase2.yaml)
+```
+
+Re-run the same command to **resume**: completed iterations are skipped, a
+finished-but-untrained collection is reused, and an interrupted training
+continues from its `last.pt`.
+
+### Plotting a run
+
+`dagger_log.csv` gets one row per iteration, appended and flushed as the loop
+runs, so it can be plotted **while training** — the plotter only reads it:
+
+```bash
+python examples/plot_dagger_run.py output/dagger_runs/dagger4_run1
+# -> <run>/curves.png  and  <run>/curves_diag.png
+```
+
+`curves.png` (did it learn): the four nested eval rates, pose error at the close
+(position *and* rotation), the outcome breakdown as a stacked area, how far the
+learner's own rollouts got, |D| with its on-policy share, and the refit's
+train/val loss. `curves_diag.png` (is the machinery healthy): expert-label scale,
+endgame coverage, planner/pinning counts, when each side closes, the beta mixing,
+and the wall-clock split.
+
+Six columns carry more weight than the rest:
+
+- **the rates are nested** (`close ≥ near`, `close ≥ grasp ≥ success`), so the
+  *gaps* localise the failure: closing in the wrong place → closing right but not
+  gripping → gripping then losing it.
+- **`eval_min_pos` / `eval_min_rot`** — closest EE→grasp position/rotation over
+  the whole episode. Defined even when the policy never closes, so they still
+  move while every rate reads 0. Rotation binds first, as in Phase 3.
+- **the conversion columns** split "never got there" from "got there and blew
+  it": `chance_rate` (ever reached a pose where closing *would* be correct — both
+  tolerances at the *same* step), `close_success_rate` (success | closed — when it
+  decides to grasp, is it right?), `missed_rate` / `miss_given_chance` (had the
+  chance, came away with nothing).
+- **`mean_label_pos`** is the standoff-stall detector. That failure decays the
+  approach labels to ~0 while step counts and rates still look normal; the label
+  scale collapsing away from `ee_step` is the only direct signal.
+- **`goal_switch`** should be flat 0 with the pin table loaded — that catches the
+  grasp moving *within* an episode.
+- **`grasp_mismatch`** must also be 0 — it catches the grasp moving *between*
+  iterations, which `goal_switch` structurally cannot see. `GraspRegistry` records
+  what each scene first aimed at in `<run>/grasp_registry.json` (survives resume)
+  and reports, rather than corrects, a scene that later aims somewhere else.
+- **`D_dagger_frac`** against `success_rate` is what separates "DAgger helps"
+  from "more data helps".
+
+Full design notes, including the trade-off from dropping the standoff cutoff:
+[`docs/thesis_phase4_dagger.md`](docs/thesis_phase4_dagger.md).

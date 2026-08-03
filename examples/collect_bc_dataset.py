@@ -169,12 +169,19 @@ def _point_cloud(obs, point_listener, panda_base_inv_tf):
 # ── episode collection ────────────────────────────────────────────────────────
 
 def collect_episode(env, point_listener, cfg, scene_idx,
-                    panda_base_inv_tf, steps_action_repeat):
+                    panda_base_inv_tf, steps_action_repeat, pin_table=None):
     """
     Run one episode and return a dict of arrays, or None if OMG planning fails.
 
     The approach plays the full OMG trajectory so the gripper actually reaches
     the grasp pose. One final gripper-close transition is appended at the end.
+
+    `pin_table` (examples/build_grasp_pin_table.py) forces the scene's committed
+    grasp. OMG otherwise picks `argmin ||traj.start - goal_set[i]||` from the home
+    configuration, which need not be what DAgger later picks from a drifted one —
+    measured, that disagreement affects ~1 scene in 5, by a median of 10.7 cm, and
+    the aggregate then holds two conflicting targets for the same scene. Pinning
+    needs a plan first (to build the goal set), then a replan to the pinned grasp.
     """
     obs = env.reset(idx=scene_idx)
     point_listener.reset()
@@ -182,6 +189,12 @@ def collect_episode(env, point_listener, cfg, scene_idx,
     expert_plan, _ = env.run_omg_planner(cfg.RL_MAX_STEP, scene_idx)
     if expert_plan is None:
         return None
+
+    if pin_table is not None and pin_table.apply(env, scene_idx):
+        expert_plan, _ = env.run_omg_planner(cfg.RL_MAX_STEP, scene_idx,
+                                             reset_scene=False)
+        if expert_plan is None:
+            return None
 
     stop_step  = len(expert_plan)
     prev_act6d = np.zeros(6, dtype=np.float32)
@@ -243,6 +256,13 @@ def parse_args():
     p.add_argument("--split",          default="train", choices=["train", "val", "test"])
     p.add_argument("--num-episodes",   type=int, default=None, help="max episodes to collect")
     p.add_argument("--seed",           type=int, default=0)
+    p.add_argument("--valid-grasp-dict", default=None,
+                   help="paper's offline hand-collision-filtered grasp dict "
+                        "(examples/valid_grasp_dict_005.pkl). MUST match what the "
+                        "DAgger/RL phases use, or they aim at different grasps.")
+    p.add_argument("--grasp-pin-table", default=None,
+                   help="per-scene committed grasp (examples/build_grasp_pin_table.py). "
+                        "Forces the same goal grasp the DAgger collector uses.")
     p.add_argument("--freeze-partial-pointcloud", action="store_true",
                    help="experimental: freeze the cloud to an early frame and hold "
                         "it for the whole episode, instead of the live cloud that "
@@ -272,6 +292,19 @@ def main():
         cfg.SIM.BULLET.USE_EGL = True   # GPU (NVIDIA) offscreen camera, headless
     np.random.seed(args.seed)
 
+    # The paper's offline hand-collision grasp filter must be on cfg.omg_config
+    # BEFORE the env is built: OMGPlanner.__init__ copies omg_config onto the
+    # global omg_cfg, so setting it afterwards is a no-op. Pass the SAME dict the
+    # DAgger/RL phases use or the two aim at different grasp sets (measured: ~1
+    # scene in 5 disagrees, median 10.7 cm apart).
+    if args.valid_grasp_dict:
+        from handover_sim2real.utils import resolve_valid_grasp_dict_path
+        _vgd = resolve_valid_grasp_dict_path(
+            {"valid_grasp_dict_path": args.valid_grasp_dict}, cfg.BENCHMARK.SETUP)
+        if _vgd is not None:
+            cfg.omg_config["valid_grasp_dict_path"] = _vgd
+            print(f"[valid_grasp_dict] paper hand-collision filter ON: {_vgd}")
+
     env            = HandoverBenchmarkWrapper(gym.make(cfg.ENV.ID, cfg=cfg))
     point_listener = PointListener(cfg, seed=args.seed)
 
@@ -286,6 +319,15 @@ def main():
 
     print(f"Collecting {num_scenes} episodes  split={args.split}  seed={args.seed}")
     print(f"Output: {args.output}")
+
+    pin_table = None
+    if args.grasp_pin_table:
+        from handover_sim2real.dagger import load_grasp_pin_table
+        pin_table = load_grasp_pin_table(
+            args.grasp_pin_table,
+            sim_cfg_block={"valid_grasp_dict_path": args.valid_grasp_dict,
+                           "hand_collision_filter": False,
+                           "split": args.split})   # scene indices are split-relative
 
     out_dir = os.path.dirname(os.path.abspath(args.output))
     os.makedirs(out_dir, exist_ok=True)
@@ -310,7 +352,7 @@ def main():
         for scene_idx in range(num_scenes):
             episode = collect_episode(
                 env, point_listener, cfg, scene_idx,
-                panda_base_inv_tf, steps_action_repeat,
+                panda_base_inv_tf, steps_action_repeat, pin_table=pin_table,
             )
 
             if episode is None:
