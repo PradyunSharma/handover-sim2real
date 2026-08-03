@@ -5,8 +5,12 @@
 #
 #   Default run:
 #     sbatch --export=ALL,RUN=dagger4_run1 examples/slurm/train_dagger_phase4.sbatch
-#   Short shakedown FIRST (2 iterations, 4 episodes, 6 eval scenes, ~20 min):
-#     sbatch --export=ALL,RUN=dagger4_smoke,CFG=examples/configs/dagger_phase4_smoke.yaml \
+#   Short shakedown FIRST (2 iterations, 4 episodes, 6 eval scenes, ~20 min).
+#   ALWAYS override --time here: the 24 h default cannot be backfilled, and with
+#   fairshare depressed after a few GPU jobs that is the difference between
+#   starting in an hour and starting in two days (measured: priority fell 46x
+#   after four allocations in one afternoon, pushing the estimate to +2.5 days).
+#     sbatch --time=00:45:00 --export=ALL,RUN=dagger4_smoke,CFG=examples/configs/dagger_phase4_smoke.yaml \
 #         examples/slurm/train_dagger_phase4.sbatch
 #   From an existing base run (skips the 100-epoch base fit):
 #     sbatch --export=ALL,RUN=dagger4_run2,BASE=output/bc_runs/phase1_full \
