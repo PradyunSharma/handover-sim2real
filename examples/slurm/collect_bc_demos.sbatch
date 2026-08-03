@@ -39,21 +39,19 @@
 #SBATCH --partition=gpu-v100          # see train_rl.sbatch for why not gpu-a100
 #SBATCH --account=education-me-msc-ro
 #SBATCH --qos=normal
-#SBATCH --time=24:00:00               # education GPU cap is 24h (gpu-v100 hard
-                                      # limit is 2 days); the h5 is incremental,
-                                      # so resubmitting resumes nothing but also
-                                      # loses nothing already collected
-# No --nodes: compute-p1 rejects a per-node request that is not --exclusive
-# ("Specify '--ntasks' and '--cpus-per-task' instead"). --ntasks=1 already lands
-# this on a single node, so --nodes was redundant on the GPU partitions too.
+# Resource block copied VERBATIM from collect_demos.sbatch, which passes
+# `sbatch --test-only`. Deviating from it produced AssocMaxGRESPerJob even though
+# the request (gres/gpu=1) sits well inside the association limit (gres/gpu=2),
+# so treat this block as load-bearing, not as defaults to tune. Specifically:
+# --gpus-per-task is MANDATORY (DelftBlue rejects --gres/--gpus outright), and
+# --nodes=1 is only a WARNING on gpu-v100 (it is an error on compute-p1, but a
+# CPU partition cannot run this job at all — OMG needs CUDA).
+#SBATCH --time=24:00:00
+#SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4             # serial script — a few cores for PyBullet/python
 #SBATCH --gpus-per-task=1
-#SBATCH --mem-per-cpu=3968M           # 15.5G total. NOT 4G: compute-p1 caps
-                                      # mem-per-cpu at 190464MB/48 = 3968MB and
-                                      # rejects the job outright. 3968 is under
-                                      # the gpu-v100 cap (5333) too, so this one
-                                      # value works on either partition.
+#SBATCH --mem-per-cpu=4G              # 16G total
 #SBATCH --output=slurm_logs/bcdemos_%j.out
 #SBATCH --error=slurm_logs/bcdemos_%j.err
 
