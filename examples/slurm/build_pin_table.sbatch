@@ -32,7 +32,9 @@
 #SBATCH --account=education-me-msc-ro
 #SBATCH --qos=normal
 #SBATCH --time=04:00:00
-#SBATCH --nodes=1
+# No --nodes: compute-p1 rejects a per-node request that is not --exclusive
+# ("Specify '--ntasks' and '--cpus-per-task' instead"). --ntasks=1 already lands
+# this on a single node, so --nodes was redundant on the GPU partitions too.
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gpus-per-task=1
