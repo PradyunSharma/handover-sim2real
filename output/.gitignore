@@ -34,3 +34,11 @@ rl_runs/*/checkpoints/
 !dagger_runs/*/*.yaml
 !dagger_runs/*/*.png
 !dagger_runs/*/*.npz
+# per-iter logs/metadata (dagger_runs/*/iters/iter_NN/) — track the small
+# log.csv/config/normalization, but the per-iter checkpoints/ (21 MB .pt each)
+# stay ignored (one level deeper, not re-included).
+!dagger_runs/*/iters/
+!dagger_runs/*/iters/*/
+!dagger_runs/*/iters/*/*.csv
+!dagger_runs/*/iters/*/*.yaml
+!dagger_runs/*/iters/*/*.npz
