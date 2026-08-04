@@ -7,6 +7,10 @@
 !fetch_cvpr2023_models.sh
 !fetch_grasp_trigger_PRE_2.sh
 
+# grasp pin tables (per-split OMG grasp selections — small JSON, useful to version)
+!grasp_pin_table_train.json
+!grasp_pin_table_val.json
+
 # Track lightweight per-run metadata under rl_runs/ (training logs, plots, and
 # configs) so runs can be committed/pushed for record-keeping. The parent dirs
 # must be re-included first, then the specific files. The large checkpoints/
