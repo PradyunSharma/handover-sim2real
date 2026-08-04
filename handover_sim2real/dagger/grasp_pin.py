@@ -96,7 +96,27 @@ class GraspPinTable:
 
         target = np.asarray(entry["ee_pose_world"], dtype=np.float64)
         d = np.linalg.norm(poses[:, :3, 3] - target[None, :3, 3], axis=1)
-        idx = int(np.argmin(d))
+
+        # Position alone does NOT identify a grasp. OMG's `flip_grasp` appends
+        # wrist-flipped duplicates that share an EE position and differ by pi in
+        # rotation, so argmin over position picks between a flip pair arbitrarily
+        # — and then the pin aims at the twin of the grasp the table recorded.
+        # Measured on train_pinned.h5: a handful of episodes closed 3.1413 rad
+        # (= pi) from their pinned grasp while p99 was 0.0029 rad. Disambiguate
+        # among the position candidates by ROTATION.
+        near = np.flatnonzero(d <= self.match_tol)
+        if len(near):
+            R_t = target[:3, :3]
+            cos = (np.trace(poses[near][:, :3, :3] @ R_t.T, axis1=1, axis2=2) - 1.0) / 2.0
+            rot = np.arccos(np.clip(cos, -1.0, 1.0))
+            idx = int(near[int(np.argmin(rot))])
+            if rot.min() > 0.35:
+                print(f"[grasp-pin] scene {scene_idx}: position matches to "
+                      f"{d[idx]:.4f} m but the closest orientation is "
+                      f"{rot.min():.3f} rad away — the stored grasp is probably a "
+                      f"wrist-flip of what the goal set now holds.")
+        else:
+            idx = int(np.argmin(d))
         if d[idx] > self.match_tol:
             self.n_mismatch += 1
             print(f"[grasp-pin] scene {scene_idx}: pinned pose not in the current "

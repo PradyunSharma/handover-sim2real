@@ -49,6 +49,19 @@ SIM:
   grasp_pin_match_tol: 0.02   # reject a pinned pose further than this from any
                               # current candidate (catches a stale table loudly)
 
+  # ---- scenes whose EXPERT is broken ----
+  # JSON list of scene indices to drop from BOTH the collection pool and the eval
+  # set, written by examples/filter_demos.py. Those are the scenes where the OMG
+  # plan clips the object while translating laterally into the pre-grasp pose and
+  # knocks it out of the hand: the demonstration ends in a benchmark failure and
+  # carries no CLOSE label (126 of 623 episodes, 20%, on train_pinned.h5).
+  # DAgger cannot learn anything useful where the expert crashes, and scoring the
+  # policy there caps the achievable rate for no reason.
+  # CAVEAT: the remaining scenes are easier BY CONSTRUCTION, so a success rate
+  # measured with this set is not comparable to one over the full split.
+  # null disables the exclusion.
+  exclude_scenes: null        # e.g. output/bc_dataset/train_pinned_ok.json
+
 DAGGER:
   num_iters: 15            # N — DAgger iterations after the base run
   # m — trajectories per iteration. Was 20, on the theory (the paper's) that more

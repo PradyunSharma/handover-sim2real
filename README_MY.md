@@ -295,9 +295,23 @@ window to give it keyboard focus, then:
 | key | action |
 |---|---|
 | **R** | reset the scene and replay |
+| **N** | next episode (wraps at the end of the dataset) |
+| **P** | previous episode (wraps at the start) |
 | **Q** | quit |
 
-`Ctrl-C` in the terminal also works.
+`Ctrl-C` in the terminal also works. **N** / **P** reload the episode in place —
+same simulator, re-reset to that episode's scene, grasp overlay redrawn for it —
+so you can walk the dataset without restarting the script.
+
+#### Expert-action arrows
+
+`--show-expert-arrows` (off by default) draws the OMG label at every visited
+state: the Δposition as a shaft from the current EE with an arrowhead at the tip
+(green = gripper-open label, red = gripper-close), and the Δrotation as a small
+orientation triad at that tip (X=yellow, Y=magenta, Z=cyan). Both are
+exaggerated by `--arrow-scale` (default 3×) since the per-step deltas are only
+~3-4 cm / a few degrees. Arrows accumulate over the rollout and stay on screen
+after it ends; they're cleared when you press R / N / P.
 
 #### Overlaying the OMG grasp (which grasp the expert aimed at)
 

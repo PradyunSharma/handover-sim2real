@@ -583,6 +583,27 @@ def main() -> None:
         match_tol=float(sim_cfg_d.get("grasp_pin_match_tol", 0.02)),
         sim_cfg_block=sim_cfg_d)
     usable = set(pin_table.entries) if pin_table is not None else None
+
+    # Scenes whose EXPERT is broken — the planned trajectory collides with the
+    # object while translating into the pre-grasp pose, so the demonstration
+    # terminated in a benchmark failure (examples/filter_demos.py writes this
+    # list). Excluding them here removes them from the collection pool AND the
+    # eval set: DAgger cannot learn anything useful on a scene where the expert
+    # crashes, and scoring the policy on one caps the achievable rate for no
+    # reason. NOTE the eval set then covers an easier subset — say so when
+    # reporting, it is not comparable to a number over the full split.
+    excl_path = sim_cfg_d.get("exclude_scenes")
+    if excl_path:
+        with open(excl_path) as f:
+            excluded = {int(s) for s in json.load(f)}
+        before = len(usable) if usable is not None else sim.num_scenes
+        usable = (usable or set(range(sim.num_scenes))) - excluded
+        n_excluded = before - len(usable)
+        print(f"[exclude_scenes] {excl_path}: dropping {n_excluded} of "
+              f"{before} scenes whose expert demonstration failed")
+    else:
+        n_excluded = 0
+
     pool, eval_scenes = scene_pools(sim.num_scenes, ev, usable=usable)
 
     train_cfg = load_yaml(trn["train_cfg"])
@@ -633,11 +654,15 @@ def main() -> None:
 
     print("=" * 78)
     print(f"Phase-4 DAgger   run={run_name}")
-    print(f"  scenes        : {sim.num_scenes} in split={sim_cfg.BENCHMARK.SPLIT}"
-          + (f" -> {len(usable)} plannable (pin table); "
-             f"{sim.num_scenes - len(usable)} dropped (OMG finds no goal set)"
-             if usable is not None else "  [NO pin table: pool unfiltered, expect "
-             "~13% of episodes to abort with OMG_FAIL_STEP0]"))
+    if usable is None:
+        print(f"  scenes        : {sim.num_scenes} in split={sim_cfg.BENCHMARK.SPLIT}"
+              f"  [NO pin table: pool unfiltered, expect ~13% of episodes to abort "
+              f"with OMG_FAIL_STEP0]")
+    else:
+        no_plan = sim.num_scenes - len(usable) - n_excluded
+        print(f"  scenes        : {sim.num_scenes} in split={sim_cfg.BENCHMARK.SPLIT}"
+              f" -> {len(usable)} usable  ({no_plan} have no OMG goal set"
+              + (f", {n_excluded} excluded as failed demos" if n_excluded else "") + ")")
     print(f"  pool / eval   : {len(pool)} / {len(eval_scenes)}"
           f"{'  [eval held out of the pool]' if ev.get('holdout', True) else '  [eval scenes also collected on]'}")
     print(f"  learner       : {learner}"

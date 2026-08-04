@@ -16,8 +16,8 @@ Visualize a BC dataset episode.  Two modes:
                            matches the OFFLINE expert dataset. For DAgger data this
                            shows the expert (not the policy) and the cloud will not
                            align — use 'states'.
-                       At each step it also draws the full EXPERT-action label (the
-                       OMG target):
+                       With --show-expert-arrows (OFF by default) it also draws the
+                       full EXPERT-action label (the OMG target) at each step:
                          - translation Δpos as a shaft from the current EE with a
                            3-D arrowhead at the TIP (where to go) — green=gripper
                            open, red=gripper close;
@@ -27,8 +27,11 @@ Visualize a BC dataset episode.  Two modes:
                        Both Δpos and Δangle are exaggerated by --arrow-scale (the
                        per-step deltas are only ~cm / a few degrees). Arrows persist
                        through the rollout AND stay on screen after it ends (cleared
-                       only when you press R to replay). Disable with
-                       --no-expert-arrows.
+                       when you press R / N / P).
+
+                       Keys in the PyBullet window: R = replay, N / P = next /
+                       previous episode (wraps around, reloads that episode's scene
+                       and grasp overlay), Q = quit.
 
 Usage — static (random episode):
     python examples/visualize_bc_dataset.py --dataset output/bc_dataset/train.h5
@@ -96,6 +99,19 @@ def _load_episode_flat(full, sl, has, dataset_path, ep_idx=None):
     print(f"[rl-demo] episode {ep_idx}/{len(ends)}  scene_idx={scene_idx}  "
           f"steps={b - a}  reward@end={reward_end:.0f}")
     return meta, data, {"rl_demo": True}, ep_idx
+
+
+def count_episodes(dataset_path):
+    """Number of episodes in the dataset — `episode_*` groups for a BC HDF5, or
+    the number of terminal flags for a flat RL demo pool (npz / streamed h5).
+    Used by the replay viewer to wrap N / P episode navigation."""
+    if str(dataset_path).endswith(".npz"):
+        d = np.load(dataset_path)
+        return int(np.sum(np.asarray(d["terminal"]).reshape(-1) >= 0.5))
+    with h5py.File(dataset_path, "r") as f:
+        if "terminal" in f:                                  # flat RL demo pool
+            return int(np.sum(np.asarray(f["terminal"][:]).reshape(-1) >= 0.5))
+        return len([k for k in f.keys() if k.startswith("episode_")])
 
 
 def load_episode(dataset_path, ep_idx=None):
@@ -244,9 +260,10 @@ def visualize_static(dataset_path, ep_idx):
 # ── simulator replay ──────────────────────────────────────────────────────────
 
 def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
-                     show_expert=True, arrow_scale=3.0, show_goal_grasp=False,
+                     show_expert=False, arrow_scale=3.0, show_goal_grasp=False,
                      show_grasp_set=False, max_grasp_set=40,
-                     valid_grasp_dict="examples/valid_grasp_dict_005.pkl"):
+                     valid_grasp_dict="examples/valid_grasp_dict_005.pkl",
+                     grasp_pin_table=None):
     import gym
     import pybullet
     import time
@@ -261,21 +278,14 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
     add_sys_path_from_env("GADDPG_DIR")
     from experiments.config import cfg_from_file
 
-    meta, data, file_meta, ep_idx = load_episode(dataset_path, ep_idx)
-    scene_idx    = int(meta["scene_idx"])
-    saved_pc     = data["point_clouds"]      # [T, N, C]  EE-frame cloud per step
-    robot_states = data["robot_states"]      # [T, 32]  joint_pos(9)+... per step
-    expert_act   = data["expert_actions"]    # [T, 7]  OMG label at each visited state
-    T = len(saved_pc)
-
-    is_dagger = bool(file_meta.get("dagger", False))
-    print(f"Replaying episode {ep_idx}  scene_idx={scene_idx}  steps={T}  "
-          f"source={source}  (dagger={is_dagger})")
-    if source == "omg" and is_dagger:
-        print("  NOTE: --replay-source omg re-plans the OMG expert and steps THAT, "
-              "not the\n        policy's recorded states — for DAgger data the robot "
-              "and the point\n        cloud will NOT match the recorded rollout. Use "
-              "--replay-source states.")
+    # Episodes are loaded lazily (below, in load_ep) so N / P can switch between
+    # them without rebuilding the simulator; we only need the count up front to
+    # wrap that navigation and to resolve a random --episode.
+    n_episodes = count_episodes(dataset_path)
+    if n_episodes == 0:
+        raise RuntimeError(f"No episodes found in {dataset_path}")
+    if ep_idx is None:
+        ep_idx = int(np.random.randint(n_episodes))
 
     cfg = get_cfg()
     cfg_from_file(filename=cfg_file, dict=cfg, merge_to_cn_dict=True)
@@ -294,26 +304,13 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
             cfg.omg_config["valid_grasp_dict_path"] = _vgd
             print(f"[valid_grasp_dict] OMG grasp overlay uses the vgd subset: {_vgd}")
 
+    pin_table = None
+    if grasp_pin_table:
+        from handover_sim2real.dagger import load_grasp_pin_table
+        pin_table = load_grasp_pin_table(grasp_pin_table)
+
     env = HandoverBenchmarkWrapper(gym.make(cfg.ENV.ID, cfg=cfg))
 
-    obs = env.reset(idx=scene_idx)
-
-    # 'omg' mode re-plans the expert and drives the sim along it (only faithful for
-    # the OFFLINE expert dataset). 'states' mode drives the sim through the stored
-    # robot_states, faithfully reproducing whatever rollout was recorded. We also
-    # run OMG (once, from the reset config = same grasp the data aimed at) when
-    # --show-goal-grasp / --show-grasp-set is set, just to read back the goal grasp /
-    # standoff poses and the full candidate grasp set OMG chose from.
-    expert_plan = None
-    if source == "omg" or show_goal_grasp or show_grasp_set:
-        expert_plan, _ = env.run_omg_planner(cfg.RL_MAX_STEP, scene_idx)
-        if expert_plan is None:
-            if source == "omg":
-                print("OMG planner failed — cannot replay (--replay-source omg).")
-                return
-            print("OMG planner failed — cannot draw --show-goal-grasp.")
-
-    stop_step           = len(expert_plan) if (source == "omg" and expert_plan is not None) else T
     steps_action_repeat = int(cfg.POLICY.TIME_ACTION_REPEAT / cfg.SIM.TIME_STEP)
 
     panda_base_inv_tf = pybullet.invertTransform(
@@ -337,9 +334,83 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
             line_ids.append(pybullet.addUserDebugLine(
                 p.tolist(), q.tolist(), lineColorRGB=colour, lineWidth=line_width))
 
-    # Goal-grasp overlay (static per scene → drawn once, kept up the whole session).
-    goal_ids = []
-    if show_goal_grasp or show_grasp_set:
+    def clear_ids(ids):
+        for item_id in ids:
+            pybullet.removeUserDebugItem(item_id)
+        ids.clear()
+
+    # ── per-episode state ─────────────────────────────────────────────────────
+    # `ep` holds everything about the episode currently loaded; load_ep() swaps it
+    # so N / P can walk the dataset without rebuilding the simulator. Debug items
+    # are split by lifetime: goal_ids are per-SCENE (drawn at load, kept up until
+    # the episode changes), arrow_ids are per-ROLLOUT (kept on screen after
+    # playback ends so the finished correction field stays inspectable, wiped when
+    # the next play starts).
+    ep        = {}
+    goal_ids  = []
+    arrow_ids = []
+    warned_omg_dagger = [False]
+
+    def load_ep(idx):
+        """Load episode `idx`, reset the sim to its scene, redraw the per-scene
+        grasp overlay and fill `ep`. Returns the fresh obs."""
+        meta, data, file_meta, idx = load_episode(dataset_path, idx)
+        scene_idx    = int(meta["scene_idx"])
+        saved_pc     = data["point_clouds"]      # [T, N, C]  EE-frame cloud per step
+        robot_states = data["robot_states"]      # [T, 32]  joint_pos(9)+... per step
+        expert_act   = data["expert_actions"]    # [T, 7]  OMG label at each visited state
+        T = len(saved_pc)
+
+        is_dagger = bool(file_meta.get("dagger", False))
+        print(f"Replaying episode {idx}/{n_episodes - 1}  scene_idx={scene_idx}  "
+              f"steps={T}  source={source}  (dagger={is_dagger})")
+        if source == "omg" and is_dagger and not warned_omg_dagger[0]:
+            print("  NOTE: --replay-source omg re-plans the OMG expert and steps THAT, "
+                  "not the\n        policy's recorded states — for DAgger data the robot "
+                  "and the point\n        cloud will NOT match the recorded rollout. Use "
+                  "--replay-source states.")
+            warned_omg_dagger[0] = True
+
+        clear_ids(goal_ids)
+        clear_ids(arrow_ids)
+        obs = env.reset(idx=scene_idx)
+
+        # 'omg' mode re-plans the expert and drives the sim along it (only faithful
+        # for the OFFLINE expert dataset). 'states' mode drives the sim through the
+        # stored robot_states, faithfully reproducing whatever rollout was recorded.
+        # We also run OMG (once per episode, from the reset config = same grasp the
+        # data aimed at) when --show-goal-grasp / --show-grasp-set is set, just to
+        # read back the goal grasp / standoff poses and the full candidate set.
+        expert_plan = None
+        if source == "omg" or show_goal_grasp or show_grasp_set:
+            expert_plan, _ = env.run_omg_planner(cfg.RL_MAX_STEP, scene_idx)
+            # Apply the pin table if the data was collected with one. Without this,
+            # OMG re-selects its goal here (argmin over the goal set, planner.py
+            # under ol_alg='Proj') and the overlay can show a DIFFERENT grasp than
+            # the episode actually aimed at — measured at up to 20.5 cm apart.
+            # Replanning after the pin keeps `expert_plan` consistent too.
+            if expert_plan is not None and pin_table is not None:
+                if pin_table.apply(env, scene_idx):
+                    expert_plan, _ = env.run_omg_planner(cfg.RL_MAX_STEP, scene_idx,
+                                                         reset_scene=False)
+            if expert_plan is None:
+                # Don't bail out of the whole session — the user can still press
+                # N / P to walk to an episode OMG can handle.
+                print("OMG planner failed — cannot replay this episode "
+                      "(--replay-source omg); press N / P for another."
+                      if source == "omg" else
+                      "OMG planner failed — cannot draw --show-goal-grasp.")
+
+        ep.update(idx=idx, scene_idx=scene_idx, pc=saved_pc, rs=robot_states,
+                  act=expert_act, T=T, expert_plan=expert_plan,
+                  stop_step=(len(expert_plan) if expert_plan is not None else 0)
+                            if source == "omg" else T)
+        _draw_goal_overlay()
+        return obs
+
+    def _draw_goal_overlay():
+        if not (show_goal_grasp or show_grasp_set):
+            return
         goal_mat     = env.get_omg_goal_grasp_pose()   # traj[-1], the grasp pose
         standoff_mat = env.get_omg_standoff_pose()     # traj[-5], the pre-grasp pose
 
@@ -371,16 +442,12 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
         if goal_mat is None and standoff_mat is None:
             print("  OMG found no goal grasp — nothing to draw.")
 
-    # Expert-action arrows live in the enclosing scope so they stay on screen
-    # after playback ends; they're wiped only when a new replay (R) starts.
-    arrow_ids = []
-
     def play_once(obs):
+        saved_pc, robot_states = ep["pc"], ep["rs"]
+        expert_act, T          = ep["act"], ep["T"]
         debug_ids = []
-        for aid in arrow_ids:
-            pybullet.removeUserDebugItem(aid)
-        arrow_ids.clear()
-        for step in range(min(stop_step, T)):
+        clear_ids(arrow_ids)
+        for step in range(min(ep["stop_step"], T)):
             link_ind = obs["panda_link_ind_hand"]
             pos_world = obs["panda_body"].link_state[0, link_ind, 0:3]
             orn_world = obs["panda_body"].link_state[0, link_ind, 3:7]
@@ -467,7 +534,7 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
             # 'omg': step the freshly re-planned expert trajectory (old behavior).
             done = False
             if source == "omg":
-                target = expert_plan[step]
+                target = ep["expert_plan"][step]
             else:
                 target = robot_states[min(step + 1, T - 1), :9]
             for _ in range(steps_action_repeat):
@@ -485,22 +552,35 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
             pybullet.removeUserDebugItem(dbg_id)
         return obs
 
+    obs = load_ep(ep_idx)
     obs = play_once(obs)
 
+    HELP = ("In the PyBullet window:  R = replay,  N / P = next / previous episode,"
+            "  Q = quit.")
     print("Replay finished.")
-    print("In the PyBullet window:  R = replay,  Q = quit.")
+    print(HELP)
 
-    R_KEY = ord('r')
-    Q_KEY = ord('q')
+    R_KEY, Q_KEY, N_KEY, P_KEY = ord('r'), ord('q'), ord('n'), ord('p')
+
+    def pressed(keys, key):
+        return key in keys and keys[key] & pybullet.KEY_WAS_TRIGGERED
+
     try:
         while True:
             keys = pybullet.getKeyboardEvents()
-            if R_KEY in keys and keys[R_KEY] & pybullet.KEY_WAS_TRIGGERED:
+            if pressed(keys, R_KEY):
                 print("Replaying...")
-                obs = env.reset(idx=scene_idx)
+                obs = env.reset(idx=ep["scene_idx"])
                 obs = play_once(obs)
-                print("Replay finished.  Press R to replay again, Q to quit.")
-            if Q_KEY in keys and keys[Q_KEY] & pybullet.KEY_WAS_TRIGGERED:
+                print("Replay finished.  " + HELP)
+            elif pressed(keys, N_KEY) or pressed(keys, P_KEY):
+                # Wrap around the dataset. load_ep re-resets the sim to the new
+                # episode's scene and redraws the grasp overlay for it.
+                step = 1 if pressed(keys, N_KEY) else -1
+                obs = load_ep((ep["idx"] + step) % n_episodes)
+                obs = play_once(obs)
+                print("Replay finished.  " + HELP)
+            if pressed(keys, Q_KEY):
                 break
             time.sleep(0.05)
     except KeyboardInterrupt:
@@ -524,8 +604,14 @@ def parse_args():
                         "recorded robot_states (faithful — use this for DAgger data); "
                         "'omg' re-plans the expert and steps that (old behavior, only "
                         "matches the offline expert dataset).")
+    p.add_argument("--show-expert-arrows", dest="show_expert", action="store_true",
+                   help="draw the per-step expert-action (OMG label) arrows in replay: "
+                        "the translation Δpos shaft (green=gripper open, red=close) and "
+                        "the Δeuler orientation triad at its tip. OFF by default — they "
+                        "clutter the view when you just want to watch the rollout.")
     p.add_argument("--no-expert-arrows", dest="show_expert", action="store_false",
-                   help="hide the per-step expert-action (OMG label) arrows in replay.")
+                   help=argparse.SUPPRESS)  # back-compat no-op (arrows are off by default)
+    p.set_defaults(show_expert=False)
     p.add_argument("--arrow-scale", type=float, default=3.0,
                    help="exaggeration factor for the expert-action arrows "
                         "(the per-step Δpos is only ~3-4 cm; default 3×).")
@@ -546,6 +632,13 @@ def parse_args():
                         "--show-goal-grasp/--show-grasp-set overlay matches how vgd demo "
                         "pools (*_vgd.h5) were collected (default). Pass '' or 'none' to "
                         "use the FULL ACRONYM grasp set instead (non-vgd pools).")
+    p.add_argument("--grasp-pin-table", default=None,
+                   help="per-scene committed grasp (examples/build_grasp_pin_table.py). "
+                        "Pass the SAME table the dataset was collected with, or the "
+                        "--show-goal-grasp overlay may draw a different grasp than the "
+                        "episode aimed at: OMG re-selects its goal on every plan "
+                        "(argmin over the goal set), and the demos-vs-replan target was "
+                        "measured up to 20.5 cm apart on unpinned data.")
     p.add_argument("--seed",     type=int, default=None)
     return p.parse_args()
 
@@ -563,7 +656,8 @@ def main():
             sys.exit(1)
         visualize_replay(args.dataset, args.episode, args.cfg_file, args.replay_source,
                          args.show_expert, args.arrow_scale, args.show_goal_grasp,
-                         args.show_grasp_set, args.max_grasp_set, args.valid_grasp_dict)
+                         args.show_grasp_set, args.max_grasp_set, args.valid_grasp_dict,
+                         args.grasp_pin_table)
 
 
 if __name__ == "__main__":
