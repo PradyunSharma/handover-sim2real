@@ -117,6 +117,14 @@ class CollectParams:
     stop_on_policy_close: bool = True
     # distance-proportional OMG horizon (see module docstring)
     ee_step: float = 0.04
+    # MUST equal OMG's cfg.reach_tail_length (config.py:92, default 5) -- it is a
+    # mirror of the planner's own constant, not a free choice. OMG builds the
+    # standoff ramp as exactly that many poses, so this is how many trailing
+    # waypoints of the returned plan are the reach. Get it wrong and traj[-N] is
+    # not the standoff, the commit freezes the wrong slice, and the horizon
+    # request comes up short. Its SPACING is standoff_dist/reach_tail_length =
+    # 1.6 cm, deliberately finer than ee_step (4 cm): coarse while flying to the
+    # standoff, fine while reaching in.
     reach_tail: int = 5
     min_free: int = 3
     max_horizon: int = 40
@@ -203,10 +211,20 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     n_omg_fail = n_goal_switch = n_expert_steps = n_close_labels = 0
     n_reach_steps = 0
     min_pos, min_rot = float("inf"), float("inf")
-    policy_closed = False
+    # `n_policy_close_cmds` counts every premature close the policy commands;
+    # `ended_on_close` is only whether one of them ENDED the episode, which is
+    # what stop_on_policy_close controls.
+    n_policy_close_cmds = 0
+    ended_on_close = False
     policy_close_step = -1
     done = False
     reason = "MAX_STEPS"
+    # Who executed the most recent step, and whether that step wrote a label.
+    # Both are needed to decide, on ENV_DONE, whether the last recorded pair is
+    # contaminated — see the ENV_DONE branch at the bottom of the loop.
+    last_exec_expert = False
+    recorded = False
+    n_dropped_tail = 0
     # Magnitude of every APPROACH label recorded. This is the stall detector: the
     # standoff failure mode is labels decaying to ~0 while the EE sits 6.6 cm
     # short, which is invisible in step counts but obvious here.
@@ -337,7 +355,8 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
             label_pos_mags.append(float(np.linalg.norm(expert_delta[:3])))
         else:
             label = None  # replan failed and we are not at the grasp: no label
-        if label is not None:
+        recorded = label is not None
+        if recorded:
             point_clouds.append(pc)
             robot_states.append(rs)
             expert_actions.append(label)
@@ -366,14 +385,22 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
             exec_delta = expert_delta
         else:
             if policy_action[6] < 0.5:
-                if params.stop_on_policy_close:
-                    policy_closed = True
+                # Count and timestamp the premature close REGARDLESS of what we
+                # do about it. Booking these inside the stop_on_policy_close
+                # branch would zero `policy_closed` / `policy_close_step` the
+                # moment that flag is turned off, hiding the very behaviour the
+                # flag exists to keep collecting corrections for.
+                n_policy_close_cmds += 1
+                if policy_close_step < 0:
                     policy_close_step = step
+                if params.stop_on_policy_close:
+                    ended_on_close = True
                 else:
                     policy_action = policy_action.copy()
                     policy_action[6] = 1.0  # override: keep approaching
             target_jp = action_to_target_joint(policy_action, obs)
             exec_delta = policy_action[:6].astype(np.float32)
+        last_exec_expert = bool(use_expert)
 
         prev_act6d = np.asarray(exec_delta, dtype=np.float32).copy()
 
@@ -386,16 +413,43 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         if committed_reach is not None:
             reach_i += 1
 
-        if policy_closed:
+        if ended_on_close:
             reason = "POLICY_CLOSE"
             break
         if done:
             reason = "ENV_DONE"
+            # The benchmark just killed the episode — usually the object knocked
+            # out of the hand by the lateral swing into the pre-grasp pose. WHO
+            # drove this step decides whether the pair we just recorded is
+            # contaminated, because the label and the executed action are only
+            # the same thing on an expert step:
+            #
+            #   policy drove -> the colliding action was the POLICY's, and the
+            #       policy's action is never recorded. The stored pair is (a state
+            #       the policy drove itself into, what the expert would have done
+            #       there) — the single most valuable kind of pair DAgger
+            #       collects. KEEP it.
+            #   expert drove -> the colliding action IS the label just written.
+            #       Training on it teaches the collision. Drop that ONE pair;
+            #       every earlier step of the episode is untouched.
+            #
+            # Only reachable on an approach label: an at_grasp step breaks above
+            # before executing, so the close label can never be the one dropped.
+            if last_exec_expert and recorded:
+                point_clouds.pop()
+                robot_states.pop()
+                expert_actions.pop()
+                if label_pos_mags:
+                    label_pos_mags.pop()
+                n_dropped_tail = 1
             break
 
     if len(expert_actions) == 0:
+        # Reachable via the ENV_DONE pop above when the episode had exactly one
+        # label and the expert's step is what ended it: nothing usable is left.
         return None, {"scene_idx": scene_idx, "skipped": True,
-                      "reason": "NO_LABELS", "steps": 0, "n_omg_fail": n_omg_fail}
+                      "reason": "NO_LABELS", "steps": 0, "n_omg_fail": n_omg_fail,
+                      "n_dropped_tail": int(n_dropped_tail)}
 
     episode = {
         "point_clouds": np.asarray(point_clouds, dtype=np.float32),
@@ -421,8 +475,17 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                        if grasp_pose is not None else None),
         "reached_standoff": int(committed_reach is not None),
         "reached_grasp": int(n_close_labels > 0),
-        "policy_closed": int(policy_closed),
+        # Episodes in which the policy commanded a close at least once. Under
+        # stop_on_policy_close this also ended the episode; without it the
+        # episode kept going, so `n_policy_close_cmds` (how MANY steps it wanted
+        # to close on) is the finer signal.
+        "policy_closed": int(n_policy_close_cmds > 0),
+        "n_policy_close_cmds": int(n_policy_close_cmds),
         "policy_close_step": int(policy_close_step),
+        # 1 if the trailing pair was dropped because an EXPERT step ended the
+        # episode. A rising count means the expert is still colliding on scenes
+        # that survived filtering, i.e. exclude_scenes is not catching them.
+        "n_dropped_tail": int(n_dropped_tail),
         "min_pos": min_pos,
         "min_rot": min_rot,
         # Approach-label scale. `n_tiny_labels` counts labels the policy cannot
@@ -504,6 +567,7 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
     agg = {"episodes": 0, "steps": 0, "skipped": 0, "n_omg_fail": 0,
            "n_goal_switch": 0, "n_expert_steps": 0, "pinned": 0, "reached_standoff": 0,
            "reached_grasp": 0, "n_reach_steps": 0, "policy_closed": 0,
+           "n_policy_close_cmds": 0, "n_dropped_tail": 0,
            "n_close_labels": 0, "n_approach_labels": 0, "sum_label_pos": 0.0,
            "n_tiny_labels": 0, "n_revisits": 0, "n_grasp_mismatch": 0,
            "max_grasp_drift": 0.0,
@@ -543,6 +607,8 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
                 agg["reached_grasp"] += st["reached_grasp"]
                 agg["n_reach_steps"] += st["n_reach_steps"]
                 agg["policy_closed"] += st["policy_closed"]
+                agg["n_policy_close_cmds"] += st["n_policy_close_cmds"]
+                agg["n_dropped_tail"] += st["n_dropped_tail"]
                 agg["n_close_labels"] += st["n_close_labels"]
                 agg["n_approach_labels"] += st["n_approach_labels"]
                 agg["sum_label_pos"] += st["sum_label_pos"]

@@ -143,7 +143,10 @@ def dynamic_replan_horizon(obs, standoff_pose_world, ee_step, reach_tail,
         horizon    = free_steps + reach_tail               (<= max_horizon)
 
     `reach_tail` (=5) is added back because OMG folds the standoff->grasp reach
-    into the last `reach_tail` waypoints; we only steer the free portion.
+    into the last `reach_tail` waypoints; we only steer the free portion. It
+    mirrors OMG's cfg.reach_tail_length and is not ours to pick: the reach is
+    sampled at standoff_dist/reach_tail_length = 1.6 cm, NOT at `ee_step`, which
+    governs the free portion alone.
     """
     body = obs["panda_body"]
     link = obs["panda_link_ind_hand"]

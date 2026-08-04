@@ -62,7 +62,11 @@ def build_sim_cfg(sim: dict):
         egl                     EGL GPU renderer for the offscreen hand camera
         valid_grasp_dict_path   paper's offline hand-collision filter (Phase 3)
         use_standoff            OMG plans to the standoff AND the reach beyond it
-        standoff_dist           metres back along the approach (OMG default 0.08)
+        standoff_dist           ramp EXTENT, not the standoff distance: OMG spaces
+                                reach_tail_length poses over
+                                linspace(0,1,n,endpoint=False)*standoff_dist, so
+                                the furthest sits at standoff_dist*(1-1/n).
+                                Default 0.08 with n=5 => standoff at 0.064 m.
 
     The renderer choice changes the point cloud, so it MUST match how the base
     dataset was collected or the policy sees a different input distribution.

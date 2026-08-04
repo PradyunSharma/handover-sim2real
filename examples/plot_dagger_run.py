@@ -48,7 +48,11 @@ DIAGNOSTIC (<run>/curves_diag.png) — 2x3 grid, "is the machinery healthy":
                  degenerate (~zero) labels. A collapse towards 0 is the standoff
                  stall returning; it is invisible in step counts.
   • endgame    — CLOSE labels produced and reach-tail steps followed: whether the
-                 expert is still teaching the part of the task that matters.
+                 expert is still teaching the part of the task that matters. Also
+                 the premature closes the policy commanded (each one is relabelled
+                 OPEN, never copied into D), and the pairs dropped because an
+                 EXPERT step collided and ended the episode — that red line should
+                 sit at 0, or exclude_scenes is missing scenes the expert breaks.
   • planner    — OMG failures, goal-grasp switches, pinned episodes. With the pin
                  table loaded, goal_switch should be flat 0; anything else means
                  the table is stale or not matching.
@@ -378,10 +382,18 @@ def main() -> None:
     # endgame coverage
     a = bx[0][1]
     for key, label in (("close_labels", "CLOSE labels"),
-                       ("reach_steps", "committed-reach steps")):
+                       ("reach_steps", "committed-reach steps"),
+                       ("policy_close_cmds", "premature close cmds")):
         ys = num(key)
         if _finite(ys):
             _plot(a, it, ys, "-o", ms=3, label=label)
+    # Pairs dropped because an EXPERT step ended the episode (the lateral-approach
+    # collision). Should be ~0: a nonzero line means exclude_scenes is not
+    # catching the scenes where the expert itself still collides.
+    ys = num("dropped_tail")
+    if _finite(ys):
+        _plot(a, it, ys, "-s", ms=3, color="tab:red",
+              label="expert-collision pairs dropped")
     _grid(a, "endgame coverage in D_i", ylabel="labels this iteration")
     _legend(a, loc="upper left")
 

@@ -1694,6 +1694,37 @@ reward cannot drift apart. Four rates are logged, ordered by how much each deman
 localise the failure: closing in the wrong place, closing right but not gripping,
 gripping then losing it.
 
+**What ends up in D, and what cannot.** Inside one step the order is: capture
+`(pc, rs)` → replan → proximity check → **write the label** → *then* query the
+policy → execute whoever the beta coin picked → step the sim. Because the label is
+written before the policy is even asked, the learner's action is structurally
+incapable of entering the dataset. Two consequences worth knowing:
+
+- **A premature close is relabelled, never copied.** When the policy commands a
+  close somewhere that is not the grasp, the pair recorded for that step is
+  `[expert_delta, OPEN]` — "no, keep approaching, and here is the direction".
+  That is the correction DAgger exists to produce. `stop_on_policy_close: false`
+  (since run 2) then overrides the gripper bit and keeps rolling, so the episode
+  yields the whole remaining trajectory instead of stopping at the mistake. Run 1
+  ran with `true` and paid for it: 28 policy closes in 355 episodes, 27 of them
+  0.13–0.22 m from the grasp against a 0.02 m threshold, each ending an episode
+  after a single correction. Only the gripper bit is overridden — the 6-DoF motion
+  is still the learner's, so the state distribution stays on-policy.
+- **On a collision, who was driving decides whether the last pair is poison.** If
+  the *policy* drove the step that knocked the object out of the hand, the
+  colliding action was never recorded, and the stored pair is (a state the policy
+  drove itself into, what the expert would have done there) — keep it, it is the
+  most valuable kind of pair in the set. If the *expert* drove it (the beta coin,
+  or `expert_after_commit` during the reach), the colliding action **is** the
+  label, and training on it teaches the collision. That one pair is dropped and
+  every earlier step is kept; the `dropped_tail` column counts it. This is finer
+  than `filter_demos.py`, which drops whole episodes but only ever runs on the
+  base demonstrations — DAgger data never passes through it.
+
+`dropped_tail` should sit at 0. A nonzero line on the endgame panel means the
+expert is still colliding on scenes that survived `exclude_scenes`, i.e. the
+filtering from stage 3 of the runbook missed them.
+
 Run dir `output/dagger_runs/<name>/`: `state.json`, `dagger_log.csv`,
 `data/dagger_iter_NN.h5`, `iters/iter_NN/`, and `best/` + `last/` — the last two
 are standalone run dirs, so:

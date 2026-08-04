@@ -30,6 +30,22 @@ SIM:
   # standoff, traj[-1] is the pose the gripper closes at. Phase 4 labels the whole
   # trajectory, so the reach segment has to be in the plan.
   use_standoff: true
+
+  # NOT the standoff distance -- an EXTENT parameter. OMG builds the ramp as
+  #     offsets = -standoff_dist * linspace(0, 1, reach_tail_length, endpoint=False)
+  # (planner.py:356), so with endpoint=False the furthest pose lands at
+  #     standoff_dist * (1 - 1/reach_tail_length) = 0.08 * 4/5 = 0.064 m
+  # and the 5 waypoints sit at 0, 1.6, 3.2, 4.8, 6.4 cm from the grasp.
+  #
+  # The EFFECTIVE standoff is 6.4 cm. Two other constants are tuned against that
+  # real value, not against 0.08: reach_commit_dist (0.05) is a radius around this
+  # pose, and reach_tail (5) must equal OMG's cfg.reach_tail_length or traj[-5] is
+  # not the standoff at all. Changing standoff_dist moves both.
+  #
+  # This also explains the measurement quoted under `reach_commit_dist` below --
+  # "the EE parks 6.6 cm short of the grasp forever" is not only the plan[0] decay,
+  # it is the gripper sitting exactly ON its target, with nothing left for plan[0]
+  # to say. Hence the committed reach.
   standoff_dist: 0.08
 
   # ---- one committed grasp per scene ----
@@ -135,10 +151,20 @@ DAGGER:
   close_rot_thresh: 0.34   # radians (~19.5 deg)
   stop_on_close_label: true    # end the episode at the close label (mirrors the
                                # single terminal close transition in the demos)
-  stop_on_policy_close: true   # the policy commanded a close: execute it and end
-                               # the episode. false overrides the gripper bit and
-                               # keeps approaching (more labels, less faithful to
-                               # "follow the learner's own policy")
+  # The policy commanded a close. true = execute it and end the episode (faithful:
+  # in deployment the episode really is over). false = override the gripper bit
+  # back to OPEN and keep rolling.
+  #
+  # false since run 2. The correct label is written either way — the label is
+  # computed from the proximity check BEFORE the policy is queried, so a premature
+  # close is always recorded as [expert_delta, OPEN], "no, keep approaching". What
+  # `true` costs is everything AFTER that point. Run 1 measured 28 policy closes in
+  # 355 episodes with 27 of them at 0.13-0.22 m from the grasp (threshold: 0.02),
+  # so 27 episodes ended early and contributed ONE correction each for the exact
+  # error DAgger exists to fix. The state distribution stays on-policy where it
+  # matters: only the gripper bit is overridden, the 6-DoF motion is still the
+  # learner's.
+  stop_on_policy_close: false
 
   # Distance-proportional OMG horizon: free = round(||ee - standoff|| / ee_step)
   # waypoints for the approach, + reach_tail for the standoff->grasp reach OMG
@@ -146,7 +172,36 @@ DAGGER:
   # per-step scale at every distance.
   ee_step: 0.04
   reach_tail: 5
-  min_free: 3
+
+  # Floor on the free portion. Its ONLY legitimate job is to stop round() from
+  # returning 0 and asking OMG for a zero-length approach (round(d/0.04) hits 0
+  # for d < 0.02). Anything above 1 is second-guessing the distance rule, and 3
+  # defeated it outright over the last 10 cm:
+  #
+  #     round(d/ee_step) < 3   <=>   d < 0.10 m
+  #
+  # so inside 10 cm the floor took over and ||plan[0]|| ~ d/3 decayed instead of
+  # holding at ee_step: 0.033 at d=0.10, 0.027 at 0.08, 0.020 at 0.06, 0.017 at
+  # 0.05. Measured it is worse than that model (0.011 at d=0.05, 0.004 at 0.018)
+  # because OMG's optimizer makes the first step shorter than uniform. The gripper
+  # therefore crept, slower the closer it got, exactly where it most needed to
+  # arrive.
+  #
+  # 1 since run 2. In practice the commit at reach_commit_dist = 0.05 means we
+  # never plan below 5 cm anyway, so free = round(d/0.04) >= 1 on its own and this
+  # floor is nearly inert -- 1 vs 2 differ only in d = (0.050, 0.058). The change
+  # that matters is dropping 3.
+  #
+  # Cost, stated honestly: fewer free waypoints is less room for OMG to curve
+  # around the object, in the 10 cm band where the lateral-approach collisions
+  # happen. Watch `dropped_tail` and the ENV_DONE share; if either climbs, this is
+  # the first thing to put back.
+  #
+  # NOTE the demonstrations are unaffected either way -- collect_bc_dataset.py
+  # plans ONCE with cfg.RL_MAX_STEP and follows by index. dynamic_replan_horizon
+  # is only used by the DAgger collector, so there is no labelling convention
+  # shared with the base dataset to keep in sync.
+  min_free: 1
   max_horizon: 40
   first_horizon: null      # horizon of the step-0 plan, before the standoff is
                            # known. null => cfg.RL_MAX_STEP (20), i.e. the same
@@ -162,10 +217,20 @@ DAGGER:
   # waypoints and follow them BY INDEX (no more replanning, so no retreat and no
   # oscillation). The delta is still recomputed from the CURRENT EE each step, so
   # the labels stay corrective under drift; only the target stops moving.
-  # 0.05, not 0.02: min_free floors the free portion at 3 steps, so
-  # ||plan[0]|| ~ d_standoff/3 and the approach labels decay near the standoff
-  # (0.040 at d=0.12, 0.011 at d=0.05, 0.004 at d=0.018). Handing off at 0.05
-  # keeps every recorded approach label at ~the demonstrations' per-step scale.
+  # Why the commit is needed AT ALL is structural and has nothing to do with
+  # min_free: the standoff is in OMG's goal set, so an EE sitting at the standoff
+  # has a stationary free portion and plan[0] -> 0 by construction, whatever the
+  # horizon. That argument stands unchanged.
+  #
+  # Why 0.05 specifically WAS "min_free=3 makes ||plan[0]|| ~ d/3, so the labels
+  # decay from 0.040 at d=0.12 to 0.011 at d=0.05 -- hand off before that bites".
+  # With min_free = 1 (run 2) that decay is gone and those numbers no longer apply;
+  # 0.05 now rests on the structural argument plus the geometry note below. It is
+  # ALSO what keeps the first frozen target reachable: at commit the tail's first
+  # waypoint is the standoff itself, i.e. a delta of up to reach_commit_dist, so
+  # 0.05 ~ ee_step keeps that handoff step at the normal per-step scale. Raising
+  # it to 0.10 to dodge min_free (the other candidate fix) would have made that
+  # first frozen label a 10 cm jump, 2.5x ee_step -- worse than what it fixed.
   reach_commit_dist: 0.05  # ||ee - standoff|| at which the reach is committed
   reach_skip_eps:    0.01  # drop leading tail waypoints closer than this to the
                            # EE (the tail's first entry IS the standoff)
@@ -210,7 +275,20 @@ TRAIN:
   # Keep SIM.exclude_scenes pointing at the matching .json so DAgger does not
   # collect or evaluate on them either.
   base_train_h5: output/bc_dataset/train_pinned_ok.h5
-  val_h5: output/bc_dataset/val_pinned.h5     # held-out expert data -> best.pt within a run
+  # Held-out expert data -> selects best.pt within a run (EVAL.ckpt: best), which
+  # is BOTH the checkpoint that gets evaluated and the one that drives the next
+  # iteration's collection. Filtered on the same rule as the train set: a failed
+  # episode carries no CLOSE label, so leaving those in would push the gripper
+  # channel toward OPEN on 28% of val episodes and dilute the one signal that
+  # speaks to the endgame.
+  #
+  # SMALL: 21 episodes / 441 steps, 4.2% of the train set. Same 4.8% CLOSE-label
+  # density as train, so it is representative, but with 7 batches per val epoch
+  # the loss is noisy and best.pt lands on a range of epochs (12-34 in run 1).
+  # The stronger selection layer is EVAL.select_on over 100 scenes; this only
+  # picks the epoch WITHIN an iteration. If it needs fixing later, hold out a
+  # slice of the TRAIN split instead and subtract those scenes from base_train_h5.
+  val_h5: output/bc_dataset/val_pinned_ok.h5
   base_run: null           # path to an existing run of the SAME policy kind to
                            # start from. null => train the base policy here as
                            # iteration 0.
