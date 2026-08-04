@@ -60,7 +60,7 @@ SIM:
   # CAVEAT: the remaining scenes are easier BY CONSTRUCTION, so a success rate
   # measured with this set is not comparable to one over the full split.
   # null disables the exclusion.
-  exclude_scenes: null        # e.g. output/bc_dataset/train_pinned_ok.json
+  exclude_scenes: output/bc_dataset/train_pinned_ok.json   # 126 scenes, 20.2%
 
 DAGGER:
   num_iters: 15            # N — DAgger iterations after the base run
@@ -201,8 +201,15 @@ TRAIN:
   # train.h5/val.h5 had NEITHER filter: measured over 72 scenes, 21% aimed at a
   # different grasp than DAgger picks (median 10.7 cm), and aggregating those two
   # label sets is the one inconsistency DAgger cannot average away.
-  # 623 episodes (720 scenes - 97 OMG "empty goal set" failures), vs 656 unfiltered.
-  base_train_h5: output/bc_dataset/train_pinned.h5
+  # 623 episodes (720 scenes - 97 OMG "empty goal set" failures), vs 656 unfiltered,
+  # then examples/filter_demos.py drops the 126 (20.2%) that ended in a benchmark
+  # FAILURE and so carry no CLOSE label — the OMG plan clips the object while
+  # translating laterally into the pre-grasp pose. 497 episodes / 10437 steps
+  # remain. Those trajectories were previously training data: the approach phase
+  # of a handover that went wrong, which is worse than no data at all.
+  # Keep SIM.exclude_scenes pointing at the matching .json so DAgger does not
+  # collect or evaluate on them either.
+  base_train_h5: output/bc_dataset/train_pinned_ok.h5
   val_h5: output/bc_dataset/val_pinned.h5     # held-out expert data -> best.pt within a run
   base_run: null           # path to an existing run of the SAME policy kind to
                            # start from. null => train the base policy here as
