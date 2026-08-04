@@ -1,9 +1,9 @@
 # SHAKEDOWN config for the Phase-4 loop — a scaled-down copy of
 # dagger_phase4.yaml. Everything STRUCTURAL is identical (same data, same
-# grasp set, same pin table, same success criterion); only the counts are
-# tiny. Purpose: prove the whole loop end-to-end in ~20 min so a typo or a
-# missing path fails here instead of 6 hours into a 24 h GPU allocation.
-# The resulting policy is worthless — delete the run dir afterwards.
+# grasp set, same pin table, same beta schedule shape, same success
+# criterion); only the counts are tiny. Purpose: prove the whole loop
+# end-to-end in ~20 min so a typo or a missing path fails here instead of
+# 6 hours into a long GPU allocation. The policy it produces is worthless.
 SIM:
   cfg_file: examples/pretrain.yaml
   split: train
@@ -22,10 +22,10 @@ DAGGER:
   max_steps: 50
   scene_sampling: random
   seed: 0
-  beta_schedule: indicator
-  beta_start: 0.5
-  beta_end: 0.0
-  beta_p: 0.5
+  beta_schedule: linear
+  beta_start: 0.75
+  beta_end: 0.1
+  beta_p: 0.7
   close_pos_thresh: 0.02
   close_rot_thresh: 0.34
   stop_on_close_label: true
@@ -50,7 +50,7 @@ TRAIN:
 EVAL:
   every: 1
   num_scenes: 6
-  holdout: true
+  holdout: false
   max_steps: 50
   ckpt: best
   success_mode: stable_grasp

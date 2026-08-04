@@ -129,23 +129,44 @@ def beta_at(i: int, d: dict, num_iters: int) -> float:
     raise ValueError(f"Unknown DAGGER.beta_schedule '{schedule}'")
 
 
-def scene_pools(num_scenes: int, ev: dict) -> tuple[list[int], list[int]]:
+def scene_pools(num_scenes: int, ev: dict,
+                usable: set | None = None) -> tuple[list[int], list[int]]:
     """(collection pool, eval scenes).
 
-    The eval scenes are taken evenly spread across the split rather than as a
-    trailing block, so they cover the same object/pose variety as the collection
-    pool. With EVAL.holdout they are removed from the collection pool — the
-    "best on validation" selection is then measured on scenes DAgger never
-    labelled, which is the point of a validation set.
+    `usable` restricts BOTH to scenes the expert can actually plan for — pass the
+    grasp pin table's keys. Roughly 13% of the s0 train split (97 of 720) has no
+    reachable goal set, and OMG fails at step 0 there: the episode is abandoned
+    with reason OMG_FAIL_STEP0 having produced no labels. Without the filter
+    DAgger rediscovers those scenes on every iteration that samples one, so
+    `episodes_per_iter: 100` yields ~86 episodes rather than 100, and eval draws
+    ~13 scenes for which no grasp pose exists (their pose metrics come out NaN
+    while success/grasp/close still count, so the denominators silently differ
+    between columns).
+
+    The pin table is the right filter by construction, not by assumption: it was
+    built by calling `run_omg_planner(..., reset_scene=True)` on each scene —
+    exactly the call the collector makes at step 0 — and recording the ones that
+    returned a plan. If planning is deterministic, a scene absent from the table
+    would fail here too. `c_omg_fail0` in dagger_log.csv stays as the check: with
+    the filter on it should be 0, and anything else is evidence that OMG's
+    outcome varies run to run.
+
+    Eval scenes are spread evenly over the usable set rather than taken as a
+    trailing block, so they cover the same object/pose variety as the pool. With
+    EVAL.holdout they are removed from the pool as well.
     """
-    n_eval = min(int(ev.get("num_scenes", 0)), num_scenes)
+    ids = sorted(usable) if usable else list(range(num_scenes))
+    n_eval = min(int(ev.get("num_scenes", 0)), len(ids))
     if n_eval <= 0:
-        return list(range(num_scenes)), []
-    eval_scenes = sorted(set(np.linspace(0, num_scenes - 1, n_eval).astype(int).tolist()))
+        return ids, []
+    # linspace over POSITIONS in `ids`, then map back — keeps the even spread
+    # when `ids` has gaps in it.
+    eval_scenes = sorted({ids[i] for i in
+                          np.linspace(0, len(ids) - 1, n_eval).astype(int).tolist()})
     if bool(ev.get("holdout", True)):
-        pool = [s for s in range(num_scenes) if s not in set(eval_scenes)]
+        pool = [s for s in ids if s not in set(eval_scenes)]
     else:
-        pool = list(range(num_scenes))
+        pool = list(ids)
     return pool, eval_scenes
 
 
@@ -552,7 +573,17 @@ def main() -> None:
     # ----- simulator (one env: OMG for collection, benchmark for eval) -----
     sim_cfg = build_sim_cfg(sim_cfg_d)
     sim = build_sim_context(sim_cfg, sim_cfg_d, seed=seed)
-    pool, eval_scenes = scene_pools(sim.num_scenes, ev)
+
+    # One committed grasp per scene, shared with the demonstrations. Without it
+    # OMG re-selects its goal on every replan and the target can move mid-episode.
+    # Loaded BEFORE the pools because its key set is also the list of scenes the
+    # expert can plan for, which is what both pools should be drawn from.
+    pin_table = load_grasp_pin_table(
+        sim_cfg_d.get("grasp_pin_table"),
+        match_tol=float(sim_cfg_d.get("grasp_pin_match_tol", 0.02)),
+        sim_cfg_block=sim_cfg_d)
+    usable = set(pin_table.entries) if pin_table is not None else None
+    pool, eval_scenes = scene_pools(sim.num_scenes, ev, usable=usable)
 
     train_cfg = load_yaml(trn["train_cfg"])
     learner = policy_kind(train_cfg)   # "bc" (single frame) | "act" (chunking)
@@ -573,13 +604,10 @@ def main() -> None:
         first_horizon=int(dag.get("first_horizon") or sim_cfg.RL_MAX_STEP),
         reach_commit_dist=float(dag.get("reach_commit_dist", 0.05)),
         reach_skip_eps=float(dag.get("reach_skip_eps", 0.01)),
+        expert_after_commit=bool(dag.get("expert_after_commit", False)),
     )
-    # One committed grasp per scene, shared with the demonstrations. Without it
-    # OMG re-selects its goal on every replan and the target can move mid-episode.
-    pin_table = load_grasp_pin_table(
-        sim_cfg_d.get("grasp_pin_table"),
-        match_tol=float(sim_cfg_d.get("grasp_pin_match_tol", 0.02)),
-        sim_cfg_block=sim_cfg_d)
+    # (pin_table is loaded above, before the scene pools, because its key set
+    # defines which scenes the expert can plan for.)
     # Verification, not enforcement: the pin can silently fail to apply (scene
     # missing from the table, stale pose, OMG failure at step 0), and a scene
     # revisited in a later iteration would then be labelled towards a DIFFERENT
@@ -605,9 +633,13 @@ def main() -> None:
 
     print("=" * 78)
     print(f"Phase-4 DAgger   run={run_name}")
-    print(f"  scenes        : {sim.num_scenes} (split={sim_cfg.BENCHMARK.SPLIT})  "
-          f"pool={len(pool)}  eval={len(eval_scenes)}"
-          f"{' [held out]' if ev.get('holdout', True) else ''}")
+    print(f"  scenes        : {sim.num_scenes} in split={sim_cfg.BENCHMARK.SPLIT}"
+          + (f" -> {len(usable)} plannable (pin table); "
+             f"{sim.num_scenes - len(usable)} dropped (OMG finds no goal set)"
+             if usable is not None else "  [NO pin table: pool unfiltered, expect "
+             "~13% of episodes to abort with OMG_FAIL_STEP0]"))
+    print(f"  pool / eval   : {len(pool)} / {len(eval_scenes)}"
+          f"{'  [eval held out of the pool]' if ev.get('holdout', True) else '  [eval scenes also collected on]'}")
     print(f"  learner       : {learner}"
           f"{' (single frame)' if learner == 'bc' else ' (temporal + chunking)'}"
           f"   <- {trn['train_cfg']}")

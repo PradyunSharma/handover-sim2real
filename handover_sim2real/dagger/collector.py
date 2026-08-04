@@ -138,6 +138,28 @@ class CollectParams:
     # across horizons 5/8/10/20). `reach_skip_eps` then simply skips fewer
     # leading waypoints, so the first frozen target is the standoff itself.
     reach_commit_dist: float = 0.05
+    # ----- expert takeover for the committed reach -----
+    # Once the reach is committed, EXECUTE the expert's waypoints regardless of
+    # beta (i.e. beta = 1 for the endgame only).
+    #
+    # Why it is tempting: committing the reach only fixes the LABEL TARGET. What
+    # moves the arm is still the beta coin, so with a weak learner the EE never
+    # converges and `close_pos_thresh` never fires. Run 1 measured exactly this —
+    # 82/90/85 committed-reach steps in iterations 15-17 with `reached_grasp` = 0
+    # throughout, and ONE close label in the entire run. Forcing the expert here
+    # converts every standoff arrival into a close label.
+    #
+    # What it costs: the states recorded during the reach are on the EXPERT's
+    # distribution, not the learner's, which is the covariate shift DAgger exists
+    # to remove — reintroduced in the region that matters most. It is mitigated by
+    # the takeover starting from wherever the LEARNER arrived (so the segment is
+    # seeded by a learner-induced state, and varies with it), and it is only the
+    # last few waypoints. The GA-DDPG/Phase-3 tail splice makes the same trade.
+    #
+    # It is falsifiable: if collection `reached_grasp` climbs while eval
+    # `chance_rate` stays 0, the takeover is manufacturing labels the policy
+    # cannot use, and the honest conclusion is that the reach itself is unlearned.
+    expert_after_commit: bool = False
     reach_skip_eps: float = 0.01
 
 
@@ -332,7 +354,12 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         policy_action = runner.act(pc, rs)   # [7], ch6 in {0,1}
 
         # ----- choose what to EXECUTE: pi_i = beta*pi* + (1-beta)*pi_hat -----
-        use_expert = expert_target_jp is not None and rng.uniform() < beta
+        # pi_i = beta*pi* + (1-beta)*pi_hat, except that the committed reach can
+        # be forced onto the expert (see CollectParams.expert_after_commit): the
+        # endgame is where the close labels live and where a weak learner stalls.
+        forced_expert = bool(params.expert_after_commit and committed_reach is not None)
+        use_expert = expert_target_jp is not None and (forced_expert
+                                                       or rng.uniform() < beta)
         if use_expert:
             n_expert_steps += 1
             target_jp = expert_target_jp

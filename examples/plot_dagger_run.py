@@ -104,6 +104,42 @@ def _finite(ys) -> bool:
     return any(y == y for y in ys)
 
 
+def _plot(ax, xs, ys, style="-", **kw):
+    """Plot a series, DROPPING missing points rather than passing NaN through.
+
+    Matplotlib breaks a line at every NaN, so a column that is only filled on
+    some iterations — every eval column when EVAL.every > 1, every collection
+    column on iteration 0 — would render as isolated markers while the legend
+    advertised a connected line. Dropping the gaps instead joins the points that
+    do exist, which is what these series mean: the same policy sequence, sampled
+    less often, not a discontinuity in it.
+
+    Returns False if there was nothing to draw, so callers can skip the label.
+    """
+    pts = [(x, y) for x, y in zip(xs, ys) if y == y]
+    if not pts:
+        return False
+    ax.plot([p[0] for p in pts], [p[1] for p in pts], style, **kw)
+    return True
+
+
+def _stack(ax, xs, series, labels, colors):
+    """Stacked area over only the iterations that HAVE data.
+
+    `stackplot` cannot take NaN, and substituting 0 is worse than useless here:
+    an iteration with no eval (EVAL.every > 1) would stack to zero and render as
+    a spike down to the axis, which reads as "everything failed" rather than
+    "not measured". So drop those rows entirely and stack the rest.
+    """
+    keep = [i for i in range(len(xs)) if any(s[i] == s[i] for s in series)]
+    if not keep:
+        return False
+    clean = [[(s[i] if s[i] == s[i] else 0.0) for i in keep] for s in series]
+    ax.stackplot([xs[i] for i in keep], *clean, labels=labels, colors=colors,
+                 alpha=0.85)
+    return True
+
+
 def _grid(ax, title, xlabel="DAgger iteration", ylabel=None):
     ax.set_title(title, fontsize=10)
     ax.set_xlabel(xlabel, fontsize=8)
@@ -161,7 +197,7 @@ def main() -> None:
                               ("success_rate", "success", "-")):
         ys = num(key)
         if _finite(ys):
-            a.plot(it, ys, style, marker="o", ms=3, label=label,
+            _plot(a, it, ys, style, marker="o", ms=3, label=label,
                    lw=2 if key == "success_rate" else 1.2)
     a.set_ylim(-0.02, 1.02)
     _grid(a, "eval (held out): the nested rates", ylabel="fraction of eval scenes")
@@ -177,7 +213,7 @@ def main() -> None:
             ("miss_given_chance", "missed | had chance", ":", "tab:purple")):
         ys = num(key)
         if _finite(ys):
-            a.plot(it, ys, style, marker="o", ms=3, color=col, label=label)
+            _plot(a, it, ys, style, marker="o", ms=3, color=col, label=label)
     a.set_ylim(-0.02, 1.02)
     _grid(a, "opportunity vs conversion", ylabel="fraction")
     _legend(a, loc="upper left")
@@ -187,9 +223,9 @@ def main() -> None:
     mp, mr = num("eval_min_pos"), num("eval_min_rot")
     pe, re_ = num("mean_pos_err"), num("mean_rot_err")
     if _finite(mp):
-        a.plot(it, mp, "-o", ms=3, color="tab:blue", label="min pos err (m)")
+        _plot(a, it, mp, "-o", ms=3, color="tab:blue", label="min pos err (m)")
     if _finite(pe):
-        a.plot(it, pe, "--o", ms=3, color="tab:cyan", alpha=0.8,
+        _plot(a, it, pe, "--o", ms=3, color="tab:cyan", alpha=0.8,
                label="pos err at close (m)")
     a.axhline(args.pos_thresh, color="tab:blue", ls=":", lw=1,
               label=f"close thresh {args.pos_thresh} m")
@@ -198,9 +234,9 @@ def main() -> None:
     a.tick_params(axis="y", labelcolor="tab:blue")
     a2 = a.twinx()
     if _finite(mr):
-        a2.plot(it, mr, "-s", ms=3, color="tab:red", label="min rot err (rad)")
+        _plot(a2, it, mr, "-s", ms=3, color="tab:red", label="min rot err (rad)")
     if _finite(re_):
-        a2.plot(it, re_, "--s", ms=3, color="tab:orange", alpha=0.8,
+        _plot(a2, it, re_, "--s", ms=3, color="tab:orange", alpha=0.8,
                 label="rot err at close (rad)")
     a2.axhline(args.rot_thresh, color="tab:red", ls=":", lw=1,
                label=f"close thresh {args.rot_thresh} rad")
@@ -221,11 +257,8 @@ def main() -> None:
               ("f_drop", "drop", "tab:red"),
               ("f_human_contact", "human contact", "tab:purple"),
               ("f_timeout", "never closed", "tab:gray")]
-    ys = [num(k) for k, _, _ in series]
-    if any(_finite(y) for y in ys):
-        clean = [[0.0 if v != v else v for v in y] for y in ys]
-        a.stackplot(it, *clean, labels=[l for _, l, _ in series],
-                    colors=[c for _, _, c in series], alpha=0.85)
+    if _stack(a, it, [num(k) for k, _, _ in series],
+              [l for _, l, _ in series], [c for _, _, c in series]):
         a.set_ylim(0, 1)
     _grid(a, "eval outcomes (fraction of scenes)")
     _legend(a, loc="lower left", ncol=2)
@@ -240,7 +273,7 @@ def main() -> None:
         frac = [(y / e if (e and e > 0 and y == y and y >= 0) else float("nan"))
                 for y, e in zip(ys, eps)]
         if _finite(frac):
-            a.plot(it, frac, "-o", ms=3, label=label)
+            _plot(a, it, frac, "-o", ms=3, label=label)
     a.set_ylim(-0.02, 1.02)
     _grid(a, "collection: how far the LEARNER got", ylabel="fraction of episodes")
     _legend(a, loc="upper left")
@@ -251,12 +284,12 @@ def main() -> None:
                             ("grasp_mismatch", "grasp CHANGED", "tab:red")):
         ys = num(key)
         if _finite(ys):
-            a.plot(it, ys, "-o", ms=3, color=col, label=label)
+            _plot(a, it, ys, "-o", ms=3, color=col, label=label)
     a.set_ylabel("episodes", fontsize=8)
     a2 = a.twinx()
     dr = num("max_grasp_drift")
     if _finite(dr):
-        a2.plot(it, dr, "--s", ms=3, color="tab:purple", label="max drift (m)")
+        _plot(a2, it, dr, "--s", ms=3, color="tab:purple", label="max drift (m)")
     a2.set_ylabel("max drift (m)", fontsize=8, color="tab:purple")
     a2.tick_params(axis="y", labelcolor="tab:purple", labelsize=7)
     _grid(a, "same grasp per scene? (should be 0 changed)")
@@ -269,13 +302,13 @@ def main() -> None:
     a = ax[1][2]
     ds = num("D_steps")
     if _finite(ds):
-        a.plot(it, ds, "-o", ms=3, color="tab:blue", label="|D| (steps)")
+        _plot(a, it, ds, "-o", ms=3, color="tab:blue", label="|D| (steps)")
     a.set_ylabel("labelled steps in D", fontsize=8, color="tab:blue")
     a.tick_params(axis="y", labelcolor="tab:blue")
     a2 = a.twinx()
     fr = num("D_dagger_frac")
     if _finite(fr):
-        a2.plot(it, fr, "-s", ms=3, color="tab:orange", label="on-policy share")
+        _plot(a2, it, fr, "-s", ms=3, color="tab:orange", label="on-policy share")
     a2.set_ylabel("DAgger fraction of D", fontsize=8, color="tab:orange")
     a2.set_ylim(0, 1)
     a2.tick_params(axis="y", labelcolor="tab:orange", labelsize=7)
@@ -292,7 +325,7 @@ def main() -> None:
                               ("best_val_loss", "best val", ":")):
         ys = num(key)
         if _finite(ys):
-            a.plot(it, ys, style, marker="o", ms=3, label=label)
+            _plot(a, it, ys, style, marker="o", ms=3, label=label)
     a.set_yscale("log")
     a.set_ylabel("loss (log)", fontsize=8)
     a2 = a.twinx()
@@ -300,7 +333,7 @@ def main() -> None:
                               ("val_grip_acc", "val grip acc", "--")):
         ys = num(key)
         if _finite(ys):
-            a2.plot(it, ys, style, marker="^", ms=3, color="tab:green", label=label,
+            _plot(a2, it, ys, style, marker="^", ms=3, color="tab:green", label=label,
                     alpha=0.7 if key == "val_grip_acc" else 1.0)
     a2.set_ylabel("gripper acc", fontsize=8, color="tab:green")
     a2.set_ylim(0, 1.02)
@@ -325,7 +358,7 @@ def main() -> None:
     a = bx[0][0]
     lp = num("mean_label_pos")
     if _finite(lp):
-        a.plot(it, lp, "-o", ms=3, color="tab:blue", label="mean approach label (m)")
+        _plot(a, it, lp, "-o", ms=3, color="tab:blue", label="mean approach label (m)")
     a.axhline(args.ee_step, color="k", ls=":", lw=1, label=f"ee_step {args.ee_step} m")
     a.set_ylim(bottom=0)
     a.set_ylabel("label displacement (m)", fontsize=8, color="tab:blue")
@@ -333,7 +366,7 @@ def main() -> None:
     a2 = a.twinx()
     ty = num("tiny_labels")
     if _finite(ty):
-        a2.plot(it, ty, "-s", ms=3, color="tab:red", label="degenerate (~0) labels")
+        _plot(a2, it, ty, "-s", ms=3, color="tab:red", label="degenerate (~0) labels")
     a2.set_ylabel("count", fontsize=8, color="tab:red")
     a2.tick_params(axis="y", labelcolor="tab:red", labelsize=7)
     _grid(a, "expert label scale (stall detector)")
@@ -348,7 +381,7 @@ def main() -> None:
                        ("reach_steps", "committed-reach steps")):
         ys = num(key)
         if _finite(ys):
-            a.plot(it, ys, "-o", ms=3, label=label)
+            _plot(a, it, ys, "-o", ms=3, label=label)
     _grid(a, "endgame coverage in D_i", ylabel="labels this iteration")
     _legend(a, loc="upper left")
 
@@ -359,7 +392,7 @@ def main() -> None:
                        ("pinned", "episodes pinned")):
         ys = num(key)
         if _finite(ys):
-            a.plot(it, ys, "-o", ms=3, label=label)
+            _plot(a, it, ys, "-o", ms=3, label=label)
     _grid(a, "planner / grasp pinning", ylabel="count this iteration")
     _legend(a, loc="upper left")
 
@@ -369,7 +402,7 @@ def main() -> None:
                        ("mean_close_step", "eval")):
         ys = num(key)
         if _finite(ys):
-            a.plot(it, ys, "-o", ms=3, label=label)
+            _plot(a, it, ys, "-o", ms=3, label=label)
     _grid(a, "step at which the policy closes", ylabel="policy step")
     _legend(a, loc="upper left")
 
@@ -377,24 +410,22 @@ def main() -> None:
     a = bx[1][1]
     b = num("beta")
     if _finite(b):
-        a.plot(it, b, "-o", ms=3, color="tab:purple", label="beta (expert prob.)")
+        _plot(a, it, b, "-o", ms=3, color="tab:purple", label="beta (expert prob.)")
     steps = num("steps")
     exp = num("expert_steps")
     frac = [(e / s if (s and s > 0 and e == e and e >= 0) else float("nan"))
             for e, s in zip(exp, steps)]
     if _finite(frac):
-        a.plot(it, frac, "--s", ms=3, color="tab:brown", label="expert share of steps")
+        _plot(a, it, frac, "--s", ms=3, color="tab:brown", label="expert share of steps")
     a.set_ylim(-0.02, 1.02)
     _grid(a, "expert mixing", ylabel="fraction")
     _legend(a, loc="upper right")
 
     # cost
     a = bx[1][2]
-    cs, ts, es = num("collect_s"), num("train_s"), num("eval_s")
-    if any(_finite(x) for x in (cs, ts, es)):
-        clean = [[0.0 if v != v else v for v in y] for y in (cs, ts, es)]
-        a.stackplot(it, *clean, labels=["collect", "train", "eval"],
-                    colors=["tab:blue", "tab:orange", "tab:green"], alpha=0.85)
+    _stack(a, it, [num("collect_s"), num("train_s"), num("eval_s")],
+           ["collect", "train", "eval"],
+           ["tab:blue", "tab:orange", "tab:green"])
     _grid(a, "wall clock per iteration", ylabel="seconds")
     _legend(a, loc="upper left")
 

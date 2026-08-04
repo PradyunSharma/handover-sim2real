@@ -348,6 +348,12 @@ def main():
         f.attrs["pc_format"]       = "xyz(3)+ycb_flag(1)+hand_flag(1) in EE frame"
         f.attrs["freeze_partial_pointcloud"]  = cfg.POLICY.FREEZE_PARTIAL_POINTCLOUD
         f.attrs["freeze_at_step"]             = cfg.POLICY.FREEZE_PARTIAL_POINTCLOUD_AT_STEP
+        # PROVENANCE — which grasp set these labels aim at. Without it a dataset
+        # is indistinguishable from one collected against a different goal set,
+        # and comparing it to a pin table silently measures the mismatch between
+        # two grasp choices instead of whatever you meant to measure.
+        f.attrs["valid_grasp_dict"] = str(args.valid_grasp_dict or "")
+        f.attrs["grasp_pin_table"]  = str(args.grasp_pin_table or "")
 
         for scene_idx in range(num_scenes):
             episode = collect_episode(
