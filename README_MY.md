@@ -1752,3 +1752,193 @@ Six columns carry more weight than the rest:
 
 Full design notes, including the trade-off from dropping the standoff cutoff:
 [`docs/thesis_phase4_dagger.md`](docs/thesis_phase4_dagger.md).
+
+## Phase-4 end to end: every command, in order
+
+The section above is the design. This one is the runbook — the five stages from a
+clean checkout to plotted curves, in the order they have to happen, because each
+stage consumes a file the previous one wrote. Everything below runs on the
+cluster inside `conda activate pch2r_dev`; **all of it needs a GPU**, including
+the parts that look like pure CPU work, because `OMG-Planner/omg/config.py` calls
+`.cuda()` at module import and fails outright without a driver.
+
+### 1. Pin one grasp per scene
+
+OMG re-decides its goal on every plan, so before collecting anything you commit
+one grasp per scene to a JSON table keyed on world pose. Two rules are available
+and they are genuinely different datasets, not variations on one:
+
+```bash
+# rule A — furthest from the hand (maximises clearance from the human)
+python examples/build_grasp_pin_table.py --cfg-file examples/configs/dagger_phase4.yaml --split train --mode furthest_from_hand --tol 0.01 --out output/grasp_pin_table_train.json
+
+# rule B — whatever OMG picks unaided from the home configuration
+python examples/build_grasp_pin_table.py --cfg-file examples/configs/dagger_phase4.yaml --split train --mode omg --out output/grasp_pin_table_omg_train.json
+```
+
+`--tol 0.01` matters for rule A. At `--tol 0` the argmax will move the grasp 8.5 cm
+across the object to gain a tenth of a millimetre of clearance; the tolerance
+resolves near-ties toward OMG's own pick instead. Rebuild the table whenever
+`valid_grasp_dict_path` or `hand_collision_filter` changes, since those change
+which candidates exist at all.
+
+Repeat with `--split val` for the validation table. On SLURM:
+
+```bash
+sbatch --export=ALL,SPLIT=train,MODE=furthest_from_hand,OUT=output/grasp_pin_table_train.json examples/slurm/build_pin_table.sbatch
+```
+
+### 2. Collect the demonstrations
+
+```bash
+python examples/collect_bc_dataset.py --cfg-file examples/pretrain.yaml --split train --valid-grasp-dict examples/valid_grasp_dict_005.pkl --grasp-pin-table output/grasp_pin_table_train.json --output output/bc_dataset/train_pinned.h5
+```
+
+`--cfg-file` **must** be the same file as `SIM.cfg_file` in `dagger_phase4.yaml`
+(`examples/pretrain.yaml`), or the demonstrations and the DAgger rollouts will
+disagree about the simulator. The pin table and grasp dict are recorded into the
+HDF5 attrs, so a dataset always knows what it was built against — which is what
+lets stage 3 refuse to analyse a mismatched pair.
+
+On SLURM, chained so collection starts the moment the table lands:
+
+```bash
+PIN=$(sbatch --parsable --export=ALL,SPLIT=train examples/slurm/build_pin_table.sbatch) && sbatch --dependency=afterok:$PIN --export=ALL,SPLIT=train,PIN=output/grasp_pin_table_train.json examples/slurm/collect_bc_demos.sbatch
+```
+
+### 3. Drop the failed demonstrations, and write the exclusion JSON
+
+About 20% of episodes end in benchmark failure — the planned trajectory clips the
+object while translating laterally into the pre-grasp pose and knocks it out of
+the hand. Those are the approach phase of a handover that went wrong, and by
+default they are training data.
+
+They are exactly identifiable: `collect_bc_dataset.py` appends the closure
+transition only `if not done`, so **an episode has no CLOSE label if and only if
+it failed**. That is the filter:
+
+```bash
+python examples/filter_demos.py --in output/bc_dataset/train_pinned.h5 --out output/bc_dataset/train_pinned_ok.h5
+# measured on run 1's data: 497 kept, 126 dropped (20.2%)
+```
+
+Two files come out. `train_pinned_ok.h5` is the dataset minus the failures, and
+`train_pinned_ok.json` is the list of scene indices they came from — the second
+one matters as much as the first, because without it DAgger goes back and
+re-attempts those same broken scenes every single iteration. Add `--dry-run` to
+see the counts before writing anything.
+
+Worth being honest in the write-up about what this costs: dropping those scenes
+makes the remainder easier *by construction*, since every scene where the expert
+itself collides is now gone. A success rate measured afterwards is on that easier
+subset and is not comparable to one measured on the full split.
+
+While you are here, confirm the expert actually closes where the config says it
+should:
+
+```bash
+python examples/analyze_close_labels.py --demos output/bc_dataset/train_pinned.h5 --pin-table output/grasp_pin_table_train.json
+# measured: median 4.6 mm / 0.0003 rad at the CLOSE label; 99.4% inside both thresholds
+```
+
+That number is what justifies keeping `close_pos_thresh` at 0.02 m rather than
+always appending the close at the end of the reach — the threshold is not the
+bottleneck. Point `--demos` at a dataset built *with* the matching `--pin-table`
+or the answer is meaningless; the script warns when the attrs disagree.
+
+### 4. Wire the outputs into the config
+
+Three keys in `examples/configs/dagger_phase4.yaml`, and they have to move
+together:
+
+```yaml
+SIM:
+  grasp_pin_table: output/grasp_pin_table_train.json   # the same table stage 2 used
+  exclude_scenes:  output/bc_dataset/train_pinned_ok.json   # stage 3's dropped scenes
+TRAIN:
+  base_train_h5:   output/bc_dataset/train_pinned_ok.h5     # the FILTERED dataset
+  val_h5:          output/bc_dataset/val_pinned.h5
+```
+
+`exclude_scenes` is subtracted from **both** pools before they are built, so the
+excluded scenes are neither collected on nor evaluated on. Swapping the pin table
+without rebuilding the dataset is the one combination that silently produces
+nonsense — the collector would aim at grasps the demonstrations never saw.
+
+### 5. Look at the demonstrations before training on them
+
+Cheap, and it is how the lateral-approach collision was identified in the first
+place. Needs a display, so run it on the PC after syncing the HDF5:
+
+```bash
+python examples/visualize_bc_dataset.py --dataset output/bc_dataset/train_pinned.h5 --mode replay --cfg-file examples/pretrain.yaml --show-goal-grasp --grasp-pin-table output/grasp_pin_table_train.json --episode 0
+```
+
+Green is the pinned grasp, cyan its pre-grasp standoff. Pass the *same*
+`--grasp-pin-table` the dataset was built with, or the green gripper will be drawn
+at whatever OMG picks on replay and will not match what the episode was aiming
+at. Add `--show-grasp-set` to see every candidate it chose from, and drop
+`--mode replay` for the no-GPU matplotlib version.
+
+### 6. Train
+
+```bash
+python examples/train_dagger_phase4.py --cfg-file examples/configs/dagger_phase4.yaml --run-name dagger4_run2
+```
+
+On SLURM, one line. Omit `BASE=` whenever the dataset changed — a base run
+trained on the old data is not a valid starting point:
+
+```bash
+sbatch --time=14:00:00 --export=ALL,RUN=dagger4_run2 examples/slurm/train_dagger_phase4.sbatch
+```
+
+Re-running the identical command resumes: completed iterations are skipped, a
+finished-but-untrained collection is reused, and an interrupted fit continues
+from its `last.pt`.
+
+Rough cost, measured on run 1 (20 iterations, 8 h total): the base fit is ~18 min,
+an iteration without evaluation ~17 min and with evaluation ~31 min. Collection
+runs 10 s per episode and evaluation 7.8 s per scene, but training dominates at
+0.87 s per epoch per 1000 steps of aggregate — 61% of the wall clock. That ratio
+is why `episodes_per_iter` went up to 100 while `iter_epochs` came down to 25:
+data is cheap here and epochs are not.
+
+### 7. Read the results
+
+Three views, answering three different questions.
+
+```bash
+# per ITERATION — did it learn? reads dagger_log.csv, safe to run mid-training
+python examples/plot_dagger_run.py output/dagger_runs/dagger4_run2
+
+# per EPOCH, all refits — is each fit healthy, and is the aggregate getting harder?
+python examples/plot_dagger_epochs.py output/dagger_runs/dagger4_run2
+
+# one iteration in full Phase-1 depth, including predicted-vs-expert per episode
+python examples/analyze_bc_run.py --run-dir output/dagger_runs/dagger4_run1/iters/iter_05 --mode both
+```
+
+The third works because **every `iters/iter_NN/` is a complete BC run dir** —
+`config.yaml`, `checkpoints/`, `normalization.npz`, `log.csv` — written by the
+same `BCTrainer` Phase 1 uses. So the whole Phase-1 analysis toolchain applies to
+any single DAgger iteration unchanged, `predict` mode and the ←/→ episode viewer
+included. `iter_00` is the base fit on the demonstrations; `iter_01` onward are
+the refits.
+
+The per-epoch logs are *not* part of the usual sync, since they sit beside the
+multi-gigabyte checkpoints. Pull just the CSVs:
+
+```bash
+rsync -avP --include='*/' --include='log.csv' --exclude='*' pradyunsharma@login.delftblue.tudelft.nl:/home/pradyunsharma/h2r/handover-sim2real/output/dagger_runs/dagger4_run2/iters/ output/dagger_runs/dagger4_run2/iters/
+```
+
+`plot_dagger_epochs.py` writes two figures. `epoch_curves.png` lays the whole
+history on one axis with a boundary line per iteration — the sawtooth is just the
+optimizer restarting under Follow-The-Leader, so read the *envelope*: a loss floor
+that climbs iteration after iteration means the aggregate is accumulating labels
+the network cannot satisfy at once, which is the one failure aggregation cannot
+average away. `epoch_curves_overlay.png` puts every refit on a shared epoch axis,
+dark for early and bright for late, so "is the fit getting harder as |D| grows" is
+a direct visual comparison. Compare floors rather than endpoints — the base fit
+gets `base_epochs` (100) and the refits get `iter_epochs` (25).
