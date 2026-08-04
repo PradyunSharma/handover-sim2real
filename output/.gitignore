@@ -18,3 +18,15 @@
 !rl_runs/*/*.yaml
 !rl_runs/*/*.npz
 rl_runs/*/checkpoints/
+
+# Same policy for dagger_runs/ — track the lightweight per-run metadata (log,
+# config, state, grasp registry, curves) but NOT the large per-iter checkpoints
+# and demo data (best/ last/ iters/ data/ — ~1 GB/run). Only files DIRECTLY in
+# the run dir are re-included; the heavy subdirs stay ignored (one level deeper).
+!dagger_runs/
+!dagger_runs/*/
+!dagger_runs/*/*.csv
+!dagger_runs/*/*.json
+!dagger_runs/*/*.yaml
+!dagger_runs/*/*.png
+!dagger_runs/*/*.npz

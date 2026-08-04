@@ -1,0 +1,175 @@
+{
+  "iterations": [
+    {
+      "iter": 0,
+      "run_dir": "output/dagger_runs/dagger4_smoke/iters/iter_00",
+      "dagger_h5": null,
+      "beta": 1.0,
+      "eval": {
+        "n": 6,
+        "success_rate": 0.0,
+        "grasp_rate": 0.16666666666666666,
+        "close_rate": 0.6666666666666666,
+        "near_rate": 0.0,
+        "close_success_rate": 0.0,
+        "chance_rate": 0.0,
+        "missed_rate": 0.0,
+        "miss_given_chance": NaN,
+        "eval_min_pos": 0.11120581378368048,
+        "eval_min_rot": 0.8402202056886704,
+        "mean_dist": 0.1569881464044253,
+        "mean_pos_err": 0.1167509864701733,
+        "mean_rot_err": 1.0835572647524603,
+        "mean_close_step": 20.25,
+        "reasons": {
+          "TIMEOUT": 1,
+          "NO_RELEASE": 3,
+          "DROP": 2
+        }
+      },
+      "is_best": true
+    },
+    {
+      "iter": 1,
+      "run_dir": "output/dagger_runs/dagger4_smoke/iters/iter_01",
+      "dagger_h5": "output/dagger_runs/dagger4_smoke/data/dagger_iter_01.h5",
+      "beta": 0.0,
+      "scenes": [
+        550,
+        225,
+        406,
+        9
+      ],
+      "collect": {
+        "episodes": 2,
+        "steps": 50,
+        "skipped": 2,
+        "n_omg_fail": 2,
+        "n_goal_switch": 0,
+        "n_expert_steps": 0,
+        "pinned": 2,
+        "reached_standoff": 1,
+        "reached_grasp": 0,
+        "n_reach_steps": 7,
+        "policy_closed": 2,
+        "n_close_labels": 0,
+        "n_approach_labels": 50,
+        "n_tiny_labels": 0,
+        "n_revisits": 0,
+        "n_grasp_mismatch": 0,
+        "max_grasp_drift": 0.0,
+        "reasons": {
+          "OMG_FAIL_STEP0": 2,
+          "POLICY_CLOSE": 2
+        },
+        "mean_min_pos": 0.0422242156895305,
+        "mean_min_rot": 1.108316031504849,
+        "mean_policy_close_step": 24.0,
+        "mean_label_pos": 0.06166619915515184,
+        "path": "output/dagger_runs/dagger4_smoke/data/dagger_iter_01.h5"
+      },
+      "eval": {
+        "n": 6,
+        "success_rate": 0.16666666666666666,
+        "grasp_rate": 0.0,
+        "close_rate": 0.6666666666666666,
+        "near_rate": 0.0,
+        "close_success_rate": 0.25,
+        "chance_rate": 0.0,
+        "missed_rate": 0.0,
+        "miss_given_chance": NaN,
+        "eval_min_pos": 0.11632599141695772,
+        "eval_min_rot": 0.8958029137996286,
+        "mean_dist": 0.1928831785917282,
+        "mean_pos_err": 0.15429996757399722,
+        "mean_rot_err": 1.4766223069001336,
+        "mean_close_step": 22.75,
+        "reasons": {
+          "DROP": 1,
+          "HUMAN_CONTACT": 1,
+          "NO_RELEASE": 3,
+          "GRASP_OK": 1
+        }
+      },
+      "is_best": true,
+      "wall_s": 99.6
+    },
+    {
+      "iter": 2,
+      "run_dir": "output/dagger_runs/dagger4_smoke/iters/iter_02",
+      "dagger_h5": "output/dagger_runs/dagger4_smoke/data/dagger_iter_02.h5",
+      "beta": 0.0,
+      "scenes": [
+        378,
+        434,
+        576,
+        110
+      ],
+      "collect": {
+        "episodes": 4,
+        "steps": 96,
+        "skipped": 0,
+        "n_omg_fail": 0,
+        "n_goal_switch": 0,
+        "n_expert_steps": 0,
+        "pinned": 4,
+        "reached_standoff": 0,
+        "reached_grasp": 0,
+        "n_reach_steps": 0,
+        "policy_closed": 3,
+        "n_close_labels": 0,
+        "n_approach_labels": 96,
+        "n_tiny_labels": 0,
+        "n_revisits": 0,
+        "n_grasp_mismatch": 0,
+        "max_grasp_drift": 0.0,
+        "reasons": {
+          "POLICY_CLOSE": 3,
+          "ENV_DONE": 1
+        },
+        "mean_min_pos": 0.19101362667977922,
+        "mean_min_rot": 1.0405023378697982,
+        "mean_policy_close_step": 24.0,
+        "mean_label_pos": 0.05980604359259208,
+        "path": "output/dagger_runs/dagger4_smoke/data/dagger_iter_02.h5"
+      },
+      "eval": {
+        "n": 6,
+        "success_rate": 0.5,
+        "grasp_rate": 0.5,
+        "close_rate": 0.8333333333333334,
+        "near_rate": 0.0,
+        "close_success_rate": 0.6,
+        "chance_rate": 0.0,
+        "missed_rate": 0.0,
+        "miss_given_chance": NaN,
+        "eval_min_pos": 0.11663510294039973,
+        "eval_min_rot": 0.7684446983490533,
+        "mean_dist": 0.15214084088802338,
+        "mean_pos_err": 0.10579608821257289,
+        "mean_rot_err": 1.4069649934282658,
+        "mean_close_step": 24.2,
+        "reasons": {
+          "DROP": 1,
+          "NO_RELEASE": 2,
+          "GRASP_OK": 3
+        }
+      },
+      "is_best": true,
+      "wall_s": 112.3
+    }
+  ],
+  "best": {
+    "iter": 2,
+    "metric": "success_rate",
+    "score": 0.5,
+    "score_tuple": [
+      0.5,
+      0.5,
+      0.0,
+      -0.15214084088802338
+    ],
+    "run_dir": "output/dagger_runs/dagger4_smoke/iters/iter_02"
+  },
+  "cursor": 0
+}

@@ -48,6 +48,7 @@
 # CPU partition cannot run this job at all — OMG needs CUDA).
 #SBATCH --time=24:00:00
 #SBATCH --nodes=1
+#SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4             # serial script — a few cores for PyBullet/python
 #SBATCH --gpus-per-task=1
