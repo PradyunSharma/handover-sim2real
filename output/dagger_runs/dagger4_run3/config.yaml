@@ -1,0 +1,55 @@
+SIM:
+  cfg_file: examples/pretrain.yaml
+  split: train
+  egl: false
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08
+  hand_points_radius: 0.35
+  use_standoff: true
+  standoff_dist: 0.08
+  grasp_pin_table: output/grasp_pin_table_train_omg.json
+  grasp_pin_match_tol: 0.02
+  exclude_scenes: output/bc_dataset/train_pinned_omg_ok.json
+DAGGER:
+  num_iters: 15
+  episodes_per_iter: 100
+  max_steps: 50
+  scene_sampling: random
+  seed: 0
+  beta_schedule: linear
+  beta_start: 0.75
+  beta_end: 0.1
+  beta_p: 0.7
+  close_pos_thresh: 0.02
+  close_rot_thresh: 0.34
+  stop_on_close_label: true
+  stop_on_policy_close: false
+  ee_step: 0.04
+  reach_tail: 5
+  min_free: 1
+  max_horizon: 40
+  first_horizon: null
+  reach_commit_dist: 0.05
+  reach_skip_eps: 0.01
+  expert_after_commit: true
+TRAIN:
+  train_cfg: examples/configs/bc_phase1.yaml
+  base_train_h5: output/bc_dataset/train_pinned_omg_ok.h5
+  val_h5: output/bc_dataset/val_pinned_omg_ok.h5
+  base_run: null
+  base_epochs: 100
+  iter_epochs: 25
+  train_from_scratch: true
+  num_workers: 2
+  device: cuda
+EVAL:
+  every: 2
+  num_scenes: 100
+  holdout: false
+  max_steps: 50
+  ckpt: best
+  success_mode: stable_grasp
+  hold_steps: 3
+  select_on: success_rate
+  verbose: false
