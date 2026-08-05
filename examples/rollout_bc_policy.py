@@ -179,15 +179,19 @@ def rollout(env, model, point_listener, gb_policy, scene_idx, device,
             panda_base_inv_tf, steps_action_repeat, max_steps,
             R_base, panda_base_pos, draw=True,
             show_goal_grasp=False, show_grasp_set=False,
-            omg_steps=None, goal_marker_ids=None):
+            omg_steps=None, goal_marker_ids=None, pin_table=None):
     obs = env.reset(idx=scene_idx)
     point_listener.reset()
 
-    # Optionally overlay the grasp OMG planned to reach for this scene. The OMG
-    # goal is deterministic per scene, so for a static handover it is exactly
-    # the grasp the expert demonstrations aimed at. Drawn once (the object is
-    # static) and left up for the whole roll so you can see the gripper close
-    # the gap; replaced on the next roll via the shared goal_marker_ids list.
+    # Optionally overlay the grasp the policy is supposed to be aiming at. Drawn
+    # once (the object is static) and left up for the whole roll so you can watch
+    # the gripper close the gap; replaced on the next roll via goal_marker_ids.
+    #
+    # PASS THE PIN TABLE the policy was trained with, or this overlay lies. OMG
+    # re-decides its goal on every plan, and on a Phase-4 dataset the pinned grasp
+    # differs from OMG's free pick on 63% of train scenes — so without the table
+    # the green gripper lands somewhere the policy was never taught to go, and a
+    # correct rollout looks like a miss.
     if show_goal_grasp:
         if goal_marker_ids is None:
             goal_marker_ids = []
@@ -196,6 +200,10 @@ def rollout(env, model, point_listener, gb_policy, scene_idx, device,
         goal_marker_ids.clear()
 
         env.run_omg_planner(omg_steps or max_steps, scene_idx)  # plans, no sim step
+        if pin_table is not None and pin_table.apply(env, scene_idx):
+            # Pruning the goal set renumbers it, so replan to re-resolve the goal
+            # index against the pinned grasp. reset_scene=False keeps the scene.
+            env.run_omg_planner(omg_steps or max_steps, scene_idx, reset_scene=False)
         if show_grasp_set:
             try:
                 for T in env.get_grasp_poses_world():
@@ -314,6 +322,12 @@ def parse_args():
     p.add_argument("--show-grasp-set", action="store_true",
                    help="also draw the full filtered OMG grasp candidate set "
                         "(faint grey); implies --show-goal-grasp.")
+    p.add_argument("--grasp-pin-table", default=None,
+                   help="per-scene committed grasp (examples/build_grasp_pin_table.py). "
+                        "Pass the table the policy was TRAINED with, or the green "
+                        "goal gripper is drawn at OMG's free pick instead — which "
+                        "differs from the pinned grasp on 63%% of train scenes, "
+                        "making a correct rollout look like a miss.")
     p.add_argument("--freeze-partial-pointcloud", action="store_true",
                    help="experimental: freeze the cloud to an early frame and hold "
                         "it for the whole episode. MUST match the setting the "
@@ -369,6 +383,12 @@ def main():
     want_goal = args.show_goal_grasp or args.show_grasp_set
     goal_marker_ids = []  # shared across re-rolls so old markers get cleared
 
+    pin_table = None
+    if args.grasp_pin_table:
+        from handover_sim2real.dagger import load_grasp_pin_table
+        pin_table = load_grasp_pin_table(args.grasp_pin_table)
+        print(f"Grasp pin table: {args.grasp_pin_table}")
+
     def do_rollout(s, draw=render):
         return rollout(env, model, point_listener, gb_policy, s, args.device,
                        panda_base_inv_tf, steps_action_repeat, args.max_steps,
@@ -376,7 +396,8 @@ def main():
                        show_goal_grasp=(want_goal and draw),
                        show_grasp_set=args.show_grasp_set,
                        omg_steps=cfg.RL_MAX_STEP,
-                       goal_marker_ids=goal_marker_ids)
+                       goal_marker_ids=goal_marker_ids,
+                       pin_table=pin_table)
 
     # Headless benchmark: roll out many scenes, report success / grasp / dist.
     if args.benchmark:
