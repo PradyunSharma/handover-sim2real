@@ -1973,3 +1973,48 @@ average away. `epoch_curves_overlay.png` puts every refit on a shared epoch axis
 dark for early and bright for late, so "is the fit getting harder as |D| grows" is
 a direct visual comparison. Compare floors rather than endpoints — the base fit
 gets `base_epochs` (100) and the refits get `iter_epochs` (25).
+
+## Syncing the cluster's scratch outputs to the personal PC
+
+DelftBlue `/home` is a **hard 30 GB quota**, so the heavy outputs (checkpoints,
+demo h5s, datasets — ~13 GB) live on **`/scratch/<netid>`** and are reachable from
+the repo through symlinks. `/scratch` is **periodically purged** (data older than a
+certain age is deleted automatically), so the PC copy is the only durable one —
+sync it regularly. Docs: https://doc.dhpc.tudelft.nl/delftblue/Data-transfer-to-DelftBlue/
+
+Run this **on the PC** (the login nodes cannot reach your laptop, so the PC always
+pulls). `-P` shows progress and makes the transfer resumable — re-running only
+moves what changed:
+
+```bash
+rsync -avP \
+  --exclude='*.tar.gz' \
+  pradyunsharma@login.delftblue.tudelft.nl:/scratch/pradyunsharma/handover-sim2real/output/ \
+  /home/pradyun/h2r/handover-sim2real/output/
+```
+
+Dry-run first with `-avn` to see what would land. Or pull by priority (each part is
+independently resumable):
+
+```bash
+R=pradyunsharma@login.delftblue.tudelft.nl:/scratch/pradyunsharma/handover-sim2real/output
+L=/home/pradyun/h2r/handover-sim2real/output
+
+rsync -avP $R/dagger_runs/ $L/dagger_runs/     # 1.4G — current work
+rsync -avP $R/rl_runs/     $L/rl_runs/         # 5.2G — all RL checkpoints
+rsync -avP $R/rl_demos/    $L/rl_demos/        # 1.6G — demo h5s
+rsync -avP $R/bc_runs/     $L/bc_runs/         # 1.5G
+rsync -avP $R/bc_dataset/  $L/bc_dataset/      # 2.4G — regenerable, lowest priority
+```
+
+Gotchas:
+- **Trailing slashes matter**: `src/ → dst/` copies the *contents* of src into dst.
+  Dropping the source slash nests it as `dst/output/`.
+- **No `--delete`** in these commands, deliberately — it would erase local files
+  that don't exist on the cluster.
+- **Sync from the `/scratch` path, not the home repo.** `~/h2r/handover-sim2real/output/`
+  on the cluster is full of symlinks into `/scratch`; a plain `rsync -av` would copy
+  them as dangling links pointing at paths that don't exist on the PC. (Add `-L` to
+  follow symlinks if you ever do pull from home.)
+- Needs TU Delft network or eduVPN ("Institute Access"). Off-campus, jump via the
+  bastion: add `-e 'ssh -J pradyunsharma@student-linux.tudelft.nl'`.
