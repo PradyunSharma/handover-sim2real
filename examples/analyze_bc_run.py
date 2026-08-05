@@ -150,6 +150,8 @@ def build_and_load_model(cfg: dict, run_dir: Path, device: str, ckpt: str):
         pointnet_radius    = float(m["pointnet_radius"]),
         pointnet_nclusters = int(m["pointnet_nclusters"]),
         use_prev_act       = bool(m.get("use_prev_act", True)),
+        drop_joint_state   = bool(m.get("drop_joint_state", False)),
+        joint_state_dim    = int(m.get("joint_state_dim", 18)),
         freeze_pc          = bool(m.get("freeze_pc", False)),
         normalizer         = normalizer,
     ).to(device)

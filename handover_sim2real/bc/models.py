@@ -191,20 +191,35 @@ class BCPolicy(nn.Module):
                  pointnet_nclusters: int = 32,
                  use_prev_act: bool = True,
                  prev_act_dim: int = 6,
+                 drop_joint_state: bool = False,
+                 joint_state_dim: int = 18,
                  freeze_pc: bool = False,
                  normalizer=None):
         super().__init__()
-        # The stored robot_state always has `robot_state_dim` channels with the
-        # previous action as the trailing `prev_act_dim`. When use_prev_act is
-        # False those trailing channels are dropped before the robot encoder
-        # (see _select_robot_state); the encoder is sized accordingly. The
-        # *input* to forward/predict is always the full robot_state_dim — the
-        # slice happens internally, so the normalizer can stay full-width.
+        # The stored robot_state always has `robot_state_dim` channels, laid out
+        # joint_pos(9)+joint_vel(9)+ee_pose(7)+gripper(1)+prev_act(6). Two
+        # optional slices trim it before the robot encoder (see
+        # _select_robot_state); the encoder is sized accordingly. The *input* to
+        # forward/predict is always the full robot_state_dim — the slice happens
+        # internally, so the normalizer can stay full-width.
+        #
+        # drop_joint_state strips the LEADING joint_pos(9)+joint_vel(9) block:
+        # the action is EE-frame, so the ee_pose already in the vector carries
+        # the kinematics, and joint space is redundant + scene-correlated (a
+        # memorization handle). Mirrors RLActor/RLCritic's flag of the same name
+        # so a Phase-3 and a Phase-4 policy can be given the same input.
+        # It changes the robot-encoder in_dim, so a checkpoint trained with it
+        # cannot be loaded into a model without it (and vice versa) — the run's
+        # config.yaml is what keeps the two in sync.
         self.use_prev_act         = bool(use_prev_act)
         self.prev_act_dim         = int(prev_act_dim)
+        self.drop_joint_state     = bool(drop_joint_state)
+        self.joint_state_dim      = int(joint_state_dim)
         self.full_robot_state_dim = int(robot_state_dim)
-        effective_robot_dim = (self.full_robot_state_dim if self.use_prev_act
-                               else self.full_robot_state_dim - self.prev_act_dim)
+        _tail = (self.full_robot_state_dim if self.use_prev_act
+                 else self.full_robot_state_dim - self.prev_act_dim)
+        _lead = self.joint_state_dim if self.drop_joint_state else 0
+        effective_robot_dim = _tail - _lead
 
         self.pc_encoder = PointCloudEncoder(
             in_channels=pc_channels,
@@ -270,17 +285,23 @@ class BCPolicy(nn.Module):
 
     # ----- robot-state channel selection -----------------------------------
     def _select_robot_state(self, rs: torch.Tensor) -> torch.Tensor:
-        """Optionally drop the trailing prev_action(6) channels.
+        """Trim the stored 32-D robot state down to the encoder's input.
 
-        prev_act is ~0.9 correlated with the target action (the OMG path is
-        smooth), so leaving it in lets the policy 'copy' the previous action
-        and ignore the point cloud (causal confusion / copycat). Dropping it
-        forces the policy to read proprioception + scene instead. Input is the
-        full robot_state_dim; this returns the encoder-sized slice.
+        Trailing prev_action(6), dropped when use_prev_act is False: prev_act is
+        ~0.9 correlated with the target action (the OMG path is smooth), so
+        leaving it in lets the policy 'copy' the previous action and ignore the
+        point cloud (causal confusion / copycat).
+
+        Leading joint_pos(9)+joint_vel(9), dropped when drop_joint_state is
+        True: redundant with the ee_pose that follows it, and scene-correlated.
+
+        Input is always the full robot_state_dim; this returns the
+        encoder-sized slice.
         """
-        if self.use_prev_act:
-            return rs
-        return rs[..., : self.full_robot_state_dim - self.prev_act_dim]
+        hi = (self.full_robot_state_dim if self.use_prev_act
+              else self.full_robot_state_dim - self.prev_act_dim)
+        lo = self.joint_state_dim if self.drop_joint_state else 0
+        return rs[..., lo:hi]
 
     # ----- forward (training) ----------------------------------------------
     def forward(self, pc: torch.Tensor, rs: torch.Tensor) -> torch.Tensor:
