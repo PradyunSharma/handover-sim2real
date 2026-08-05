@@ -15,6 +15,11 @@
 #   From an existing base run (skips the 100-epoch base fit):
 #     sbatch --export=ALL,RUN=dagger4_run2,BASE=output/bc_runs/phase1_full \
 #         examples/slurm/train_dagger_phase4.sbatch
+#   EVALUATION IS NO LONGER IN THIS JOB when the config sets EVAL.every: 0. It is
+#   not on the critical path (train_dagger_phase4.py hands the next collection the
+#   fresh policy before eval runs), so it costs ~19% of wall clock for nothing.
+#   Score the iterations alongside, in a second job:
+#     sbatch --export=ALL,RUN=dagger4_run6 examples/slurm/eval_dagger_run.sbatch
 #   Watch:  tail -f slurm_logs/dagger4_<jobid>.out
 #   Plot (safe while running — read-only):
 #     python examples/plot_dagger_run.py output/dagger_runs/<RUN>
@@ -46,7 +51,15 @@
 #SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4             # main process + TRAIN.num_workers DataLoader workers
+#SBATCH --cpus-per-task=22            # 20 parallel collection workers + 2 for the
+                                      # main loop and the refit's DataLoader. 20 DIVIDES
+                                      # DAGGER.episodes_per_iter=100 (5 episodes each,
+                                      # 100% utilization); 16 would leave some workers
+                                      # with 7. Past ~20 the gain is minutes on a whole
+                                      # run and the queue wait is worse — collection
+                                      # drops to ~1 min/iteration and the FTL refit
+                                      # becomes the entire cost. A V100 node has 48
+                                      # cores across 4 GPUs, so 64 is NOT schedulable.
 #SBATCH --gpus-per-task=1
 #SBATCH --mem-per-cpu=4G              # 16G total
 #SBATCH --output=slurm_logs/dagger4_%j.out
@@ -76,10 +89,12 @@ CFG="${CFG:-examples/configs/dagger_phase4.yaml}"
 RUN="${RUN:-dagger4_run1}"
 OUT_ROOT="${OUT_ROOT:-output/dagger_runs}"
 BASE="${BASE:-}"                      # existing base run dir; empty => train it here
+WORKERS="${WORKERS:-$(( SLURM_CPUS_PER_TASK - 2 ))}"   # parallel collection processes
 EXTRA="${EXTRA:-}"
 
 echo "host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
 echo "cfg=${CFG}  run=${RUN}  out-root=${OUT_ROOT}  base=${BASE:-none}  extra=${EXTRA:-none}"
+echo "cpus-per-task=${SLURM_CPUS_PER_TASK}  collection workers=${WORKERS}"
 
 BASE_ARG=()
 [ -n "${BASE}" ] && BASE_ARG=(--base-run "${BASE}")
@@ -88,5 +103,6 @@ srun python examples/train_dagger_phase4.py \
     --cfg-file "${CFG}" \
     --run-name "${RUN}" \
     --out-root "${OUT_ROOT}" \
+    --num-workers "${WORKERS}" \
     "${BASE_ARG[@]}" \
     ${EXTRA}

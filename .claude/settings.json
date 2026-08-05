@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git diff *)",
+      "Bash(python3 /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/c790be60-5e96-4232-9970-349c38e20b3d/scratchpad/mkconfigs.py)",
+      "Bash(python3 -c ' *)",
+      "Bash(awk '{print $5, $9}')"
+    ]
+  }
+}

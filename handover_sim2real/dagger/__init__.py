@@ -53,6 +53,11 @@ from .collector import (
     DaggerHDF5Writer,
 )
 from .evaluator import EvalParams, evaluate_policy
+from .setup import Phase4Context, build_phase4_context, scene_pools
+# NOT imported here: .parallel. It spawns worker processes that re-import this
+# package, and pulling torch.multiprocessing in at package import would pay that
+# cost for every consumer. train_dagger_phase4 imports it only when
+# --num-workers > 1.
 
 __all__ = [
     "SimContext",
@@ -75,4 +80,7 @@ __all__ = [
     "DaggerHDF5Writer",
     "EvalParams",
     "evaluate_policy",
+    "Phase4Context",
+    "build_phase4_context",
+    "scene_pools",
 ]

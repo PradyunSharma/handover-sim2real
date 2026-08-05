@@ -91,6 +91,7 @@ from handover_sim2real.dagger import (
     load_policy_runner,
     policy_kind,
 )
+from handover_sim2real.dagger.setup import build_phase4_context, scene_pools
 
 
 # ── config plumbing ──────────────────────────────────────────────────────────
@@ -126,48 +127,27 @@ def beta_at(i: int, d: dict, num_iters: int) -> float:
         if num_iters <= 1:
             return hi
         return lo + (hi - lo) * (i - 1) / (num_iters - 1)
+    if schedule == "piecewise":
+        # Two linear segments joined at `beta_knee` (a FRACTION of num_iters, so
+        # the shape survives a change of num_iters): beta_start -> beta_mid over
+        # the first segment, beta_mid -> beta_end over the second. A single
+        # `linear` cannot express "hand over slowly, then hold a floor", which is
+        # the response to run 3's collapse — reached_grasp fell 87 -> 45 over
+        # iterations 10-15 as beta annealed to 0.10, and success followed it down.
+        lo = float(d.get("beta_start", 1.0))
+        mid = float(d.get("beta_mid", 0.5))
+        hi = float(d.get("beta_end", 0.0))
+        knee = float(d.get("beta_knee", 0.66))
+        if num_iters <= 1:
+            return hi
+        # k is the LAST iteration of the first segment, so beta_at(k) == beta_mid
+        # exactly and the second segment starts one step below it. Clamped to
+        # [1, num_iters-1] so both segments always have somewhere to go.
+        k = min(max(int(round(knee * num_iters)), 1), num_iters - 1)
+        if i <= k:
+            return lo + (mid - lo) * (i - 1) / max(k - 1, 1)
+        return mid + (hi - mid) * (i - k) / max(num_iters - k, 1)
     raise ValueError(f"Unknown DAGGER.beta_schedule '{schedule}'")
-
-
-def scene_pools(num_scenes: int, ev: dict,
-                usable: set | None = None) -> tuple[list[int], list[int]]:
-    """(collection pool, eval scenes).
-
-    `usable` restricts BOTH to scenes the expert can actually plan for — pass the
-    grasp pin table's keys. Roughly 13% of the s0 train split (97 of 720) has no
-    reachable goal set, and OMG fails at step 0 there: the episode is abandoned
-    with reason OMG_FAIL_STEP0 having produced no labels. Without the filter
-    DAgger rediscovers those scenes on every iteration that samples one, so
-    `episodes_per_iter: 100` yields ~86 episodes rather than 100, and eval draws
-    ~13 scenes for which no grasp pose exists (their pose metrics come out NaN
-    while success/grasp/close still count, so the denominators silently differ
-    between columns).
-
-    The pin table is the right filter by construction, not by assumption: it was
-    built by calling `run_omg_planner(..., reset_scene=True)` on each scene —
-    exactly the call the collector makes at step 0 — and recording the ones that
-    returned a plan. If planning is deterministic, a scene absent from the table
-    would fail here too. `c_omg_fail0` in dagger_log.csv stays as the check: with
-    the filter on it should be 0, and anything else is evidence that OMG's
-    outcome varies run to run.
-
-    Eval scenes are spread evenly over the usable set rather than taken as a
-    trailing block, so they cover the same object/pose variety as the pool. With
-    EVAL.holdout they are removed from the pool as well.
-    """
-    ids = sorted(usable) if usable else list(range(num_scenes))
-    n_eval = min(int(ev.get("num_scenes", 0)), len(ids))
-    if n_eval <= 0:
-        return ids, []
-    # linspace over POSITIONS in `ids`, then map back — keeps the even spread
-    # when `ids` has gaps in it.
-    eval_scenes = sorted({ids[i] for i in
-                          np.linspace(0, len(ids) - 1, n_eval).astype(int).tolist()})
-    if bool(ev.get("holdout", True)):
-        pool = [s for s in ids if s not in set(eval_scenes)]
-    else:
-        pool = list(ids)
-    return pool, eval_scenes
 
 
 def sample_scenes(pool: list[int], m: int, mode: str, rng, cursor: int) -> tuple[list[int], int]:
@@ -358,7 +338,7 @@ LOG_FIELDS = [
     "episodes", "steps", "skipped", "pinned",
     "reached_standoff", "reached_grasp", "reach_steps",
     "omg_fail", "goal_switch", "expert_steps", "policy_closed",
-    "policy_close_cmds", "dropped_tail",
+    "policy_close_cmds", "dropped_tail", "dart", "dart_env_done",
     "mean_min_pos", "mean_min_rot", "mean_policy_close_step",
     "c_close_label", "c_policy_close", "c_max_steps", "c_env_done", "c_no_labels",
     "c_omg_fail0",
@@ -449,6 +429,8 @@ def collect_columns(c: dict) -> dict:
         "expert_steps": c["n_expert_steps"], "policy_closed": c["policy_closed"],
         "policy_close_cmds": c.get("n_policy_close_cmds", -1),
         "dropped_tail": c.get("n_dropped_tail", -1),
+        "dart": c.get("n_dart", -1),
+        "dart_env_done": c.get("n_dart_env_done", -1),
         "mean_min_pos": _r(c.get("mean_min_pos")),
         "mean_min_rot": _r(c.get("mean_min_rot")),
         "mean_policy_close_step": _r(c.get("mean_policy_close_step"), 2),
@@ -536,6 +518,15 @@ def parse_args() -> argparse.Namespace:
                    help="override TRAIN.base_run: start from an existing ACT run")
     p.add_argument("--device", default=None, help="override TRAIN.device")
     p.add_argument("--seed", type=int, default=None, help="override DAGGER.seed")
+    p.add_argument("--num-workers", type=int, default=1,
+                   help="parallel COLLECTION worker processes. 1 = the original "
+                        "serial loop. Set ~ --cpus-per-task minus 2, and prefer a "
+                        "value that DIVIDES DAGGER.episodes_per_iter (at m=100, 20 "
+                        "gives 5 episodes each; 16 gives 7 to some workers).")
+    p.add_argument("--worker-device", default="cuda", choices=["cpu", "cuda"],
+                   help="device for a collection worker's policy. MUST be cuda: "
+                        "PointNet++'s furthest_point_sample has no CPU kernel. "
+                        "Left as a flag only so the failure is explicit.")
     p.add_argument("--no-eval", action="store_true", help="disable evaluation (EVAL.every=0)")
     return p.parse_args()
 
@@ -629,6 +620,13 @@ def main() -> None:
         reach_commit_dist=float(dag.get("reach_commit_dist", 0.05)),
         reach_skip_eps=float(dag.get("reach_skip_eps", 0.01)),
         expert_after_commit=bool(dag.get("expert_after_commit", False)),
+        # DART. Off by default: `dart_ratio: 0` draws no random number, so a run
+        # that omits these keys collects exactly what it collected before DART
+        # existed.
+        dart_ratio=float(dag.get("dart_ratio", 0.0)),
+        dart_max_dist=float(dag.get("dart_max_dist", 0.20)),
+        dart_pos_mag=float(dag.get("dart_pos_mag", 0.04)),
+        dart_rot_mag=float(dag.get("dart_rot_mag", 0.2)),
     )
     # (pin_table is loaded above, before the scene pools, because its key set
     # defines which scenes the expert can plan for.)
@@ -638,6 +636,21 @@ def main() -> None:
     # grasp. `goal_switch` cannot see that — it is per-episode.
     registry = GraspRegistry(run_root / "grasp_registry.json",
                              tol=float(sim_cfg_d.get("grasp_pin_match_tol", 0.02)))
+
+    # Parallel D_i collection. Built AFTER the main env so a startup failure in a
+    # worker is reported before any iteration begins. The main env stays: the
+    # evaluator still uses it, and it is what `sim.num_scenes` is read from.
+    collector_pool = None
+    if int(args.num_workers) > 1:
+        from handover_sim2real.dagger.parallel import ParallelDaggerCollector
+        collector_pool = ParallelDaggerCollector(
+            num_workers=int(args.num_workers), cfg4=cfg4, base_seed=seed,
+            worker_device=str(args.worker_device))
+        m_ep = int(dag["episodes_per_iter"])
+        rounds = -(-m_ep // int(args.num_workers))
+        print(f"[parallel] m={m_ep} over {args.num_workers} workers -> "
+              f"{rounds} episode(s) each at the slowest worker "
+              f"({m_ep / (rounds * int(args.num_workers)) * 100:.0f}% utilization)")
 
     # Success is the PHASE-3 criterion (hold the close, object secured), not the
     # benchmark's carry-to-GOAL_CENTER SUCCESS — Phase 4 has no retreat, so the
@@ -675,10 +688,19 @@ def main() -> None:
     print(f"  beta schedule : {dag.get('beta_schedule')}  "
           f"(iter1={beta_at(1, dag, num_iters):.3f}, "
           f"iter{num_iters}={beta_at(num_iters, dag, num_iters):.3f})")
+    print("                  "
+          + " ".join(f"{beta_at(j, dag, num_iters):.2f}"
+                     for j in range(1, num_iters + 1)))
     print(f"  grasp pinning : "
           f"{pin_table.describe() if pin_table else 'OFF (OMG re-selects every replan)'}")
     print(f"  close label   : pos<={collect_params.close_pos_thresh} m  "
           f"rot<={collect_params.close_rot_thresh} rad")
+    print(f"  DART          : "
+          + (f"p={collect_params.dart_ratio} per approach step within "
+             f"({collect_params.reach_commit_dist}, {collect_params.dart_max_dist}] m "
+             f"of the standoff; +-{collect_params.dart_pos_mag} m / "
+             f"+-{collect_params.dart_rot_mag} rad"
+             if collect_params.dart_ratio > 0.0 else "OFF"))
     print(f"  eval success  : {eval_params.success_mode}"
           + (f" (hold {eval_params.hold_steps} steps, then released & not dropped)"
              if eval_params.success_mode == "stable_grasp"
@@ -782,6 +804,7 @@ def main() -> None:
                       "reached_grasp": -1, "n_omg_fail": -1, "n_goal_switch": -1,
                       "n_expert_steps": -1, "policy_closed": -1,
                       "n_policy_close_cmds": -1, "n_dropped_tail": -1,
+                      "n_dart": -1, "n_dart_env_done": -1,
                       "mean_min_pos": float("nan"), "mean_min_rot": float("nan"),
                       "mean_policy_close_step": float("nan"),
                       "n_close_labels": -1, "n_approach_labels": -1,
@@ -790,20 +813,38 @@ def main() -> None:
                       "max_grasp_drift": float("nan"),
                       "reasons": {}, "path": str(h5_path)}
         else:
-            runner, _ = load_policy_runner(cur_run_dir, device, ckpt=eval_ckpt)
             print(f"  [collect] {len(scenes)} episodes -> {h5_path.name}")
-            cstats = collect_iteration(
-                sim, runner, scenes, h5_path, rng=rng,
-                beta=beta, params=collect_params, pin_table=pin_table,
-                registry=registry, iteration=i)
-            del runner
-            if device != "cpu":
-                torch.cuda.empty_cache()
+            if collector_pool is not None:
+                # Per-episode seeds drawn from the iteration rng, so the scene
+                # sequence AND the seed sequence are what the serial path would
+                # have produced; only which RandomState each episode reads from
+                # differs (bitwise identity is not meaningful once episodes run
+                # concurrently). Aggregation still happens in collect_iteration.
+                ep_seeds = [int(rng.randint(0, 2 ** 31 - 1)) for _ in scenes]
+                results = collector_pool.collect(
+                    cur_run_dir, eval_ckpt, scenes, ep_seeds, beta,
+                    collect_params, i)
+                cstats = collect_iteration(
+                    None, None, scenes, h5_path, rng=rng,
+                    beta=beta, params=collect_params, pin_table=pin_table,
+                    registry=registry, iteration=i, results=results)
+            else:
+                runner, _ = load_policy_runner(cur_run_dir, device, ckpt=eval_ckpt)
+                cstats = collect_iteration(
+                    sim, runner, scenes, h5_path, rng=rng,
+                    beta=beta, params=collect_params, pin_table=pin_table,
+                    registry=registry, iteration=i)
+                del runner
+                if device != "cpu":
+                    torch.cuda.empty_cache()
             print(f"  [collect] episodes={cstats['episodes']} steps={cstats['steps']} "
                   f"standoff={cstats.get('reached_standoff', -1)} "
                   f"grasp={cstats['reached_grasp']} pinned={cstats.get('pinned', -1)} "
                   f"skipped={cstats['skipped']} "
-                  f"omg_fail={cstats['n_omg_fail']} reasons={cstats['reasons']}")
+                  + (f"dart={cstats.get('n_dart', -1)}"
+                     f"(ended={cstats.get('n_dart_env_done', -1)}) "
+                     if collect_params.dart_ratio > 0.0 else "")
+                  + f"omg_fail={cstats['n_omg_fail']} reasons={cstats['reasons']}")
 
         collect_s = time.time() - t_collect
 
@@ -883,6 +924,9 @@ def main() -> None:
         row.update(eval_columns(emetrics))
         log_row(log_path, row)
 
+    if collector_pool is not None:
+        collector_pool.close()
+
     print("\n" + "=" * 78)
     print(f"Done. {len(dagger_files)} DAgger iterations aggregated.")
     if (run_root / "last").exists():
@@ -892,7 +936,9 @@ def main() -> None:
         print(f"  best : {run_root / 'best'}  "
               f"(iteration {b['iter']}, {b['metric']}={b['score']:.4f})")
     else:
-        print("  best : not selected (evaluation was disabled)")
+        print("  best : not selected — score the iterations separately:\n"
+              f"         python examples/eval_dagger_run.py --run-dir {run_root} "
+              f"--publish-best")
     print(f"  log  : {log_path}")
     print("=" * 78)
 

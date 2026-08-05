@@ -56,6 +56,11 @@ DIAGNOSTIC (<run>/curves_diag.png) — 2x3 grid, "is the machinery healthy":
   • planner    — OMG failures, goal-grasp switches, pinned episodes. With the pin
                  table loaded, goal_switch should be flat 0; anything else means
                  the table is stale or not matching.
+  • mixing     — beta and the expert's share of executed steps, plus (DART runs
+                 only) the share taken by random jolts and the fraction of those
+                 jolts that ended the episode. That last line is the magnitude
+                 tripwire: if it climbs, dart_pos_mag is knocking the object out
+                 of the hand rather than displacing the gripper.
   • closing    — when each side decides to close: the learner's mean close step
                  during collection vs at eval, against the horizon.
   • beta/mix   — the beta schedule and the fraction of executed steps that were
@@ -78,7 +83,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 
 
-def _load(log_path: Path):
+def _load(log_path: Path, eval_log: Path | None = None):
     cols: dict[str, list] = {}
     with log_path.open() as f:
         for row in csv.DictReader(f):
@@ -86,6 +91,28 @@ def _load(log_path: Path):
                 cols.setdefault(k, []).append(v)
 
     n_rows = len(cols.get("iter", []))
+
+    # With EVAL.every: 0 the loop leaves every eval column blank and the metrics
+    # live in eval_log.csv instead (examples/eval_dagger_run.py, a separate job).
+    # Splice them in by iteration so the plots look the same either way. Only
+    # BLANK cells are filled — an in-loop number always wins, so a run that did
+    # both never has its own numbers overwritten by a re-scored pool.
+    if eval_log is not None and eval_log.exists():
+        with eval_log.open() as f:
+            by_iter = {r["iter"]: r for r in csv.DictReader(f) if r.get("iter")}
+        if by_iter:
+            keys = set().union(*(set(r) for r in by_iter.values())) - {"iter", "run_dir"}
+            filled = 0
+            for k in keys:
+                col = cols.setdefault(k, [""] * n_rows)
+                for i, it in enumerate(cols.get("iter", [])):
+                    if i < len(col) and not str(col[i]).strip():
+                        v = by_iter.get(str(it), {}).get(k, "")
+                        if str(v).strip():
+                            col[i] = v
+                            filled += 1
+            print(f"[plot] merged {len(by_iter)} rows / {filled} cells from "
+                  f"{eval_log.name}")
 
     def num(key):
         """Column as floats. Absent column (an older log) or blank cell -> NaN,
@@ -185,7 +212,7 @@ def main() -> None:
     if not log_path.exists():
         raise SystemExit(f"no log at {log_path}")
 
-    num, n = _load(log_path)
+    num, n = _load(log_path, eval_log=run / "eval_log.csv")
     if n == 0:
         raise SystemExit(f"{log_path} has no rows yet")
     it = num("iter")
@@ -429,6 +456,25 @@ def main() -> None:
             for e, s in zip(exp, steps)]
     if _finite(frac):
         _plot(a, it, frac, "--s", ms=3, color="tab:brown", label="expert share of steps")
+    # DART belongs here: it is the OTHER thing that overrides the executed action.
+    # Absent (or all -1) on a run collected without it, so `_finite` keeps the
+    # panel unchanged for every pre-DART run.
+    dart = num("dart")
+    if _finite(dart) and any(d == d and d > 0 for d in dart):
+        dfrac = [(d / s if (s and s > 0 and d == d and d >= 0) else float("nan"))
+                 for d, s in zip(dart, steps)]
+        _plot(a, it, dfrac, "-^", ms=3, color="tab:olive",
+              label="DART share of steps")
+        # The magnitude tripwire: jolts that ended the episode, as a fraction of
+        # jolts fired. Climbing means dart_pos_mag is knocking the object out of
+        # the hand rather than displacing the gripper.
+        ended = num("dart_env_done")
+        if _finite(ended):
+            efrac = [(e / d if (d and d > 0 and e == e and e >= 0) else float("nan"))
+                     for e, d in zip(ended, dart)]
+            if _finite(efrac):
+                _plot(a, it, efrac, ":v", ms=3, color="tab:red",
+                      label="jolts that ended the episode")
     a.set_ylim(-0.02, 1.02)
     _grid(a, "expert mixing", ylabel="fraction")
     _legend(a, loc="upper right")

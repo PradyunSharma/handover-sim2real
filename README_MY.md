@@ -1725,6 +1725,48 @@ incapable of entering the dataset. Two consequences worth knowing:
 expert is still colliding on scenes that survived `exclude_scenes`, i.e. the
 filtering from stage 3 of the runbook missed them.
 
+**DART (optional; off unless `dart_ratio > 0`).** On a fraction of approach steps
+the executed action is replaced by a random task-space jump, so the EE lands
+off-plan and the following steps are labelled with the expert's recovery from
+there. It buys the one kind of coverage DAgger stops producing on its own: once
+beta has annealed and the learner tracks the plan, it no longer visits the states
+where it arrives at the standoff a few centimetres off *laterally*, so it never
+sees a correction for them.
+
+Phase 4 needs none of the machinery this costs upstream. GA-DDPG
+(`core/ddpg.py`) and Phase 3 (`rl/td3bc_trainer.py`) must flag the perturbed row
+and drop it from the critic's Bellman fit, because there the stored action *is*
+the artificial jump; Phase 4 stores only `(state, pi*(state))` and never the
+executed action, so there is nothing to mask and the pair recorded on a jolt step
+is entirely ordinary. GA-DDPG also has to replan and splice the tail after each
+jolt — here every step already re-queries OMG from the current configuration, so
+the perturbed state gets a correct fresh label by construction.
+
+| key | default | what it does |
+|---|---|---|
+| `dart_ratio` | `0.0` | per-step probability; `0` also draws no random number, so a DART-free run is bit-identical to a pre-DART one |
+| `dart_max_dist` | `0.20` | upper edge of the trigger band, metres from the standoff |
+| `dart_pos_mag` | `0.04` | ± metres per axis (GA-DDPG's value, and exactly `ee_step`) |
+| `dart_rot_mag` | `0.2` | ± radians per axis |
+
+The trigger is **distance to the standoff**, not a step index as in GA-DDPG and
+Phase 3. Theirs works because the expert plays a plan by index, so step count
+tracks progress; here every step replans and `max_steps` is 50, so a far scene
+needs ~36 steps to reach the standoff and a near one ~10 — a fixed window would
+jolt one episode mid-flight and another before it had moved. The band's lower
+edge is `reach_commit_dist` by construction: below it the reach has committed, and
+jolting then would kick the EE back out of `close_pos_thresh` and destroy the
+close label. A jolt also never steals a step on which the policy asked to close,
+so `policy_closed` and `c_policy_close` keep meaning the same thing as in a run
+without DART — which is what makes a DART-vs-no-DART comparison readable.
+
+Two columns to watch, both on the mixing panel of `curves_diag.png`: `dart`
+(jolts fired — zero with a nonzero ratio means the band is never entered) and
+`dart_env_done` (jolts that ended the episode). Read the second as a fraction of
+the first: if it climbs, `dart_pos_mag` is knocking the object out of the hand
+rather than displacing the gripper. Watch `c_max_steps` too, since a jolt spends
+one of the 50 steps.
+
 Run dir `output/dagger_runs/<name>/`: `state.json`, `dagger_log.csv`,
 `data/dagger_iter_NN.h5`, `iters/iter_NN/`, and `best/` + `last/` — the last two
 are standalone run dirs, so:
@@ -1791,7 +1833,21 @@ clean checkout to plotted curves, in the order they have to happen, because each
 stage consumes a file the previous one wrote. Everything below runs on the
 cluster inside `conda activate pch2r_dev`; **all of it needs a GPU**, including
 the parts that look like pure CPU work, because `OMG-Planner/omg/config.py` calls
-`.cuda()` at module import and fails outright without a driver.
+`.cuda()` at module import and fails outright without a driver. The two exceptions
+are `filter_demos.py` and the plotting scripts, which import only h5py/numpy/
+matplotlib and are fine on a login node.
+
+A fresh login shell has neither conda nor the env, and DelftBlue's default
+`python` is old enough that `from __future__ import annotations` is a
+`SyntaxError` (Python < 3.7) and `h5py` is missing. Start every session with:
+
+```bash
+module load miniconda3
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate pch2r_dev
+```
+
+`conda activate` on its own will not work — the hook has to be sourced first.
 
 ### 1. Pin one grasp per scene
 
@@ -1935,19 +1991,87 @@ runs 10 s per episode and evaluation 7.8 s per scene, but training dominates at
 is why `episodes_per_iter` went up to 100 while `iter_epochs` came down to 25:
 data is cheap here and epochs are not.
 
+### 6b. Making a run faster on the cluster
+
+Measured on runs 2 and 3, a DAgger iteration splits roughly 44% collection, 36%
+refit, 20% evaluation, and the job asks for 4 CPUs and 1 GPU. Two of those three
+phases were being run serially for no reason.
+
+**Evaluation is not on the critical path.** `train_dagger_phase4.py` assigns `cur_run_dir = iter_dir`
+*before* the eval block (line 823 vs 827), and the next iteration collects from
+`cur_run_dir`. The metrics feed only
+`maybe_update_best` — checkpoint selection and reporting. So the loop never waits
+on eval; running it inline just adds ~12 minutes every second iteration. Pass
+`--no-eval` (or set `EVAL.every: 0` in the config) and score the iterations in a
+second job:
+
+```bash
+# trainer: collection parallelised, evaluation skipped
+sbatch --time=12:00:00 --export=ALL,RUN=dagger4_run6,CFG=examples/configs/dagger_phase4_omg_nojoint.yaml,EXTRA=--no-eval examples/slurm/train_dagger_phase4.sbatch
+
+# scorer, alongside — polls for new iterations, exits when the trainer stops
+sbatch --export=ALL,RUN=dagger4_run6 examples/slurm/eval_dagger_run.sbatch
+```
+
+`eval_dagger_run.py` reads the run's own saved `config.yaml` and rebuilds the
+simulator, pin table, scene pool and thresholds through the same
+`build_phase4_context` the trainer uses, so its numbers mean exactly what the
+in-loop ones did. It writes `<run>/eval_log.csv` atomically, skips iterations
+already scored, and is read-only on everything else — safe to resubmit, and safe
+to run while training continues. `plot_dagger_run.py` splices `eval_log.csv` into
+the blank eval columns automatically, so the plots look the same either way.
+
+Run it once at the end instead, if you prefer, with `WATCH=0,PUBLISH=1` — the
+`--publish-best` flag exports `<run>/best`, which you should not do while the
+trainer is running, because it writes there too.
+
+**Collection parallelises exactly.** π̂ᵢ is frozen for the whole of iteration i
+and all m scenes are drawn up front, so the episodes are independent — unlike
+Phase-3 RL, where the actor updates continuously and concurrent rollouts see
+stale weights. `--num-workers` fans them across persistent processes that each
+own an env and an OMG planner; the manager stamps per-episode seeds and returns
+results in job order, so the HDF5 episode order and the `GraspRegistry`
+first-seen bookkeeping do not depend on which worker finished first. Aggregation,
+writing and the registry checks still happen in the one `collect_iteration` loop.
+
+The sbatch now requests 22 CPUs and derives `WORKERS = cpus - 2`. **20 is the
+number to want**: it divides `episodes_per_iter: 100` exactly (5 episodes each,
+100% utilisation) where 16 leaves some workers with 7. Going higher is close to
+pointless — collection is already down to about a minute per iteration and the
+from-scratch refit becomes the entire cost — and a V100 node has 48 cores across
+4 GPUs, so the association's `cpu=64` is not schedulable on one node anyway.
+
+Every worker needs a CUDA context because PointNet++'s `furthest_point_sample`
+has no CPU kernel. That is a correctness constraint, not a throughput one: the
+policy forward is 2.2 ms of a 163 ms collection step, against 84.6 ms of
+point-cloud rendering and 74.2 ms of OMG replanning. Collection is CPU-bound, so
+a second GPU would not help it.
+
+Expected effect on a 15-iteration run, from the fitted run-2 timings:
+
+| | projected | speedup |
+|---|---|---|
+| as-is (4 CPUs, serial, in-loop eval) | 8.92 h | 1.00× |
+| eval moved to its own job | 7.26 h | 1.23× |
+| + 20 collection workers | 4.25 h | 2.10× |
+
+The remaining time is almost entirely the Follow-The-Leader refit, which re-fits
+the whole aggregate every iteration by design. Nothing here touches that.
+
 ### 7. Read the results
 
 Three views, answering three different questions.
 
 ```bash
-# per ITERATION — did it learn? reads dagger_log.csv, safe to run mid-training
+# per ITERATION — did it learn? reads dagger_log.csv (+ eval_log.csv if the
+# evaluation ran as a separate job), safe to run mid-training
 python examples/plot_dagger_run.py output/dagger_runs/dagger4_run2
 
 # per EPOCH, all refits — is each fit healthy, and is the aggregate getting harder?
 python examples/plot_dagger_epochs.py output/dagger_runs/dagger4_run2
 
 # one iteration in full Phase-1 depth, including predicted-vs-expert per episode
-python examples/analyze_bc_run.py --run-dir output/dagger_runs/dagger4_run1/iters/iter_05 --mode both
+python examples/analyze_bc_run.py --run-dir output/dagger_runs/dagger4_run2/iters/iter_05 --mode both
 ```
 
 The third works because **every `iters/iter_NN/` is a complete BC run dir** —
@@ -1973,6 +2097,156 @@ average away. `epoch_curves_overlay.png` puts every refit on a shared epoch axis
 dark for early and bright for late, so "is the fit getting harder as |D| grows" is
 a direct visual comparison. Compare floors rather than endpoints — the base fit
 gets `base_epochs` (100) and the refits get `iter_epochs` (25).
+
+### 8. The run variants, and what each one changes
+
+Stages 1–7 are the same for every run; only the config differs. The runs form a
+chain in which each step moves exactly one thing, so any difference in the curves
+has one candidate explanation:
+
+| run | config | pinned grasp | cameras | robot MLP input |
+|---|---|---|---|---|
+| 2 | `dagger_phase4.yaml` | furthest from hand | wrist | 26 dims |
+| 3 | `dagger_phase4_omg.yaml` | OMG's own pick | wrist | 26 dims |
+| 4 | `dagger_phase4_omg_nojoint.yaml` | OMG's own pick | wrist | **8 dims** |
+| 5 | `dagger_phase4_omg_nojoint_multicam.yaml` | OMG's own pick | **wrist+left+right** | 8 dims |
+
+Runs 6–10 branch off run 4 rather than continuing the chain, because they form a
+2×2 with two controls — `{run 4's β schedule, the extended one} × {DART 0.2,
+DART 0.5}`:
+
+| run | config | vs | β schedule | iters | `dart_ratio` |
+|---|---|---|---|---|---|
+| 4 | `dagger_phase4_omg_nojoint.yaml` | — | linear 0.75→0.10 | 15 | off (control) |
+| 6 | `dagger_phase4_dart02.yaml` | 4 | linear 0.75→0.10 | 15 | **0.2** |
+| 7 | `dagger_phase4_dart05.yaml` | 4 | linear 0.75→0.10 | 15 | **0.5** |
+| 8 | `dagger_phase4_beta_ext.yaml` | 4 | **piecewise 1.0→0.5→0.3** | **25** | off (control) |
+| 9 | `dagger_phase4_beta_ext_dart02.yaml` | 8 | piecewise 1.0→0.5→0.3 | 25 | **0.2** |
+| 10 | `dagger_phase4_beta_ext_dart05.yaml` | 8 | piecewise 1.0→0.5→0.3 | 25 | **0.5** |
+
+Each row differs from the run in its **vs** column by only the bolded keys — 4
+keys for 6 and 9, 1 key for 7 and 10, 6 keys for 8. Run 4's existing result is
+the control for 6 and 7 at no extra cost; run 8 is the control for 9 and 10.
+
+The β schedule for 8–10 needs the `piecewise` mode added in `beta_at`: two linear
+segments joined at `beta_knee` as a *fraction* of `num_iters`, so with 25
+iterations the join is iteration 16 and β runs 1.00 → 0.50 over 1–16, then
+0.50 → 0.30 over 17–25. A single `linear` cannot express "hand over slowly, then
+hold a floor", which is the response to run 3's collapse — `reached_grasp` fell
+87 → 45 across iterations 10–15 as β annealed to 0.10.
+
+Two costs of that schedule are worth stating. At β = 1.00 iteration 1 is *pure*
+expert (with `expert_after_commit` already true, nothing in it is on the
+learner's distribution), so it contributes fresh demonstrations rather than
+DAgger corrections and the first genuinely on-policy data arrives at iteration 2.
+And Follow-The-Leader refits the whole aggregate every iteration, so cost grows
+quadratically: measured off run 4's own log at 0.87 ms per sample-epoch with
+|D| growing 2855 steps/iteration, 25 iterations is **7.1 h of refits** against
+run 4's 3.0 h — 2.4×, not 1.7×.
+
+```bash
+# runs 6 and 7 — DART on run 4's schedule (~4.8 h each, eval inline)
+sbatch --time=08:00:00 --export=ALL,RUN=dagger4_run6,CFG=examples/configs/dagger_phase4_dart02.yaml examples/slurm/train_dagger_phase4.sbatch
+sbatch --time=08:00:00 --export=ALL,RUN=dagger4_run7,CFG=examples/configs/dagger_phase4_dart05.yaml examples/slurm/train_dagger_phase4.sbatch
+
+# runs 8, 9, 10 — extended β schedule, 25 iterations (~10 h each, eval inline)
+sbatch --time=16:00:00 --export=ALL,RUN=dagger4_run8,CFG=examples/configs/dagger_phase4_beta_ext.yaml examples/slurm/train_dagger_phase4.sbatch
+sbatch --time=16:00:00 --export=ALL,RUN=dagger4_run9,CFG=examples/configs/dagger_phase4_beta_ext_dart02.yaml examples/slurm/train_dagger_phase4.sbatch
+sbatch --time=16:00:00 --export=ALL,RUN=dagger4_run10,CFG=examples/configs/dagger_phase4_beta_ext_dart05.yaml examples/slurm/train_dagger_phase4.sbatch
+```
+
+**Share run 4's base policy across all five.** Every one of these configs has the
+same `train_cfg`, `base_train_h5`, `val_h5`, `base_epochs` and seed as run 4, so
+iteration 0 is not merely similar — it is the same fit. Passing run 4's saves
+~14 min per run and, more importantly, removes base-fit seed variance from a
+comparison that has no measured noise floor to absorb it:
+
+```bash
+# check it is there first — iters/ checkpoints are often left on /scratch
+ls output/dagger_runs/dagger4_run4/iters/iter_00/checkpoints/best.pt
+# then add to each command above:
+#   BASE=output/dagger_runs/dagger4_run4/iters/iter_00
+```
+
+To take the ~1.3 h (15 iters) / ~2.1 h (25 iters) of evaluation off the critical
+path, set `EVAL.every: 0` in the config and run `eval_dagger_run.sbatch`
+alongside — see §6b. Left inline here so the eval cadence matches run 4's
+exactly, which is what keeps the comparison clean.
+
+Run 2 versus 3 isolates the pin rule (`furthest_from_hand` maximises clearance
+from the human hand; `omg` keeps `argmin ‖traj.start − goal_set[i]‖` in joint
+space from the home configuration, i.e. the grasp reachable with the least arm
+motion). The two rules disagree on 63% of train scenes, so they are genuinely
+different labellings.
+
+Run 3 versus 4 isolates the robot-state width. `TRAIN.train_cfg` swaps
+`bc_phase1.yaml` for `bc_phase1_nojoint.yaml`, whose `MODEL.drop_joint_state`
+strips the leading `joint_pos(9)+joint_vel(9)` block, leaving
+`[ee_pos(3), ee_orn_wxyz(4), gripper(1)]`. The action is EE-frame, so `ee_pose`
+already carries the kinematics; joint space is redundant and scene-correlated,
+which with only ~350 usable scenes makes it a handle for memorising scene
+identity instead of reading the point cloud. It is the same flag Phase-3 `rl_run28`
+introduced. The stored state stays 32-D and the normalizer stays full width — the
+trim happens inside `BCPolicy._select_robot_state`, so nothing upstream changes.
+
+Run 4 versus 5 isolates the cameras, and is the only variant needing new data.
+
+**Run 4 reuses run 3's files exactly**, so there is nothing to collect:
+
+```bash
+sbatch --time=12:00:00 --export=ALL,RUN=dagger4_run4,CFG=examples/configs/dagger_phase4_omg_nojoint.yaml examples/slurm/train_dagger_phase4.sbatch
+```
+
+Do **not** pass `BASE=`. Any existing base run has a 26-dim robot encoder and its
+checkpoint will not load into an 8-dim model — the size mismatch raises rather
+than failing quietly, but the run dies either way. `base_run: null` in the config
+already makes iteration 0 train here.
+
+**Run 5 needs its demonstrations re-collected.** `SIM.cfg_file` becomes
+`examples/pretrain_multicam_wlr.yaml`: the dynamic wrist eye-in-hand camera fused
+with the two fixed side cameras, in the panda hand frame. Crucially
+`COMPUTE_ROBOT_POINT_STATE` stays **off**, so the classes remain `[object, hand]`
+and `pc_channels` stays 5 — `bc_phase1_nojoint.yaml` is unchanged and the CVPR2023
+PointNet++ warm start still transfers all 68/68 encoder tensors. The Phase-3
+multicam configs (`pretrain_multicam.yaml`, `pretrain_multicam_wl.yaml`) turn the
+robot class on, go to 6 channels, and have to reinitialise the first SA conv.
+Excluding the arm also keeps the camera change from undoing run 4: a robot point
+class would put the joint configuration back into the observation through the
+cloud.
+
+Measured on scene 0, wrist-only against wrist+left+right: raw object points
+1429 → 2227 and raw hand points 95 → 321, both merging to the same `(1024, 5)`
+cloud at the same 896/128 split. The cost is ~54 ms → ~122 ms per point-state
+call under the CPU renderer, roughly +2 s per episode.
+
+The point cloud is the policy's input, so a wrist-only base dataset cannot be
+aggregated with 3-camera DAgger data — that puts two input distributions in one
+D, the same inconsistency the grasp pinning exists to prevent. Re-collect with
+the same `SIM_CFG`, reusing the OMG pin tables unchanged (grasp geometry does not
+depend on the cameras):
+
+```bash
+# eyeball the camera coverage first — the poses are only defaults
+python examples/viz_cameras_pybullet.py --sim-cfg examples/pretrain_multicam_wlr.yaml
+
+# re-collect both splits under the new cameras
+sbatch --export=ALL,SIM_CFG=examples/pretrain_multicam_wlr.yaml,SPLIT=train,OUT=output/bc_dataset/train_pinned_omg_wlr.h5,PIN=output/grasp_pin_table_train_omg.json examples/slurm/collect_bc_demos.sbatch
+sbatch --export=ALL,SIM_CFG=examples/pretrain_multicam_wlr.yaml,SPLIT=val,OUT=output/bc_dataset/val_pinned_omg_wlr.h5,PIN=output/grasp_pin_table_val_omg.json examples/slurm/collect_bc_demos.sbatch
+
+# drop the failed episodes (stage 3, on the new files) — login node is fine here
+python examples/filter_demos.py --in output/bc_dataset/train_pinned_omg_wlr.h5 --out output/bc_dataset/train_pinned_omg_wlr_ok.h5 --scenes-out output/bc_dataset/train_pinned_omg_wlr_ok.json
+python examples/filter_demos.py --in output/bc_dataset/val_pinned_omg_wlr.h5 --out output/bc_dataset/val_pinned_omg_wlr_ok.h5
+
+# launch
+sbatch --time=12:00:00 --export=ALL,RUN=dagger4_run5,CFG=examples/configs/dagger_phase4_omg_nojoint_multicam.yaml examples/slurm/train_dagger_phase4.sbatch
+```
+
+The filter step doubles as a free consistency check. The demonstrations replay the
+OMG plan open-loop and rendering never touches the physics, so the new
+`train_pinned_omg_wlr_ok.json` must list the **same 151 scenes** as
+`train_pinned_omg_ok.json`. A different count means something other than the
+cameras changed, and it is worth stopping to find out what before spending a run
+on it.
 
 ## Syncing the cluster's scratch outputs to the personal PC
 

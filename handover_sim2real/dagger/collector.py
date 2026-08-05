@@ -58,6 +58,47 @@ What differs from the Phase-1/2 collectors (`collect_dagger_*_dataset.py`):
     the trajectory tail — so the recorded first-step delta stays at the
     demonstrations' per-step scale at every distance, and the plan always
     contains the final reach.
+
+  * **DART is nearly free here** (`dart_ratio > 0`; Laskey et al. 2017, GA-DDPG
+    `env.random_perturb`). On a fraction of approach steps the executed action is
+    REPLACED by a random task-space jump (+-dart_pos_mag m, +-dart_rot_mag rad,
+    gripper open), landing the EE off-plan so the FOLLOWING steps are labelled
+    with the expert's recovery from there. It manufactures the off-plan near-grasp
+    coverage the learner stops producing on its own once beta anneals and it has
+    learned to track the plan — the states where it arrives at the standoff a few
+    cm off LATERALLY and has never seen a correction.
+
+    Two things that cost real machinery upstream cost nothing in Phase 4:
+
+      - **No perturb flag, no masking.** GA-DDPG (`core/ddpg.py`) and Phase 3
+        (`rl/td3bc_trainer.py`) must tag the perturbed row and drop it from the
+        critic's Bellman fit, because there the stored action IS the artificial
+        jump. Phase 4 stores only (state, pi*(state)) — the executed action is
+        never written — so replacing it costs nothing and there is nothing to
+        mask. The pair recorded on a jolt step is an ordinary one.
+      - **No replan/splice.** GA-DDPG re-plans and splices the tail onto the
+        committed prefix after each jolt. This collector already re-queries OMG
+        from the current drifted configuration EVERY step, so the next iteration
+        of the loop labels the perturbed state correctly by construction. (It
+        also avoids GA-DDPG's ordering bug, where the recorded observation is
+        pre-jolt while `expert_action` comes from the post-jolt replan.)
+
+    The trigger is DISTANCE to the standoff, not a step index as in GA-DDPG
+    (`DART_MIN_STEP`/`DART_MAX_STEP`) and Phase 3 (`[15, 22)`). Those work because
+    the expert there plays a plan BY INDEX, so step count tracks progress. Here
+    every step replans and `max_steps` is 50: a far scene needs ~36 steps to
+    reach the standoff and a near one ~10, so a fixed step window would jolt one
+    episode mid-flight and another before it had moved. The band is effectively
+    (`reach_commit_dist`, `dart_max_dist`] — floored because the reach commits
+    below it, and jolting during the committed reach would kick the EE back out
+    of `close_pos_thresh` and destroy the close label, which is the scarcest
+    thing an iteration produces.
+
+    The jolt REPLACES a step rather than being an extra out-of-band one, so it
+    costs one of the `max_steps` budget. If `c_max_steps` rises when DART is on,
+    that budget is the reason: the alternative is to execute the chosen action
+    first and jolt at the END of the loop body (after the `env.step` block), so
+    the next iteration reads the perturbed state and the step budget is untouched.
 """
 
 from __future__ import annotations
@@ -169,6 +210,25 @@ class CollectParams:
     # cannot use, and the honest conclusion is that the reach itself is unlearned.
     expert_after_commit: bool = False
     reach_skip_eps: float = 0.01
+    # ----- DART (see the module docstring) -----
+    # Per-step probability of replacing the executed action with a random jump,
+    # drawn BEFORE the beta coin so this is the unconditional rate. 0 disables
+    # DART *and* leaves the rng stream untouched (the ratio is tested first, so
+    # no draw happens) — a dart_ratio: 0 run is bit-identical to one built before
+    # DART existed.
+    dart_ratio: float = 0.0
+    # Upper edge of the trigger band, in metres from the pre-grasp standoff. The
+    # lower edge is `reach_commit_dist` by construction: below it the reach has
+    # committed and DART is off. 0.20 puts every jolt in the last ~4-6 approach
+    # steps, which is where off-plan coverage is missing and where the recovery
+    # is still short enough to fit in the remaining step budget.
+    dart_max_dist: float = 0.20
+    # GA-DDPG's magnitudes (env/panda_scene.py random_perturb), kept deliberately:
+    # 0.04 m is exactly `ee_step`, so one jolt displaces the EE by one step's
+    # worth in a random direction — within what the policy could plausibly undo
+    # in a step or two, which is the point.
+    dart_pos_mag: float = 0.04
+    dart_rot_mag: float = 0.2
 
 
 def _grasp_moved(prev, cur, tol: float = 1e-4) -> bool:
@@ -225,6 +285,14 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     last_exec_expert = False
     recorded = False
     n_dropped_tail = 0
+    # DART: how many jolts fired, and how many of them ended the episode. The
+    # second is the magnitude tripwire — a +-4 cm jump near the standoff is close
+    # to the MANO hand, and if a large fraction of jolts trip the benchmark's
+    # contact/drop check then dart_pos_mag is knocking the object loose rather
+    # than displacing the gripper.
+    n_dart = 0
+    n_dart_env_done = 0
+    last_exec_dart = False
     # Magnitude of every APPROACH label recorded. This is the stall detector: the
     # standoff failure mode is labels decaying to ~0 while the EE sits 6.6 cm
     # short, which is invisible in step counts but obvious here.
@@ -236,6 +304,12 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         rs = _robot_state(obs, prev_act6d)
 
         expert_target_jp = None
+        # ||ee - standoff||, once a plan has told us where the standoff is. Drives
+        # BOTH the reach commit and the DART trigger band, so it is computed once
+        # rather than in two places that could drift apart. Stays None while the
+        # reach is committed (no replan, so nothing updates it) and on a step
+        # whose plan failed — DART is off in both cases.
+        d_standoff = None
         if committed_reach is None:
             # ----- APPROACH: pi*(s) is a FRESH OMG plan from the CURRENT
             # (drifted) config, and the label is its first waypoint. The horizon
@@ -306,10 +380,12 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                 # convert_target_joint_position_to_action still recomputes the
                 # delta from the CURRENT EE, so the labels stay corrective under
                 # drift; only the TARGET stops moving.
-                if (standoff_pose is not None
+                if standoff_pose is not None:
+                    d_standoff = float(np.linalg.norm(
+                        _ee_pos(obs) - standoff_pose[:3, 3]))
+                if (d_standoff is not None
                         and len(plan) >= params.reach_tail
-                        and float(np.linalg.norm(_ee_pos(obs) - standoff_pose[:3, 3]))
-                        <= params.reach_commit_dist):
+                        and d_standoff <= params.reach_commit_dist):
                     committed_reach = np.asarray(plan[-params.reach_tail:])
                     # The tail's first entry IS the standoff, i.e. where the EE
                     # already is — skip leading no-ops so the first reach label
@@ -372,14 +448,57 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # policy it is simply one forward pass.
         policy_action = runner.act(pc, rs)   # [7], ch6 in {0,1}
 
+        # ----- DART? drawn BEFORE the beta coin, so `dart_ratio` is the
+        # unconditional per-step rate rather than a rate conditioned on who would
+        # otherwise have driven — the point is to displace the state, and it does
+        # not matter whose step is spent doing it. `params.dart_ratio > 0.0` is
+        # tested FIRST so a DART-off run draws nothing and its rng stream is
+        # identical to a pre-DART run's.
+        #
+        # `not at_grasp` closes the one hole the band leaves: with
+        # stop_on_close_label off, a close label can be written before the reach
+        # commits (the EE happened to land inside the thresholds), and jolting
+        # then would throw away the arrival we just recorded.
+        #
+        # A jolt also never steals a step on which the POLICY asked to close.
+        # DART overriding an approach action just displaces the state, which is
+        # the point; overriding a close would suppress a TERMINAL decision, and
+        # `policy_closed` / `c_policy_close` / `mean_policy_close_step` would then
+        # measure something different in a DART run than in the run it is being
+        # compared against. The label written above this line is the same either
+        # way (an approach delta saying "do not close here"), so declining the
+        # jolt costs no supervision — only the episode's continuation differs, and
+        # those steps were about to end the episode anyway.
+        dart = (params.dart_ratio > 0.0
+                and committed_reach is None
+                and not at_grasp
+                and policy_action[6] >= 0.5
+                and d_standoff is not None
+                and d_standoff <= params.dart_max_dist
+                and rng.uniform() < params.dart_ratio)
+
         # ----- choose what to EXECUTE: pi_i = beta*pi* + (1-beta)*pi_hat -----
         # pi_i = beta*pi* + (1-beta)*pi_hat, except that the committed reach can
         # be forced onto the expert (see CollectParams.expert_after_commit): the
         # endgame is where the close labels live and where a weak learner stalls.
         forced_expert = bool(params.expert_after_commit and committed_reach is not None)
-        use_expert = expert_target_jp is not None and (forced_expert
-                                                       or rng.uniform() < beta)
-        if use_expert:
+        use_expert = (not dart) and expert_target_jp is not None and (
+            forced_expert or rng.uniform() < beta)
+        if dart:
+            # Random task-space jump instead of anyone's action. The gripper stays
+            # OPEN (1.0): a jolt must never be the thing that closes the hand.
+            # The pair recorded above this line is untouched and entirely ordinary
+            # — it is (the state we were in, what the expert would do there). Only
+            # the state the NEXT step starts from is perturbed, and that step gets
+            # its own fresh OMG label.
+            n_dart += 1
+            exec_delta = np.concatenate([
+                rng.uniform(-params.dart_pos_mag, params.dart_pos_mag, size=3),
+                rng.uniform(-params.dart_rot_mag, params.dart_rot_mag, size=3),
+            ]).astype(np.float32)
+            target_jp = action_to_target_joint(
+                np.concatenate([exec_delta, [1.0]]).astype(np.float32), obs)
+        elif use_expert:
             n_expert_steps += 1
             target_jp = expert_target_jp
             exec_delta = expert_delta
@@ -401,6 +520,7 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
             target_jp = action_to_target_joint(policy_action, obs)
             exec_delta = policy_action[:6].astype(np.float32)
         last_exec_expert = bool(use_expert)
+        last_exec_dart = bool(dart)
 
         prev_act6d = np.asarray(exec_delta, dtype=np.float32).copy()
 
@@ -432,9 +552,16 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
             #   expert drove -> the colliding action IS the label just written.
             #       Training on it teaches the collision. Drop that ONE pair;
             #       every earlier step of the episode is untouched.
+            #   DART drove -> like the policy case, and for the same reason: the
+            #       jolt is not the label, so the pair is clean. KEEP it. It is
+            #       still counted below, because a jolt magnitude that routinely
+            #       ends episodes is buying coverage at the cost of the episodes
+            #       that would have produced the close labels.
             #
             # Only reachable on an approach label: an at_grasp step breaks above
             # before executing, so the close label can never be the one dropped.
+            if last_exec_dart:
+                n_dart_env_done += 1
             if last_exec_expert and recorded:
                 point_clouds.pop()
                 robot_states.pop()
@@ -449,7 +576,9 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # label and the expert's step is what ended it: nothing usable is left.
         return None, {"scene_idx": scene_idx, "skipped": True,
                       "reason": "NO_LABELS", "steps": 0, "n_omg_fail": n_omg_fail,
-                      "n_dropped_tail": int(n_dropped_tail)}
+                      "n_dropped_tail": int(n_dropped_tail),
+                      "n_dart": int(n_dart),
+                      "n_dart_env_done": int(n_dart_env_done)}
 
     episode = {
         "point_clouds": np.asarray(point_clouds, dtype=np.float32),
@@ -486,6 +615,13 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # episode. A rising count means the expert is still colliding on scenes
         # that survived filtering, i.e. exclude_scenes is not catching them.
         "n_dropped_tail": int(n_dropped_tail),
+        # DART jolts fired, and how many of them ended the episode. Read as a
+        # ratio: n_dart tells you the band is firing at all (0 with dart_ratio > 0
+        # means dart_max_dist never triggers, or the reach commits before the EE
+        # enters the band), n_dart_env_done tells you whether the magnitude is
+        # destroying the episodes it was meant to enrich.
+        "n_dart": int(n_dart),
+        "n_dart_env_done": int(n_dart_env_done),
         "min_pos": min_pos,
         "min_rot": min_rot,
         # Approach-label scale. `n_tiny_labels` counts labels the policy cannot
@@ -557,17 +693,25 @@ class DaggerHDF5Writer:
 def collect_iteration(sim, runner, scenes, out_path, *, rng,
                       beta: float, params: CollectParams, pin_table=None,
                       registry=None, iteration: int = 0,
-                      progress_every: int = 5) -> dict:
+                      progress_every: int = 5, results=None) -> dict:
     """Collect D_i: `len(scenes)` trajectories under the current mixed policy.
 
     `registry` (a GraspRegistry) verifies that a scene revisited in a later
     iteration still aims at the same grasp — the pin table enforces that, this
     checks it actually held.
+
+    `results`, when given, is a pre-computed `[(episode | None, stats), ...]`
+    aligned with `scenes` — what dagger/parallel.py's worker pool returns. The
+    episodes were produced elsewhere but the aggregation, the HDF5 writing and
+    the registry checks still happen HERE, in this one loop, so the parallel and
+    serial paths cannot drift apart in what they count or what they store.
+    `sim` and `runner` are then unused and may be None.
     """
     agg = {"episodes": 0, "steps": 0, "skipped": 0, "n_omg_fail": 0,
            "n_goal_switch": 0, "n_expert_steps": 0, "pinned": 0, "reached_standoff": 0,
            "reached_grasp": 0, "n_reach_steps": 0, "policy_closed": 0,
            "n_policy_close_cmds": 0, "n_dropped_tail": 0,
+           "n_dart": 0, "n_dart_env_done": 0,
            "n_close_labels": 0, "n_approach_labels": 0, "sum_label_pos": 0.0,
            "n_tiny_labels": 0, "n_revisits": 0, "n_grasp_mismatch": 0,
            "max_grasp_drift": 0.0,
@@ -584,13 +728,22 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
         "reach_commit_dist": float(params.reach_commit_dist),
         "stop_on_close_label": bool(params.stop_on_close_label),
         "stop_on_policy_close": bool(params.stop_on_policy_close),
+        # Recorded even when off, so a DART-free shard is provably DART-free
+        # rather than merely predating the feature.
+        "dart_ratio": float(params.dart_ratio),
+        "dart_max_dist": float(params.dart_max_dist),
+        "dart_pos_mag": float(params.dart_pos_mag),
+        "dart_rot_mag": float(params.dart_rot_mag),
         "scenes": np.asarray(scenes, dtype=np.int32),
     })
     try:
         for i, scene in enumerate(scenes):
-            episode, st = collect_dagger_episode(
-                sim, runner, int(scene), rng=rng, beta=beta, params=params,
-                pin_table=pin_table)
+            if results is not None:
+                episode, st = results[i]
+            else:
+                episode, st = collect_dagger_episode(
+                    sim, runner, int(scene), rng=rng, beta=beta, params=params,
+                    pin_table=pin_table)
 
             agg["n_omg_fail"] += st.get("n_omg_fail", 0)
             agg["reasons"][st["reason"]] = agg["reasons"].get(st["reason"], 0) + 1
@@ -609,6 +762,8 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
                 agg["policy_closed"] += st["policy_closed"]
                 agg["n_policy_close_cmds"] += st["n_policy_close_cmds"]
                 agg["n_dropped_tail"] += st["n_dropped_tail"]
+                agg["n_dart"] += st["n_dart"]
+                agg["n_dart_env_done"] += st["n_dart_env_done"]
                 agg["n_close_labels"] += st["n_close_labels"]
                 agg["n_approach_labels"] += st["n_approach_labels"]
                 agg["sum_label_pos"] += st["sum_label_pos"]
