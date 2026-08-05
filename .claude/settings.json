@@ -4,7 +4,18 @@
       "Bash(git diff *)",
       "Bash(python3 /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/c790be60-5e96-4232-9970-349c38e20b3d/scratchpad/mkconfigs.py)",
       "Bash(python3 -c ' *)",
-      "Bash(awk '{print $5, $9}')"
+      "Bash(awk '{print $5, $9}')",
+      "Bash(sacct -X -j 10581677,10581678,10581807 --format=JobID,JobName%12,State,Elapsed,ExitCode -P)",
+      "Bash(timeout 100 du -sh output/dagger_runs/dagger4_run5)",
+      "Bash(timeout 100 du -sh output/dagger_runs/dagger4_run5/*)",
+      "Bash(timeout 60 du -sh output/dagger_runs/dagger4_run5/iters/iter_05)",
+      "Bash(timeout 100 du -sh output/dagger_runs/*)",
+      "Bash(git -C handover-sim rev-parse HEAD)",
+      "Bash(echo \"actually checked out: $\\(git -C handover-sim rev-parse HEAD \\)\")",
+      "Bash(git -C handover-sim status --porcelain)",
+      "Bash(git -C handover-sim log --oneline -3)",
+      "Bash(timeout 60 git ls-remote --heads origin)",
+      "Bash(timeout 60 git ls-remote origin)"
     ]
   }
 }
