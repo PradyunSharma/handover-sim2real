@@ -15,7 +15,9 @@
       "Bash(git -C handover-sim status --porcelain)",
       "Bash(git -C handover-sim log --oneline -3)",
       "Bash(timeout 60 git ls-remote --heads origin)",
-      "Bash(timeout 60 git ls-remote origin)"
+      "Bash(timeout 60 git ls-remote origin)",
+      "Bash(timeout 100 du -sh output/dagger_runs/dagger4_run7)",
+      "Bash(timeout 100 du -sh output/dagger_runs/dagger4_run7/*)"
     ]
   }
 }
