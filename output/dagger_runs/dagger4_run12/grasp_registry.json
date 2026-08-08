@@ -1,7 +1,7 @@
 {
  "_meta": {
   "tol": 0.02,
-  "scenes": 457
+  "scenes": 467
  },
  "281": {
   "ee_pose_world": [
@@ -31,7 +31,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 5
+  "visits": 6
  },
  "471": {
   "ee_pose_world": [
@@ -91,7 +91,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 5
+  "visits": 6
  },
  "685": {
   "ee_pose_world": [
@@ -211,7 +211,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 5
+  "visits": 6
  },
  "468": {
   "ee_pose_world": [
@@ -241,7 +241,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 5
+  "visits": 6
  },
  "219": {
   "ee_pose_world": [
@@ -331,7 +331,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 8
+  "visits": 10
  },
  "253": {
   "ee_pose_world": [
@@ -421,7 +421,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 6
+  "visits": 8
  },
  "503": {
   "ee_pose_world": [
@@ -481,7 +481,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 5
+  "visits": 7
  },
  "323": {
   "ee_pose_world": [
@@ -511,7 +511,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 9
+  "visits": 12
  },
  "570": {
   "ee_pose_world": [
@@ -601,7 +601,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 5
+  "visits": 6
  },
  "421": {
   "ee_pose_world": [
@@ -751,7 +751,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 4
+  "visits": 5
  },
  "672": {
   "ee_pose_world": [
@@ -871,7 +871,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 5
+  "visits": 6
  },
  "96": {
   "ee_pose_world": [
@@ -901,7 +901,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 2
+  "visits": 3
  },
  "380": {
   "ee_pose_world": [
@@ -931,7 +931,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 4
+  "visits": 5
  },
  "590": {
   "ee_pose_world": [
@@ -1021,7 +1021,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 5
+  "visits": 6
  },
  "99": {
   "ee_pose_world": [
@@ -1051,7 +1051,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 6
+  "visits": 7
  },
  "502": {
   "ee_pose_world": [
@@ -1081,7 +1081,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 3
+  "visits": 4
  },
  "431": {
   "ee_pose_world": [
@@ -1171,7 +1171,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 7
+  "visits": 8
  },
  "9": {
   "ee_pose_world": [
@@ -1261,7 +1261,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 8
+  "visits": 9
  },
  "494": {
   "ee_pose_world": [
@@ -1321,7 +1321,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 3
+  "visits": 4
  },
  "22": {
   "ee_pose_world": [
@@ -1351,7 +1351,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 3
+  "visits": 5
  },
  "270": {
   "ee_pose_world": [
@@ -1531,7 +1531,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 3
+  "visits": 4
  },
  "634": {
   "ee_pose_world": [
@@ -1591,7 +1591,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 4
+  "visits": 5
  },
  "490": {
   "ee_pose_world": [
@@ -1621,7 +1621,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 7
+  "visits": 8
  },
  "441": {
   "ee_pose_world": [
@@ -1651,7 +1651,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 3
+  "visits": 4
  },
  "340": {
   "ee_pose_world": [
@@ -1801,7 +1801,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 4
+  "visits": 6
  },
  "485": {
   "ee_pose_world": [
@@ -1861,7 +1861,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 5
+  "visits": 6
  },
  "322": {
   "ee_pose_world": [
@@ -1921,7 +1921,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 5
+  "visits": 6
  },
  "481": {
   "ee_pose_world": [
@@ -1981,7 +1981,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 9
+  "visits": 10
  },
  "464": {
   "ee_pose_world": [
@@ -2041,7 +2041,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 4
+  "visits": 5
  },
  "596": {
   "ee_pose_world": [
@@ -2071,7 +2071,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 2
+  "visits": 4
  },
  "207": {
   "ee_pose_world": [
@@ -2161,7 +2161,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 6
+  "visits": 8
  },
  "185": {
   "ee_pose_world": [
@@ -2251,7 +2251,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 3
+  "visits": 4
  },
  "614": {
   "ee_pose_world": [
@@ -2281,7 +2281,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 7
+  "visits": 8
  },
  "487": {
   "ee_pose_world": [
@@ -2371,7 +2371,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 6
+  "visits": 7
  },
  "653": {
   "ee_pose_world": [
@@ -2401,7 +2401,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 4
+  "visits": 6
  },
  "10": {
   "ee_pose_world": [
@@ -2431,7 +2431,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 5
+  "visits": 7
  },
  "599": {
   "ee_pose_world": [
@@ -2461,7 +2461,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 4
+  "visits": 6
  },
  "16": {
   "ee_pose_world": [
@@ -2521,7 +2521,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 5
+  "visits": 6
  },
  "666": {
   "ee_pose_world": [
@@ -2551,7 +2551,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 6
+  "visits": 7
  },
  "273": {
   "ee_pose_world": [
@@ -2611,7 +2611,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 5
+  "visits": 6
  },
  "673": {
   "ee_pose_world": [
@@ -2641,7 +2641,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 6
+  "visits": 7
  },
  "359": {
   "ee_pose_world": [
@@ -2671,7 +2671,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 6
+  "visits": 7
  },
  "91": {
   "ee_pose_world": [
@@ -2851,7 +2851,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 4
+  "visits": 5
  },
  "639": {
   "ee_pose_world": [
@@ -2881,7 +2881,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 3
+  "visits": 4
  },
  "364": {
   "ee_pose_world": [
@@ -3001,7 +3001,7 @@
    ]
   ],
   "first_iter": 1,
-  "visits": 7
+  "visits": 8
  },
  "306": {
   "ee_pose_world": [
@@ -3181,7 +3181,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 5
+  "visits": 6
  },
  "234": {
   "ee_pose_world": [
@@ -3241,7 +3241,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 4
+  "visits": 5
  },
  "299": {
   "ee_pose_world": [
@@ -3331,7 +3331,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 4
+  "visits": 5
  },
  "297": {
   "ee_pose_world": [
@@ -3361,7 +3361,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 3
+  "visits": 4
  },
  "208": {
   "ee_pose_world": [
@@ -3391,7 +3391,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 6
+  "visits": 7
  },
  "210": {
   "ee_pose_world": [
@@ -3421,7 +3421,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 4
+  "visits": 5
  },
  "578": {
   "ee_pose_world": [
@@ -3511,7 +3511,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 3
+  "visits": 4
  },
  "537": {
   "ee_pose_world": [
@@ -3571,7 +3571,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 2
+  "visits": 3
  },
  "286": {
   "ee_pose_world": [
@@ -3631,7 +3631,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 6
+  "visits": 7
  },
  "357": {
   "ee_pose_world": [
@@ -3691,7 +3691,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 6
+  "visits": 7
  },
  "567": {
   "ee_pose_world": [
@@ -3721,7 +3721,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 7
+  "visits": 8
  },
  "516": {
   "ee_pose_world": [
@@ -3841,7 +3841,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 2
+  "visits": 3
  },
  "348": {
   "ee_pose_world": [
@@ -3931,7 +3931,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 6
+  "visits": 7
  },
  "40": {
   "ee_pose_world": [
@@ -4021,7 +4021,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 4
+  "visits": 6
  },
  "716": {
   "ee_pose_world": [
@@ -4051,7 +4051,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 2
+  "visits": 3
  },
  "29": {
   "ee_pose_world": [
@@ -4081,7 +4081,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 5
+  "visits": 6
  },
  "238": {
   "ee_pose_world": [
@@ -4141,7 +4141,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 3
+  "visits": 4
  },
  "414": {
   "ee_pose_world": [
@@ -4231,7 +4231,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 5
+  "visits": 6
  },
  "139": {
   "ee_pose_world": [
@@ -4261,7 +4261,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 6
+  "visits": 7
  },
  "362": {
   "ee_pose_world": [
@@ -4321,7 +4321,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 5
+  "visits": 6
  },
  "58": {
   "ee_pose_world": [
@@ -4351,7 +4351,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 6
+  "visits": 7
  },
  "510": {
   "ee_pose_world": [
@@ -4381,7 +4381,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 4
+  "visits": 5
  },
  "60": {
   "ee_pose_world": [
@@ -4411,7 +4411,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 2
+  "visits": 3
  },
  "150": {
   "ee_pose_world": [
@@ -4501,7 +4501,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 5
+  "visits": 6
  },
  "429": {
   "ee_pose_world": [
@@ -4561,7 +4561,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 4
+  "visits": 6
  },
  "19": {
   "ee_pose_world": [
@@ -4591,7 +4591,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 7
+  "visits": 8
  },
  "181": {
   "ee_pose_world": [
@@ -4711,7 +4711,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 4
+  "visits": 5
  },
  "535": {
   "ee_pose_world": [
@@ -4771,7 +4771,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 4
+  "visits": 5
  },
  "512": {
   "ee_pose_world": [
@@ -4801,7 +4801,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 2
+  "visits": 3
  },
  "329": {
   "ee_pose_world": [
@@ -4831,7 +4831,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 5
+  "visits": 7
  },
  "428": {
   "ee_pose_world": [
@@ -4891,7 +4891,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 5
+  "visits": 7
  },
  "31": {
   "ee_pose_world": [
@@ -4921,7 +4921,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 4
+  "visits": 5
  },
  "671": {
   "ee_pose_world": [
@@ -4981,7 +4981,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 5
+  "visits": 6
  },
  "156": {
   "ee_pose_world": [
@@ -5011,7 +5011,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 6
+  "visits": 8
  },
  "665": {
   "ee_pose_world": [
@@ -5131,7 +5131,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 2
+  "visits": 3
  },
  "285": {
   "ee_pose_world": [
@@ -5221,7 +5221,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 3
+  "visits": 5
  },
  "269": {
   "ee_pose_world": [
@@ -5281,7 +5281,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 4
+  "visits": 6
  },
  "508": {
   "ee_pose_world": [
@@ -5311,7 +5311,7 @@
    ]
   ],
   "first_iter": 2,
-  "visits": 4
+  "visits": 6
  },
  "443": {
   "ee_pose_world": [
@@ -5371,7 +5371,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 3
+  "visits": 4
  },
  "566": {
   "ee_pose_world": [
@@ -5401,7 +5401,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 2
+  "visits": 3
  },
  "496": {
   "ee_pose_world": [
@@ -5461,7 +5461,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 2
+  "visits": 3
  },
  "606": {
   "ee_pose_world": [
@@ -5521,7 +5521,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 5
+  "visits": 6
  },
  "90": {
   "ee_pose_world": [
@@ -5581,7 +5581,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 3
+  "visits": 4
  },
  "217": {
   "ee_pose_world": [
@@ -5611,7 +5611,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 4
+  "visits": 6
  },
  "608": {
   "ee_pose_world": [
@@ -5641,7 +5641,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 4
+  "visits": 5
  },
  "241": {
   "ee_pose_world": [
@@ -5701,7 +5701,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 5
+  "visits": 6
  },
  "137": {
   "ee_pose_world": [
@@ -5761,7 +5761,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 4
+  "visits": 5
  },
  "591": {
   "ee_pose_world": [
@@ -5881,7 +5881,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 4
+  "visits": 6
  },
  "133": {
   "ee_pose_world": [
@@ -5911,7 +5911,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 3
+  "visits": 4
  },
  "21": {
   "ee_pose_world": [
@@ -6121,7 +6121,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 6
+  "visits": 9
  },
  "711": {
   "ee_pose_world": [
@@ -6151,7 +6151,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 3
+  "visits": 4
  },
  "129": {
   "ee_pose_world": [
@@ -6181,7 +6181,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 3
+  "visits": 4
  },
  "126": {
   "ee_pose_world": [
@@ -6211,7 +6211,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 6
+  "visits": 7
  },
  "419": {
   "ee_pose_world": [
@@ -6241,7 +6241,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 2
+  "visits": 3
  },
  "491": {
   "ee_pose_world": [
@@ -6271,7 +6271,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 3
+  "visits": 4
  },
  "650": {
   "ee_pose_world": [
@@ -6301,7 +6301,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 3
+  "visits": 4
  },
  "20": {
   "ee_pose_world": [
@@ -6361,7 +6361,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 4
+  "visits": 5
  },
  "159": {
   "ee_pose_world": [
@@ -6391,7 +6391,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 6
+  "visits": 7
  },
  "204": {
   "ee_pose_world": [
@@ -6421,7 +6421,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 4
+  "visits": 5
  },
  "294": {
   "ee_pose_world": [
@@ -6481,7 +6481,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 3
+  "visits": 4
  },
  "184": {
   "ee_pose_world": [
@@ -6571,7 +6571,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 4
+  "visits": 5
  },
  "246": {
   "ee_pose_world": [
@@ -6661,7 +6661,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 2
+  "visits": 3
  },
  "556": {
   "ee_pose_world": [
@@ -6691,7 +6691,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 4
+  "visits": 6
  },
  "95": {
   "ee_pose_world": [
@@ -6721,7 +6721,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 4
+  "visits": 5
  },
  "216": {
   "ee_pose_world": [
@@ -6781,7 +6781,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 4
+  "visits": 5
  },
  "92": {
   "ee_pose_world": [
@@ -6811,7 +6811,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 4
+  "visits": 5
  },
  "15": {
   "ee_pose_world": [
@@ -6841,7 +6841,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 3
+  "visits": 6
  },
  "649": {
   "ee_pose_world": [
@@ -6931,7 +6931,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 6
+  "visits": 7
  },
  "713": {
   "ee_pose_world": [
@@ -7021,7 +7021,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 4
+  "visits": 5
  },
  "435": {
   "ee_pose_world": [
@@ -7111,7 +7111,7 @@
    ]
   ],
   "first_iter": 3,
-  "visits": 2
+  "visits": 4
  },
  "459": {
   "ee_pose_world": [
@@ -7292,7 +7292,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 4
+  "visits": 5
  },
  "283": {
   "ee_pose_world": [
@@ -7352,7 +7352,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 3
+  "visits": 5
  },
  "97": {
   "ee_pose_world": [
@@ -7382,7 +7382,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 1
+  "visits": 2
  },
  "422": {
   "ee_pose_world": [
@@ -7442,7 +7442,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 6
+  "visits": 7
  },
  "433": {
   "ee_pose_world": [
@@ -7472,7 +7472,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 4
+  "visits": 5
  },
  "212": {
   "ee_pose_world": [
@@ -7502,7 +7502,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 4
+  "visits": 5
  },
  "558": {
   "ee_pose_world": [
@@ -7532,7 +7532,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 3
+  "visits": 4
  },
  "576": {
   "ee_pose_world": [
@@ -7562,7 +7562,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 3
+  "visits": 5
  },
  "98": {
   "ee_pose_world": [
@@ -7592,7 +7592,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 5
+  "visits": 6
  },
  "163": {
   "ee_pose_world": [
@@ -7622,7 +7622,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 5
+  "visits": 6
  },
  "103": {
   "ee_pose_world": [
@@ -7682,7 +7682,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 4
+  "visits": 5
  },
  "662": {
   "ee_pose_world": [
@@ -7712,7 +7712,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 2
+  "visits": 3
  },
  "603": {
   "ee_pose_world": [
@@ -7802,7 +7802,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 4
+  "visits": 5
  },
  "321": {
   "ee_pose_world": [
@@ -7892,7 +7892,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 7
+  "visits": 8
  },
  "105": {
   "ee_pose_world": [
@@ -8042,7 +8042,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 5
+  "visits": 6
  },
  "314": {
   "ee_pose_world": [
@@ -8282,7 +8282,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 5
+  "visits": 6
  },
  "499": {
   "ee_pose_world": [
@@ -8312,7 +8312,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 2
+  "visits": 3
  },
  "660": {
   "ee_pose_world": [
@@ -8342,7 +8342,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 2
+  "visits": 3
  },
  "132": {
   "ee_pose_world": [
@@ -8462,7 +8462,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 2
+  "visits": 3
  },
  "18": {
   "ee_pose_world": [
@@ -8492,7 +8492,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 7
+  "visits": 8
  },
  "528": {
   "ee_pose_world": [
@@ -8522,7 +8522,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 8
+  "visits": 9
  },
  "708": {
   "ee_pose_world": [
@@ -8552,7 +8552,7 @@
    ]
   ],
   "first_iter": 4,
-  "visits": 5
+  "visits": 6
  },
  "361": {
   "ee_pose_world": [
@@ -8582,7 +8582,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 3
+  "visits": 4
  },
  "454": {
   "ee_pose_world": [
@@ -8642,7 +8642,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 4
+  "visits": 5
  },
  "507": {
   "ee_pose_world": [
@@ -8702,7 +8702,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 5
+  "visits": 7
  },
  "205": {
   "ee_pose_world": [
@@ -8792,7 +8792,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 2
+  "visits": 3
  },
  "453": {
   "ee_pose_world": [
@@ -8852,7 +8852,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 3
+  "visits": 5
  },
  "465": {
   "ee_pose_world": [
@@ -8882,7 +8882,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 5
+  "visits": 6
  },
  "278": {
   "ee_pose_world": [
@@ -8912,7 +8912,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 2
+  "visits": 4
  },
  "62": {
   "ee_pose_world": [
@@ -8942,7 +8942,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 2
+  "visits": 3
  },
  "113": {
   "ee_pose_world": [
@@ -8972,7 +8972,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 1
+  "visits": 2
  },
  "646": {
   "ee_pose_world": [
@@ -9002,7 +9002,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 6
+  "visits": 7
  },
  "233": {
   "ee_pose_world": [
@@ -9212,7 +9212,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 4
+  "visits": 5
  },
  "245": {
   "ee_pose_world": [
@@ -9242,7 +9242,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 3
+  "visits": 5
  },
  "43": {
   "ee_pose_world": [
@@ -9272,7 +9272,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 3
+  "visits": 4
  },
  "667": {
   "ee_pose_world": [
@@ -9302,7 +9302,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 2
+  "visits": 3
  },
  "564": {
   "ee_pose_world": [
@@ -9392,7 +9392,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 3
+  "visits": 4
  },
  "523": {
   "ee_pose_world": [
@@ -9452,7 +9452,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 2
+  "visits": 3
  },
  "300": {
   "ee_pose_world": [
@@ -9482,7 +9482,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 4
+  "visits": 5
  },
  "26": {
   "ee_pose_world": [
@@ -9542,7 +9542,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 2
+  "visits": 3
  },
  "82": {
   "ee_pose_world": [
@@ -9572,7 +9572,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 4
+  "visits": 5
  },
  "629": {
   "ee_pose_world": [
@@ -9632,7 +9632,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 6
+  "visits": 7
  },
  "149": {
   "ee_pose_world": [
@@ -9692,7 +9692,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 4
+  "visits": 5
  },
  "14": {
   "ee_pose_world": [
@@ -9722,7 +9722,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 4
+  "visits": 5
  },
  "540": {
   "ee_pose_world": [
@@ -9752,7 +9752,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 7
+  "visits": 8
  },
  "275": {
   "ee_pose_world": [
@@ -9782,7 +9782,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 5
+  "visits": 6
  },
  "375": {
   "ee_pose_world": [
@@ -9842,7 +9842,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 4
+  "visits": 5
  },
  "288": {
   "ee_pose_world": [
@@ -9932,7 +9932,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 2
+  "visits": 4
  },
  "536": {
   "ee_pose_world": [
@@ -9962,7 +9962,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 3
+  "visits": 4
  },
  "702": {
   "ee_pose_world": [
@@ -10052,7 +10052,7 @@
    ]
   ],
   "first_iter": 5,
-  "visits": 2
+  "visits": 3
  },
  "575": {
   "ee_pose_world": [
@@ -10082,7 +10082,7 @@
    ]
   ],
   "first_iter": 6,
-  "visits": 3
+  "visits": 4
  },
  "177": {
   "ee_pose_world": [
@@ -10172,7 +10172,7 @@
    ]
   ],
   "first_iter": 6,
-  "visits": 2
+  "visits": 3
  },
  "387": {
   "ee_pose_world": [
@@ -10262,7 +10262,7 @@
    ]
   ],
   "first_iter": 6,
-  "visits": 4
+  "visits": 6
  },
  "226": {
   "ee_pose_world": [
@@ -10292,7 +10292,7 @@
    ]
   ],
   "first_iter": 6,
-  "visits": 2
+  "visits": 4
  },
  "585": {
   "ee_pose_world": [
@@ -10322,7 +10322,7 @@
    ]
   ],
   "first_iter": 6,
-  "visits": 1
+  "visits": 4
  },
  "34": {
   "ee_pose_world": [
@@ -10442,7 +10442,7 @@
    ]
   ],
   "first_iter": 6,
-  "visits": 2
+  "visits": 3
  },
  "63": {
   "ee_pose_world": [
@@ -10502,7 +10502,7 @@
    ]
   ],
   "first_iter": 6,
-  "visits": 1
+  "visits": 2
  },
  "521": {
   "ee_pose_world": [
@@ -10622,7 +10622,7 @@
    ]
   ],
   "first_iter": 6,
-  "visits": 4
+  "visits": 5
  },
  "108": {
   "ee_pose_world": [
@@ -10652,7 +10652,7 @@
    ]
   ],
   "first_iter": 6,
-  "visits": 5
+  "visits": 6
  },
  "349": {
   "ee_pose_world": [
@@ -10682,7 +10682,7 @@
    ]
   ],
   "first_iter": 6,
-  "visits": 3
+  "visits": 4
  },
  "66": {
   "ee_pose_world": [
@@ -10712,7 +10712,7 @@
    ]
   ],
   "first_iter": 6,
-  "visits": 2
+  "visits": 3
  },
  "531": {
   "ee_pose_world": [
@@ -10742,7 +10742,7 @@
    ]
   ],
   "first_iter": 6,
-  "visits": 4
+  "visits": 5
  },
  "604": {
   "ee_pose_world": [
@@ -10772,7 +10772,7 @@
    ]
   ],
   "first_iter": 6,
-  "visits": 2
+  "visits": 4
  },
  "597": {
   "ee_pose_world": [
@@ -10862,7 +10862,7 @@
    ]
   ],
   "first_iter": 7,
-  "visits": 2
+  "visits": 3
  },
  "488": {
   "ee_pose_world": [
@@ -10892,7 +10892,7 @@
    ]
   ],
   "first_iter": 7,
-  "visits": 3
+  "visits": 4
  },
  "609": {
   "ee_pose_world": [
@@ -10952,7 +10952,7 @@
    ]
   ],
   "first_iter": 7,
-  "visits": 5
+  "visits": 6
  },
  "518": {
   "ee_pose_world": [
@@ -10982,7 +10982,7 @@
    ]
   ],
   "first_iter": 7,
-  "visits": 2
+  "visits": 4
  },
  "93": {
   "ee_pose_world": [
@@ -11012,7 +11012,7 @@
    ]
   ],
   "first_iter": 7,
-  "visits": 4
+  "visits": 5
  },
  "641": {
   "ee_pose_world": [
@@ -11042,7 +11042,7 @@
    ]
   ],
   "first_iter": 7,
-  "visits": 5
+  "visits": 6
  },
  "469": {
   "ee_pose_world": [
@@ -11102,7 +11102,7 @@
    ]
   ],
   "first_iter": 7,
-  "visits": 4
+  "visits": 5
  },
  "32": {
   "ee_pose_world": [
@@ -11132,7 +11132,7 @@
    ]
   ],
   "first_iter": 7,
-  "visits": 4
+  "visits": 6
  },
  "337": {
   "ee_pose_world": [
@@ -11192,7 +11192,7 @@
    ]
   ],
   "first_iter": 7,
-  "visits": 5
+  "visits": 7
  },
  "6": {
   "ee_pose_world": [
@@ -11222,7 +11222,7 @@
    ]
   ],
   "first_iter": 7,
-  "visits": 1
+  "visits": 2
  },
  "1": {
   "ee_pose_world": [
@@ -11252,7 +11252,7 @@
    ]
   ],
   "first_iter": 8,
-  "visits": 4
+  "visits": 5
  },
  "580": {
   "ee_pose_world": [
@@ -11282,7 +11282,7 @@
    ]
   ],
   "first_iter": 8,
-  "visits": 2
+  "visits": 3
  },
  "690": {
   "ee_pose_world": [
@@ -11312,7 +11312,7 @@
    ]
   ],
   "first_iter": 8,
-  "visits": 4
+  "visits": 5
  },
  "589": {
   "ee_pose_world": [
@@ -11342,7 +11342,7 @@
    ]
   ],
   "first_iter": 8,
-  "visits": 3
+  "visits": 4
  },
  "13": {
   "ee_pose_world": [
@@ -11372,7 +11372,7 @@
    ]
   ],
   "first_iter": 8,
-  "visits": 1
+  "visits": 2
  },
  "345": {
   "ee_pose_world": [
@@ -11402,7 +11402,7 @@
    ]
   ],
   "first_iter": 8,
-  "visits": 3
+  "visits": 4
  },
  "504": {
   "ee_pose_world": [
@@ -11462,7 +11462,7 @@
    ]
   ],
   "first_iter": 8,
-  "visits": 1
+  "visits": 2
  },
  "546": {
   "ee_pose_world": [
@@ -11552,7 +11552,7 @@
    ]
   ],
   "first_iter": 8,
-  "visits": 4
+  "visits": 5
  },
  "284": {
   "ee_pose_world": [
@@ -11642,7 +11642,7 @@
    ]
   ],
   "first_iter": 8,
-  "visits": 2
+  "visits": 3
  },
  "588": {
   "ee_pose_world": [
@@ -11672,7 +11672,7 @@
    ]
   ],
   "first_iter": 8,
-  "visits": 4
+  "visits": 5
  },
  "678": {
   "ee_pose_world": [
@@ -11732,7 +11732,7 @@
    ]
   ],
   "first_iter": 9,
-  "visits": 4
+  "visits": 5
  },
  "440": {
   "ee_pose_world": [
@@ -11822,7 +11822,7 @@
    ]
   ],
   "first_iter": 9,
-  "visits": 1
+  "visits": 2
  },
  "197": {
   "ee_pose_world": [
@@ -11882,7 +11882,7 @@
    ]
   ],
   "first_iter": 9,
-  "visits": 3
+  "visits": 5
  },
  "545": {
   "ee_pose_world": [
@@ -11912,7 +11912,7 @@
    ]
   ],
   "first_iter": 9,
-  "visits": 3
+  "visits": 4
  },
  "486": {
   "ee_pose_world": [
@@ -11972,7 +11972,7 @@
    ]
   ],
   "first_iter": 9,
-  "visits": 4
+  "visits": 5
  },
  "474": {
   "ee_pose_world": [
@@ -12002,7 +12002,7 @@
    ]
   ],
   "first_iter": 9,
-  "visits": 3
+  "visits": 4
  },
  "547": {
   "ee_pose_world": [
@@ -12212,7 +12212,7 @@
    ]
   ],
   "first_iter": 10,
-  "visits": 1
+  "visits": 2
  },
  "637": {
   "ee_pose_world": [
@@ -12242,7 +12242,7 @@
    ]
   ],
   "first_iter": 10,
-  "visits": 2
+  "visits": 3
  },
  "373": {
   "ee_pose_world": [
@@ -12272,7 +12272,7 @@
    ]
   ],
   "first_iter": 10,
-  "visits": 3
+  "visits": 4
  },
  "320": {
   "ee_pose_world": [
@@ -12302,7 +12302,7 @@
    ]
   ],
   "first_iter": 10,
-  "visits": 3
+  "visits": 5
  },
  "2": {
   "ee_pose_world": [
@@ -12332,7 +12332,7 @@
    ]
   ],
   "first_iter": 10,
-  "visits": 3
+  "visits": 4
  },
  "255": {
   "ee_pose_world": [
@@ -12362,7 +12362,7 @@
    ]
   ],
   "first_iter": 10,
-  "visits": 2
+  "visits": 4
  },
  "141": {
   "ee_pose_world": [
@@ -12392,7 +12392,7 @@
    ]
   ],
   "first_iter": 10,
-  "visits": 1
+  "visits": 3
  },
  "231": {
   "ee_pose_world": [
@@ -12422,7 +12422,7 @@
    ]
   ],
   "first_iter": 10,
-  "visits": 1
+  "visits": 3
  },
  "395": {
   "ee_pose_world": [
@@ -12452,7 +12452,7 @@
    ]
   ],
   "first_iter": 10,
-  "visits": 4
+  "visits": 6
  },
  "301": {
   "ee_pose_world": [
@@ -12482,7 +12482,7 @@
    ]
   ],
   "first_iter": 11,
-  "visits": 1
+  "visits": 2
  },
  "195": {
   "ee_pose_world": [
@@ -12512,7 +12512,7 @@
    ]
   ],
   "first_iter": 11,
-  "visits": 2
+  "visits": 5
  },
  "158": {
   "ee_pose_world": [
@@ -12632,7 +12632,7 @@
    ]
   ],
   "first_iter": 11,
-  "visits": 2
+  "visits": 3
  },
  "509": {
   "ee_pose_world": [
@@ -12692,7 +12692,7 @@
    ]
   ],
   "first_iter": 11,
-  "visits": 4
+  "visits": 6
  },
  "112": {
   "ee_pose_world": [
@@ -12722,7 +12722,7 @@
    ]
   ],
   "first_iter": 11,
-  "visits": 1
+  "visits": 3
  },
  "676": {
   "ee_pose_world": [
@@ -12752,7 +12752,7 @@
    ]
   ],
   "first_iter": 12,
-  "visits": 2
+  "visits": 3
  },
  "144": {
   "ee_pose_world": [
@@ -12782,7 +12782,7 @@
    ]
   ],
   "first_iter": 12,
-  "visits": 2
+  "visits": 4
  },
  "135": {
   "ee_pose_world": [
@@ -12842,7 +12842,7 @@
    ]
   ],
   "first_iter": 12,
-  "visits": 1
+  "visits": 2
  },
  "48": {
   "ee_pose_world": [
@@ -12872,7 +12872,7 @@
    ]
   ],
   "first_iter": 12,
-  "visits": 4
+  "visits": 5
  },
  "136": {
   "ee_pose_world": [
@@ -12932,7 +12932,7 @@
    ]
   ],
   "first_iter": 12,
-  "visits": 1
+  "visits": 2
  },
  "460": {
   "ee_pose_world": [
@@ -12962,7 +12962,7 @@
    ]
   ],
   "first_iter": 12,
-  "visits": 2
+  "visits": 3
  },
  "506": {
   "ee_pose_world": [
@@ -12992,7 +12992,7 @@
    ]
   ],
   "first_iter": 13,
-  "visits": 2
+  "visits": 3
  },
  "305": {
   "ee_pose_world": [
@@ -13142,7 +13142,7 @@
    ]
   ],
   "first_iter": 13,
-  "visits": 4
+  "visits": 5
  },
  "147": {
   "ee_pose_world": [
@@ -13172,7 +13172,7 @@
    ]
   ],
   "first_iter": 13,
-  "visits": 4
+  "visits": 5
  },
  "423": {
   "ee_pose_world": [
@@ -13232,7 +13232,7 @@
    ]
   ],
   "first_iter": 13,
-  "visits": 1
+  "visits": 3
  },
  "341": {
   "ee_pose_world": [
@@ -13322,7 +13322,7 @@
    ]
   ],
   "first_iter": 14,
-  "visits": 2
+  "visits": 4
  },
  "232": {
   "ee_pose_world": [
@@ -13352,7 +13352,7 @@
    ]
   ],
   "first_iter": 15,
-  "visits": 1
+  "visits": 3
  },
  "470": {
   "ee_pose_world": [
@@ -13472,7 +13472,7 @@
    ]
   ],
   "first_iter": 15,
-  "visits": 1
+  "visits": 2
  },
  "701": {
   "ee_pose_world": [
@@ -13712,6 +13712,306 @@
    ]
   ],
   "first_iter": 17,
+  "visits": 2
+ },
+ "616": {
+  "ee_pose_world": [
+   [
+    0.1850948225944844,
+    0.9205843014977694,
+    -0.3438959878867166,
+    0.5597939538811585
+   ],
+   [
+    0.977860782688117,
+    -0.207293399023746,
+    -0.02859609067277677,
+    -0.08671572146058215
+   ],
+   [
+    -0.09761248039723149,
+    -0.33098941154823436,
+    -0.9385722205103102,
+    1.362302059975111
+   ],
+   [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ]
+  ],
+  "first_iter": 18,
+  "visits": 2
+ },
+ "336": {
+  "ee_pose_world": [
+   [
+    -0.3858284152013205,
+    0.9148099695587875,
+    -0.11941169799935092,
+    0.5008831665356361
+   ],
+   [
+    0.47145906165513446,
+    0.3067669812033922,
+    0.8268133842812524,
+    0.18372499735606418
+   ],
+   [
+    0.7930086930207624,
+    0.2627103706350556,
+    -0.5496548680347462,
+    1.3378676179713886
+   ],
+   [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ]
+  ],
+  "first_iter": 18,
+  "visits": 1
+ },
+ "586": {
+  "ee_pose_world": [
+   [
+    0.32053647986962497,
+    0.8228844454057438,
+    -0.46916687285236924,
+    0.5807608149145419
+   ],
+   [
+    0.9462539048102314,
+    -0.30071872919159737,
+    0.1190453423901183,
+    0.01355819443549433
+   ],
+   [
+    -0.043126705232130774,
+    -0.4821093604387625,
+    -0.8750489425587284,
+    1.360929208249936
+   ],
+   [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ]
+  ],
+  "first_iter": 18,
+  "visits": 1
+ },
+ "574": {
+  "ee_pose_world": [
+   [
+    -0.2438213341205855,
+    0.01536675238110713,
+    0.9696984170085643,
+    0.46647046636141287
+   ],
+   [
+    0.9532964036255456,
+    -0.17998811929747527,
+    0.24254946659673127,
+    -0.07028491862283243
+   ],
+   [
+    0.1782613919564719,
+    0.9835487480715003,
+    0.029235873592651784,
+    1.1549256883401382
+   ],
+   [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ]
+  ],
+  "first_iter": 19,
+  "visits": 1
+ },
+ "524": {
+  "ee_pose_world": [
+   [
+    -0.056463924115463415,
+    0.5207916657085304,
+    0.8518144552671182,
+    0.3429232083674461
+   ],
+   [
+    0.926072780500668,
+    -0.29150636022059495,
+    0.2396106157220545,
+    -0.03199369007466846
+   ],
+   [
+    0.37309654312154195,
+    0.8023715366832715,
+    -0.46583139292160247,
+    1.1697769384741887
+   ],
+   [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ]
+  ],
+  "first_iter": 19,
+  "visits": 1
+ },
+ "656": {
+  "ee_pose_world": [
+   [
+    -0.35734542339397124,
+    0.9333557441206382,
+    0.033930860531282914,
+    0.5424264436002783
+   ],
+   [
+    0.873488856509762,
+    0.3211222008332212,
+    0.3659204144145237,
+    0.12119114458200075
+   ],
+   [
+    0.3306379680748294,
+    0.16039821398331797,
+    -0.9300273904667056,
+    1.3576186761185878
+   ],
+   [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ]
+  ],
+  "first_iter": 19,
+  "visits": 1
+ },
+ "228": {
+  "ee_pose_world": [
+   [
+    0.8278614986620778,
+    -0.17600554691256076,
+    -0.5326043432877625,
+    0.4983291553473199
+   ],
+   [
+    0.32726473002803,
+    -0.6195956420699662,
+    0.7134416842374623,
+    -0.041979519001770604
+   ],
+   [
+    -0.45556902387306697,
+    -0.7649335185386484,
+    -0.45533896901475956,
+    1.3253699409542223
+   ],
+   [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ]
+  ],
+  "first_iter": 19,
+  "visits": 1
+ },
+ "663": {
+  "ee_pose_world": [
+   [
+    0.268234532670766,
+    0.12973357872173913,
+    -0.9545781445407946,
+    0.811368600229754
+   ],
+   [
+    0.9403823539570244,
+    0.1798363811649042,
+    0.2886865157497959,
+    0.09101704669810584
+   ],
+   [
+    0.20912021387025614,
+    -0.9751041352396992,
+    -0.0737608404866481,
+    1.2433238217854459
+   ],
+   [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ]
+  ],
+  "first_iter": 19,
+  "visits": 1
+ },
+ "52": {
+  "ee_pose_world": [
+   [
+    -0.5073834839998532,
+    0.8381559308619037,
+    0.20014153922958375,
+    0.4837719586122394
+   ],
+   [
+    0.8579176872002595,
+    0.4695352979804326,
+    0.20859972660428927,
+    0.17473866379087066
+   ],
+   [
+    0.08086558076913161,
+    0.27754502249444557,
+    -0.9573032530684462,
+    1.4161071109225685
+   ],
+   [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ]
+  ],
+  "first_iter": 19,
+  "visits": 1
+ },
+ "24": {
+  "ee_pose_world": [
+   [
+    -0.07308696502503875,
+    0.9947363627715486,
+    -0.07181827151539338,
+    0.5208650127347819
+   ],
+   [
+    0.5252837118509692,
+    0.09960766878010818,
+    0.8450771174184402,
+    0.20661005845268876
+   ],
+   [
+    0.8477825886437493,
+    0.024039153483895515,
+    -0.5297988311541286,
+    1.3035015569966928
+   ],
+   [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ]
+  ],
+  "first_iter": 20,
   "visits": 1
  }
 }
