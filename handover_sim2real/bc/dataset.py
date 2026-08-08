@@ -232,9 +232,23 @@ class BCDataset(Dataset):
     """
 
     def __init__(self, hdf5_paths, normalizer: Normalizer | None = None,
-                 goal_table=None):
+                 goal_table=None, reach_tail_weight: float = 1.0,
+                 reach_tail: int = 5):
         self.hdf5_paths = _as_path_list(hdf5_paths)
         self.normalizer = normalizer
+        # Oversampling weight for the last `reach_tail` steps of every episode —
+        # the standoff->grasp reach plus the CLOSE label. 1.0 leaves the dataset
+        # uniform and `sample_weights` None, so nothing downstream changes.
+        #
+        # WHY. Measured on train_pinned_omg_ok, those steps are 23.8% of the data
+        # but contribute only 11.1% of the SmoothL1 pose gradient, because the
+        # expert's labels shrink into the reach (per-axis mean |dpos| 0.0120 m
+        # over the last five steps against 0.0255 m during the free approach, and
+        # |drot| 0.0155 rad against 0.0497). Under a loss that is quadratic in the
+        # small-error regime, the phase that decides the task is the phase the
+        # optimizer can most cheaply ignore.
+        self.reach_tail_weight = float(reach_tail_weight)
+        self.reach_tail = int(reach_tail)
         # Auxiliary goal-grasp target (run 13). When enabled, __getitem__ returns a
         # 4th element. Reconstructed per step from the stored ee_pose, so NO
         # RE-COLLECTION is needed: every dataset already carries `scene_idx` per
@@ -279,6 +293,10 @@ class BCDataset(Dataset):
         index: list[tuple[int, str, int]] = []
         # episode -> scene_idx, read once here rather than per __getitem__.
         scene_of: dict[tuple[int, str], int] = {}
+        # Per-item sampling weight, aligned with `index`. Built here because
+        # step-from-end needs the episode length, which is only known while the
+        # index is being walked.
+        weights: list[float] = []
         for fi, path in enumerate(self.hdf5_paths):
             with h5py.File(path, "r") as f:
                 ep_keys = sorted(k for k in f.keys() if k.startswith("episode_"))
@@ -295,8 +313,21 @@ class BCDataset(Dataset):
                         scene_of[(fi, k)] = int(sc)
                     for t in range(T):
                         index.append((fi, k, t))
+                        weights.append(self.reach_tail_weight
+                                       if (T - 1 - t) < self.reach_tail else 1.0)
         self._index = index
         self._scene_of = scene_of
+        # None when uniform, so callers can branch on "is this dataset weighted"
+        # without comparing floats.
+        self.sample_weights = weights if self.reach_tail_weight != 1.0 else None
+        if self.sample_weights is not None:
+            n_tail = sum(1 for w in weights if w != 1.0)
+            share = self.reach_tail_weight * n_tail / (
+                self.reach_tail_weight * n_tail + (len(weights) - n_tail))
+            print(f"[reach-weight] last {self.reach_tail} steps x"
+                  f"{self.reach_tail_weight}: {n_tail}/{len(weights)} items "
+                  f"({100*n_tail/len(weights):.1f}% of the data) -> "
+                  f"{100*share:.1f}% of draws")
         if self._goal_tables is not None:
             missing = {(fi, s) for (fi, _), s in scene_of.items()
                        if s not in self._goal_tables[fi]}

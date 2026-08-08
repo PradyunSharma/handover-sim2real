@@ -67,7 +67,7 @@ import h5py
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from handover_sim2real.bc import (
     ACTTrainer,
@@ -218,8 +218,13 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
         if bool(cfg["MODEL"].get("aux_head", False)) and \
                 float(cfg.get("LOSS", {}).get("aux_weight", 0.0)) > 0.0:
             goal_table = cfg["DATA"].get("grasp_pin_table") or "auto"
+        # Reach-tail oversampling (run 14). TRAIN ONLY — weighting val would
+        # change what val_loss means and break comparability across runs.
         train_ds = BCDataset(cfg["DATA"]["train_h5"], normalizer=normalizer,
-                             goal_table=goal_table)
+                             goal_table=goal_table,
+                             reach_tail_weight=float(cfg["DATA"].get(
+                                 "reach_tail_weight", 1.0)),
+                             reach_tail=int(cfg["DATA"].get("reach_tail", 5)))
         val_ds = (BCDataset(val_h5, normalizer=normalizer, goal_table=goal_table)
                   if val_h5 and os.path.exists(val_h5) else None)
     else:
@@ -236,8 +241,13 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
         print(f"          {path}: {ne} episodes")
 
     pin = device != "cpu"
+    train_sampler = (WeightedRandomSampler(train_ds.sample_weights,
+                                           num_samples=len(train_ds),
+                                           replacement=True)
+                     if getattr(train_ds, "sample_weights", None) else None)
     train_dl = DataLoader(train_ds, batch_size=int(cfg["TRAIN"]["batch_size"]),
-                          shuffle=True, num_workers=int(num_workers),
+                          shuffle=(train_sampler is None), sampler=train_sampler,
+                          num_workers=int(num_workers),
                           pin_memory=pin, drop_last=True)
     val_dl = (DataLoader(val_ds, batch_size=int(cfg["TRAIN"]["batch_size"]),
                          shuffle=False, num_workers=int(num_workers),

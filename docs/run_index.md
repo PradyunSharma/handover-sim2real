@@ -29,26 +29,106 @@ those success rates are training-set performance. A generalization number needs
 | **dagger4_run1** | 0.13 @it4 | 0.04 | First real run. `beta_schedule: indicator` (β=0 from iteration 1), m=20 episodes/iter, 50 epochs, unfiltered `train_pinned.h5`. **Failed**: produced ONE close label in 20 iterations — β=0 meant the learner never reached the grasp, so D got no endgame data at all. |
 | **dagger4_run2** | 0.21 @it2 | 0.06 | Fixes run 1: `beta linear 0.75→0.10`, m=20→**100**, epochs 50→25, and the base dataset filtered to `train_pinned_ok.h5` (126 failed demos dropped). Pin rule `furthest_from_hand`. Close labels went from 1-per-run to ~86-per-iteration. |
 | **dagger4_run3** | 0.35 @it10 | 0.17 | = run 2 with **one** key changed: pin rule `furthest_from_hand` → **`omg`** (the grasp reachable with least arm motion from home). Config diff verified 1 of 51 keys. |
-| **dagger4_run4** | **0.51 @it0** | 0.36 | = run 3 with **one** key changed: `train_cfg` → `bc_phase1_nojoint.yaml`, i.e. `MODEL.drop_joint_state: true`. Robot-MLP input **26 → 8 dims** (`ee_pos`, `ee_orn`, `gripper`); joint_pos(9)+joint_vel(9) removed. |
-| **dagger4_run5** | 0.53 @it2 | 0.46 (it4, running) | = run 4 with the **camera set**: `SIM.cfg_file` → `pretrain_multicam_wlr.yaml` (wrist + left + right), plus the re-collected `*_omg_wlr_*` demos it requires. `COMPUTE_ROBOT_POINT_STATE` stays off, so still 2 classes / `pc_channels: 5`. |
-| **dagger4_run6** | *queued* | | = run 4 + **DART** at `dart_ratio: 0.2`. On 20% of approach steps inside (0.05, 0.20] m of the standoff, the executed action becomes a random ±0.04 m / ±0.2 rad jump, so the following steps carry the expert's recovery from off-plan. 4 of 55 keys differ from run 4. |
-| **dagger4_run7** | *queued* | | = run 6 with `dart_ratio: 0.5`. 1 key differs from run 6. Phase 3 found 0.2 ≫ 0.5 (rl_run15 0.458 vs rl_run20 0.25), but that was tuned against a 7-step *index* window, so it does not transfer by assumption. |
-| **dagger4_run8** | *queued* | | = run 4 with `num_iters: 15 → 25` and β `linear 0.75→0.10` → **`piecewise 1.0→0.5→0.3`** (knee at iteration 16). No DART — this is the control for runs 9/10. 6 of 53 keys differ from run 4. |
-| **dagger4_run9** | *queued* | | = run 8 + `dart_ratio: 0.2`. 4 keys differ from run 8. Note the interaction: the DART coin is drawn *before* the β coin, so jolts fire even at β = 1.00 — runs 9/10 keep some off-distribution coverage in the early iterations that run 8 has none of. |
-| **dagger4_run10** | *queued* | | = run 8 + `dart_ratio: 0.5`. 1 key differs from run 9. |
+| **dagger4_run4** | 0.51 @it0 | 0.27 | = run 3 with **one** key changed: `train_cfg` → `bc_phase1_nojoint.yaml`, i.e. `MODEL.drop_joint_state: true`. Robot-MLP input **26 → 8 dims** (`ee_pos`, `ee_orn`, `gripper`); joint_pos(9)+joint_vel(9) removed. |
+| **dagger4_run5** | 0.59 @it8 | 0.37 | = run 4 with the **camera set**: `SIM.cfg_file` → `pretrain_multicam_wlr.yaml` (wrist + left + right), plus the re-collected `*_omg_wlr_*` demos it requires. `COMPUTE_ROBOT_POINT_STATE` stays off, so still 2 classes / `pc_channels: 5`. |
+| **dagger4_run6** | 0.65 @it4 | 0.18 | = run 4 + **DART** at `dart_ratio: 0.2`. On 20% of approach steps inside (0.05, 0.20] m of the standoff, the executed action becomes a random ±0.04 m / ±0.2 rad jump, so the following steps carry the expert's recovery from off-plan. 4 of 55 keys differ from run 4. |
+| **dagger4_run7** | **0.69 @it6** | 0.34 | = run 6 with `dart_ratio: 0.5`. 1 key differs from run 6. Phase 3 found 0.2 ≫ 0.5 (rl_run15 0.458 vs rl_run20 0.25), but that was tuned against a 7-step *index* window, so it does not transfer by assumption. |
+| **dagger4_run8** | 0.48 @it25 | 0.48 | = run 4 with `num_iters: 15 → 25` and β `linear 0.75→0.10` → **`piecewise 1.0→0.5→0.3`** (knee at iteration 16). No DART — this is the control for runs 9/10. 6 of 53 keys differ from run 4. |
+| **dagger4_run9** | **0.70 @it24** | 0.47 | = run 8 + `dart_ratio: 0.2`. 4 keys differ from run 8. Note the interaction: the DART coin is drawn *before* the β coin, so jolts fire even at β = 1.00 — runs 9/10 keep some off-distribution coverage in the early iterations that run 8 has none of. |
+| **dagger4_run10** | 0.60 @it4 | 0.47 | = run 8 + `dart_ratio: 0.5`. 1 key differs from run 9. |
+| **dagger4_run11** | *queued* | | = run 10 with `num_iters: 25 → 20` and `train_cfg` → `bc_phase4_pm.yaml`: **`LOSS.pose_loss: pm`**, GA-DDPG's point-matching pose loss on the denormalized action, at `pm_weight: 7.0`. First of three tests of the off-pose finding below. |
+| **dagger4_run12** | *queued* | | = run 11 with the pose loss reverted to `smooth_l1`, plus **DART inside the committed reach** (`dart_reach_ratio: 0.3`, ±0.012 m / ±0.3 rad, rejection-sampled against the cloud), and `dart_rot_mag` 0.2 → 0.3. |
+| **dagger4_run13** | *queued* | | = run 11 with the pose loss reverted to `smooth_l1`, plus an **auxiliary goal-grasp head** (`MODEL.aux_head`, `LOSS.aux_weight: 1.0`) predicting `[quat, trans]` of the pinned grasp in the current EE frame — GA-DDPG's `extra_pred`, which this policy had dropped. |
 | dagger4_smoke | — | — | Shakedown only. m=4, 2 iterations, 6 eval scenes. Not a result. |
 
 Runs 6–10 are a 2×2 with two DART-free controls: `{run 4's β schedule, the
-extended one} × {DART 0.2, DART 0.5}`, with runs 4 and 8 as the controls. If
-DART's effect has the same sign under both schedules it is a property of DART;
-if it flips, it is an interaction with how much of the collection the expert
-drives. **Caveat that applies to all four DART readings:** Phase 4 has no
-measured run-to-run noise floor — rl_run28 vs rl_run38 (byte-identical configs,
-0.02 vs 0.30) shows Phase 3 had enough seed variance to swamp an effect this
-size, and nothing rules that out here. A repeat of run 4 under a different seed
-costs the same as one DART variant and would make all four readable.
+extended one} × {DART 0.2, DART 0.5}`, with runs 4 and 8 as the controls. **The
+2×2 did not resolve** — see the noise floor below. Runs 11–13 are three
+independent single-variable tests of the off-pose finding, sharing run 10 as
+control.
 
-### The two findings that matter
+### The noise floor, finally measured — and it invalidates the 2×2
+
+All six of runs 4, 6, 7, 8, 9, 10 train iteration 0 from an **identical**
+configuration: same `train_cfg`, same `base_train_h5`, same `val_h5`,
+`base_epochs: 100`, `seed: 0`. DART cannot touch it (it perturbs collection at
+iterations ≥ 1) and neither can the β schedule or `num_iters`. Verified key by key.
+
+Their six iteration-0 success rates:
+
+```
+0.32   0.34   0.39   0.49   0.51   0.62        mean 0.445   sd 0.115   range 0.30
+```
+
+Binomial sampling on 100 scenes at p ≈ 0.45 would give sd 0.050. The observed
+0.115 is **2.3× that**, so most of the spread is training nondeterminism producing
+genuinely different policies, not eval sampling.
+
+A ±0.115 floor is larger than every difference in the 2×2. Peak success
+(0.51 / 0.65 / 0.69 / 0.48 / 0.70 / 0.60) cannot be read as a DART ranking, and
+run 4's own best iteration being its *base fit* is hard to read as anything but
+noise. This is the Phase-4 analogue of runs 28 vs 38, and it was predicted in this
+document before the runs went out; the prediction was correct and the cost was the
+whole family.
+
+What is still readable, because it is counted rather than scored: DART at 0.5
+costs collection horizon (`c_max_steps` 84 → 215 between runs 4 and 7, ~7.5
+jolts/episode, steps/episode 28.5 → 35.1), while eval-time `f_timeout` moves the
+*other* way (0.109 → 0.073). And `reached_grasp` collapses in **all** arms, DART or
+not — that pathology is not what DART addresses.
+
+### The finding that reframes Phase 4: the policy never reaches the pinned grasp
+
+Across runs 4/6/7/8/9/10 — 69 evaluations of 100 scenes each — `near_rate` (closed
+within the label tolerances of 0.02 m / 0.34 rad) never exceeded **0.12**, and was
+usually 0.00–0.04. Run 7's best checkpoint scores 0.69 success at `near_rate`
+0.06. **Essentially every success is a grasp at some other pose that the object
+happened to survive.**
+
+`eval_min_rot` — the closest the gripper's *orientation* ever comes to the pinned
+grasp, over the whole episode — never went below **0.43 rad** in any evaluation of
+any run, against a 0.34 threshold. Not a spread; a plateau.
+
+The metric is sound, checked two ways. The scene is static
+(`MANO_SIMULATION_MODE: disable_control_and_move_by_reset`), so the world-frame
+pinned pose stays valid all episode. And the expert, scored by the *same* function
+against the *same* poses during collection, reaches 0.014–0.023 m / 0.04–0.10 rad.
+
+| closest approach ever reached | expert | policy | threshold |
+|---|---|---|---|
+| position | 0.018 m | 0.076 m | 0.02 |
+| rotation | 0.07 rad | 0.60 rad | 0.34 |
+
+**Rotation error integrates; position error does not.** Run 7's best checkpoint has
+a per-step rotation error of 0.0230 rad over ~25-step episodes — 0.0230 × 25 =
+0.57 rad, and its measured `eval_min_rot` is 0.559. Position would integrate to
+0.22 m by the same arithmetic, but `eval_min_pos` is 0.076, because the wrist
+camera sees where the object is. There is closed-loop feedback on position and
+none on orientation.
+
+Three candidate causes, one per run 11–13:
+
+1. **The loss cannot see rotation properly.** Per-channel z-scoring makes all six
+   action channels unit-variance, but 1σ of translation moves the gripper control
+   points 16–22 mm while 1σ of rotation moves them 2.2–4.9 mm. → run 11 (PM loss).
+   *Note this cuts against the obvious reading: z-scoring already over-weights
+   rotation 4–8× relative to its physical effect, so PM will shift weight toward
+   translation.*
+2. **The demonstrations never show orientation being corrected near the object.**
+   OMG aligns the wrist during the free approach then reaches in a straight line:
+   per-axis mean `|drot|` over the last four demonstration steps is 0.0005–0.0136
+   rad against 0.050–0.059 during the approach. → run 12 (DART in the reach).
+3. **The observation never says which orientation to arrive at.** No goal-pose
+   head, and `pc_pretrained` loads an encoder that *was* trained with one before
+   being fine-tuned without it for 100 epochs × N iterations. → run 13 (aux head).
+
+Correlations over 55 eval points sharpen the failure modes: `f_drop` rises with
+distance from the grasp (r = +0.48 vs `eval_min_pos`) while `f_human_contact`
+*falls* (r = −0.31). Hanging back gives drops and timeouts; pressing in gives hand
+contact. Only an orientation-correct approach breaks that trade-off, which is why
+success plateaus around 0.5–0.7 regardless of what else is changed.
+
+### The earlier findings — the joint state, and the β floor
 
 **Dropping the joint state is the single largest effect measured in this project.**
 Runs 3 and 4 train iteration 0 on the *same* HDF5 file; the only difference is
@@ -202,7 +282,12 @@ Configs without a numbered run file were shared across several runs.
 | `dagger_phase4_dart02.yaml`, `_dart05.yaml` | dagger4_run6, run7 |
 | `dagger_phase4_beta_ext.yaml` | dagger4_run8 |
 | `dagger_phase4_beta_ext_dart02.yaml`, `_dart05.yaml` | dagger4_run9, run10 |
+| `dagger_phase4_pm.yaml` | dagger4_run11 |
+| `dagger_phase4_reachdart.yaml` | dagger4_run12 |
+| `dagger_phase4_aux.yaml` | dagger4_run13 |
 | `bc_phase1.yaml` / `bc_phase1_nojoint.yaml` | Phase-4 `TRAIN.train_cfg` |
+| `bc_phase4_pm.yaml` | run 11 `TRAIN.train_cfg` — `LOSS.pose_loss: pm`, `pm_weight: 7.0` |
+| `bc_phase4_aux.yaml` | run 13 `TRAIN.train_cfg` — `MODEL.aux_head`, `LOSS.aux_weight: 1.0` |
 
 ---
 
@@ -222,4 +307,24 @@ rule produces *more* failed demonstrations than `furthest_from_hand` (24.2% vs
 20.2%) and a distinctly better policy — it is the easier target for a learner to
 track even though it is the harder one for the planner to fly.
 
-**Single 250-iteration RL runs are not decisive.** See runs 28 vs 38.
+**Single runs are not decisive in EITHER phase, and the floor is now measured.**
+Phase 3 had runs 28 vs 38 (byte-identical configs, 0.02 vs 0.30) as an accident.
+Phase 4 has six deliberate samples of the same base fit: **0.32 – 0.62, sd 0.115**,
+2.3× the binomial expectation. Any Phase-4 comparison resting on a success-rate
+difference smaller than ~0.15 on 100 scenes is unreadable, which retrospectively
+covers the whole 6–10 DART family. Budget a repeat before attributing an effect,
+and prefer metrics with a floor near zero — `near_rate`, `eval_min_rot` — which
+have room to move and are not dominated by this variance.
+
+**Success rate is measuring the wrong thing.** `stable_grasp` rewards coming away
+with the object from anywhere; the demonstrations teach one specific pinned pose.
+The policy solved the first and ignored the second — 0.69 success at `near_rate`
+0.06. Any claim that this work "learns the demonstrated grasp" needs `near_rate`
+reported beside the success rate, and right now that number is ~0.
+
+**Orientation has no feedback loop; position does.** Per-step rotation error
+integrates almost exactly (0.0230 rad × ~25 steps = 0.57 vs measured 0.559) while
+position error does not (would be 0.22 m, measured 0.076). The wrist camera
+localizes the object but nothing in the observation names the orientation to
+arrive at. This is the standing explanation for the ~0.5–0.7 plateau, and runs
+11–13 test its three candidate causes.

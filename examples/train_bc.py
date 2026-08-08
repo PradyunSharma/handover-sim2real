@@ -38,7 +38,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from handover_sim2real.bc import (
     BCDataset,
@@ -197,9 +197,15 @@ def main() -> None:
             float(cfg.get("LOSS", {}).get("aux_weight", 0.0)) > 0.0:
         goal_table = cfg["DATA"].get("grasp_pin_table") or "auto"
 
+    # Reach-tail oversampling (run 14). TRAIN ONLY — weighting the val set would
+    # change what val_loss means and break comparability with every other run.
+    rtw = float(cfg["DATA"].get("reach_tail_weight", 1.0))
+    rt  = int(cfg["DATA"].get("reach_tail", 5))
+
     # Datasets + loaders.
     train_ds = BCDataset(cfg["DATA"]["train_h5"], normalizer=normalizer,
-                         goal_table=goal_table)
+                         goal_table=goal_table,
+                         reach_tail_weight=rtw, reach_tail=rt)
     val_ds   = (BCDataset(cfg["DATA"]["val_h5"],   normalizer=normalizer,
                           goal_table=goal_table)
                 if cfg["DATA"].get("val_h5") and os.path.exists(cfg["DATA"]["val_h5"])
@@ -216,7 +222,16 @@ def main() -> None:
     bs       = int(cfg["TRAIN"]["batch_size"])
     nw       = int(cfg["TRAIN"]["num_workers"])
     pin      = (cfg["TRAIN"]["device"] != "cpu")
-    train_dl = DataLoader(train_ds, batch_size=bs, shuffle=True,
+    # WeightedRandomSampler draws WITH replacement, so an epoch no longer visits
+    # each item exactly once (~63% unique coverage at num_samples=len). Over 100
+    # epochs that is immaterial, and it is the standard way to reweight without
+    # touching the loss.
+    train_sampler = (WeightedRandomSampler(train_ds.sample_weights,
+                                           num_samples=len(train_ds),
+                                           replacement=True)
+                     if getattr(train_ds, "sample_weights", None) else None)
+    train_dl = DataLoader(train_ds, batch_size=bs, shuffle=(train_sampler is None),
+                          sampler=train_sampler,
                           num_workers=nw, pin_memory=pin, drop_last=True)
     val_dl   = (DataLoader(val_ds, batch_size=bs, shuffle=False,
                            num_workers=nw, pin_memory=pin, drop_last=False)
