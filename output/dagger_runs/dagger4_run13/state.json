@@ -1,0 +1,49 @@
+{
+  "iterations": [
+    {
+      "iter": 0,
+      "run_dir": "output/dagger_runs/dagger4_run13/iters/iter_00",
+      "dagger_h5": null,
+      "beta": 1.0,
+      "eval": {
+        "n": 100,
+        "success_rate": 0.56,
+        "grasp_rate": 0.56,
+        "close_rate": 0.69,
+        "near_rate": 0.02,
+        "close_success_rate": 0.8115942028985508,
+        "chance_rate": 0.03,
+        "missed_rate": 0.01,
+        "miss_given_chance": 0.3333333333333333,
+        "eval_min_pos": 0.07237730694284149,
+        "eval_min_rot": 0.7104889446138725,
+        "mean_dist": 0.16750674694776535,
+        "mean_pos_err": 0.07348342055463655,
+        "mean_rot_err": 0.8123385053445502,
+        "mean_close_step": 23.144927536231883,
+        "reasons": {
+          "GRASP_OK": 56,
+          "HUMAN_CONTACT": 19,
+          "NO_RELEASE": 7,
+          "TIMEOUT": 5,
+          "DROP": 12,
+          "GRASP_MISS": 1
+        }
+      },
+      "is_best": true
+    }
+  ],
+  "best": {
+    "iter": 0,
+    "metric": "success_rate",
+    "score": 0.56,
+    "score_tuple": [
+      0.56,
+      0.56,
+      0.02,
+      -0.16750674694776535
+    ],
+    "run_dir": "output/dagger_runs/dagger4_run13/iters/iter_00"
+  },
+  "cursor": 0
+}
