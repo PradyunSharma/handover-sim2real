@@ -339,6 +339,7 @@ LOG_FIELDS = [
     "reached_standoff", "reached_grasp", "reach_steps",
     "omg_fail", "goal_switch", "expert_steps", "policy_closed",
     "policy_close_cmds", "dropped_tail", "dart", "dart_env_done",
+    "dart_reach", "dart_reject",
     "mean_min_pos", "mean_min_rot", "mean_policy_close_step",
     "c_close_label", "c_policy_close", "c_max_steps", "c_env_done", "c_no_labels",
     "c_omg_fail0",
@@ -431,6 +432,8 @@ def collect_columns(c: dict) -> dict:
         "dropped_tail": c.get("n_dropped_tail", -1),
         "dart": c.get("n_dart", -1),
         "dart_env_done": c.get("n_dart_env_done", -1),
+        "dart_reach": c.get("n_dart_reach", -1),
+        "dart_reject": c.get("n_dart_reject", -1),
         "mean_min_pos": _r(c.get("mean_min_pos")),
         "mean_min_rot": _r(c.get("mean_min_rot")),
         "mean_policy_close_step": _r(c.get("mean_policy_close_step"), 2),
@@ -627,6 +630,14 @@ def main() -> None:
         dart_max_dist=float(dag.get("dart_max_dist", 0.20)),
         dart_pos_mag=float(dag.get("dart_pos_mag", 0.04)),
         dart_rot_mag=float(dag.get("dart_rot_mag", 0.2)),
+        # DART inside the committed reach (run 12). Same "0 draws nothing"
+        # contract, so leaving it unset keeps a config bit-identical to runs 4-11.
+        dart_reach_ratio=float(dag.get("dart_reach_ratio", 0.0)),
+        dart_reach_pos_mag=float(dag.get("dart_reach_pos_mag", 0.01202)),
+        dart_reach_rot_mag=float(dag.get("dart_reach_rot_mag", 0.01549)),
+        dart_reach_max_tries=int(dag.get("dart_reach_max_tries", 5)),
+        dart_reach_clearance=float(dag.get("dart_reach_clearance", 0.01)),
+        dart_reach_path_steps=int(dag.get("dart_reach_path_steps", 4)),
     )
     # (pin_table is loaded above, before the scene pools, because its key set
     # defines which scenes the expert can plan for.)
@@ -701,6 +712,13 @@ def main() -> None:
              f"of the standoff; +-{collect_params.dart_pos_mag} m / "
              f"+-{collect_params.dart_rot_mag} rad"
              if collect_params.dart_ratio > 0.0 else "OFF"))
+    print(f"  DART (reach)  : "
+          + (f"p={collect_params.dart_reach_ratio} per committed-reach step; "
+             f"+-{collect_params.dart_reach_pos_mag} m / "
+             f"+-{collect_params.dart_reach_rot_mag} rad, rejection-sampled "
+             f"(clearance {collect_params.dart_reach_clearance} m, "
+             f"{collect_params.dart_reach_max_tries} tries)"
+             if collect_params.dart_reach_ratio > 0.0 else "OFF"))
     print(f"  eval success  : {eval_params.success_mode}"
           + (f" (hold {eval_params.hold_steps} steps, then released & not dropped)"
              if eval_params.success_mode == "stable_grasp"
@@ -805,6 +823,7 @@ def main() -> None:
                       "n_expert_steps": -1, "policy_closed": -1,
                       "n_policy_close_cmds": -1, "n_dropped_tail": -1,
                       "n_dart": -1, "n_dart_env_done": -1,
+                      "n_dart_reach": -1, "n_dart_reject": -1,
                       "mean_min_pos": float("nan"), "mean_min_rot": float("nan"),
                       "mean_policy_close_step": float("nan"),
                       "n_close_labels": -1, "n_approach_labels": -1,
@@ -844,6 +863,9 @@ def main() -> None:
                   + (f"dart={cstats.get('n_dart', -1)}"
                      f"(ended={cstats.get('n_dart_env_done', -1)}) "
                      if collect_params.dart_ratio > 0.0 else "")
+                  + (f"dart_reach={cstats.get('n_dart_reach', -1)}"
+                     f"(rejected={cstats.get('n_dart_reject', -1)}) "
+                     if collect_params.dart_reach_ratio > 0.0 else "")
                   + f"omg_fail={cstats['n_omg_fail']} reasons={cstats['reasons']}")
 
         collect_s = time.time() - t_collect

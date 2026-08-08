@@ -37,6 +37,7 @@ In the PyBullet window:  R = re-roll the same scene,  N = next scene,  Q = quit.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -55,7 +56,7 @@ import handover_sim2real   # noqa: F401  registers envs
 
 from handover.benchmark_wrapper import HandoverBenchmarkWrapper, EpisodeStatus
 from handover_sim2real.config import get_cfg
-from handover_sim2real.policy import PointListener, HandoverSim2RealPolicy
+from handover_sim2real.policy import PointListener
 from handover_sim2real.eval_wrapper import GraspBenchmarkWrapper
 from handover_sim2real.utils import add_sys_path_from_env
 
@@ -69,6 +70,68 @@ from collect_bc_dataset import _robot_state, _point_cloud  # noqa: E402
 
 
 # ── model loading ────────────────────────────────────────────────────────────
+
+def scenes_from_run(path, num_scenes: int):
+    """The scene pool a Phase-4 run actually collected and trained on.
+
+    Mirrors handover_sim2real.dagger.setup.build_phase4_context exactly: the
+    grasp pin table's key set is the FIRST filter (scenes OMG can plan for at
+    all — ~13% of the s0 train split has no reachable goal set), and
+    SIM.exclude_scenes is the second (scenes whose expert demonstration ended in
+    a benchmark failure). Rolling out over range(num_scenes) instead scores the
+    policy on both groups, which it never saw in training.
+    """
+    p = Path(path)
+    cfg_path = p / "config.yaml" if p.is_dir() else p
+    if not cfg_path.exists():
+        raise SystemExit(f"--scenes-from-run: no config at {cfg_path}")
+    with cfg_path.open() as f:
+        sim = (yaml.safe_load(f) or {}).get("SIM", {}) or {}
+
+    pin = sim.get("grasp_pin_table")
+    if pin and Path(pin).exists():
+        with open(pin) as f:
+            raw = json.load(f)
+        usable = {int(k) for k, v in raw.items() if k != "_meta" and v is not None}
+    else:
+        if pin:
+            print(f"WARNING: pin table {pin} missing — pool NOT filtered by it")
+        usable = set(range(num_scenes))
+
+    excl = sim.get("exclude_scenes")
+    if excl and Path(excl).exists():
+        with open(excl) as f:
+            usable -= {int(s) for s in json.load(f)}
+    elif excl:
+        print(f"WARNING: exclude_scenes {excl} missing — failed scenes KEPT")
+
+    return sorted(s for s in usable if 0 <= s < num_scenes)
+
+
+def resolve_scenes(args, num_scenes: int):
+    """Explicit scene list to roll out, or None to mean range(num_scenes)."""
+    if args.scenes and args.scenes_from_run:
+        raise SystemExit("pass --scenes or --scenes-from-run, not both")
+
+    if args.scenes_from_run:
+        ids = scenes_from_run(args.scenes_from_run, num_scenes)
+        print(f"Scene pool from {args.scenes_from_run}: {len(ids)} scenes")
+    elif args.scenes:
+        pth = Path(args.scenes)
+        if pth.exists():
+            with pth.open() as f:
+                ids = sorted({int(s) for s in json.load(f)})
+        else:
+            ids = sorted({int(s) for s in args.scenes.replace(" ", "").split(",") if s})
+        ids = [s for s in ids if 0 <= s < num_scenes]
+        print(f"Scene pool: {len(ids)} scenes")
+    else:
+        return None
+
+    if not ids:
+        raise SystemExit("scene selection is empty")
+    return ids
+
 
 def load_policy(run_dir: Path, device: str):
     from handover_sim2real.bc import BCPolicy, Normalizer
@@ -177,13 +240,13 @@ def draw_gripper(pose_mat, colour, line_ids, line_width=2.0):
 
 # ── rollout ──────────────────────────────────────────────────────────────────
 
-def rollout(env, model, point_listener, gb_policy, scene_idx, device,
+def rollout(env, model, point_listener, scene_idx, device,
             panda_base_inv_tf, steps_action_repeat, max_steps,
             R_base, panda_base_pos, draw=True,
             show_goal_grasp=False, show_grasp_set=False,
-            omg_steps=None, goal_marker_ids=None, pin_table=None):
+            omg_steps=None, goal_marker_ids=None, pin_table=None,
+            hold_steps=3, dwell_steps=20):
     obs = env.reset(idx=scene_idx)
-    point_listener.reset()
 
     # Optionally overlay the grasp the policy is supposed to be aiming at. Drawn
     # once (the object is static) and left up for the whole roll so you can watch
@@ -219,6 +282,15 @@ def rollout(env, model, point_listener, gb_policy, scene_idx, device,
         else:
             print("  OMG found no goal grasp for this scene — nothing to draw.")
 
+    # AFTER the overlay, never before: reset() reseeds the GLOBAL numpy stream
+    # (policy.PointListener.reset -> np.random.seed) and the per-step point-cloud
+    # subsample draws from that same global stream (np.random.choice of 1024
+    # points). OMG's planner also draws from it (omg/planner.py goal selection and
+    # sampling), so planning between the reseed and step 0 shifts the stream and
+    # the policy sees a DIFFERENT 1024-point sample — same scene, same physics,
+    # divergent rollout. Reseeding here makes --show-goal-grasp purely visual.
+    point_listener.reset()
+
     debug_ids = []
     status = 0
     done = False
@@ -226,6 +298,8 @@ def rollout(env, model, point_listener, gb_policy, scene_idx, device,
     dist = float("nan")
     close_step = -1
     grasped = False
+    success = False
+    reason = None
 
     # prev_action matches collection: zeros at step 0, then the previous step's
     # raw 6-D Δee action. model.predict() returns denormalized (real-unit)
@@ -247,22 +321,44 @@ def rollout(env, model, point_listener, gb_policy, scene_idx, device,
         ycb_pos = env.ycb.bodies[env.ycb.ids[0]].link_state[0, 6, 0:3].numpy()
         dist = np.linalg.norm(ee_pos - ycb_pos)
 
-        # First time the policy commands a grasp (gripper close), hand off to the
-        # scripted grasp-and-back: close in place (standoff 0) and carry to
-        # GOAL_CENTER, then let the benchmark decide success.
+        # First time the policy commands a grasp (gripper close): close IN PLACE
+        # and hold. No carry to GOAL_CENTER — the episode ends at the committed
+        # close, exactly as it does during collection and in the Phase-4
+        # evaluator, so the number here means the same thing as the training
+        # one. `grasp_held_after_hold` is the same function rl/rollout_worker.py
+        # scores with, so this cannot drift from the `stable_grasp` criterion.
         if action[6] < 0.5:
+            # Lazy: rollout_worker imports action_to_target_joint from THIS
+            # module, so a top-level import here would be circular.
+            from handover_sim2real.rl.rollout_worker import grasp_held_after_hold
             close_step = step
-            print(f"  step {step:3d}  GRASP commanded  ee→ycb={dist:.3f} m  → grasp_and_back")
-            gb_policy.reset()
-            gb_done = False
-            while not gb_done and not done:
-                gb_action, gb_done = gb_policy.grasp_and_back(obs)
-                for _ in range(steps_action_repeat):
-                    obs, _, done, info = env.step(gb_action)
-                    if done:
+            print(f"  step {step:3d}  GRASP commanded  ee→ycb={dist:.3f} m  "
+                  f"→ close + hold {hold_steps}")
+            held, obs = grasp_held_after_hold(
+                env, obs, steps_action_repeat, hold_steps)
+            grasped = bool(env.grasped_active())
+            success = held
+            reason = ("GRASP_OK" if held else
+                      "DROP" if bool(getattr(env, "_dropped", False)) else
+                      "NO_RELEASE" if not bool(env.ycb.released) else
+                      "GRASP_MISS")
+
+            # VIEWING ONLY, render mode only. The hold above is 3 policy-steps —
+            # a blink on screen — so keep the shut gripper live a while longer so
+            # the grasp is actually watchable. Nothing here touches success /
+            # grasped / reason: those are already decided, and this must not
+            # become a lift test by the back door.
+            if draw and dwell_steps > 0:
+                shut = np.concatenate([np.zeros(6, np.float32), [0.0]]).astype(np.float32)
+                for _ in range(int(dwell_steps)):
+                    jp = action_to_target_joint(shut, obs)
+                    for _ in range(steps_action_repeat):
+                        obs, _, d_, _ = env.step(jp)
+                        if d_:
+                            break
+                    time.sleep(0.03)
+                    if d_:
                         break
-                status = info.get("status", 0)
-                grasped = grasped or env.grasped_active()
             break
 
         # Approach step (gripper still open).
@@ -287,18 +383,21 @@ def rollout(env, model, point_listener, gb_policy, scene_idx, device,
         if draw:
             time.sleep(0.03)
 
-    # Report outcome.
-    flags = []
-    if status & EpisodeStatus.SUCCESS:               flags.append("SUCCESS")
-    if status & EpisodeStatus.FAILURE_HUMAN_CONTACT: flags.append("HUMAN_CONTACT")
-    if status & EpisodeStatus.FAILURE_OBJECT_DROP:   flags.append("OBJECT_DROP")
-    if status & EpisodeStatus.FAILURE_TIMEOUT:       flags.append("TIMEOUT")
+    # Report outcome. `reason` is set at the close; otherwise the episode ran out
+    # of steps or the env ended it, and the status bits say which.
+    if reason is None:
+        if status & EpisodeStatus.FAILURE_HUMAN_CONTACT:
+            reason = "HUMAN_CONTACT"
+        elif status & EpisodeStatus.FAILURE_OBJECT_DROP:
+            reason = "DROP"
+        else:
+            reason = "TIMEOUT"
     closed = f"close@{close_step}" if close_step >= 0 else "never closed"
-    print(f"  result: {' | '.join(flags) if flags else 'no-success'}  "
+    print(f"  result: {'SUCCESS' if success else 'FAIL'} [{reason}]  "
           f"({closed}, grasped={grasped}, ee→ycb={dist:.3f} m)")
     for d in debug_ids:
         pybullet.removeUserDebugItem(d)
-    return status, dist, grasped, close_step
+    return success, reason, dist, grasped, close_step
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -310,6 +409,15 @@ def parse_args():
     p.add_argument("--cfg-file", required=True, help="simulator config (e.g. examples/pretrain.yaml)")
     p.add_argument("--scene",    type=int, default=0, help="scene index to roll out")
     p.add_argument("--max-steps", type=int, default=30, help="max policy steps")
+    p.add_argument("--hold-steps", type=int, default=3,
+                   help="stable_grasp: policy-steps to hold the gripper shut after "
+                        "the close before checking the object is secured. Match the "
+                        "run's EVAL.hold_steps (default 3).")
+    p.add_argument("--dwell-steps", type=int, default=20,
+                   help="GUI only: extra policy-steps to keep the gripper shut on "
+                        "screen after the grasp has already been scored, so the "
+                        "close is watchable. 0 disables. Never affects the result, "
+                        "and is skipped entirely under --no-render/--benchmark.")
     p.add_argument("--device",   default="cuda")
     p.add_argument("--no-render", action="store_true",
                    help="run headless (no GUI, no point overlay)")
@@ -317,6 +425,19 @@ def parse_args():
                    help="headless eval over many scenes: prints success rate + mean ee→ycb")
     p.add_argument("--num-scenes", type=int, default=None,
                    help="benchmark: number of scenes to roll out (default: all)")
+    p.add_argument("--scenes", default=None,
+                   help="restrict to an explicit scene set instead of range(n): "
+                        "either '3,7,12' or a path to a JSON list of ints. "
+                        "--num-scenes then caps how many of THESE are rolled out, "
+                        "and 'N' in the GUI steps through them.")
+    p.add_argument("--scenes-from-run", default=None,
+                   help="restrict to the scenes a Phase-4 run actually trained on: "
+                        "pass its run dir (or config.yaml) and the pool is rebuilt "
+                        "the way handover_sim2real.dagger.setup does — the grasp pin "
+                        "table's keys minus SIM.exclude_scenes. Rolling out over "
+                        "range(n) instead includes scenes OMG cannot plan for and "
+                        "scenes whose expert demo failed, both of which the policy "
+                        "never saw and neither of which it can be expected to solve.")
     p.add_argument("--show-goal-grasp", action="store_true",
                    help="overlay the gripper pose OMG planned to reach for the "
                         "scene (green wireframe) — the grasp the expert demos "
@@ -368,11 +489,6 @@ def main():
     point_listener = PointListener(cfg, seed=0)
     model = load_policy(run_dir, args.device)
 
-    # Scripted grasp-and-back, reused from the paper's policy (close + carry to
-    # GOAL_CENTER). Standoff 0 → close at the policy's pose, not 8 cm beyond it.
-    gb_policy = HandoverSim2RealPolicy(cfg, None, None, 0.0)
-    gb_policy._standoff_offset = np.zeros(3, dtype=np.float32)
-
     panda_base_inv_tf = pybullet.invertTransform(
         cfg.ENV.PANDA_BASE_POSITION, cfg.ENV.PANDA_BASE_ORIENTATION)
     steps_action_repeat = int(cfg.POLICY.TIME_ACTION_REPEAT / cfg.SIM.TIME_STEP)
@@ -381,7 +497,11 @@ def main():
     panda_base_pos = np.array(cfg.ENV.PANDA_BASE_POSITION)
     R_base = Rot.from_quat(np.array(cfg.ENV.PANDA_BASE_ORIENTATION)).as_matrix()
 
+    scene_ids = resolve_scenes(args, env.num_scenes)
     scene = args.scene
+    if scene_ids is not None and scene not in scene_ids:
+        scene = scene_ids[0]
+        print(f"scene {args.scene} is not in the pool — starting at {scene}")
     want_goal = args.show_goal_grasp or args.show_grasp_set
     goal_marker_ids = []  # shared across re-rolls so old markers get cleared
 
@@ -392,35 +512,44 @@ def main():
         print(f"Grasp pin table: {args.grasp_pin_table}")
 
     def do_rollout(s, draw=render):
-        return rollout(env, model, point_listener, gb_policy, s, args.device,
+        return rollout(env, model, point_listener, s, args.device,
                        panda_base_inv_tf, steps_action_repeat, args.max_steps,
                        R_base, panda_base_pos, draw=draw,
                        show_goal_grasp=(want_goal and draw),
                        show_grasp_set=args.show_grasp_set,
                        omg_steps=cfg.RL_MAX_STEP,
                        goal_marker_ids=goal_marker_ids,
-                       pin_table=pin_table)
+                       pin_table=pin_table,
+                       hold_steps=args.hold_steps,
+                       dwell_steps=args.dwell_steps)
 
     # Headless benchmark: roll out many scenes, report success / grasp / dist.
     if args.benchmark:
-        n = min(args.num_scenes or env.num_scenes, env.num_scenes)
+        ids = scene_ids if scene_ids is not None else list(range(env.num_scenes))
+        if args.num_scenes:
+            ids = ids[:args.num_scenes]
+        n = len(ids)
         succ, grasped_n, closed_n, dists = 0, 0, 0, []
-        for s in range(n):
-            status, dist, grasped, close_step = do_rollout(s, draw=False)
-            if status & EpisodeStatus.SUCCESS:
+        reasons = {}
+        for s in ids:
+            success, reason, dist, grasped, close_step = do_rollout(s, draw=False)
+            if success:
                 succ += 1
             if grasped:
                 grasped_n += 1
             if close_step >= 0:
                 closed_n += 1
+            reasons[reason] = reasons.get(reason, 0) + 1
             dists.append(dist)
         dists = np.array(dists, dtype=np.float32)
         print("\n==== benchmark ====")
         print(f"policy         : {run_dir}")
         print(f"scenes         : {n}")
-        print(f"success rate   : {succ}/{n} = {succ / n:.1%}  (grasped + carried to goal)")
+        print(f"success rate   : {succ}/{n} = {succ / n:.1%}  "
+              f"(stable_grasp: closed, held {args.hold_steps}, object secured)")
         print(f"grasp rate     : {grasped_n}/{n} = {grasped_n / n:.1%}  (both fingers gripping object)")
         print(f"commanded close: {closed_n}/{n}")
+        print(f"reasons        : {dict(sorted(reasons.items(), key=lambda kv: -kv[1]))}")
         print(f"ee→ycb         : mean {np.nanmean(dists):.3f} m  median {np.nanmedian(dists):.3f} m  "
               f"min {np.nanmin(dists):.3f}  max {np.nanmax(dists):.3f}")
         return
@@ -439,7 +568,11 @@ def main():
                 do_rollout(scene)
                 print("R = re-roll,  N = next scene,  Q = quit.")
             if N_KEY in keys and keys[N_KEY] & pybullet.KEY_WAS_TRIGGERED:
-                scene = (scene + 1) % env.num_scenes
+                if scene_ids is None:
+                    scene = (scene + 1) % env.num_scenes
+                else:
+                    i = scene_ids.index(scene) if scene in scene_ids else -1
+                    scene = scene_ids[(i + 1) % len(scene_ids)]
                 do_rollout(scene)
                 print("R = re-roll,  N = next scene,  Q = quit.")
             if Q_KEY in keys and keys[Q_KEY] & pybullet.KEY_WAS_TRIGGERED:

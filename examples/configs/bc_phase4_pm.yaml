@@ -1,0 +1,148 @@
+# Phase-1 BC training config — nojoint + POINT-MATCHING pose loss (run 11).
+#
+# = bc_phase1_nojoint.yaml with LOSS.pose_loss: pm. Everything else is byte-identical,
+# so a run using this file differs from runs 4-10 in the pose loss and NOTHING else.
+# Used as TRAIN.train_cfg by examples/configs/dagger_phase4_pm.yaml.
+
+DATA:
+  train_h5: output/bc_dataset/train.h5
+  # No val_h5 default on purpose: pass --val-h5 explicitly each run so the
+  # train/val distributions can't silently mismatch (e.g. frozen vs live).
+  # Omitting --val-h5 now means no validation (no val_* metrics, best.pt=last).
+  val_h5:
+  # These four are fixed by the collection script's schema; here for sanity.
+  pc_channels:     5      # xyz + ycb_flag + hand_flag
+  robot_state_dim: 32     # joint_pos(9)+joint_vel(9)+ee_pose(7)+gripper(1)+prev_act(6)
+  action_dim:      7      # Δpos(3)+Δeuler(3)+gripper_cmd(1)
+
+MODEL:
+  feature_dim:        256  # D — scene and robot encoders both output this width
+  robot_hidden:       128
+  policy_hidden:      [256, 256]
+  pointnet_scale:     1     # multiplies all PointNet++ channel widths
+  pointnet_radius:    0.02  # first SA module ball-query radius (metres)
+  pointnet_nclusters: 32    # first SA module npoint
+  use_prev_act:       false # include the trailing prev_action(6) in the robot state?
+                            # false drops it (recommended): prev_act is ~0.9 correlated
+                            # with the target, so keeping it lets the policy copy it and
+                            # ignore the point cloud. Override with --use-prev-act/--no-prev-act.
+  # Strip the LEADING joint_pos(9)+joint_vel(9) block from the robot-MLP input.
+  # The robot MLP then sees 8 dims: [ee_pos(3), ee_orn_wxyz(4), gripper(1)].
+  #
+  # Rationale, carried over verbatim from Phase-3 rl_run28 where this flag was
+  # introduced: the action is EE-frame, so the ee_pose already in the state
+  # carries all the kinematics the policy needs; joint space is redundant AND
+  # scene-correlated, which makes it a memorization handle — the network can
+  # index "which of the 351 scenes am I in" off the arm configuration instead of
+  # reading the point cloud. Removing it forces the scene features to do the work.
+  #
+  # This changes the robot-encoder in_dim (26 -> 8), so a checkpoint trained with
+  # this flag CANNOT be loaded into a model built without it. That is not a
+  # problem for Phase 4, which refits from scratch every iteration and only
+  # warm-starts the PointNet++ encoder (pc_pretrained, untouched by this flag) —
+  # but it does mean the run's config.yaml is the only record of the input width,
+  # so keep it with the checkpoints.
+  drop_joint_state:   true
+  joint_state_dim:    18    # width of the leading block (9 pos + 9 vel)
+  # PointNet++ encoder init. Points at the handover-sim2real CVPR2023 model's
+  # state-feat checkpoint — a 5-channel (xyz+ycb+hand) encoder trained on this
+  # exact task, so all 68/68 encoder tensors transfer (first SA conv matches:
+  # (64,8)). The GA-DDPG grasp encoder is the weaker fallback: 4-channel
+  # (xyz+gripper-flag), only 67/68 transfer (first SA conv (64,7) reinit'd).
+  # freeze_pc=false => fine-tune the encoder; true => train only robot MLP + head.
+  pc_pretrained:      output/cvpr2023_models/2022-10-16_08-48-30_finetune_5_s0_train/DDPG_state_feat_PandaYCBEnv_latest
+  freeze_pc:          false
+
+OPTIM:
+  kind:         adamw       # adam | adamw
+  lr:           1.0e-3
+  weight_decay: 1.0e-4
+  scheduler:   cosine       # none | cosine | step
+
+LOSS:
+  gripper_weight: 1.0       # weight on BCE term vs the pose term
+
+  # THE ONE LINE that separates run 11 from run 10.
+  #
+  #   smooth_l1  SmoothL1 on the NORMALIZED action channels (runs 1-10).
+  #   pm         GA-DDPG's point-matching loss (core/loss.py `pose_bc_loss`) on the
+  #              DENORMALIZED action: transform 6 Panda gripper control points by
+  #              both the predicted and the target (R, t) and L1 the displacement.
+  #              One SE(3) distance in metres. Our port in bc/losses.py is faithful
+  #              — same 6 control points, same Rz@Ry@Rx euler convention, same
+  #              sum-over-xyz-then-mean reduction.
+  #   both       smooth_l1 + pm_weight * pm.
+  #
+  # WHY THIS IS BEING TESTED. Eval diagnostics over runs 4/6/7/8/9 (55 evaluations,
+  # 100 scenes each): the policy's CLOSEST approach to the pinned grasp averages
+  # 0.069-0.113 m and 0.46-0.80 rad, against an expert that reaches 0.014-0.023 m
+  # and 0.04-0.10 rad on the same scenes under the same metric. `near_rate` — closed
+  # inside (0.02 m, 0.34 rad) — is 0.01-0.08 in EVERY evaluation, so essentially
+  # every success is a grasp at some other pose that the object happened to survive.
+  # eval_min_rot never once went below 0.46 rad. That is a plateau, and the
+  # docstring in bc/losses.py predicted it for Phase 3 at ~0.4 rad.
+  #
+  # THE NORMALIZATION INSIGHT, and it cuts against the naive reading. GA-DDPG has NO
+  # per-channel z-scoring: its policy tanh-squashes into the action-space bounds, so
+  # `pose_bc_loss` already operates in metres and radians, and PM's job there is to
+  # stop a raw L1 from over-weighting rotation (radians are numerically ~4x larger
+  # than metres in this action distribution). We z-score instead, which ALREADY
+  # equalizes the channels. Measured on train_pinned_omg_ok's action stats, one
+  # sigma of error displaces the gripper control points by:
+  #
+  #     dx 16.0 mm   dy 21.6 mm   dz 18.8 mm  |  rx 4.2 mm   ry 4.9 mm   rz 2.2 mm
+  #
+  # So SmoothL1-on-z-scores gives rotation 4-8x MORE weight than its physical effect
+  # warrants, and switching to PM will move weight TOWARD translation. If the wrist
+  # were simply under-weighted, we would already be fine. We are not — which means
+  # the reweighting is not the mechanism, and this run is testing PM's OTHER two
+  # properties:
+  #   (1) it is representation-invariant, where three independent SmoothL1 terms on
+  #       euler channels are not (same rotation, different euler triples, and the
+  #       channels interact);
+  #   (2) it is COUPLED — it scores where the fingertips end up, not position and
+  #       orientation as if they were independent, and fingertip placement is what
+  #       decides between a grasp, a drop, and a hand collision.
+  #
+  # HONEST PRIOR: weaker than the "wire in the fix" framing suggests. The measured
+  # per-channel weighting says PM should help rotation LESS than expected, possibly
+  # not at all. The competing explanation — that the demonstrations contain almost no
+  # orientation correction near the object (expert |drot| is 0.0005-0.0136 rad over
+  # the last 4 steps before the close, vs 0.050-0.059 during the approach, because
+  # OMG aligns the wrist far out and then reaches in a straight line) — is a DATA
+  # problem no loss function can fix. That one is tested separately by moving the
+  # DART band inside the reach. Run 11 is the loss half of that pair.
+  #
+  # WATCH: val_pose_rot_rad and val_pose_pm_mm in the iteration log.csv (both new,
+  # both in real units and therefore comparable across pose losses), and eval_min_rot
+  # / near_rate in dagger_log.csv. `total` is NOT comparable to runs 4-10 — it is
+  # metres here and z-scores there, so best.pt selection within a run still works but
+  # the numbers do not transfer.
+  pose_loss: pm
+
+  # 7.0, NOT 1.0, and this is not a tuning knob — it is what keeps the ablation
+  # honest. The two pose losses are denominated differently (z-scores vs metres),
+  # so swapping them also silently rescales the pose term against the gripper BCE.
+  # Measured by running run 7's best checkpoint over val_pinned_omg_ok (357 steps):
+  #
+  #     SmoothL1 pose 0.19022 | PM pose 0.02613 m (26.1 mm) | gripper BCE 0.02908
+  #     pose:gripper  = 6.54:1 under smooth_l1
+  #                   = 0.90:1 under pm at weight 1.0     <- 7.3x weaker
+  #
+  # At weight 1.0 this run would mostly be training the gripper classifier, and any
+  # behaviour change could be blamed on that rather than on the loss shape. 7.0
+  # restores the 6.54:1 balance runs 4-10 had, so the SHAPE of the pose loss is the
+  # only thing that differs. Matched at the converged operating point; the ratio
+  # still drifts during training, which is unavoidable and the same for both losses.
+  pm_weight: 7.0            # only read when pose_loss != smooth_l1
+
+TRAIN:
+  batch_size:      64
+  num_epochs:      100
+  num_workers:     4
+  device:          cuda
+  mixed_precision: false
+  val_every:       1
+  save_every:      5
+  grad_clip:       1.0      # 0 disables
+  seed:            0

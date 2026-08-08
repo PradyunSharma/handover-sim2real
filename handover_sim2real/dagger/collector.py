@@ -128,6 +128,9 @@ from collect_bc_dataset import (  # noqa: E402
     ROBOT_STATE_DIM,
 )
 from rollout_bc_policy import action_to_target_joint  # noqa: E402
+# 'sxyz' axes — the same convention the actions are built with (train_env.py uses
+# transforms3d's mat2euler default), so this inverts the label exactly.
+from transforms3d.euler import euler2mat  # noqa: E402
 
 
 CLOSE_LABEL = np.array([0, 0, 0, 0, 0, 0, 0.0], dtype=np.float32)
@@ -230,6 +233,65 @@ class CollectParams:
     dart_pos_mag: float = 0.04
     dart_rot_mag: float = 0.2
 
+    # ----- DART inside the COMMITTED REACH (run 12) -----
+    # The band above stops at `reach_commit_dist` by construction, so DART has
+    # never fired in the reach — and the reach is exactly where the policy fails.
+    # Measured over runs 4/6/7/8/9 (55 evaluations x 100 scenes): the policy's
+    # closest approach to the pinned grasp is 0.069-0.113 m / 0.46-0.80 rad
+    # against an expert that reaches 0.014-0.023 m / 0.04-0.10 rad, and
+    # `near_rate` never exceeded 0.08. The cause is visible in the labels: OMG
+    # aligns the wrist during the free approach and then reaches in a straight
+    # line, so per-axis |drot| over the last four demonstration steps is
+    # 0.0005-0.0136 rad against 0.050-0.059 during the approach. The
+    # demonstrations contain almost no orientation correction near the object,
+    # so the policy has never been shown one.
+    #
+    # This is safe here for a reason specific to the committed reach: the target
+    # is a FROZEN JOINT CONFIGURATION commanded absolutely (`target_jp =
+    # expert_target_jp`), not a delta that has to be re-derived, and `reach_i`
+    # saturates at the final waypoint. So recovery is a servo to a fixed target
+    # rather than an accumulating error — displace the gripper and it converges
+    # back onto the grasp on its own.
+    #
+    # 0 disables and draws nothing, so a run with this off is bit-identical to
+    # runs 4-11.
+    dart_reach_ratio: float = 0.0
+    # Magnitudes MATCHED TO THE DEMONSTRATIONS' OWN REACH STEPS, measured on
+    # train_pinned_omg_ok over the last 5 label-producing steps of each episode:
+    # per-axis mean |dpos| = 0.01202 m, mean |drot| = 0.01549 rad.
+    #
+    # NOTE the factor of two: uniform(-m, m) has mean |.| = m/2, so setting the
+    # parameter TO the measured mean makes a jolt average HALF a reach step
+    # (0.0060 m / 0.0077 rad per axis). Doubling these to 0.024 / 0.031 would
+    # make it average a full reach step. Deliberately the smaller of the two —
+    # it keeps the perturbed states on the reach's own scale, which is what
+    # makes the recovery expressible by the next frozen waypoint and keeps the
+    # resulting labels at the same magnitude as the rest of the reach.
+    #
+    # These DEFAULTS are the demo-matched values. Run 12 keeps the translation
+    # one and overrides the rotation to 0.3: 0.0155 rad is ~0.9 deg per axis
+    # against the ~0.56 rad of accumulated wrist error the run exists to teach
+    # recovery from, and the demonstrations' near-object rotation scale is the
+    # diagnosed PROBLEM — copying it into the jolt would reproduce it rather than
+    # probe it. Kept as the default anyway because it is the measured, principled
+    # number; the override belongs in the run config where it can be read.
+    dart_reach_pos_mag: float = 0.01202
+    dart_reach_rot_mag: float = 0.01549
+    # Rejection sampling: a jolt is only executed if neither the jolted pose NOR
+    # the servo back to the next reach waypoint brings the gripper's control
+    # points within `dart_reach_clearance` of a hand- or object-flagged point.
+    # Checking the endpoint alone is not enough — the recovery is a straight line
+    # in joint space, and cutting diagonally into the object is the failure that
+    # put 151 scenes on the exclusion list. After `dart_reach_max_tries` refusals
+    # the step simply takes no jolt.
+    #
+    # Rejecting is not a biased noise model: a jolt that knocks the object out of
+    # the hand ENDS the episode, so it carries no expert label and was never
+    # training signal. This conditions on the support where pi* is defined.
+    dart_reach_max_tries: int = 5
+    dart_reach_clearance: float = 0.01   # metres
+    dart_reach_path_steps: int = 4       # interpolation samples along the recovery
+
 
 def _grasp_moved(prev, cur, tol: float = 1e-4) -> bool:
     """Did the planner re-select a different goal grasp between two plans?"""
@@ -241,6 +303,75 @@ def _grasp_moved(prev, cur, tol: float = 1e-4) -> bool:
 def _ee_pos(obs) -> np.ndarray:
     return np.asarray(obs["panda_body"].link_state[0, obs["panda_link_ind_hand"], 0:3],
                       dtype=np.float64)
+
+
+# The same six Panda control points the PM loss uses (bc/losses.py), in the hand
+# link frame — which is also the frame the observation point cloud is expressed
+# in, so a candidate delta can be checked against the cloud with no transform.
+_CTRL_PTS = np.array([[0.000, 0.000, 0.000],
+                      [0.000, 0.000, 0.000],
+                      [0.053, 0.000, 0.075],
+                      [-0.053, 0.000, 0.075],
+                      [0.053, 0.000, 0.105],
+                      [-0.053, 0.000, 0.105]], dtype=np.float64)
+
+
+def _delta_to_points(delta) -> np.ndarray:
+    """Where the gripper control points land under a 6-D EE-frame delta pose."""
+    R = euler2mat(*np.asarray(delta, dtype=np.float64)[3:6])
+    return _CTRL_PTS @ R.T + np.asarray(delta, dtype=np.float64)[:3]
+
+
+def _path_min_dist(obstacles, a, b, path_steps: int) -> float:
+    """Closest any gripper control point comes to `obstacles` while the pose is
+    swept from delta `a` to delta `b`. Interpolating the 6-vector is exact in
+    translation and a small-angle approximation in rotation, which is all these
+    magnitudes are."""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    best = np.inf
+    for t in np.linspace(0.0, 1.0, max(int(path_steps), 1) + 1):
+        pts = _delta_to_points(a + t * (b - a))
+        d2 = ((obstacles[None, :, :] - pts[:, None, :]) ** 2).sum(-1)
+        best = min(best, float(d2.min()))
+    return float(np.sqrt(best))
+
+
+def _jolt_is_safe(pc, jolt_delta, recover_delta, *, clearance: float,
+                  path_steps: int) -> bool:
+    """Would this jolt, AND the servo back to the next reach waypoint, stay clear?
+
+    `pc` is the observation cloud [N, 5] in the EE frame: xyz + ycb_flag +
+    hand_flag. The gripper control points are in the same frame, so both the
+    jolted pose and the recovery path can be checked directly against it.
+
+    Checking the jolt's ENDPOINT alone would miss the failure that matters: the
+    recovery is a straight line in joint space from the displaced configuration
+    to a frozen waypoint, and a lateral displacement makes that line cut through
+    the object. So the whole segment is swept.
+
+    The test is RELATIVE, not absolute, and it has to be. During the reach the
+    gripper is closing on an object held in a human hand, so it is *supposed* to
+    end up within a centimetre of hand and object points — an absolute floor
+    rejects the expert's own trajectory. Measured on a 6-episode shakedown at
+    ratio 1.0, an absolute 0.01 m floor refused 65 draws to accept 7. So the bar
+    is `min(clearance, nominal)`: a jolt is allowed when it leaves the gripper no
+    closer than the unperturbed reach was already going to come, and never
+    closer than `clearance` when there was room to spare.
+
+    True when nothing to avoid is in the cloud — an empty scene cannot refute a
+    jolt.
+    """
+    obstacles = pc[(pc[:, 3] > 0.5) | (pc[:, 4] > 0.5), :3]
+    if obstacles.shape[0] == 0:
+        return True
+
+    zero = np.zeros(6, dtype=np.float64)
+    rec = zero if recover_delta is None else np.asarray(recover_delta, dtype=np.float64)
+    nominal = _path_min_dist(obstacles, zero, rec, path_steps)
+    jolted = _path_min_dist(obstacles, np.asarray(jolt_delta, dtype=np.float64),
+                            rec, path_steps)
+    return jolted >= min(float(clearance), nominal)
 
 
 def collect_dagger_episode(sim, runner, scene_idx, *, rng,
@@ -292,6 +423,15 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     # than displacing the gripper.
     n_dart = 0
     n_dart_env_done = 0
+    # Reach jolts are counted separately from approach jolts: they fire under a
+    # different rule, at a different magnitude, and their risk profile is
+    # different (a jolt 5 cm from the object is not a jolt 20 cm from it).
+    # `n_dart_reject` counts REFUSED candidate draws, not steps — if it is near
+    # zero the clearance test never binds and the magnitude can safely rise; if
+    # it approaches max_tries x the jolt count, the magnitude is too large for
+    # the geometry and jolts are being silently skipped.
+    n_dart_reach = 0
+    n_dart_reject = 0
     last_exec_dart = False
     # Magnitude of every APPROACH label recorded. This is the stall detector: the
     # standoff failure mode is labels decaying to ~0 while the EE sits 6.6 cm
@@ -477,25 +617,68 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                 and d_standoff <= params.dart_max_dist
                 and rng.uniform() < params.dart_ratio)
 
+        # ----- DART inside the committed reach (run 12) -----
+        # Same guards on `at_grasp` and on the policy's close, for the same
+        # reasons; the band conditions are replaced by "the reach has committed".
+        # The jolt is REJECTION SAMPLED: drawn, checked against the cloud
+        # together with the servo back to the next frozen waypoint, redrawn on a
+        # refusal, and abandoned after `dart_reach_max_tries`. See CollectParams.
+        dart_reach_delta = None
+        if (params.dart_reach_ratio > 0.0
+                and committed_reach is not None
+                and not at_grasp
+                and policy_action[6] >= 0.5
+                and rng.uniform() < params.dart_reach_ratio):
+            # Where the servo will pull the gripper AFTER the jolt: reach_i is
+            # incremented once this step executes, and the index is clamped, so
+            # the recovery target is the next waypoint (or the grasp at the end).
+            nxt = committed_reach[min(reach_i + 1, len(committed_reach) - 1)]
+            recover_delta = np.asarray(
+                env.convert_target_joint_position_to_action(nxt), dtype=np.float64)
+            for _ in range(int(params.dart_reach_max_tries)):
+                cand = np.concatenate([
+                    rng.uniform(-params.dart_reach_pos_mag,
+                                params.dart_reach_pos_mag, size=3),
+                    rng.uniform(-params.dart_reach_rot_mag,
+                                params.dart_reach_rot_mag, size=3),
+                ])
+                if _jolt_is_safe(pc, cand, recover_delta,
+                                 clearance=params.dart_reach_clearance,
+                                 path_steps=params.dart_reach_path_steps):
+                    dart_reach_delta = cand.astype(np.float32)
+                    break
+                n_dart_reject += 1
+
         # ----- choose what to EXECUTE: pi_i = beta*pi* + (1-beta)*pi_hat -----
         # pi_i = beta*pi* + (1-beta)*pi_hat, except that the committed reach can
         # be forced onto the expert (see CollectParams.expert_after_commit): the
         # endgame is where the close labels live and where a weak learner stalls.
         forced_expert = bool(params.expert_after_commit and committed_reach is not None)
-        use_expert = (not dart) and expert_target_jp is not None and (
-            forced_expert or rng.uniform() < beta)
-        if dart:
+        # A reach jolt PRE-EMPTS the forced expert, exactly as an approach jolt
+        # pre-empts the beta coin. Placed before the beta draw so a
+        # dart_reach_ratio: 0 run consumes the rng identically to runs 4-11.
+        use_expert = (not dart) and dart_reach_delta is None \
+            and expert_target_jp is not None and (
+                forced_expert or rng.uniform() < beta)
+        if dart or dart_reach_delta is not None:
             # Random task-space jump instead of anyone's action. The gripper stays
             # OPEN (1.0): a jolt must never be the thing that closes the hand.
             # The pair recorded above this line is untouched and entirely ordinary
             # — it is (the state we were in, what the expert would do there). Only
             # the state the NEXT step starts from is perturbed, and that step gets
-            # its own fresh OMG label.
-            n_dart += 1
-            exec_delta = np.concatenate([
-                rng.uniform(-params.dart_pos_mag, params.dart_pos_mag, size=3),
-                rng.uniform(-params.dart_rot_mag, params.dart_rot_mag, size=3),
-            ]).astype(np.float32)
+            # its own fresh label: a replanned pi*(s) on the approach, or the
+            # delta to the next frozen waypoint inside the reach. Either way it is
+            # a genuine expert query from the displaced state, never a
+            # reconstruction of the pre-jolt label.
+            if dart_reach_delta is not None:
+                n_dart_reach += 1
+                exec_delta = dart_reach_delta
+            else:
+                n_dart += 1
+                exec_delta = np.concatenate([
+                    rng.uniform(-params.dart_pos_mag, params.dart_pos_mag, size=3),
+                    rng.uniform(-params.dart_rot_mag, params.dart_rot_mag, size=3),
+                ]).astype(np.float32)
             target_jp = action_to_target_joint(
                 np.concatenate([exec_delta, [1.0]]).astype(np.float32), obs)
         elif use_expert:
@@ -520,7 +703,7 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
             target_jp = action_to_target_joint(policy_action, obs)
             exec_delta = policy_action[:6].astype(np.float32)
         last_exec_expert = bool(use_expert)
-        last_exec_dart = bool(dart)
+        last_exec_dart = bool(dart or dart_reach_delta is not None)
 
         prev_act6d = np.asarray(exec_delta, dtype=np.float32).copy()
 
@@ -578,7 +761,9 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                       "reason": "NO_LABELS", "steps": 0, "n_omg_fail": n_omg_fail,
                       "n_dropped_tail": int(n_dropped_tail),
                       "n_dart": int(n_dart),
-                      "n_dart_env_done": int(n_dart_env_done)}
+                      "n_dart_env_done": int(n_dart_env_done),
+                      "n_dart_reach": int(n_dart_reach),
+                      "n_dart_reject": int(n_dart_reject)}
 
     episode = {
         "point_clouds": np.asarray(point_clouds, dtype=np.float32),
@@ -622,6 +807,11 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # destroying the episodes it was meant to enrich.
         "n_dart": int(n_dart),
         "n_dart_env_done": int(n_dart_env_done),
+        # Reach jolts and the draws the clearance test refused (see the counter
+        # declarations). `n_dart_env_done` covers BOTH bands, so read it against
+        # n_dart + n_dart_reach.
+        "n_dart_reach": int(n_dart_reach),
+        "n_dart_reject": int(n_dart_reject),
         "min_pos": min_pos,
         "min_rot": min_rot,
         # Approach-label scale. `n_tiny_labels` counts labels the policy cannot
@@ -712,6 +902,7 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
            "reached_grasp": 0, "n_reach_steps": 0, "policy_closed": 0,
            "n_policy_close_cmds": 0, "n_dropped_tail": 0,
            "n_dart": 0, "n_dart_env_done": 0,
+           "n_dart_reach": 0, "n_dart_reject": 0,
            "n_close_labels": 0, "n_approach_labels": 0, "sum_label_pos": 0.0,
            "n_tiny_labels": 0, "n_revisits": 0, "n_grasp_mismatch": 0,
            "max_grasp_drift": 0.0,
@@ -734,6 +925,10 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
         "dart_max_dist": float(params.dart_max_dist),
         "dart_pos_mag": float(params.dart_pos_mag),
         "dart_rot_mag": float(params.dart_rot_mag),
+        "dart_reach_ratio": float(params.dart_reach_ratio),
+        "dart_reach_pos_mag": float(params.dart_reach_pos_mag),
+        "dart_reach_rot_mag": float(params.dart_reach_rot_mag),
+        "dart_reach_clearance": float(params.dart_reach_clearance),
         "scenes": np.asarray(scenes, dtype=np.int32),
     })
     try:
@@ -764,6 +959,8 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
                 agg["n_dropped_tail"] += st["n_dropped_tail"]
                 agg["n_dart"] += st["n_dart"]
                 agg["n_dart_env_done"] += st["n_dart_env_done"]
+                agg["n_dart_reach"] += st.get("n_dart_reach", 0)
+                agg["n_dart_reject"] += st.get("n_dart_reject", 0)
                 agg["n_close_labels"] += st["n_close_labels"]
                 agg["n_approach_labels"] += st["n_approach_labels"]
                 agg["sum_label_pos"] += st["sum_label_pos"]

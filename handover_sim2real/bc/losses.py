@@ -74,9 +74,24 @@ def pose_pm_loss(pred_pose: torch.Tensor, target_pose: torch.Tensor) -> torch.Te
     return (_xf(pred_pose) - _xf(target_pose)).abs().sum(-1).mean()
 
 
+POSE_LOSSES = ("smooth_l1", "pm", "both")
+
+
+def _denorm(x: torch.Tensor, mean, std) -> torch.Tensor:
+    """Normalized channels 0..5 -> real metres/radians. Identity if no stats."""
+    if std is None:
+        return x[..., :6]
+    return x[..., :6] * std + mean
+
+
 def bc_loss(pred: torch.Tensor,
             target: torch.Tensor,
-            gripper_weight: float = 1.0) -> Dict[str, torch.Tensor]:
+            gripper_weight: float = 1.0,
+            *,
+            pose_loss: str = "smooth_l1",
+            pm_weight: float = 1.0,
+            action_mean: torch.Tensor | None = None,
+            action_std: torch.Tensor | None = None) -> Dict[str, torch.Tensor]:
     """Composite BC loss for a single batch.
 
     Args:
@@ -84,10 +99,31 @@ def bc_loss(pred: torch.Tensor,
         target: [B, 7] expert action with the *same* normalization applied as
                 in BCDataset (channels 0..5 normalized, channel 6 raw 0/1).
         gripper_weight: scalar multiplier on the gripper BCE term.
+        pose_loss: which pose term drives the gradient —
+            smooth_l1  SmoothL1 on the NORMALIZED channels (the Phase-1 default).
+                       Per-channel z-scoring makes all six unit-variance, so this
+                       weights a 1-sigma rotation error the same as a 1-sigma
+                       translation error even though (measured on
+                       train_pinned_omg_ok) 1 sigma of translation moves the
+                       gripper control points 16-22 mm and 1 sigma of rotation
+                       moves them 2.2-4.9 mm.
+            pm         `pose_pm_loss` on the DENORMALIZED action — GA-DDPG's
+                       core/loss.py `pose_bc_loss`, which it applies in raw units
+                       (its policy tanh-squashes into the action-space bounds; it
+                       has no z-scoring at all). One SE(3) metric in metres, so
+                       the two parts are weighted by physical effect rather than
+                       by the variance of their channel.
+            both       smooth_l1 + pm_weight * pm.
+        pm_weight: multiplier on the PM term (ignored when pose_loss=smooth_l1).
+        action_mean/action_std: [6] tensors used to denormalize before the PM
+            term. Required for pm/both — without them the "metres" are z-scores
+            and the whole point is lost.
 
     Returns:
         Dict with tensors:
-            pose_loss     scalar — SmoothL1 over channels 0..5
+            pose_loss     scalar — whichever term(s) `pose_loss` selected
+            pose_sl1      scalar — the SmoothL1 term, always reported
+            pose_pm       scalar — the PM term in metres (pm/both only)
             gripper_loss  scalar — BCEWithLogits over channel 6
             total         scalar — pose_loss + gripper_weight * gripper_loss
     """
@@ -95,19 +131,34 @@ def bc_loss(pred: torch.Tensor,
         raise ValueError(f"pred {tuple(pred.shape)} vs target {tuple(target.shape)}")
     if pred.shape[-1] != 7:
         raise ValueError(f"expected last dim 7, got {pred.shape[-1]}")
+    if pose_loss not in POSE_LOSSES:
+        raise ValueError(f"pose_loss must be one of {POSE_LOSSES}, got {pose_loss!r}")
+    if pose_loss != "smooth_l1" and action_std is None:
+        raise ValueError(f"pose_loss={pose_loss!r} needs action_mean/action_std to "
+                         f"denormalize; PM loss is only meaningful in real units")
 
-    pose_loss    = F.smooth_l1_loss(pred[..., :6], target[..., :6])
+    sl1          = F.smooth_l1_loss(pred[..., :6], target[..., :6])
     gripper_loss = F.binary_cross_entropy_with_logits(pred[..., 6], target[..., 6])
-    total        = pose_loss + gripper_weight * gripper_loss
-    return {
-        "pose_loss":    pose_loss,
-        "gripper_loss": gripper_loss,
-        "total":        total,
-    }
+
+    out: Dict[str, torch.Tensor] = {"pose_sl1": sl1}
+    if pose_loss == "smooth_l1":
+        pose = sl1
+    else:
+        pm = pose_pm_loss(_denorm(pred, action_mean, action_std),
+                          _denorm(target, action_mean, action_std))
+        out["pose_pm"] = pm
+        pose = pm_weight * pm if pose_loss == "pm" else sl1 + pm_weight * pm
+
+    out["pose_loss"]    = pose
+    out["gripper_loss"] = gripper_loss
+    out["total"]        = pose + gripper_weight * gripper_loss
+    return out
 
 
 @torch.no_grad()
-def bc_metrics(pred: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
+def bc_metrics(pred: torch.Tensor, target: torch.Tensor,
+               action_mean: torch.Tensor | None = None,
+               action_std: torch.Tensor | None = None) -> Dict[str, float]:
     """Per-batch diagnostic metrics — handy to log alongside the loss.
 
     All values returned as plain Python floats (already detached).
@@ -118,18 +169,31 @@ def bc_metrics(pred: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
     pose_rot_l1   same, but only Δeuler channels 3..5.
     gripper_acc   fraction of samples where sigmoid(logit) ≥ 0.5 matches the
                   binary target. Random-init baseline is ~0.5.
+
+    With action_mean/action_std, three more in REAL units. These are the ones to
+    compare across runs that use different pose losses: the normalized ones above
+    are denominated in the run's own channel sigmas, and `total` changes scale
+    entirely between smooth_l1 (z-scores) and pm (metres).
+
+    pose_pos_m    mean |Δpos error| in metres
+    pose_rot_rad  mean |Δeuler error| in radians
+    pose_pm_mm    the PM metric in millimetres — the single number that says how
+                  far apart the two gripper poses actually are
     """
     err = (pred[..., :6] - target[..., :6]).abs()
-    pose_l1     = err.mean().item()
-    pose_pos_l1 = err[..., :3].mean().item()
-    pose_rot_l1 = err[..., 3:].mean().item()
-
     pred_gripper = (torch.sigmoid(pred[..., 6]) >= 0.5).float()
-    gripper_acc  = (pred_gripper == target[..., 6]).float().mean().item()
 
-    return {
-        "pose_l1":     pose_l1,
-        "pose_pos_l1": pose_pos_l1,
-        "pose_rot_l1": pose_rot_l1,
-        "gripper_acc": gripper_acc,
+    out = {
+        "pose_l1":     err.mean().item(),
+        "pose_pos_l1": err[..., :3].mean().item(),
+        "pose_rot_l1": err[..., 3:].mean().item(),
+        "gripper_acc": (pred_gripper == target[..., 6]).float().mean().item(),
     }
+    if action_std is not None:
+        pr = _denorm(pred, action_mean, action_std)
+        tg = _denorm(target, action_mean, action_std)
+        real = (pr - tg).abs()
+        out["pose_pos_m"]   = real[..., :3].mean().item()
+        out["pose_rot_rad"] = real[..., 3:].mean().item()
+        out["pose_pm_mm"]   = pose_pm_loss(pr, tg).item() * 1000.0
+    return out

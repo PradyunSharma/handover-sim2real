@@ -110,6 +110,10 @@ class BCTrainer:
         self.grad_clip      = float(cfg["TRAIN"].get("grad_clip", 0.0))   # 0 = off
         self.use_amp        = bool(cfg["TRAIN"].get("mixed_precision", False))
         self.gripper_weight = float(cfg["LOSS"].get("gripper_weight", 1.0))
+        # smooth_l1 (normalized channels) | pm (GA-DDPG point-matching, real
+        # units) | both. See losses.bc_loss for why the choice matters.
+        self.pose_loss      = str(cfg["LOSS"].get("pose_loss", "smooth_l1"))
+        self.pm_weight      = float(cfg["LOSS"].get("pm_weight", 1.0))
 
         self.run_dir = Path(run_dir)
         (self.run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -142,14 +146,30 @@ class BCTrainer:
         if norm is not None:
             norm.save(self.run_dir / "normalization.npz")
 
+        # Action stats as tensors: the PM loss and the real-unit metrics both need
+        # to undo the per-channel z-scoring. forward() emits NORMALIZED actions
+        # (only predict() denormalizes), so this is the only place they exist.
+        if norm is not None:
+            self.a_mean_t = torch.as_tensor(norm.action_mean, dtype=torch.float32,
+                                            device=self.device)
+            self.a_std_t  = torch.as_tensor(norm.action_std, dtype=torch.float32,
+                                            device=self.device)
+        else:
+            self.a_mean_t = self.a_std_t = None
+            if self.pose_loss != "smooth_l1":
+                raise ValueError(f"LOSS.pose_loss={self.pose_loss!r} needs a Normalizer "
+                                 f"on the model to denormalize into real units")
+
     # ----- one epoch --------------------------------------------------------
     def _step_batch(self, batch, train: bool) -> tuple[Dict[str, torch.Tensor], Dict[str, float], int]:
         pc, rs, act = (t.to(self.device, non_blocking=True) for t in batch)
         autocast = torch.cuda.amp.autocast if (self.use_amp and self.device != "cpu") else _noop_ctx
         with autocast():
             out    = self.model(pc, rs)
-            losses = bc_loss(out, act, gripper_weight=self.gripper_weight)
-            metrics = bc_metrics(out, act)
+            losses = bc_loss(out, act, gripper_weight=self.gripper_weight,
+                             pose_loss=self.pose_loss, pm_weight=self.pm_weight,
+                             action_mean=self.a_mean_t, action_std=self.a_std_t)
+            metrics = bc_metrics(out, act, self.a_mean_t, self.a_std_t)
         if train:
             self.optimizer.zero_grad(set_to_none=True)
             if self.scaler is not None:
@@ -235,6 +255,8 @@ class BCTrainer:
         print(f"Epochs  : {self.start_epoch} → {self.num_epochs}")
         print(f"AMP     : {self.use_amp}")
         print(f"Scheduler: {self.cfg['OPTIM'].get('scheduler', 'none')}")
+        print(f"Pose loss: {self.pose_loss}"
+              + (f" (pm_weight={self.pm_weight})" if self.pose_loss != "smooth_l1" else ""))
         n_train_steps = len(self.train_loader)
         n_val_steps   = len(self.val_loader) if self.val_loader is not None else 0
         print(f"Steps/epoch: train={n_train_steps}, val={n_val_steps}")
