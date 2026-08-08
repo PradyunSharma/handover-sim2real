@@ -929,6 +929,13 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
         "dart_reach_pos_mag": float(params.dart_reach_pos_mag),
         "dart_reach_rot_mag": float(params.dart_reach_rot_mag),
         "dart_reach_clearance": float(params.dart_reach_clearance),
+        # Which pin table the labels aim at. The base collector has always written
+        # this; the DAgger shards did not, which meant an aggregate could not say
+        # what its `scene_idx` values were relative to. BCDataset's auxiliary
+        # goal-grasp target (run 13) resolves scene_idx through exactly this file,
+        # so recording it makes each shard self-describing and removes the chance
+        # of pairing a train table with val indices.
+        "grasp_pin_table": str(getattr(pin_table, "path", "") or ""),
         "scenes": np.asarray(scenes, dtype=np.int32),
     })
     try:

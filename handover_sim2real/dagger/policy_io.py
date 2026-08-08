@@ -68,6 +68,13 @@ def build_policy(run_cfg: dict, normalizer: Normalizer | None):
             drop_joint_state=bool(m.get("drop_joint_state", False)),
             joint_state_dim=int(m.get("joint_state_dim", 18)),
             freeze_pc=bool(m.get("freeze_pc", False)),
+            # Must mirror train_bc.build_model: the aux head adds state_dict keys,
+            # so a run-13 checkpoint will not strict-load into a policy built
+            # without it. This is the path the collector and evaluator go through,
+            # so omitting it here would make run 13's own checkpoints unloadable.
+            aux_head=bool(m.get("aux_head", False)),
+            aux_dim=int(m.get("aux_dim", 7)),
+            aux_hidden=tuple(m.get("aux_hidden", (256, 256))),
             normalizer=normalizer,
         )
     return ACTPolicy(

@@ -1,0 +1,147 @@
+# Phase-1 BC training config — nojoint + AUXILIARY GOAL-GRASP HEAD (run 13).
+#
+# = bc_phase1_nojoint.yaml plus MODEL.aux_head and LOSS.aux_weight. The pose loss
+# stays smooth_l1, so this is NOT stacked on run 11's change and a result is
+# attributable to the head alone.
+# Used as TRAIN.train_cfg by examples/configs/dagger_phase4_aux.yaml.
+#
+# WHAT THE HEAD IS. A second output branch on the SAME concatenated
+# [scene ‖ robot] features, predicting where the goal grasp is relative to the
+# current end-effector: [quat_wxyz(4) ‖ trans(3)], quaternion L2-normalized.
+# GA-DDPG's `extra_pred` (core/networks.py:294, supervised by core/loss.py
+# `goal_pred_loss`), which this policy dropped when it was written.
+#
+# WHY. Measured over runs 4/6/7/8/9 — 55 evaluations of 100 scenes — the policy
+# never reached the pinned grasp: near_rate 0.01-0.08 in every evaluation,
+# eval_min_rot never below 0.46 rad against a 0.34 threshold. Run 7's best
+# checkpoint has a per-step rotation error of 0.0230 rad over ~25-step episodes,
+# which integrates to 0.57 rad — and its measured eval_min_rot is 0.559. Rotation
+# error integrates essentially UNCORRECTED. Position error does not: 0.0090 m/step
+# would integrate to 0.22 m, but eval_min_pos is 0.076, because the wrist camera
+# sees where the object is. There is feedback on position and none on orientation,
+# and the reason is that nothing in the observation tells the policy which
+# orientation it is supposed to arrive at. This head makes that an explicit
+# prediction target and forces the scene features to carry it.
+#
+# It also repairs an own goal: `pc_pretrained` below loads the CVPR2023 state_feat
+# encoder, which WAS trained with this aux loss — and we then fine-tune it
+# (freeze_pc: false) for 100 epochs x N iterations with no aux term, so whatever
+# goal-pose structure it carried is trained away.
+#
+# NO RE-COLLECTION NEEDED. The target is reconstructed at load time from each
+# episode's `scene_idx` attr plus the pin table's world grasp pose and the
+# ee_pose already in robot_state[18:25]. Every existing dataset carries scene_idx,
+# and the handover config is static (MANO_SIMULATION_MODE:
+# disable_control_and_move_by_reset), so a world-frame grasp pose is valid for the
+# whole episode. See handover_sim2real/bc/dataset.py::goal_target_from_state.
+
+DATA:
+  train_h5: output/bc_dataset/train.h5
+  # No val_h5 default on purpose: pass --val-h5 explicitly each run so the
+  # train/val distributions can't silently mismatch (e.g. frozen vs live).
+  # Omitting --val-h5 now means no validation (no val_* metrics, best.pt=last).
+  val_h5:
+  # These four are fixed by the collection script's schema; here for sanity.
+  pc_channels:     5      # xyz + ycb_flag + hand_flag
+  robot_state_dim: 32     # joint_pos(9)+joint_vel(9)+ee_pose(7)+gripper(1)+prev_act(6)
+  action_dim:      7      # Δpos(3)+Δeuler(3)+gripper_cmd(1)
+
+MODEL:
+  feature_dim:        256  # D — scene and robot encoders both output this width
+  robot_hidden:       128
+  policy_hidden:      [256, 256]
+  pointnet_scale:     1     # multiplies all PointNet++ channel widths
+  pointnet_radius:    0.02  # first SA module ball-query radius (metres)
+  pointnet_nclusters: 32    # first SA module npoint
+  use_prev_act:       false # include the trailing prev_action(6) in the robot state?
+                            # false drops it (recommended): prev_act is ~0.9 correlated
+                            # with the target, so keeping it lets the policy copy it and
+                            # ignore the point cloud. Override with --use-prev-act/--no-prev-act.
+  # Strip the LEADING joint_pos(9)+joint_vel(9) block from the robot-MLP input.
+  # The robot MLP then sees 8 dims: [ee_pos(3), ee_orn_wxyz(4), gripper(1)].
+  #
+  # Rationale, carried over verbatim from Phase-3 rl_run28 where this flag was
+  # introduced: the action is EE-frame, so the ee_pose already in the state
+  # carries all the kinematics the policy needs; joint space is redundant AND
+  # scene-correlated, which makes it a memorization handle — the network can
+  # index "which of the 351 scenes am I in" off the arm configuration instead of
+  # reading the point cloud. Removing it forces the scene features to do the work.
+  #
+  # This changes the robot-encoder in_dim (26 -> 8), so a checkpoint trained with
+  # this flag CANNOT be loaded into a model built without it. That is not a
+  # problem for Phase 4, which refits from scratch every iteration and only
+  # warm-starts the PointNet++ encoder (pc_pretrained, untouched by this flag) —
+  # but it does mean the run's config.yaml is the only record of the input width,
+  # so keep it with the checkpoints.
+  drop_joint_state:   true
+  joint_state_dim:    18    # width of the leading block (9 pos + 9 vel)
+
+  # ---- auxiliary goal-grasp head — THE run-13 change ----
+  # Adds state_dict keys, so a run-13 checkpoint will NOT strict-load into a model
+  # built without it, and vice versa. Same situation drop_joint_state already has,
+  # and this config is again the only record — it is copied into every iteration's
+  # config.yaml, and dagger/policy_io.build_policy reads it back so the collector
+  # and evaluator build the matching architecture.
+  aux_head:   true
+  aux_dim:    7             # [quat_wxyz(4) + trans(3)]. Quaternion, not euler:
+                            # the action is a small delta where euler is harmless,
+                            # but the goal pose is up to ~0.5 m away at arbitrary
+                            # orientation, where euler has branch cuts the network
+                            # would have to learn around. PM loss makes the q/-q
+                            # sign ambiguity free (both give the same points), so
+                            # nothing needs canonicalizing.
+  aux_hidden: [256, 256]    # mirrors policy_hidden, and GA-DDPG's 2-layer branch
+  # PointNet++ encoder init. Points at the handover-sim2real CVPR2023 model's
+  # state-feat checkpoint — a 5-channel (xyz+ycb+hand) encoder trained on this
+  # exact task, so all 68/68 encoder tensors transfer (first SA conv matches:
+  # (64,8)). The GA-DDPG grasp encoder is the weaker fallback: 4-channel
+  # (xyz+gripper-flag), only 67/68 transfer (first SA conv (64,7) reinit'd).
+  # freeze_pc=false => fine-tune the encoder; true => train only robot MLP + head.
+  pc_pretrained:      output/cvpr2023_models/2022-10-16_08-48-30_finetune_5_s0_train/DDPG_state_feat_PandaYCBEnv_latest
+  freeze_pc:          false
+
+OPTIM:
+  kind:         adamw       # adam | adamw
+  lr:           1.0e-3
+  weight_decay: 1.0e-4
+  scheduler:   cosine       # none | cosine | step
+
+LOSS:
+  gripper_weight: 1.0       # weight on BCE term vs SmoothL1 pose term
+
+  # Weight on the auxiliary goal-grasp PM loss. 0 makes the head inert (it is
+  # still built and still in the checkpoint, but gets no gradient and the dataset
+  # skips building targets), which is the cheap A/B against this exact config.
+  #
+  # The term is `goal_pm_loss` — the SAME point-matching metric as pose_pm_loss,
+  # so it reads in metres of gripper-control-point displacement and is directly
+  # comparable to the action's own error. Watch val_aux_mm in the iteration log.
+  #
+  # 1.0 is GA-DDPG's effective weight (core/agent.py sums the loss terms with no
+  # scaling), but it was CHECKED rather than inherited blind — see pm_weight in
+  # bc_phase4_pm.yaml, where an unchecked 1.0 would have de-weighted the pose term
+  # 7x. Measured here over 6 epochs on train_pinned_omg_ok:
+  #
+  #     epoch |  pose    gripper   aux      val_aux
+  #       0   | 0.2390   0.0959   0.1145    94.9 mm
+  #       2   | 0.1138   0.0625   0.0779    71.0 mm
+  #       5   | 0.0745   0.0490   0.0534    61.9 mm
+  #
+  # The aux term tracks 0.5-0.7x the pose term throughout and never dominates it,
+  # so 1.0 needs no correction. The head is also clearly learning — it localizes
+  # the goal grasp to ~6 cm within 6 epochs, from a start where the target is
+  # 0.52 m away on average.
+  #
+  # Cost: +198,919 parameters (1.76M -> 1.96M, +11%) and ~5% wall time per epoch.
+  aux_weight: 1.0
+
+TRAIN:
+  batch_size:      64
+  num_epochs:      100
+  num_workers:     4
+  device:          cuda
+  mixed_precision: false
+  val_every:       1
+  save_every:      5
+  grad_clip:       1.0      # 0 disables
+  seed:            0

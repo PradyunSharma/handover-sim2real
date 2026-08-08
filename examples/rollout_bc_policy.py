@@ -30,6 +30,9 @@ scene (green wireframe). The OMG goal is deterministic per scene, so for a
 static handover it is exactly the grasp the expert demos aimed at — the target
 the policy is imitating; watch the live gripper converge to or miss it.
 --show-grasp-set additionally draws the full filtered candidate set (faint grey).
+--show-pred-grasp overlays what the run-13 auxiliary head THINKS the grasp is
+(magenta), redrawn each step. With --show-goal-grasp you get belief vs truth in
+one view.
 
 In the PyBullet window:  R = re-roll the same scene,  N = next scene,  Q = quit.
 """
@@ -159,6 +162,12 @@ def load_policy(run_dir: Path, device: str):
         drop_joint_state   = bool(m.get("drop_joint_state", False)),
         joint_state_dim    = int(m.get("joint_state_dim", 18)),
         freeze_pc          = bool(m.get("freeze_pc", False)),
+        # Run 13's auxiliary goal-grasp head. Must be built when the config says
+        # so or the checkpoint will not strict-load — and it is what
+        # --show-pred-grasp reads.
+        aux_head           = bool(m.get("aux_head", False)),
+        aux_dim            = int(m.get("aux_dim", 7)),
+        aux_hidden         = tuple(m.get("aux_hidden", (256, 256))),
         normalizer         = normalizer,
     ).to(device)
 
@@ -245,7 +254,7 @@ def rollout(env, model, point_listener, scene_idx, device,
             R_base, panda_base_pos, draw=True,
             show_goal_grasp=False, show_grasp_set=False,
             omg_steps=None, goal_marker_ids=None, pin_table=None,
-            hold_steps=3, dwell_steps=20):
+            hold_steps=3, dwell_steps=20, show_pred_grasp=False):
     obs = env.reset(idx=scene_idx)
 
     # Optionally overlay the grasp the policy is supposed to be aiming at. Drawn
@@ -292,6 +301,7 @@ def rollout(env, model, point_listener, scene_idx, device,
     point_listener.reset()
 
     debug_ids = []
+    pred_marker_ids: list = []
     status = 0
     done = False
     info = {}
@@ -316,6 +326,33 @@ def rollout(env, model, point_listener, scene_idx, device,
         rs_t = torch.from_numpy(rs).float().unsqueeze(0).to(device)
         action = model.predict(pc_t, rs_t)[0].cpu().numpy()         # [7] real units
         prev_act6d = action[:6].astype(np.float32)                  # for next step's robot_state
+
+        # ----- run-13 auxiliary head: where does the policy THINK the grasp is --
+        # Redrawn every step: unlike the pinned overlay (static, the scene does
+        # not move) this is a live belief and watching it settle — or not — is the
+        # point. Costs one extra forward pass, render mode only.
+        #
+        # Purely diagnostic: `action` above is what drives the arm, and it came
+        # from predict() before this ran. Nothing here can change the rollout.
+        if show_pred_grasp and getattr(model, "aux_head", None) is not None:
+            with torch.no_grad():
+                _, goal = model.forward_aux(
+                    pc_t, model.normalizer.normalize_state(rs_t)
+                    if model.normalizer is not None else rs_t)
+            g = goal[0].cpu().numpy()                    # [quat_wxyz(4) ‖ trans(3)]
+            # EE frame -> world. The head predicts the grasp RELATIVE TO THE
+            # CURRENT EE, which is exactly how the training target was built
+            # (bc/dataset.py::goal_target_from_state), so composing with the live
+            # EE pose is the inverse of that construction.
+            link = obs["panda_link_ind_hand"]
+            ee_mat = unpack_pose(np.hstack([
+                obs["panda_body"].link_state[0, link, 0:3].numpy(),
+                tf_quat(obs["panda_body"].link_state[0, link, 3:7].numpy())]))
+            T_rel = unpack_pose(np.hstack([g[4:7], g[:4]]))   # pos-first packing
+            for d in pred_marker_ids:
+                pybullet.removeUserDebugItem(d)
+            pred_marker_ids.clear()
+            draw_gripper(ee_mat @ T_rel, [1.0, 0.0, 1.0], pred_marker_ids, 2.0)
 
         ee_pos = obs["panda_body"].link_state[0, obs["panda_link_ind_hand"], 0:3].numpy()
         ycb_pos = env.ycb.bodies[env.ycb.ids[0]].link_state[0, 6, 0:3].numpy()
@@ -445,6 +482,16 @@ def parse_args():
     p.add_argument("--show-grasp-set", action="store_true",
                    help="also draw the full filtered OMG grasp candidate set "
                         "(faint grey); implies --show-goal-grasp.")
+    p.add_argument("--show-pred-grasp", action="store_true",
+                   help="overlay the grasp the policy's AUXILIARY HEAD predicts "
+                        "(magenta wireframe), redrawn every step so you can watch "
+                        "the belief settle. Needs a checkpoint trained with "
+                        "MODEL.aux_head (run 13 on); silently inert otherwise. "
+                        "Pair with --show-goal-grasp to see prediction (magenta) "
+                        "against ground truth (green): the gap between them is "
+                        "what the aux head is being asked to close, and it is a "
+                        "different quantity from the gap between the gripper and "
+                        "the green pose. Ignored in --no-render / --benchmark.")
     p.add_argument("--grasp-pin-table", default=None,
                    help="per-scene committed grasp (examples/build_grasp_pin_table.py). "
                         "Pass the table the policy was TRAINED with, or the green "
@@ -521,7 +568,8 @@ def main():
                        goal_marker_ids=goal_marker_ids,
                        pin_table=pin_table,
                        hold_steps=args.hold_steps,
-                       dwell_steps=args.dwell_steps)
+                       dwell_steps=args.dwell_steps,
+                       show_pred_grasp=(args.show_pred_grasp and draw))
 
     # Headless benchmark: roll out many scenes, report success / grasp / dist.
     if args.benchmark:

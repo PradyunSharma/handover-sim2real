@@ -210,8 +210,17 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
 
     kind = policy_kind(cfg)
     if kind == "bc":
-        train_ds = BCDataset(cfg["DATA"]["train_h5"], normalizer=normalizer)
-        val_ds = (BCDataset(val_h5, normalizer=normalizer)
+        # Auxiliary goal-grasp target (run 13), only when the head exists and the
+        # weight is nonzero. "auto" resolves each shard's pin table from its own
+        # attrs — the base h5 has always carried it and the DAgger shards do from
+        # run 12 on, which matters here because the aggregate mixes both.
+        goal_table = None
+        if bool(cfg["MODEL"].get("aux_head", False)) and \
+                float(cfg.get("LOSS", {}).get("aux_weight", 0.0)) > 0.0:
+            goal_table = cfg["DATA"].get("grasp_pin_table") or "auto"
+        train_ds = BCDataset(cfg["DATA"]["train_h5"], normalizer=normalizer,
+                             goal_table=goal_table)
+        val_ds = (BCDataset(val_h5, normalizer=normalizer, goal_table=goal_table)
                   if val_h5 and os.path.exists(val_h5) else None)
     else:
         T = int(cfg["MODEL"]["history_len"])
@@ -351,7 +360,7 @@ LOG_FIELDS = [
     "aggregate_files", "D_episodes", "D_steps", "D_dagger_frac",
     # -- (5) the refit itself
     "epochs", "train_loss", "train_grip_acc", "val_loss", "val_grip_acc",
-    "best_val_loss",
+    "best_val_loss", "aux_pos_mm", "aux_rot_deg", "aux_pm_mm",
     # -- (1) eval
     "success_rate", "grasp_rate", "near_rate", "close_rate",
     "close_success_rate", "chance_rate", "missed_rate", "miss_given_chance",
@@ -493,6 +502,12 @@ def read_train_log(run_dir: Path) -> dict:
         "val_loss": _r(get(last, "val_total")),
         "val_grip_acc": _r(get(last, "val_gripper_acc")),
         "best_val_loss": _r(min(finite)) if finite else "",
+        # Auxiliary goal-grasp head (run 13). NaN — and so an empty CSV cell —
+        # on every run without the head, which is what keeps the column harmless
+        # in older runs' plots.
+        "aux_pos_mm": _r(get(last, "val_aux_pos_mm")),
+        "aux_rot_deg": _r(get(last, "val_aux_rot_deg")),
+        "aux_pm_mm": _r(get(last, "val_aux_pm_mm")),
     }
 
 

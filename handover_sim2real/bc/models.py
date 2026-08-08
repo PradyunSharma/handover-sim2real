@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from handover_sim2real.utils import add_sys_path_from_env
 
@@ -194,6 +195,9 @@ class BCPolicy(nn.Module):
                  drop_joint_state: bool = False,
                  joint_state_dim: int = 18,
                  freeze_pc: bool = False,
+                 aux_head: bool = False,
+                 aux_dim: int = 7,
+                 aux_hidden=(256, 256),
                  normalizer=None):
         super().__init__()
         # The stored robot_state always has `robot_state_dim` channels, laid out
@@ -238,6 +242,35 @@ class BCPolicy(nn.Module):
             hidden=tuple(policy_hidden),
             action_dim=action_dim,
         )
+        # ----- optional AUXILIARY GOAL-GRASP HEAD (run 13) -----
+        # A second head on the SAME concatenated features predicting where the
+        # goal grasp is relative to the current EE: [quat_wxyz(4) ‖ trans(3)].
+        # GA-DDPG's `extra_pred` (core/networks.py), which we dropped when this
+        # policy was written, and the evidence says that was the costly omission.
+        #
+        # Measured over runs 4/6/7/8/9: the policy's per-step rotation error is
+        # 0.0230 rad and its episodes are ~25 steps, so 0.57 rad of wrist error
+        # accumulates — and eval_min_rot is 0.559, i.e. rotation error integrates
+        # essentially UNCORRECTED. Position error does not (0.0090 m/step would
+        # integrate to 0.22 m; eval_min_pos is 0.076) because the wrist camera
+        # sees where the object is. Nothing in the observation tells the policy
+        # which ORIENTATION it is meant to arrive at, so this head makes that an
+        # explicit prediction target and forces the scene features to carry it.
+        #
+        # Note `pc_pretrained` loads the CVPR2023 state_feat encoder, which WAS
+        # trained with this aux loss — and we then fine-tune it for 100 epochs x
+        # N iterations with no aux term, so whatever goal-pose structure it
+        # carried is trained away. This puts the term back.
+        #
+        # Adding the head changes state_dict keys, so an aux checkpoint will not
+        # strict-load into a model built without it (and vice versa) — exactly the
+        # situation drop_joint_state already has, and the run's config.yaml is
+        # again the only record.
+        self.aux_dim = int(aux_dim) if aux_head else 0
+        self.aux_head = (PolicyHead(in_dim=2 * feature_dim,
+                                    hidden=tuple(aux_hidden),
+                                    action_dim=self.aux_dim)
+                         if self.aux_dim else None)
         self.feature_dim = feature_dim
         self.action_dim  = action_dim
         # Normalizer is *not* a submodule — it's a plain Python object that
@@ -304,10 +337,34 @@ class BCPolicy(nn.Module):
         return rs[..., lo:hi]
 
     # ----- forward (training) ----------------------------------------------
-    def forward(self, pc: torch.Tensor, rs: torch.Tensor) -> torch.Tensor:
+    def _features(self, pc: torch.Tensor, rs: torch.Tensor) -> torch.Tensor:
+        """Concatenated [scene ‖ robot] features — one PointNet++ pass."""
         scene = self.pc_encoder(pc)
         robot = self.robot_encoder(self._select_robot_state(rs))
-        return self.policy_head(torch.cat([scene, robot], dim=-1))
+        return torch.cat([scene, robot], dim=-1)
+
+    def forward(self, pc: torch.Tensor, rs: torch.Tensor) -> torch.Tensor:
+        """Raw action [B, 7]. Return type is UNCHANGED by the aux head, so every
+        existing caller (predict, PolicyRunner, the evaluator, the rollouts) is
+        untouched whether the head is present or not."""
+        return self.policy_head(self._features(pc, rs))
+
+    def forward_aux(self, pc: torch.Tensor, rs: torch.Tensor):
+        """(action [B, 7], goal [B, 7] or None) from ONE encoder pass.
+
+        The goal's quaternion block is L2-normalized here rather than in the loss,
+        so whatever reads the head gets a unit quaternion — GA-DDPG normalizes in
+        the same place (core/networks.py `extra_pred`).
+        """
+        feat = self._features(pc, rs)
+        action = self.policy_head(feat)
+        if self.aux_head is None:
+            return action, None
+        goal = self.aux_head(feat)
+        if self.aux_dim == 7:
+            goal = torch.cat(
+                [F.normalize(goal[..., :4], p=2, dim=-1), goal[..., 4:]], dim=-1)
+        return action, goal
 
     # ----- inference helper -------------------------------------------------
     @torch.no_grad()

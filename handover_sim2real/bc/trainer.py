@@ -38,7 +38,7 @@ from typing import Any, Dict, Optional
 import torch
 from torch.utils.data import DataLoader
 
-from .losses import bc_loss, bc_metrics
+from .losses import aux_metrics, bc_loss, bc_metrics, goal_pm_loss
 
 try:
     from tqdm import tqdm  # type: ignore
@@ -114,6 +114,9 @@ class BCTrainer:
         # units) | both. See losses.bc_loss for why the choice matters.
         self.pose_loss      = str(cfg["LOSS"].get("pose_loss", "smooth_l1"))
         self.pm_weight      = float(cfg["LOSS"].get("pm_weight", 1.0))
+        # Auxiliary goal-grasp head. 0 disables the term even if the model has the
+        # head; the head itself is a MODEL flag, so both have to be on.
+        self.aux_weight     = float(cfg["LOSS"].get("aux_weight", 0.0))
 
         self.run_dir = Path(run_dir)
         (self.run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -162,14 +165,28 @@ class BCTrainer:
 
     # ----- one epoch --------------------------------------------------------
     def _step_batch(self, batch, train: bool) -> tuple[Dict[str, torch.Tensor], Dict[str, float], int]:
-        pc, rs, act = (t.to(self.device, non_blocking=True) for t in batch)
+        # 4-tuple when the dataset was given a goal table (run 13); 3 otherwise.
+        moved = [t.to(self.device, non_blocking=True) for t in batch]
+        pc, rs, act = moved[0], moved[1], moved[2]
+        goal = moved[3] if len(moved) > 3 else None
+        want_aux = self.aux_weight > 0.0 and goal is not None \
+            and getattr(self.model, "aux_head", None) is not None
         autocast = torch.cuda.amp.autocast if (self.use_amp and self.device != "cpu") else _noop_ctx
         with autocast():
-            out    = self.model(pc, rs)
+            if want_aux:
+                out, goal_pred = self.model.forward_aux(pc, rs)
+            else:
+                out, goal_pred = self.model(pc, rs), None
             losses = bc_loss(out, act, gripper_weight=self.gripper_weight,
                              pose_loss=self.pose_loss, pm_weight=self.pm_weight,
                              action_mean=self.a_mean_t, action_std=self.a_std_t)
             metrics = bc_metrics(out, act, self.a_mean_t, self.a_std_t)
+            if goal_pred is not None:
+                # goal is [B, 8] = [quat(4) ‖ trans(3) ‖ valid(1)].
+                aux = goal_pm_loss(goal_pred, goal[:, :7], goal[:, 7])
+                losses["aux_loss"] = aux
+                losses["total"] = losses["total"] + self.aux_weight * aux
+                metrics.update(aux_metrics(goal_pred, goal[:, :7], goal[:, 7]))
         if train:
             self.optimizer.zero_grad(set_to_none=True)
             if self.scaler is not None:
@@ -257,6 +274,11 @@ class BCTrainer:
         print(f"Scheduler: {self.cfg['OPTIM'].get('scheduler', 'none')}")
         print(f"Pose loss: {self.pose_loss}"
               + (f" (pm_weight={self.pm_weight})" if self.pose_loss != "smooth_l1" else ""))
+        has_head = getattr(self.model, "aux_head", None) is not None
+        print(f"Aux head : "
+              + (f"goal-grasp PM, weight={self.aux_weight}" if has_head and self.aux_weight > 0
+                 else "present but weight=0 (inert)" if has_head
+                 else "OFF"))
         n_train_steps = len(self.train_loader)
         n_val_steps   = len(self.val_loader) if self.val_loader is not None else 0
         print(f"Steps/epoch: train={n_train_steps}, val={n_val_steps}")

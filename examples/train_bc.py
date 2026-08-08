@@ -103,6 +103,9 @@ def build_model(cfg: dict, normalizer: Normalizer) -> BCPolicy:
         drop_joint_state   = bool(m.get("drop_joint_state", False)),
         joint_state_dim    = int(m.get("joint_state_dim", 18)),
         freeze_pc          = bool(m.get("freeze_pc", False)),
+        aux_head           = bool(m.get("aux_head", False)),
+        aux_dim            = int(m.get("aux_dim", 7)),
+        aux_hidden         = tuple(m.get("aux_hidden", (256, 256))),
         normalizer         = normalizer,
     )
 
@@ -185,9 +188,20 @@ def main() -> None:
         normalizer.save(norm_path)
         print(f"Saved normalization to {norm_path}")
 
+    # Auxiliary goal-grasp target: only built when the model actually has the head
+    # AND the loss weight is nonzero, so the extra per-item work is not paid by
+    # runs that cannot use it. "auto" resolves the pin table per file from its own
+    # attrs, which is what keeps train and val indices from being crossed.
+    goal_table = None
+    if bool(cfg["MODEL"].get("aux_head", False)) and \
+            float(cfg.get("LOSS", {}).get("aux_weight", 0.0)) > 0.0:
+        goal_table = cfg["DATA"].get("grasp_pin_table") or "auto"
+
     # Datasets + loaders.
-    train_ds = BCDataset(cfg["DATA"]["train_h5"], normalizer=normalizer)
-    val_ds   = (BCDataset(cfg["DATA"]["val_h5"],   normalizer=normalizer)
+    train_ds = BCDataset(cfg["DATA"]["train_h5"], normalizer=normalizer,
+                         goal_table=goal_table)
+    val_ds   = (BCDataset(cfg["DATA"]["val_h5"],   normalizer=normalizer,
+                          goal_table=goal_table)
                 if cfg["DATA"].get("val_h5") and os.path.exists(cfg["DATA"]["val_h5"])
                 else None)
     print(f"Train steps: {len(train_ds)}  ({train_ds.num_episodes} episodes)")

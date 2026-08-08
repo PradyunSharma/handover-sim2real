@@ -23,10 +23,68 @@ Normalization:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import h5py
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+
+GOAL_DIM = 8   # [quat_wxyz(4) ‖ trans(3) ‖ valid(1)]
+
+
+def load_goal_table(path) -> dict[int, np.ndarray]:
+    """scene_idx -> 4x4 world pose of that scene's pinned goal grasp.
+
+    Reads the pin table written by examples/build_grasp_pin_table.py — the same
+    file SIM.grasp_pin_table points at, so the auxiliary target is by construction
+    the pose the demonstrations were labelled towards and the evaluator scores
+    against. Scene indices are SPLIT-RELATIVE, so a train table must not be paired
+    with val data.
+    """
+    import json
+    with open(path) as f:
+        raw = json.load(f)
+    out: dict[int, np.ndarray] = {}
+    for k, v in raw.items():
+        if k == "_meta" or v is None:
+            continue
+        out[int(k)] = np.asarray(v["ee_pose_world"], dtype=np.float64)
+    if not out:
+        raise RuntimeError(f"no usable entries in pin table {path}")
+    return out
+
+
+def _se3_inverse(T: np.ndarray) -> np.ndarray:
+    R, t = T[:3, :3], T[:3, 3]
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = R.T
+    out[:3, 3] = -R.T @ t
+    return out
+
+
+def goal_target_from_state(rs_raw: np.ndarray, grasp_world: np.ndarray) -> np.ndarray:
+    """[quat_wxyz(4) ‖ trans(3) ‖ 1.0] — the goal grasp IN THE CURRENT EE FRAME.
+
+    `rs_raw` is the UN-normalized robot_state; channels 18:21 are ee_xyz and
+    21:25 are ee_wxyz (see the module docstring for the layout). Same quantity
+    GA-DDPG feeds its aux head — `inv_relative_pose(cur_goal, ef_pose)` — minus
+    their rotZ(pi/2), which exists only for their grasp-frame convention. Ours is
+    already the hand-link frame the control points and the pin table share, so no
+    extra rotation belongs here.
+
+    Not normalized: the PM loss that consumes this works in real metres, which is
+    the entire reason it is a meaningful 6-DoF metric.
+    """
+    from transforms3d.quaternions import mat2quat, quat2mat
+
+    ee = np.eye(4, dtype=np.float64)
+    ee[:3, 3] = np.asarray(rs_raw[18:21], dtype=np.float64)
+    ee[:3, :3] = quat2mat(np.asarray(rs_raw[21:25], dtype=np.float64))
+
+    rel = _se3_inverse(ee) @ np.asarray(grasp_world, dtype=np.float64)
+    return np.concatenate([mat2quat(rel[:3, :3]), rel[:3, 3], [1.0]]).astype(np.float32)
 
 
 def _as_path_list(paths) -> list[str]:
@@ -173,14 +231,54 @@ class BCDataset(Dataset):
     so the flat index keys on (file_idx, episode_key, step).
     """
 
-    def __init__(self, hdf5_paths, normalizer: Normalizer | None = None):
+    def __init__(self, hdf5_paths, normalizer: Normalizer | None = None,
+                 goal_table=None):
         self.hdf5_paths = _as_path_list(hdf5_paths)
         self.normalizer = normalizer
+        # Auxiliary goal-grasp target (run 13). When enabled, __getitem__ returns a
+        # 4th element. Reconstructed per step from the stored ee_pose, so NO
+        # RE-COLLECTION is needed: every dataset already carries `scene_idx` per
+        # episode, and the handover config is static (MANO_SIMULATION_MODE:
+        # disable_control_and_move_by_reset), so a world-frame grasp pose stays
+        # valid for the whole episode.
+        #
+        # `goal_table` accepts:
+        #   None      off — three-element items, exactly as before
+        #   "auto"    resolve PER FILE from that file's `grasp_pin_table` attr.
+        #             Preferred: scene indices are SPLIT-RELATIVE, so this is what
+        #             makes it impossible to score val episodes against the train
+        #             table. Requires the attr (base collector always writes it;
+        #             DAgger shards do from run 12 on).
+        #   str/Path  one table for every file
+        #   dict      a pre-loaded {scene_idx: 4x4}
+        self.goal_table = goal_table
+        self._goal_tables: list[dict[int, np.ndarray]] | None = None
+        if goal_table is not None:
+            if isinstance(goal_table, dict):
+                self._goal_tables = [goal_table] * len(self.hdf5_paths)
+            elif str(goal_table) == "auto":
+                self._goal_tables = []
+                for p in self.hdf5_paths:
+                    with h5py.File(p, "r") as f:
+                        tp = f.attrs.get("grasp_pin_table", "")
+                    tp = tp.decode() if isinstance(tp, bytes) else str(tp or "")
+                    if not tp:
+                        raise RuntimeError(
+                            f"{p} has no `grasp_pin_table` attr, so the auxiliary "
+                            f"goal target cannot be resolved automatically. Pass an "
+                            f"explicit DATA.grasp_pin_table, or re-collect.")
+                    self._goal_tables.append(load_goal_table(tp))
+                    print(f"[aux] {Path(p).name} -> {tp}")
+            else:
+                one = load_goal_table(goal_table)
+                self._goal_tables = [one] * len(self.hdf5_paths)
 
         # Build a flat (file_idx, episode_key, step) index using one-shot file
         # handles. Don't keep the handles around past __init__ — see
         # _ensure_open below.
         index: list[tuple[int, str, int]] = []
+        # episode -> scene_idx, read once here rather than per __getitem__.
+        scene_of: dict[tuple[int, str], int] = {}
         for fi, path in enumerate(self.hdf5_paths):
             with h5py.File(path, "r") as f:
                 ep_keys = sorted(k for k in f.keys() if k.startswith("episode_"))
@@ -188,9 +286,24 @@ class BCDataset(Dataset):
                     raise RuntimeError(f"No episodes found in {path}")
                 for k in ep_keys:
                     T = int(f[k].attrs["num_steps"])
+                    if goal_table is not None:
+                        sc = f[k].attrs.get("scene_idx")
+                        if sc is None:
+                            raise RuntimeError(
+                                f"{path}:{k} has no scene_idx attr — the auxiliary "
+                                f"goal target cannot be reconstructed without it")
+                        scene_of[(fi, k)] = int(sc)
                     for t in range(T):
                         index.append((fi, k, t))
         self._index = index
+        self._scene_of = scene_of
+        if self._goal_tables is not None:
+            missing = {(fi, s) for (fi, _), s in scene_of.items()
+                       if s not in self._goal_tables[fi]}
+            if missing:
+                print(f"WARNING: {len(missing)} (file, scene) pair(s) have no "
+                      f"pin-table entry — those goal targets are masked out "
+                      f"(valid=0) and contribute nothing to the aux loss")
         # One handle slot per file, opened per-worker on first use.
         self._files: list[h5py.File | None] = [None] * len(self.hdf5_paths)
 
@@ -216,14 +329,25 @@ class BCDataset(Dataset):
         grp = f[ep_key]
 
         pc  = torch.from_numpy(grp["point_clouds"][t]).float()       # [1024, 5]
-        rs  = torch.from_numpy(grp["robot_states"][t]).float()       # [32]
+        rs_raw = grp["robot_states"][t]                              # [32], RAW
+        rs  = torch.from_numpy(rs_raw).float()
         act = torch.from_numpy(grp["expert_actions"][t]).float()     # [7]
+
+        # Built from the RAW state, before normalization touches the ee_pose.
+        goal = None
+        if self._goal_tables is not None:
+            grasp = self._goal_tables[fi].get(self._scene_of[(fi, ep_key)])
+            goal = (torch.from_numpy(goal_target_from_state(rs_raw, grasp))
+                    if grasp is not None
+                    else torch.zeros(GOAL_DIM, dtype=torch.float32))   # valid=0
 
         if self.normalizer is not None:
             rs  = self.normalizer.normalize_state(rs)
             act = self.normalizer.normalize_action(act)
 
-        return pc, rs, act
+        if goal is None:
+            return pc, rs, act
+        return pc, rs, act, goal
 
     # ----- convenience ------------------------------------------------------
     @property

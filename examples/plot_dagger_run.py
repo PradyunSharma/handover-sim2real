@@ -26,6 +26,14 @@ MAIN (<run>/curves.png) — 2x4 grid, "did it learn":
                  defined even when the policy never closes) and the error AT the
                  close (dashed), position on the left axis and rotation on the
                  right. Phase-3 experience is that ROTATION binds first.
+                 With an auxiliary goal-grasp head (run 13 on) a third, DOTTED
+                 pair is added: how far the network's PREDICTION of the grasp is
+                 from the pinned pose. Read it against the solid curves — an
+                 accurate prediction alongside a gripper that still arrives far
+                 away means the information is in the features and the action
+                 head is not using it; both large means the observation cannot
+                 support the target at all. The two say different things and
+                 point at different fixes.
   • outcomes   — eval outcome breakdown as a stacked area (fractions summing to 1):
                  which failure mode is being traded for which as success moves.
   • learner    — how far the LEARNER's own rollouts got during collection:
@@ -78,6 +86,7 @@ import csv
 from pathlib import Path
 
 import matplotlib
+import numpy as np
 matplotlib.use("Agg")  # headless-safe; overridden by --show below
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
@@ -258,6 +267,18 @@ def main() -> None:
     if _finite(pe):
         _plot(a, it, pe, "--o", ms=3, color="tab:cyan", alpha=0.8,
                label="pos err at close (m)")
+    # Auxiliary goal-grasp head (run 13 on): how far the network's BELIEF about
+    # the grasp is from the pinned pose. Plotted on the same axes as the gripper's
+    # actual error on purpose — the comparison is the whole point. If the head
+    # predicts the pose accurately while the gripper still arrives far away, the
+    # information is present in the features and the action head is not using it;
+    # if both are large, the observation cannot support the target at all.
+    # Absent (all-NaN) on runs without the head, so nothing changes for those.
+    ap = num("aux_pos_mm")
+    if _finite(ap):
+        _plot(a, it, (np.asarray(ap, dtype=float) / 1000.0).tolist(), ":^", ms=3,
+              color="tab:green", alpha=0.9,
+              label="aux: predicted grasp pos err (m)")
     a.axhline(args.pos_thresh, color="tab:blue", ls=":", lw=1,
               label=f"close thresh {args.pos_thresh} m")
     a.set_ylim(bottom=0)
@@ -269,6 +290,11 @@ def main() -> None:
     if _finite(re_):
         _plot(a2, it, re_, "--s", ms=3, color="tab:orange", alpha=0.8,
                 label="rot err at close (rad)")
+    ar = num("aux_rot_deg")
+    if _finite(ar):
+        _plot(a2, it, np.radians(np.asarray(ar, dtype=float)).tolist(), ":^", ms=3,
+              color="tab:olive", alpha=0.9,
+              label="aux: predicted grasp rot err (rad)")
     a2.axhline(args.rot_thresh, color="tab:red", ls=":", lw=1,
                label=f"close thresh {args.rot_thresh} rad")
     a2.set_ylim(bottom=0)

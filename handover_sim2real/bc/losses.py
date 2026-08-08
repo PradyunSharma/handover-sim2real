@@ -21,6 +21,7 @@ logging, plus a couple of plain-Python metrics (gripper accuracy, per-step
 
 from __future__ import annotations
 
+import math
 from typing import Dict
 
 import torch
@@ -82,6 +83,91 @@ def _denorm(x: torch.Tensor, mean, std) -> torch.Tensor:
     if std is None:
         return x[..., :6]
     return x[..., :6] * std + mean
+
+
+def _qrot(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Rotate points `v` [..., P, 3] by unit quaternions `q` [..., 4] in WXYZ.
+
+    GA-DDPG's core/utils.py `qrot`, batched over a points axis. WXYZ because that
+    is what the stored ee_pose uses (`tf_quat` converts pybullet's XYZW once, at
+    collection time) and what transforms3d's quat2mat expects.
+    """
+    qw, qv = q[..., :1].unsqueeze(-2), q[..., 1:].unsqueeze(-2)   # [...,1,1], [...,1,3]
+    uv = torch.cross(qv.expand_as(v), v, dim=-1)
+    uuv = torch.cross(qv.expand_as(v), uv, dim=-1)
+    return v + 2.0 * (qw * uv + uuv)
+
+
+def goal_pm_loss(pred: torch.Tensor, target: torch.Tensor,
+                 valid: torch.Tensor | None = None) -> torch.Tensor:
+    """Point-matching loss for the AUXILIARY goal-grasp head.
+
+    GA-DDPG's core/loss.py `goal_pred_loss`. pred/target are [B, 7] =
+    [quat_wxyz(4) ‖ trans(3)] giving the goal grasp pose IN THE CURRENT EE FRAME,
+    in metres. The six gripper control points are transformed by both and the
+    displacement L1'd — the same metric `pose_pm_loss` uses on the action, so the
+    two terms are commensurable and both read in metres.
+
+    Quaternions, not euler, and deliberately: the action is a small delta where
+    euler is harmless, but the goal pose is up to ~0.5 m away at an arbitrary
+    orientation, where euler has branch cuts the network would have to learn
+    around. PM loss also makes the q/-q sign ambiguity free — both give the same
+    control points — so no canonicalization is needed anywhere.
+
+    `valid` [B] or [B,1] masks steps with no pin-table entry (nothing to predict).
+    Returns 0 when nothing in the batch is valid.
+    """
+    def _xf(p):
+        cp = _GRIPPER_CONTROL_POINTS.to(p.device, p.dtype).expand(p.shape[0], -1, -1)
+        return _qrot(p[..., :4], cp) + p[..., None, 4:7]
+
+    per_sample = (_xf(pred) - _xf(target)).abs().sum(-1).mean(-1)      # [B]
+    if valid is None:
+        return per_sample.mean()
+    m = valid.reshape(-1).to(per_sample.dtype)
+    denom = m.sum()
+    if float(denom) == 0.0:
+        return per_sample.sum() * 0.0        # keeps the graph, contributes nothing
+    return (per_sample * m).sum() / denom
+
+
+@torch.no_grad()
+def aux_metrics(pred: torch.Tensor, target: torch.Tensor,
+                valid: torch.Tensor | None = None) -> Dict[str, float]:
+    """How well the auxiliary head localizes the pinned grasp. Real units.
+
+    aux_pos_mm   ‖predicted translation − pinned translation‖, millimetres.
+                 "How far off is the grasp it thinks it is heading for."
+    aux_rot_deg  geodesic angle between the predicted and pinned orientations,
+                 degrees. THE metric for this run: the diagnosis is that rotation
+                 error integrates uncorrected (0.0230 rad/step x ~25 steps = 0.57
+                 rad, measured eval_min_rot 0.559), so this says whether the
+                 network can represent the target orientation at all — separately
+                 from whether the action head then uses it. Computed from
+                 |<q_pred, q_tgt>| so the q/−q sign ambiguity cannot inflate it.
+    aux_pm_mm    the point-matching metric the loss optimizes, in millimetres —
+                 one SE(3) number combining both, comparable to pose_pm_mm.
+
+    Split because they can move independently, and the split is the finding: a
+    head that nails position but not orientation reproduces exactly the asymmetry
+    the policy already shows, and would say the observation cannot support the
+    orientation at all rather than that the head merely failed to learn it.
+    """
+    m = (torch.ones(pred.shape[0], device=pred.device, dtype=pred.dtype)
+         if valid is None else valid.reshape(-1).to(pred.dtype))
+    n = m.sum()
+    if float(n) == 0.0:
+        return {"aux_pos_mm": float("nan"), "aux_rot_deg": float("nan"),
+                "aux_pm_mm": float("nan")}
+
+    pos = (pred[..., 4:7] - target[..., 4:7]).norm(dim=-1)                  # [B]
+    dot = (pred[..., :4] * target[..., :4]).sum(-1).abs().clamp(max=1.0)    # [B]
+    rot = 2.0 * torch.arccos(dot)
+    return {
+        "aux_pos_mm":  float((pos * m).sum() / n) * 1000.0,
+        "aux_rot_deg": float((rot * m).sum() / n) * 180.0 / math.pi,
+        "aux_pm_mm":   float(goal_pm_loss(pred, target, valid)) * 1000.0,
+    }
 
 
 def bc_loss(pred: torch.Tensor,
