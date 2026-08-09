@@ -1632,13 +1632,95 @@ Moved to its own file: [`README_PHASE4.md`](README_PHASE4.md) — the design not
 and the full runbook (pin table -> demonstrations -> filtering -> config -> train
 -> read the results -> the run variants).
 
+## Writing cluster runs to `/scratch`, not `/home`
+
+DelftBlue `/home` is a **hard 30 GB quota** and hitting it is nasty to diagnose:
+the job dies with **exit code 6 and no Python traceback**, because a traceback
+cannot be flushed to a full disk. The only symptom is a truncated `.out` file.
+`/scratch/<netid>` has 5 TiB and is nearly empty. Check both with:
+
+```bash
+beegfs-ctl --getquota --uid $USER
+```
+
+A DAgger run costs roughly **42 MB fixed + 78 MB per iteration** (41 MB
+checkpoints + 27 MB replay `.h5`), so 15 iterations is ~1.2 GB and 25 is ~2.0 GB.
+A handful of runs fills home.
+
+**One knob: `SCRATCH_ROOT`.** All three job scripts
+(`train_dagger_phase4.sbatch`, `train_rl.sbatch`, `eval_dagger_run.sbatch`) take
+it, and it defaults to empty — which keeps the old in-repo behaviour, so nothing
+changes when running on the PC. Set it and the run's `OUT_ROOT` becomes
+`<SCRATCH_ROOT>/output/{dagger_runs,rl_runs}`. `OUT_ROOT` can still be set
+directly and wins, if you need a path outside that layout.
+
+```bash
+SCRATCH=/scratch/pradyunsharma/handover-sim2real
+
+# DAgger
+sbatch --export=ALL,RUN=dagger4_run15,CFG=examples/configs/dagger_phase4_all.yaml,\
+SCRATCH_ROOT=$SCRATCH examples/slurm/train_dagger_phase4.sbatch
+
+# RL
+sbatch --export=ALL,RUN_NAME=rl_run40,SCRATCH_ROOT=$SCRATCH \
+    examples/slurm/train_rl.sbatch
+
+# scoring a DAgger run outside the training loop — pass the SAME SCRATCH_ROOT,
+# or it looks in the repo and exits with "config.yaml not found"
+sbatch --export=ALL,RUN=dagger4_run15,SCRATCH_ROOT=$SCRATCH \
+    examples/slurm/eval_dagger_run.sbatch
+```
+
+**Inputs are unaffected.** The configs' `grasp_pin_table` and `bc_dataset` paths
+are still read relative to the repo; only a run's *output* moves. `output/bc_dataset`
+is itself already a symlink into scratch on the cluster, and the collection jobs
+(`collect_bc_demos.sbatch`, `build_pin_table.sbatch`) take a fully overridable
+`OUT=` with `mkdir -p`, so they write wherever you point them.
+
+**Resume still works**, but the path moved. `train_rl.sbatch` documents
+`--resume ${OUT_ROOT}/${RUN_NAME}/checkpoints/last.pt` — *not* `output/rl_runs/...`,
+which with `SCRATCH_ROOT` set would silently resume from nothing or from a stale
+same-named run in home. Resubmit with the same `SCRATCH_ROOT` and it resolves
+itself. DAgger resumes from `state.json` + existing checkpoints in `OUT_ROOT`, so
+the identical submit command continues the run.
+
+**Scripts that take a run directory now get the scratch path:**
+
+```bash
+python examples/plot_dagger_run.py $SCRATCH/output/dagger_runs/dagger4_run15
+```
+
+### Harvesting the run record back into git
+
+`/scratch` is **periodically purged by age**. Checkpoints are large and get synced
+to the PC selectively, but a run's *metadata* is the experiment record and belongs
+in git. `examples/harvest_run.py` copies only that back into the repo — roughly
+**1 MB per run against the 1–2 GB left behind**:
+
+```bash
+python examples/harvest_run.py --run-dir $SCRATCH/output/dagger_runs/dagger4_run15
+python examples/harvest_run.py --all --scratch-root $SCRATCH        # every run
+python examples/harvest_run.py --run-dir <...> --dry-run            # list only
+```
+
+It copies `dagger_log.csv`, `eval_log.csv`, `log.csv`, `config.yaml`, `state.json`,
+`grasp_registry.json`, the per-iteration `iters/*/log.csv` and `iters/*/config.yaml`,
+and any `*.png` curves. It never copies `*.pt` or `*.h5` — the selection is a
+strict **allow-list**, not "everything except", so a future addition to a run
+directory cannot start quietly filling the quota this exists to protect.
+
+It is **idempotent** (skips files whose size and mtime match) and **safe to run
+while a job is still going**: every file it reads is either append-only or written
+atomically via a `.tmp` rename, and it only ever writes into the repo.
+
 ## Syncing the cluster's scratch outputs to the personal PC
 
-DelftBlue `/home` is a **hard 30 GB quota**, so the heavy outputs (checkpoints,
-demo h5s, datasets — ~13 GB) live on **`/scratch/<netid>`** and are reachable from
-the repo through symlinks. `/scratch` is **periodically purged** (data older than a
-certain age is deleted automatically), so the PC copy is the only durable one —
-sync it regularly. Docs: https://doc.dhpc.tudelft.nl/delftblue/Data-transfer-to-DelftBlue/
+The heavy outputs (checkpoints, demo h5s, datasets — ~13 GB) live on
+**`/scratch/<netid>`**. Runs made *before* this change were migrated by hand and
+are reachable from the repo through symlinks; runs submitted with `SCRATCH_ROOT`
+live on scratch directly, with no symlink. Either way `/scratch` is **periodically
+purged**, so the PC copy is the only durable one — sync it regularly.
+Docs: https://doc.dhpc.tudelft.nl/delftblue/Data-transfer-to-DelftBlue/
 
 Run this **on the PC** (the login nodes cannot reach your laptop, so the PC always
 pulls). `-P` shows progress and makes the transfer resumable — re-running only
@@ -1671,8 +1753,12 @@ Gotchas:
 - **No `--delete`** in these commands, deliberately — it would erase local files
   that don't exist on the cluster.
 - **Sync from the `/scratch` path, not the home repo.** `~/h2r/handover-sim2real/output/`
-  on the cluster is full of symlinks into `/scratch`; a plain `rsync -av` would copy
-  them as dangling links pointing at paths that don't exist on the PC. (Add `-L` to
-  follow symlinks if you ever do pull from home.)
+  on the cluster still holds symlinks into `/scratch` for the hand-migrated older
+  runs; a plain `rsync -av` would copy them as dangling links pointing at paths
+  that don't exist on the PC. (Add `-L` to follow symlinks if you ever do pull
+  from home.) Runs submitted with `SCRATCH_ROOT` are not in the home repo at all,
+  which is another reason to pull from `/scratch`.
+- **This is not a substitute for `harvest_run.py`.** rsync brings the checkpoints
+  to the PC; harvest brings the ~1 MB experiment record into *git*. Do both.
 - Needs TU Delft network or eduVPN ("Institute Access"). Off-campus, jump via the
   bastion: add `-e 'ssh -J pradyunsharma@student-linux.tudelft.nl'`.

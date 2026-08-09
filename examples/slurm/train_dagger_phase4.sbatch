@@ -87,7 +87,35 @@ export PYTHONUNBUFFERED=1
 # ── parameters (override via sbatch --export=ALL,...) ───────────────────────
 CFG="${CFG:-examples/configs/dagger_phase4.yaml}"
 RUN="${RUN:-dagger4_run1}"
-OUT_ROOT="${OUT_ROOT:-output/dagger_runs}"
+
+# ── where the run writes — /home has a HARD 30 GB quota on DelftBlue ─────────
+# Hitting it kills the job with exit code 6 and NO traceback: Python cannot flush
+# one to a full disk, so the only symptom is a truncated .out file. A DAgger run
+# is ~42 MB fixed + ~78 MB per iteration (41 MB checkpoints + 27 MB .h5), so 25
+# iterations is ~2.0 GB and a handful of runs fills home. Send it to /scratch.
+#
+# SCRATCH_ROOT is the ONE knob, shared with train_rl.sbatch and
+# eval_dagger_run.sbatch. Empty (the default) keeps the in-repo behaviour, so
+# nothing differs when running outside the cluster:
+#   sbatch --export=ALL,RUN=dagger4_run15,CFG=examples/configs/dagger_phase4_all.yaml,\
+#       SCRATCH_ROOT=/scratch/pradyunsharma/handover-sim2real \
+#       examples/slurm/train_dagger_phase4.sbatch
+# OUT_ROOT can still be set directly and wins, for a path that is not
+# <root>/output/dagger_runs.
+#
+# INPUTS ARE UNAFFECTED. The config's grasp_pin_table and bc_dataset paths are
+# read relative to the repo as before; only the run's OUTPUT moves.
+#
+# /scratch is PERIODICALLY PURGED BY AGE, so bring the small metadata back into
+# git when the run finishes (or alongside it — the script is safe mid-run):
+#   python examples/harvest_run.py --run-dir "${OUT_ROOT}/${RUN}"
+SCRATCH_ROOT="${SCRATCH_ROOT:-}"
+if [ -n "${SCRATCH_ROOT}" ]; then
+    OUT_ROOT="${OUT_ROOT:-${SCRATCH_ROOT}/output/dagger_runs}"
+else
+    OUT_ROOT="${OUT_ROOT:-output/dagger_runs}"
+fi
+mkdir -p "${OUT_ROOT}"
 BASE="${BASE:-}"                      # existing base run dir; empty => train it here
 WORKERS="${WORKERS:-$(( SLURM_CPUS_PER_TASK - 2 ))}"   # parallel collection processes
 EXTRA="${EXTRA:-}"

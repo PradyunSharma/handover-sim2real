@@ -24,6 +24,7 @@ import numpy as np
 
 from handover_sim2real.dagger.env_setup import build_sim_cfg, build_sim_context
 from handover_sim2real.dagger.evaluator import EvalParams
+from handover_sim2real.dagger.grasp_box import build_box_params
 from handover_sim2real.dagger.grasp_pin import load_grasp_pin_table
 
 
@@ -128,6 +129,8 @@ def build_phase4_context(cfg4: dict, *, seed: int = 0,
         hold_steps=int(ev.get("hold_steps", 3)),
         close_pos_thresh=float(dag.get("close_pos_thresh", 0.02)),
         close_rot_thresh=float(dag.get("close_rot_thresh", 0.34)),
+        box_check=bool(ev.get("box_check", True)),
+        box=build_box_params(ev),
         verbose=bool(ev.get("verbose", False)))
 
     return Phase4Context(

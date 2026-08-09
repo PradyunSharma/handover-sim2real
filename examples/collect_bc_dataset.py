@@ -357,6 +357,24 @@ def main():
         # two grasp choices instead of whatever you meant to measure.
         f.attrs["valid_grasp_dict"] = str(args.valid_grasp_dict or "")
         f.attrs["grasp_pin_table"]  = str(args.grasp_pin_table or "")
+        # PROVENANCE — which OBSERVATION produced this cloud. Until this existed,
+        # a wrist-only and a wrist+left+right collection were indistinguishable
+        # from their attrs: both carry pc_channels 5, num_pts 1024 and the same
+        # pc_format, so the FILENAME was the only evidence. Aggregating two
+        # camera configs is the one inconsistency DAgger cannot average away, and
+        # it fails silently — training looks fine and the policy is wrong only at
+        # deployment.
+        #
+        # The resolved CAMERA LIST, not just the cfg path: a path stays true
+        # while the file it names is edited, so the name alone can drift away
+        # from what was actually collected. The renderer is recorded for the same
+        # reason — EGL and the CPU TinyRenderer do not produce identical clouds.
+        _hcps = cfg.ENV.HANDOVER_HAND_CAMERA_POINT_STATE_ENV
+        f.attrs["sim_cfg_file"]   = str(args.cfg_file or "")
+        f.attrs["cameras"]        = ",".join(_hcps.CAMERAS)
+        f.attrs["compute_mano"]   = bool(_hcps.COMPUTE_MANO_POINT_STATE)
+        f.attrs["compute_robot"]  = bool(_hcps.COMPUTE_ROBOT_POINT_STATE)
+        f.attrs["renderer"]       = "egl" if cfg.SIM.BULLET.USE_EGL else "tiny"
 
         for scene_idx in range(num_scenes):
             episode = collect_episode(

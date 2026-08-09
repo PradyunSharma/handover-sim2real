@@ -78,6 +78,7 @@ from handover_sim2real.bc import (
     compute_normalization_stats,
 )
 from handover_sim2real.dagger import (
+    build_box_params,
     CollectParams,
     EvalParams,
     build_policy,
@@ -374,6 +375,8 @@ LOG_FIELDS = [
     # -- (1) eval
     "success_rate", "grasp_rate", "near_rate", "close_rate",
     "close_success_rate", "chance_rate", "missed_rate", "miss_given_chance",
+    "box_chance_rate", "box_taken_rate", "box_missed_rate", "miss_given_box",
+    "mean_box_steps", "mean_box_frac",
     "eval_min_pos", "eval_min_rot",
     "mean_dist", "mean_pos_err", "mean_rot_err", "mean_close_step",
     # -- (2) eval outcome breakdown, fractions of the eval set
@@ -430,6 +433,8 @@ def eval_columns(m: dict | None) -> dict:
     out = {k: _r(m.get(k)) for k in (
         "success_rate", "grasp_rate", "near_rate", "close_rate",
         "close_success_rate", "chance_rate", "missed_rate", "miss_given_chance",
+        "box_chance_rate", "box_taken_rate", "box_missed_rate", "miss_given_box",
+        "mean_box_steps", "mean_box_frac",
         "eval_min_pos", "eval_min_rot",
         "mean_dist", "mean_pos_err", "mean_rot_err", "mean_close_step")}
     out.update(reason_columns(m.get("reasons"), EVAL_REASONS, denom=m.get("n") or None))
@@ -693,12 +698,18 @@ def main() -> None:
     # benchmark's flag could never fire. The proximity thresholds are taken from
     # the DAgger block so `proximity` mode scores exactly the predicate the
     # collector uses to emit its CLOSE label.
+    # Geometric opportunity test. Defaults describe the Panda pads and are not
+    # per-run knobs; min_frac/open_thresh DEFINE the metric, so changing either
+    # makes box_* incomparable across runs — see dagger/grasp_box.py.
+    box_params = build_box_params(ev)
     eval_params = EvalParams(
         max_steps=int(ev.get("max_steps", 30)),
         success_mode=str(ev.get("success_mode", "stable_grasp")),
         hold_steps=int(ev.get("hold_steps", 3)),
         close_pos_thresh=collect_params.close_pos_thresh,
         close_rot_thresh=collect_params.close_rot_thresh,
+        box_check=bool(ev.get("box_check", True)),
+        box=box_params,
         verbose=bool(ev.get("verbose", False)))
     eval_every = int(ev.get("every", 1))
     eval_ckpt = str(ev.get("ckpt", "best"))
@@ -935,6 +946,13 @@ def main() -> None:
                   f"min_pos={emetrics['eval_min_pos']:.3f} m "
                   f"min_rot={emetrics['eval_min_rot']:.3f} rad "
                   f"ee->ycb={emetrics['mean_dist']:.3f} m")
+            # Geometric opportunity — the pin-free reading. box_chance is the
+            # denominator, taken|box the conversion.
+            print(f"  [eval] box_chance={emetrics['box_chance_rate']:.3f} "
+                  f"(taken|box={emetrics['box_taken_rate']:.3f} "
+                  f"missed|box={emetrics['miss_given_box']:.3f}) "
+                  f"window={emetrics['mean_box_steps']:.1f} steps "
+                  f"occ={emetrics['mean_box_frac']:.3f}")
         eval_s = time.time() - t_eval
 
         # --- best / last snapshots ---

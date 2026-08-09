@@ -31,6 +31,7 @@ Modules:
     policy_io  run-dir load/save + the PolicyRunner per-step interface
     collector  Phase-4 DAgger episode collection -> BC-schema HDF5
     evaluator  closed-loop eval (Phase-3 criterion) for best-policy selection
+    grasp_box  ray-cast "is the object in the open jaws" opportunity test
 """
 
 from .env_setup import SimContext, build_sim_cfg, build_sim_context
@@ -52,6 +53,7 @@ from .collector import (
     collect_iteration,
     DaggerHDF5Writer,
 )
+from .grasp_box import BoxParams, build_box_params, grasp_opportunity
 from .evaluator import EvalParams, evaluate_policy
 from .setup import Phase4Context, build_phase4_context, scene_pools
 # NOT imported here: .parallel. It spawns worker processes that re-import this
@@ -78,6 +80,9 @@ __all__ = [
     "collect_dagger_episode",
     "collect_iteration",
     "DaggerHDF5Writer",
+    "BoxParams",
+    "build_box_params",
+    "grasp_opportunity",
     "EvalParams",
     "evaluate_policy",
     "Phase4Context",

@@ -95,7 +95,30 @@ SIM_CFG="${SIM_CFG:-examples/pretrain.yaml}"
 # Pair with a demo pool collected on the same first-N scenes (collect_demos EXTRA=--num-scenes N).
 NUM_SCENES="${NUM_SCENES:-0}"
 
-echo "run=${RUN_NAME}"
+# ── where the run writes — /home has a HARD 30 GB quota on DelftBlue ─────────
+# Hitting it kills the job with exit code 6 and NO traceback: Python cannot flush
+# one to a full disk, so the only symptom is a truncated .out file. An RL run is
+# GBs of checkpoints, so send it to /scratch (5 TiB) instead.
+#
+# SCRATCH_ROOT is the ONE knob. Empty (the default) keeps the in-repo behaviour
+# unchanged, so nothing differs when running outside the cluster:
+#   sbatch --export=ALL,RUN_NAME=rl_run40,\
+#       SCRATCH_ROOT=/scratch/pradyunsharma/handover-sim2real examples/slurm/train_rl.sbatch
+# OUT_ROOT can still be set directly and wins over SCRATCH_ROOT if you need a
+# path that is not <root>/output/rl_runs.
+#
+# /scratch is PERIODICALLY PURGED BY AGE. Checkpoints are meant to be transient
+# there, but the run's metadata is the experiment record — bring it back into git
+# with:  python examples/harvest_run.py --run-dir "${OUT_ROOT}/${RUN_NAME}"
+SCRATCH_ROOT="${SCRATCH_ROOT:-}"
+if [ -n "${SCRATCH_ROOT}" ]; then
+    OUT_ROOT="${OUT_ROOT:-${SCRATCH_ROOT}/output/rl_runs}"
+else
+    OUT_ROOT="${OUT_ROOT:-output/rl_runs}"
+fi
+mkdir -p "${OUT_ROOT}"
+
+echo "run=${RUN_NAME}  out-root=${OUT_ROOT}"
 echo "host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
 echo "cpus-per-task=${SLURM_CPUS_PER_TASK}  rollout workers=${WORKERS}"
 
@@ -114,6 +137,7 @@ srun python examples/train_rl.py \
     --bc-run  output/bc_runs/dagger_iter_2_3 \
     --demos   "${DEMOS}" \
     --run-name "${RUN_NAME}" \
+    --out-root "${OUT_ROOT}" \
     --num-workers "${WORKERS}" \
     --worker-device cuda \
     --episodes-per-iter "${WORKERS}" \
@@ -121,4 +145,8 @@ srun python examples/train_rl.py \
     --num-scenes "${NUM_SCENES}"
 
 # Resume after a walltime kill: add
-#   --resume output/rl_runs/${RUN_NAME}/checkpoints/last.pt
+#   --resume ${OUT_ROOT}/${RUN_NAME}/checkpoints/last.pt
+# NOT output/rl_runs/... — with SCRATCH_ROOT set the run does not live in the
+# repo, and a hardcoded path here would silently resume from nothing (or from a
+# stale same-named run in home). Resubmit with the SAME SCRATCH_ROOT/OUT_ROOT and
+# the path resolves itself.

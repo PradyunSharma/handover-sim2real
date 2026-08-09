@@ -243,19 +243,33 @@ def main() -> None:
     _grid(a, "eval (held out): the nested rates", ylabel="fraction of eval scenes")
     _legend(a, loc="upper left")
 
-    # opportunity vs conversion: did it get a chance, and did it take it
+    # opportunity vs conversion: did it get a chance, and did it take it.
+    #
+    # LEADS WITH THE GEOMETRIC TEST (box_*, dagger/grasp_box.py): object material
+    # actually between the open jaws, which counts an off-pose grasp as the
+    # opportunity it is. The pinned-pose pair (chance_rate / miss_given_chance)
+    # is kept as a faint reference only — it gates on agreement with the pin and
+    # reads 0.03-0.05 in runs succeeding 60-70% of the time, so it measures pin
+    # agreement, not opportunity. Runs before this metric existed show only the
+    # faint pair, which is why both are drawn rather than one replacing the other.
     a = ax[0][1]
-    for key, label, style, col in (
-            ("chance_rate", "had a graspable pose", "-", "tab:blue"),
-            ("close_rate", "commanded a close", "--", "tab:orange"),
-            ("close_success_rate", "success | closed", "-", "tab:green"),
-            ("missed_rate", "had chance, no grasp", "-", "tab:red"),
-            ("miss_given_chance", "missed | had chance", ":", "tab:purple")):
+    for key, label, style, col, lw in (
+            ("box_chance_rate", "object in jaws", "-", "tab:blue", 1.4),
+            ("box_taken_rate", "closed | in jaws", "-", "tab:green", 2.0),
+            ("miss_given_box", "no grasp | in jaws", "-", "tab:red", 1.4),
+            ("close_success_rate", "success | closed", "--", "tab:olive", 1.2),
+            ("mean_box_frac", "mean jaw occupancy", ":", "tab:gray", 1.0)):
         ys = num(key)
         if _finite(ys):
-            _plot(a, it, ys, style, marker="o", ms=3, color=col, label=label)
+            _plot(a, it, ys, style, marker="o", ms=3, color=col, label=label, lw=lw)
+    for key, label, col in (("chance_rate", "at pinned pose (ref)", "tab:blue"),
+                            ("miss_given_chance", "missed | pinned (ref)", "tab:red")):
+        ys = num(key)
+        if _finite(ys):
+            _plot(a, it, ys, ":", marker="", color=col, label=label,
+                  lw=1.0, alpha=0.4)
     a.set_ylim(-0.02, 1.02)
-    _grid(a, "opportunity vs conversion", ylabel="fraction")
+    _grid(a, "opportunity vs conversion (geometric)", ylabel="fraction")
     _legend(a, loc="upper left")
 
     # approach: CLOSEST the EE ever came, and where it was when it closed
@@ -461,13 +475,20 @@ def main() -> None:
     _grid(a, "planner / grasp pinning", ylabel="count this iteration")
     _legend(a, loc="upper left")
 
-    # when does it close
+    # when does it close — and how long it had to decide. `mean_box_steps` is in
+    # the same units (policy steps), so it belongs on this axis: a long window
+    # sitting above the close step means the policy loitered in the jaws-occupied
+    # state rather than never reaching it, which box_taken_rate alone cannot say.
     a = bx[1][0]
     for key, label in (("mean_policy_close_step", "collection (learner)"),
                        ("mean_close_step", "eval")):
         ys = num(key)
         if _finite(ys):
             _plot(a, it, ys, "-o", ms=3, label=label)
+    ys = num("mean_box_steps")
+    if _finite(ys):
+        _plot(a, it, ys, "--s", ms=3, color="tab:gray",
+              label="opportunity window (steps)")
     _grid(a, "step at which the policy closes", ylabel="policy step")
     _legend(a, loc="upper left")
 

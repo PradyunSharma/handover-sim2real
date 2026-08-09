@@ -61,6 +61,8 @@ EVAL_FIELDS = [
     "iter", "run_dir", "ckpt", "num_scenes",
     "success_rate", "grasp_rate", "near_rate", "close_rate", "close_success_rate",
     "chance_rate", "missed_rate", "miss_given_chance",
+    "box_chance_rate", "box_taken_rate", "box_missed_rate", "miss_given_box",
+    "mean_box_steps", "mean_box_frac",
     "eval_min_pos", "eval_min_rot", "mean_dist", "mean_pos_err", "mean_rot_err",
     "mean_close_step",
     "f_grasp_ok", "f_grasp_miss", "f_no_release", "f_drop", "f_timeout",

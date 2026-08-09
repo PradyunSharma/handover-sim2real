@@ -28,6 +28,15 @@ step-0 OMG plan. `stable_grasp` needs no grasp pose at all, so with it the
 evaluator makes no OMG calls and an eval sweep stays cheap enough to run after
 every DAgger iteration.
 
+OPPORTUNITY IS MEASURED TWO WAYS. `chance_rate` gates on proximity to the pinned
+grasp and is therefore a pin-agreement measure, not an opportunity measure — it
+reads 0.03-0.05 in runs that succeed 60-70% of the time, because the policy's
+grasps are real but off-pose. `box_chance_rate` / `box_taken_rate` instead ask,
+per step, whether object material actually sits between the open finger pads
+(`dagger/grasp_box.py`, ray-cast against ground-truth collision geometry). Both
+are reported; the geometric pair is the honest one, the pinned pair is kept so
+runs 4-14 stay comparable.
+
 Protocol per scene:
   * observe -> runner.act() -> Delta-ee-pose -> IK -> step
   * the first time the policy commands a close, score it (hold + secured check),
@@ -56,6 +65,9 @@ from rollout_bc_policy import action_to_target_joint  # noqa: E402
 from handover_sim2real.rl.rollout_worker import (  # noqa: E402
     _status_name, grasp_held_after_hold,
 )
+from handover_sim2real.dagger.grasp_box import (  # noqa: E402
+    BoxParams, grasp_opportunity,
+)
 
 SUCCESS_MODES = ("stable_grasp", "proximity")
 
@@ -67,12 +79,19 @@ class EvalParams:
     hold_steps: int = 3                  # stable_grasp: policy-steps held shut
     close_pos_thresh: float = 0.02       # proximity: metres
     close_rot_thresh: float = 0.34       # proximity: radians (~19.5 deg)
+    # Geometric opportunity test (see dagger/grasp_box.py). Runs ALONGSIDE the
+    # pinned-pose `had_chance`, never replacing it, so `chance_rate` keeps the
+    # meaning it had in runs 4-14 and the two remain comparable.
+    box_check: bool = True
+    box: BoxParams = None
     verbose: bool = False
 
     def __post_init__(self):
         if self.success_mode not in SUCCESS_MODES:
             raise ValueError(f"success_mode must be one of {SUCCESS_MODES}, "
                              f"got {self.success_mode!r}")
+        if self.box is None:
+            self.box = BoxParams()
 
 
 def _resolve_grasp_pose(sim, scene_idx: int, pin_table):
@@ -115,6 +134,14 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
     # `min_pos <= t and min_rot <= t`, which can be satisfied at two different
     # steps and would over-report the opportunity.
     had_chance = False
+    # The GEOMETRIC opportunity: was the object ever really between the open
+    # jaws (dagger/grasp_box.py), independent of the pin. `box_taken` is the one
+    # that answers "given a chance, did it take it" — it is only set when the
+    # close is commanded ON such a step, not merely in an episode that had one.
+    box_chance = False
+    box_taken = False
+    box_steps = 0
+    box_frac_max = 0.0
     close_step = -1
     success = False
     grasped = False
@@ -125,6 +152,17 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
         rs = _robot_state(obs, prev_act6d)
         action = runner.act(pc, rs)          # [7], ch6 in {0,1}
         prev_act6d = action[:6].astype(np.float32)
+
+        # Read from `obs`, i.e. the state the policy just acted FROM — so an
+        # opportunity is scored against the pose at which the decision was made,
+        # not one the action has already moved away from.
+        opportunity = False
+        if params.box_check:
+            opportunity, box_frac = grasp_opportunity(env, params.box)
+            box_frac_max = max(box_frac_max, box_frac)
+            if opportunity:
+                box_chance = True
+                box_steps += 1
 
         ee_pos = obs["panda_body"].link_state[0, obs["panda_link_ind_hand"], 0:3].numpy()
         ycb_pos = env.ycb.bodies[env.ycb.ids[0]].link_state[0, 6, 0:3].numpy()
@@ -139,6 +177,7 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
         if action[6] < 0.5:
             # ---- the policy committed a close: score it (Phase-3 criterion) ----
             close_step = step
+            box_taken = bool(opportunity)
 
             # Geometry FIRST, from the pose the close was committed at — the hold
             # moves the fingers, so this has to be read before it runs.
@@ -194,6 +233,13 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
         # either never closed there, or closed and lost it. Separates "never got
         # there" from "got there and blew it", which a success rate cannot.
         "missed": int(had_chance and not success),
+        # ---- geometric opportunity (grasp_box.py), pin-independent ----
+        "box_chance": int(box_chance),      # object was ever in the open jaws
+        "box_taken": int(box_taken),        # ...and the close was commanded there
+        "box_missed": int(box_chance and not success),
+        "box_steps": int(box_steps),        # how long the window stayed open
+        "box_frac_max": float(box_frac_max),  # best jaw occupancy seen, for
+                                              # recalibrating min_frac offline
         "status": int(status),
         "reason": reason,
     }
@@ -211,6 +257,14 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
         grasp_rate      ...and both fingers ended the hold on the object
         success_rate    ...and the object was secured (release, no drop)
     Reading them left to right localises where the policy is losing episodes.
+
+    Opportunity is reported TWICE, against two different definitions, because
+    they disagree and the disagreement is itself the finding:
+        chance_rate     the EE was within tolerance of the PINNED grasp
+        box_chance_rate the object was geometrically between the open jaws
+    The first is near-zero in runs that succeed 60-70% of the time (it is really
+    measuring pin agreement); the second counts off-pose grasps as the
+    opportunities they are. `box_taken_rate` is the conversion of the latter.
     """
     rows = []
     for i, scene in enumerate(scenes):
@@ -230,7 +284,10 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
             print(f"    eval [{i+1:3d}/{len(scenes)}] scene={scene:4d} "
                   f"success={row['success']} grasped={row['grasped']} "
                   f"close@{row['close_step']} pos_err={row['pos_err']:.3f} "
-                  f"ee->ycb={row['dist']:.3f} {row['reason']}")
+                  f"ee->ycb={row['dist']:.3f} "
+                  f"box={row['box_chance']}/{row['box_taken']}"
+                  f"@{row['box_steps']}st({row['box_frac_max']:.2f}) "
+                  f"{row['reason']}")
 
     n = max(len(rows), 1)
 
@@ -247,6 +304,7 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
 
     n_closed = sum(r["closed"] for r in rows)
     n_chance = sum(r["had_chance"] for r in rows)
+    n_box = sum(r["box_chance"] for r in rows)
 
     return {
         "n": len(rows),
@@ -267,6 +325,38 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
         "missed_rate": sum(r["missed"] for r in rows) / n,
         "miss_given_chance": (sum(r["missed"] for r in rows) / n_chance
                               if n_chance else float("nan")),
+        # ---- the GEOMETRIC opportunity, pin-independent (grasp_box.py) ----
+        # Unlike chance_rate this does not require agreement with the pinned
+        # pose, so an off-pose grasp — which is most of what the policy does —
+        # counts as the opportunity it is.
+        #
+        # NaN, not 0, when the check is disabled: a 0 here would read as "the
+        # policy never got a chance", which is a claim about the policy rather
+        # than about what was measured. NaN writes a BLANK cell (see `_r` in
+        # train_dagger_phase4) and plots as a gap.
+        "box_chance_rate": (n_box / n) if params.box_check else float("nan"),
+        # THE headline: given that the object really was between the open jaws,
+        # how often did the policy command the close there. Conditional on the
+        # chance, so it separates "never got a chance" from "got one and did not
+        # take it" — the distinction success_rate cannot make. NaN when nothing
+        # ever presented a chance.
+        "box_taken_rate": (sum(r["box_taken"] for r in rows) / n_box
+                           if (n_box and params.box_check) else float("nan")),
+        # ...and, taken or not, how often that chance failed to become a grasp.
+        "box_missed_rate": (sum(r["box_missed"] for r in rows) / n
+                            if params.box_check else float("nan")),
+        "miss_given_box": (sum(r["box_missed"] for r in rows) / n_box
+                           if (n_box and params.box_check) else float("nan")),
+        # How many policy-steps the window stayed open, over the episodes that
+        # had one. A long declined window is a much stronger indictment of the
+        # close decision than a one-step flicker, and the two are indistinguish-
+        # able in box_taken_rate alone.
+        "mean_box_steps": (_mean("box_steps", where=lambda r: r["box_chance"])
+                           if params.box_check else float("nan")),
+        # Best jaw occupancy seen per episode, averaged. Continuous, so
+        # `box.min_frac` can be recalibrated from logs without re-running eval.
+        "mean_box_frac": (_mean("box_frac_max") if params.box_check
+                          else float("nan")),
         # Closest approach over the whole episode — defined even when the policy
         # never closes, so it still moves while every rate above reads 0.
         "eval_min_pos": _mean("min_pos"),

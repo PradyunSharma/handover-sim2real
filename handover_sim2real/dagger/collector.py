@@ -880,6 +880,33 @@ class DaggerHDF5Writer:
 
 # ── one DAgger iteration's worth of data ─────────────────────────────────────
 
+def _observation_attrs(sim) -> dict:
+    """Camera/renderer provenance for a shard's HDF5 attrs.
+
+    The resolved CAMERA LIST, not just the sim cfg path: a path stays true while
+    the file it names is edited, so the filename can drift away from what was
+    actually collected. The renderer is here for the same reason — EGL and the
+    CPU TinyRenderer do not produce identical clouds, which is why the Phase-4
+    configs already warn that SIM.egl must match the base dataset.
+
+    Degrades to empty rather than raising: this is metadata, and a missing
+    attribute must never be the thing that kills a 20-hour collection.
+    """
+    cfg = getattr(sim, "cfg", None)
+    if cfg is None:
+        return {}
+    try:
+        hcps = cfg.ENV.HANDOVER_HAND_CAMERA_POINT_STATE_ENV
+        return {
+            "cameras": ",".join(hcps.CAMERAS),
+            "compute_mano": bool(hcps.COMPUTE_MANO_POINT_STATE),
+            "compute_robot": bool(hcps.COMPUTE_ROBOT_POINT_STATE),
+            "renderer": "egl" if cfg.SIM.BULLET.USE_EGL else "tiny",
+        }
+    except AttributeError:
+        return {}
+
+
 def collect_iteration(sim, runner, scenes, out_path, *, rng,
                       beta: float, params: CollectParams, pin_table=None,
                       registry=None, iteration: int = 0,
@@ -937,6 +964,14 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
         # of pairing a train table with val indices.
         "grasp_pin_table": str(getattr(pin_table, "path", "") or ""),
         "scenes": np.asarray(scenes, dtype=np.int32),
+        # Which OBSERVATION produced these clouds. The base collector records the
+        # same keys; this is the other half of the aggregate, and the aggregate is
+        # exactly where a camera mismatch would do its damage. Two collections
+        # with different cameras are indistinguishable from every other attr —
+        # same pc_channels, num_pts and pc_format — so without this the only
+        # evidence is a filename, and a mixed aggregate trains silently and is
+        # wrong only at deployment.
+        **_observation_attrs(sim),
     })
     try:
         for i, scene in enumerate(scenes):

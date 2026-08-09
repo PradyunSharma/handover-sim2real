@@ -61,7 +61,15 @@ export PYTHONUNBUFFERED=1
 
 # ── parameters (override via sbatch --export=ALL,...) ───────────────────────
 RUN="${RUN:?set RUN=<run name>, e.g. --export=ALL,RUN=dagger4_run6}"
-OUT_ROOT="${OUT_ROOT:-output/dagger_runs}"
+# Same SCRATCH_ROOT knob as train_dagger_phase4.sbatch — pass the SAME value the
+# trainer was submitted with, or this job looks for the run in the repo and exits
+# with "config.yaml not found". Empty default = unchanged in-repo behaviour.
+SCRATCH_ROOT="${SCRATCH_ROOT:-}"
+if [ -n "${SCRATCH_ROOT}" ]; then
+    OUT_ROOT="${OUT_ROOT:-${SCRATCH_ROOT}/output/dagger_runs}"
+else
+    OUT_ROOT="${OUT_ROOT:-output/dagger_runs}"
+fi
 RUN_DIR="${RUN_DIR:-${OUT_ROOT}/${RUN}}"
 WATCH="${WATCH:-1}"                   # 1 = poll for new iterations while training runs
 POLL_S="${POLL_S:-300}"

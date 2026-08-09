@@ -1,0 +1,195 @@
+# Phase-1 BC training config — EVERYTHING STACKED (run 15).
+#
+# = bc_phase1_nojoint.yaml + all three training-side changes from runs 11/13/14
+# at once. Used as TRAIN.train_cfg by examples/configs/dagger_phase4_all.yaml.
+#
+#   pose_loss: pm + pm_weight 7.0     run 11  (bc_phase4_pm.yaml)
+#   aux_head: true + aux_weight 1.0   run 13  (bc_phase4_aux.yaml)
+#   reach_tail_weight 2.5             run 14  (bc_phase4_reachw.yaml)
+#
+# READ THE RESULT ACCORDINGLY. This is a combination run, not an experiment: with
+# three training changes and two collection changes moving together, a gain
+# cannot be attributed to any one of them, and the ±0.115 noise floor measured
+# over runs 4/6/7/8/9/10 means even the combined effect needs to clear ~2σ = 0.23
+# before it is distinguishable from a reseed. Runs 11-14 are the controls that
+# make this interpretable; this run is only worth reading against them.
+#
+# ---------------------------------------------------------------------------
+# THE REACH-TAIL PROBLEM (run 14's change, below in DATA)
+#
+# Measured on train_pinned_omg_ok: the last 5 steps of every episode
+# — the standoff->grasp reach plus the CLOSE label — are 23.8% of the data but
+# contribute only 11.1% of the SmoothL1 pose gradient. The expert's labels shrink
+# into the reach (per-axis mean |dpos| 0.0120 m over the last five steps against
+# 0.0255 m during the free approach; |drot| 0.0155 rad against 0.0497), and under
+# a loss that is quadratic in the small-error regime a small label is a small
+# gradient. So the phase that actually decides the task is the phase the optimizer
+# can most cheaply ignore — which is the same mechanism behind the deceleration
+# visible in rollouts, where the gripper crosses the room quickly and then crawls.
+
+DATA:
+  train_h5: output/bc_dataset/train.h5
+  # No val_h5 default on purpose: pass --val-h5 explicitly each run so the
+  # train/val distributions can't silently mismatch (e.g. frozen vs live).
+  # Omitting --val-h5 now means no validation (no val_* metrics, best.pt=last).
+  val_h5:
+  # These four are fixed by the collection script's schema; here for sanity.
+  pc_channels:     5      # xyz + ycb_flag + hand_flag
+  robot_state_dim: 32     # joint_pos(9)+joint_vel(9)+ee_pose(7)+gripper(1)+prev_act(6)
+  action_dim:      7      # Δpos(3)+Δeuler(3)+gripper_cmd(1)
+
+  # ---- reach-tail oversampling — THE run-14 change ----
+  # Oversample the last `reach_tail` steps of every episode via a
+  # WeightedRandomSampler on the TRAIN loader. Val is deliberately left uniform:
+  # weighting it would change what val_loss means and break comparability with
+  # every other run (and best.pt selection with it).
+  #
+  # 2.5 is DERIVED, not picked. Sampling weight w moves the tail's share of draws
+  # and, through it, its share of gradient. Measured on train_pinned_omg_ok:
+  #
+  #     w      share of draws    share of pose gradient
+  #    1.0        23.8%                 11.1%     <- as collected
+  #    2.0        38.5%                 19.9%
+  #    2.5        43.9%                 23.7%     <- gradient share == step share
+  #    3.0        48.4%                 27.2%
+  #    4.0        55.6%                 33.2%
+  #
+  # 2.5 is exactly the weight that restores the tail's gradient share to its
+  # share of the data, i.e. it removes the magnitude-induced deficit and adds no
+  # prior beyond that. Anything above it is asserting the reach deserves MORE
+  # than proportional attention, which may well be true but is a second claim.
+  #
+  # COST, stated plainly: the tail goes from 23.8% of items to 43.9% of draws, so
+  # the network sees free-approach states considerably less often. If the approach
+  # degrades — watch reached_standoff in dagger_log.csv, and f_timeout in eval —
+  # this is the number to lower. WeightedRandomSampler also draws WITH
+  # replacement, so an epoch covers ~63% of unique items rather than 100%;
+  # immaterial over 100 epochs, but it does mean "epoch" is no longer a full pass.
+  reach_tail_weight: 2.5
+  reach_tail:        5    # must match DAGGER.reach_tail, or the window is not the reach
+
+MODEL:
+  feature_dim:        256  # D — scene and robot encoders both output this width
+  robot_hidden:       128
+  policy_hidden:      [256, 256]
+  pointnet_scale:     1     # multiplies all PointNet++ channel widths
+  pointnet_radius:    0.02  # first SA module ball-query radius (metres)
+  pointnet_nclusters: 32    # first SA module npoint
+  use_prev_act:       false # include the trailing prev_action(6) in the robot state?
+                            # false drops it (recommended): prev_act is ~0.9 correlated
+                            # with the target, so keeping it lets the policy copy it and
+                            # ignore the point cloud. Override with --use-prev-act/--no-prev-act.
+  # Strip the LEADING joint_pos(9)+joint_vel(9) block from the robot-MLP input.
+  # The robot MLP then sees 8 dims: [ee_pos(3), ee_orn_wxyz(4), gripper(1)].
+  #
+  # Rationale, carried over verbatim from Phase-3 rl_run28 where this flag was
+  # introduced: the action is EE-frame, so the ee_pose already in the state
+  # carries all the kinematics the policy needs; joint space is redundant AND
+  # scene-correlated, which makes it a memorization handle — the network can
+  # index "which of the 351 scenes am I in" off the arm configuration instead of
+  # reading the point cloud. Removing it forces the scene features to do the work.
+  #
+  # This changes the robot-encoder in_dim (26 -> 8), so a checkpoint trained with
+  # this flag CANNOT be loaded into a model built without it. That is not a
+  # problem for Phase 4, which refits from scratch every iteration and only
+  # warm-starts the PointNet++ encoder (pc_pretrained, untouched by this flag) —
+  # but it does mean the run's config.yaml is the only record of the input width,
+  # so keep it with the checkpoints.
+  drop_joint_state:   true
+  joint_state_dim:    18    # width of the leading block (9 pos + 9 vel)
+
+  # ---- run 13's change: the AUXILIARY GOAL-GRASP HEAD ----
+  # A second output branch on the SAME [scene ‖ robot] features, predicting where
+  # the goal grasp is in the CURRENT EE frame. Supervision is free — the target is
+  # rebuilt offline from the pin table plus each step's recorded ee_pose, so no
+  # re-collection was needed. Validated to 4.8 mm / 0.04 deg against an
+  # independently recorded reference. Saved into the run's config.yaml, and
+  # dagger/policy_io.build_policy reads it back so collector and evaluator build
+  # the matching architecture.
+  aux_head:   true
+  aux_dim:    7             # [quat_wxyz(4) + trans(3)]. Quaternion, not euler:
+                            # the goal is up to ~0.5 m away at arbitrary
+                            # orientation, where euler has branch cuts. PM makes
+                            # the q/-q ambiguity free, so nothing needs
+                            # canonicalizing.
+  aux_hidden: [256, 256]    # mirrors policy_hidden, and GA-DDPG's 2-layer branch.
+                            #
+                            # KNOWN ARCHITECTURE GAP, unresolved and carried over
+                            # from run 13 deliberately so the two stay comparable:
+                            # GA-DDPG splits its aux head at the LAST linear off a
+                            # shared trunk, so the aux loss also shapes the policy
+                            # head. Ours branches at the encoder, and the measured
+                            # policy_head gradient norm from the aux loss is
+                            # exactly 0. The aux task therefore shapes only the
+                            # shared scene/robot features. `aux_hidden: []` would
+                            # close the gap; it has not been tested.
+  # PointNet++ encoder init. Points at the handover-sim2real CVPR2023 model's
+  # state-feat checkpoint — a 5-channel (xyz+ycb+hand) encoder trained on this
+  # exact task, so all 68/68 encoder tensors transfer (first SA conv matches:
+  # (64,8)). The GA-DDPG grasp encoder is the weaker fallback: 4-channel
+  # (xyz+gripper-flag), only 67/68 transfer (first SA conv (64,7) reinit'd).
+  # freeze_pc=false => fine-tune the encoder; true => train only robot MLP + head.
+  pc_pretrained:      output/cvpr2023_models/2022-10-16_08-48-30_finetune_5_s0_train/DDPG_state_feat_PandaYCBEnv_latest
+  freeze_pc:          false
+
+OPTIM:
+  kind:         adamw       # adam | adamw
+  lr:           1.0e-3
+  weight_decay: 1.0e-4
+  scheduler:   cosine       # none | cosine | step
+
+LOSS:
+  gripper_weight: 1.0       # weight on BCE term vs the pose term
+
+  # ---- run 11's change: POINT-MATCHING pose loss (see bc_phase4_pm.yaml for the
+  # full rationale, measurements and the honest prior against it) ----
+  #   smooth_l1  SmoothL1 on the NORMALIZED action channels (runs 1-10, 12, 14)
+  #   pm         GA-DDPG's point-matching loss on the DENORMALIZED action: six
+  #              Panda control points through both poses, L1 of the displacement,
+  #              one SE(3) distance in metres. Representation-invariant, and
+  #              COUPLED — it scores where the fingertips land rather than
+  #              position and orientation as if independent.
+  pose_loss: pm
+
+  # 7.0, NOT 1.0, and not a tuning knob. The two losses are denominated
+  # differently (z-scores vs metres) so swapping them silently rescales pose
+  # against the gripper BCE. Measured on run 7's best ckpt over val_pinned_omg_ok:
+  #     pose:gripper = 6.54:1 under smooth_l1, 0.90:1 under pm at weight 1.0
+  # At 1.0 this run would mostly be training the gripper classifier. 7.0 restores
+  # the balance runs 4-10 had, so the SHAPE of the pose loss is the only change.
+  pm_weight: 7.0
+
+  # ---- run 13's change: AUXILIARY GOAL-GRASP HEAD (see bc_phase4_aux.yaml) ----
+  # Weight on `goal_pm_loss`, the same point-matching metric as the pose term, so
+  # it reads in metres of control-point displacement. 1.0 is GA-DDPG's effective
+  # weight and was CHECKED, not inherited: measured over 6 epochs the aux term
+  # tracks 0.5-0.7x the pose term and never dominates.
+  #
+  # RE-CHECKED for this run, because PM + aux together is a combination neither
+  # run 11 nor run 13 exercised: in run 13 the pose term was smooth_l1 (z-scores)
+  # and the aux term pm (metres), so they were not even in the same units. Here
+  # both are pm. Measured over a 2-epoch smoke fit on train_pinned_omg_ok:
+  #
+  #     epoch |  pose (7.0 x pm)   gripper   aux     aux/pose
+  #       0   |     0.1747         0.1383   0.0973    0.56
+  #       1   |     0.1300         0.1123   0.0717    0.55
+  #
+  # aux sits at ~0.55x pose, squarely inside the 0.5-0.7x band run 13 measured,
+  # so 1.0 carries over unchanged and needs no correction. (train_total checks
+  # out as the plain sum: 0.1300 + 0.1123 + 0.0717 = 0.3140.)
+  #
+  # Still watch train_aux_loss against train_pose_loss in the first iteration's
+  # log.csv over a full 100 epochs — two epochs is a balance check, not a
+  # convergence one — and drop this if aux starts leading.
+  aux_weight: 1.0
+
+TRAIN:
+  batch_size:      64
+  num_epochs:      100
+  num_workers:     4
+  device:          cuda
+  mixed_precision: false
+  val_every:       1
+  save_every:      5
+  grad_clip:       1.0      # 0 disables
+  seed:            0
