@@ -39,6 +39,10 @@ those success rates are training-set performance. A generalization number needs
 | **dagger4_run11** | *queued* | | = run 10 with `num_iters: 25 → 20` and `train_cfg` → `bc_phase4_pm.yaml`: **`LOSS.pose_loss: pm`**, GA-DDPG's point-matching pose loss on the denormalized action, at `pm_weight: 7.0`. First of three tests of the off-pose finding below. |
 | **dagger4_run12** | *queued* | | = run 11 with the pose loss reverted to `smooth_l1`, plus **DART inside the committed reach** (`dart_reach_ratio: 0.3`, ±0.012 m / ±0.3 rad, rejection-sampled against the cloud), and `dart_rot_mag` 0.2 → 0.3. |
 | **dagger4_run13** | *queued* | | = run 11 with the pose loss reverted to `smooth_l1`, plus an **auxiliary goal-grasp head** (`MODEL.aux_head`, `LOSS.aux_weight: 1.0`) predicting `[quat, trans]` of the pinned grasp in the current EE frame — GA-DDPG's `extra_pred`, which this policy had dropped. |
+| **dagger4_run14** | *queued* | | = run 11 with the pose loss reverted to `smooth_l1`, plus **reach-tail oversampling** (`DATA.reach_tail_weight: 2.5` on a `WeightedRandomSampler`). 2.5 is derived, not picked: it is the weight at which the last 5 steps' share of pose gradient (11.1%) is restored to their share of the data (23.8%). Third of the three single-variable tests. |
+| **dagger4_run15** | *queued* | | **Combination run, not an experiment.** = run 14's family with everything stacked: `pm` + aux head + reach-tail weighting, three-camera demos (`pretrain_multicam_wlr` and the `*_omg_wlr_ok` datasets), `num_iters` 25, `dart_ratio` 0.3 with reach-tail DART, DART from step 0, β `piecewise 1.0→0.5→0.3`, `EVAL.every: 1`. Nine changes moving together, so a gain attributes to none of them; runs 11–14 are the controls that make it readable. First run to log the geometric grasp-opportunity metric. |
+| **dagger4_run16** | *queued* | | = run 15 with **one** key changed: `beta_schedule: piecewise → constant`, `beta_start: 0.75`. A flat 75/25 expert mix that never anneals — trades DAgger's distribution-shift guarantee for a steady supply of close labels to the last iteration. Clean one-variable comparison against run 15. |
+| **dagger4_run17** | *queued* | | = run 16 with **one** key changed: `train_cfg` → `bc_phase4_all_prevact.yaml`, i.e. `MODEL.use_prev_act: false → true`. Robot-MLP input **8 → 14 dims** — the previous *executed* 6-D delta comes back in. The one temporal signal available to a clockless single-frame policy, and the first test of it since run 4; also the copycat risk that kept it off. **Read on `success_rate`, not `val_loss`** — copycat improves both losses. Matched baseline is run 16. |
 | dagger4_smoke | — | — | Shakedown only. m=4, 2 iterations, 6 eval scenes. Not a result. |
 
 Runs 6–10 are a 2×2 with two DART-free controls: `{run 4's β schedule, the
@@ -285,9 +289,16 @@ Configs without a numbered run file were shared across several runs.
 | `dagger_phase4_pm.yaml` | dagger4_run11 |
 | `dagger_phase4_reachdart.yaml` | dagger4_run12 |
 | `dagger_phase4_aux.yaml` | dagger4_run13 |
+| `dagger_phase4_reachw.yaml` | dagger4_run14 |
+| `dagger_phase4_all.yaml` | dagger4_run15 |
+| `dagger_phase4_all_beta075.yaml` | dagger4_run16 |
+| `dagger_phase4_all_beta075_prevact.yaml` | dagger4_run17 |
 | `bc_phase1.yaml` / `bc_phase1_nojoint.yaml` | Phase-4 `TRAIN.train_cfg` |
 | `bc_phase4_pm.yaml` | run 11 `TRAIN.train_cfg` — `LOSS.pose_loss: pm`, `pm_weight: 7.0` |
 | `bc_phase4_aux.yaml` | run 13 `TRAIN.train_cfg` — `MODEL.aux_head`, `LOSS.aux_weight: 1.0` |
+| `bc_phase4_reachw.yaml` | run 14 `TRAIN.train_cfg` — `DATA.reach_tail_weight: 2.5` |
+| `bc_phase4_all.yaml` | runs 15, 16 `TRAIN.train_cfg` — pm + aux + reach-tail weighting |
+| `bc_phase4_all_prevact.yaml` | run 17 `TRAIN.train_cfg` — same, `MODEL.use_prev_act: true` |
 
 ---
 
