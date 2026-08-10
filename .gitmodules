@@ -1,7 +1,7 @@
 [submodule "handover-sim"]
         path = handover-sim
-        url = https://github.com/NVlabs/handover-sim.git
-        branch = master
+	url = https://github.com/PradyunSharma/handover-sim.git
+	branch = handover-sim2real
 [submodule "GA-DDPG"]
 	path = GA-DDPG
 	url = https://github.com/NVlabs/GA-DDPG.git
