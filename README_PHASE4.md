@@ -393,3 +393,54 @@ sbatch --time=12:00:00 --export=ALL,RUN=dagger4_run5,CFG=examples/configs/dagger
 Free consistency check: `train_pinned_omg_wlr_ok.json` must list the **same 151
 scenes** as `train_pinned_omg_ok.json`. A different count means something other
 than the cameras changed.
+
+## Harvesting a scratch run's logs back into the repo
+
+Runs now write to `/scratch` (`OUT_ROOT` in `examples/slurm/train_dagger_phase4.sbatch`),
+because `/home` is a hard 30 GB quota and fills silently — a full `/home` kills a
+job with exit code 6 and **no traceback**. The consequence is that a run's logs no
+longer appear in the repo on their own: `output/dagger_runs/<RUN>/` does not exist
+here until you copy the small files back. `examples/harvest_run.py` does that.
+
+It is a **manual snapshot, not a symlink or a live view** — nothing in the repo
+updates by itself. Run it before every `git add`, and again once a run finishes,
+or you will commit a half-finished log.
+
+```bash
+# one run
+python examples/harvest_run.py --run-dir /scratch/$USER/handover-sim2real/output/dagger_runs/dagger4_run15
+
+# every run under scratch (dagger_runs, rl_runs, bc_runs) — the usual form
+python examples/harvest_run.py --all --scratch-root /scratch/$USER/handover-sim2real
+
+# preview without writing
+python examples/harvest_run.py --all --scratch-root /scratch/$USER/handover-sim2real --dry-run
+
+git add output/dagger_runs/dagger4_run15
+git commit -m "run15 logs"
+```
+
+Each run mirrors into `output/<kind>/<RUN>/` at the same path it would have had if
+written in-repo, so `iters/iter_00/log.csv` lands where you expect. Typical cost is
+**~600 KB per run**; a full `--all` sweep copies ~1.8 MB and leaves ~26 GB of
+checkpoints and replay data on scratch.
+
+What it copies is a strict **allow-list**: `dagger_log.csv`, `eval_log.csv`,
+`log.csv`, `config.yaml`, `state.json`, `grasp_registry.json`, `source.txt`,
+`iters/*/log.csv`, `iters/*/config.yaml`, and all `*.png`. Checkpoints (`.pt`) and
+replay data (`.h5`) can never be picked up — a deny-list raises rather than copies,
+so widening the patterns carelessly fails loudly instead of quietly filling `/home`.
+
+Safe to run **while a job is still going** (it only ever writes into the repo, never
+into the run directory) and idempotent (size + mtime compare), so re-running just
+extends the CSVs.
+
+The `output/.gitignore` rules `!dagger_runs/*/*.csv`, `*.json`, `*.yaml`, `*.png`
+are negations that explicitly un-ignore these files, so harvested metadata is
+trackable with no `.gitignore` change. Note `git check-ignore -v` prints the
+matching rule even when it is a negation — use the exit code (`-q`; 0 = ignored)
+if you need to test a path.
+
+Checkpoints stay on scratch by design. Pull those to the PC separately — see the
+sync section in `README_MY.md`. **`/scratch` is periodically purged by age**, so
+harvesting is what makes a run's record survive.
