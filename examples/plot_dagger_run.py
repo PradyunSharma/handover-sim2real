@@ -423,7 +423,7 @@ def main() -> None:
     print(f"wrote {main_out}")
 
     # ── DIAGNOSTIC ──────────────────────────────────────────────────────────
-    fig2, bx = plt.subplots(2, 3, figsize=(16, 8))
+    fig2, bx = plt.subplots(2, 4, figsize=(21, 8))
 
     # labels
     a = bx[0][0]
@@ -533,6 +533,45 @@ def main() -> None:
            ["tab:blue", "tab:orange", "tab:green"])
     _grid(a, "wall clock per iteration", ylabel="seconds")
     _legend(a, loc="upper left")
+
+    # ---- collection outcomes (DAGGER.outcome_check; empty for runs 1-17) ----
+    # Deliberately the same taxonomy and the same colours as the eval-outcome
+    # panel on curves.png, so the two stacks can be read against each other. The
+    # difference between them IS the beta mixture: this one is what the
+    # expert/learner blend achieved on the collection scenes, that one is what the
+    # policy achieves alone on the eval scenes.
+    a = bx[0][3]
+    series = [("co_grasp_ok", "secured", "tab:green"),
+              ("co_grasp_miss", "closed, not secured", "tab:olive"),
+              ("co_no_release", "no release", "tab:orange"),
+              ("co_drop", "drop", "tab:red"),
+              ("co_human_contact", "human contact", "tab:purple"),
+              ("co_bench_timeout", "benchmark timeout", "tab:brown"),
+              ("co_timeout", "never closed", "tab:gray")]
+    if _stack(a, it, [num(k) for k, _, _ in series],
+              [l for _, l, _ in series], [c for _, _, c in series]):
+        a.set_ylim(0, 1)
+    _grid(a, "collection outcomes (fraction of kept episodes)")
+    _legend(a, loc="lower left", ncol=2)
+
+    # ---- collection success vs eval success ----
+    # The GAP is the quantity of interest, not either line. Collection runs at
+    # beta (mostly expert) on the training pool; eval runs the policy alone on the
+    # eval scenes. A collection line that stays high while eval sags says the data
+    # is still good and the policy is not absorbing it; both sagging together says
+    # the expert itself is failing on these scenes and the labels are the problem.
+    a = bx[1][3]
+    cs, es, bt = num("c_success_rate"), num("success_rate"), num("beta")
+    if _finite(cs):
+        _plot(a, it, cs, "-o", ms=3, color="tab:blue",
+              label="collection (beta mixture)")
+    if _finite(es):
+        _plot(a, it, es, "-s", ms=3, color="tab:green", label="eval (policy alone)")
+    if _finite(bt):
+        _plot(a, it, bt, ":", color="tab:gray", label="beta (expert share)")
+    a.set_ylim(0, 1)
+    _grid(a, "success: collection vs eval", ylabel="fraction")
+    _legend(a, loc="lower left")
 
     _fix_x(fig2, it)
     fig2.suptitle(f"Phase-4 DAgger diagnostics — {run.name}", fontsize=12)

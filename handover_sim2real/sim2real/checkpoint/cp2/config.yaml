@@ -1,0 +1,35 @@
+# Deployment config for the checkpoint in this directory.
+#
+# PROVENANCE: best.pt and normalization.npz here are byte-identical (md5) to
+#   output/dagger_runs/dagger4_run12/best/{checkpoints/best.pt,normalization.npz}
+# which is DAgger run 12, iteration 8 (val success_rate = 0.7400).
+#
+# This file is a trimmed copy of that run's config.yaml. handover_sim2real.dagger
+# .policy_io.build_policy reads only DATA.{pc_channels,robot_state_dim,action_dim}
+# and the MODEL block, so the training-only fields are dropped:
+#   DATA.train_h5 / DATA.val_h5   paths on the training cluster, meaningless here
+#   MODEL.pc_pretrained           encoder warm-start, already baked into best.pt
+#   OPTIM / LOSS / TRAIN          training-time only
+# Every field below is copied verbatim and must not be edited: each one changes
+# the tensor shapes, so a mismatch makes best.pt fail to strict-load (or, worse
+# for use_prev_act/drop_joint_state, silently feed the wrong state channels).
+
+DATA:
+  pc_channels: 5          # xyz(3) + ycb_flag(1) + hand_flag(1), EE (panda_hand) frame
+  robot_state_dim: 32     # joint_pos(9)+joint_vel(9)+ee_xyz(3)+ee_wxyz(4)+gripper(1)+prev_act(6)
+  action_dim: 7           # dpos(3) + deuler(3) + gripper_cmd(1)
+MODEL:
+  feature_dim: 256
+  robot_hidden: 128
+  policy_hidden:
+  - 256
+  - 256
+  pointnet_scale: 1
+  pointnet_radius: 0.02
+  pointnet_nclusters: 32
+  # These two trim the 32-D robot state down to the 8 channels the robot encoder
+  # was actually fit on: ee_xyz(3) + ee_wxyz(4) + gripper_norm(1), i.e. rs[18:26].
+  use_prev_act: false     # drops the trailing prev_act(6)
+  drop_joint_state: true  # drops the leading joint_pos(9)+joint_vel(9)
+  joint_state_dim: 18
+  freeze_pc: false

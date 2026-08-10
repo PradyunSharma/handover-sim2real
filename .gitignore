@@ -74,3 +74,18 @@ venv*/*
 # Adding a genuinely new figure elsewhere needs `git add -f`.
 *.png
 !docs/*.png
+
+# Real-robot deployment binaries (handover_sim2real/sim2real/)
+# The sim2real SOURCE is tracked — policy_runner.py, camera.py, the calibration
+# scripts and their small .npy/.json. These are the payloads that came with it:
+# 454 MB of .ckpt, 630 MB of RealSense .bag, 15 MB of rendered .mp4. GitHub
+# hard-rejects anything over 100 MB, and git keeps blobs forever, so a later
+# delete would not shrink the history.
+#
+# Deliberately NOT ignored: checkpoint/*/config.yaml and normalization.npz.
+# Those are ~1 KB and are the ONLY record of how to denormalize a checkpoint's
+# output — same reasoning as the run npz under output/.gitignore.
+*.ckpt
+*.bag
+*.mp4
+handover_sim2real/sim2real/checkpoint/**/*.pt

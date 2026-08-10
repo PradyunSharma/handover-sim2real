@@ -24,8 +24,21 @@ Normalization:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import h5py
+if TYPE_CHECKING:
+    import h5py                                 # annotations only; see below
+else:
+    try:
+        import h5py
+    except ModuleNotFoundError:                 # pragma: no cover - deployment only
+        # Only BCDataset and compute_normalization_stats touch HDF5. Deployment
+        # environments (the robot PC runs handover_sim2real/sim2real/*) import
+        # this module solely for `Normalizer`, which is four numpy arrays, and
+        # have no reason to carry h5py. Leaving it None lets the import succeed
+        # there; every real use below still fails on the attribute access, with
+        # h5py named in the traceback.
+        h5py = None
 import numpy as np
 import torch
 from torch.utils.data import Dataset

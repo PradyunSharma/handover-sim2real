@@ -106,6 +106,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import h5py
 import numpy as np
@@ -128,6 +129,14 @@ from collect_bc_dataset import (  # noqa: E402
     ROBOT_STATE_DIM,
 )
 from rollout_bc_policy import action_to_target_joint  # noqa: E402
+
+# Outcome scoring, imported from the Phase-3 worker rather than reimplemented —
+# the evaluator imports the same two, so a collection outcome and an eval outcome
+# are decided by identical code (see CollectParams.outcome_check).
+from handover_sim2real.rl.rollout_worker import (  # noqa: E402
+    _status_name,
+    grasp_held_after_hold,
+)
 # 'sxyz' axes — the same convention the actions are built with (train_env.py uses
 # transforms3d's mat2euler default), so this inverts the label exactly.
 from transforms3d.euler import euler2mat  # noqa: E402
@@ -173,6 +182,60 @@ class CollectParams:
     min_free: int = 3
     max_horizon: int = 40
     first_horizon: int = 30  # horizon of the very first plan (standoff unknown)
+    # ----- planner-free pre-grasp (run 18) -----
+    # false: the standoff is read from the plan (`env.get_omg_standoff_pose()` =
+    # FK of traj[-reach_tail]) — the behaviour of runs 1-17.
+    # true:  it is DERIVED from the pinned grasp via `derived_standoff_pose`.
+    #
+    # The two poses are numerically identical (5.6e-7 m; see that function), so
+    # this does not move the reach commit. What changes is when the pose EXISTS:
+    #   * at reset, seeded from the pin table, so the step-0 plan gets the same
+    #     distance-proportional horizon every later step gets instead of the flat
+    #     `first_horizon` fallback. This is the ONLY behavioural difference that
+    #     fires in practice, and it touches 1 step per episode.
+    #   * on a step whose replan failed, so `d_standoff` — and therefore the DART
+    #     trigger band — is no longer silently unavailable. Latent robustness
+    #     only: run 16 logged omg_fail = 0 over 89,645 steps, so it never fires.
+    # Expect collection to be near-identical to a `false` run. If it is not,
+    # something else changed.
+    #
+    # The pin table's stored pose is used ONLY for the reset seed, and only for
+    # horizon sizing: `apply()` matches it to the nearest goal-set entry within
+    # `grasp_pin_match_tol`, so it can sit up to that far from the grasp actually
+    # planned to (measured 0.015 m on train scene 0, 0.0 on scenes 1-4). The
+    # first successful plan replaces it with the live grasp and it is never
+    # consulted again. Sizing a horizon as round(d / ee_step) with d ~ 0.4 m
+    # cannot notice 1.5 cm; the commit test never sees this value.
+    derive_standoff: bool = False
+    # ----- per-episode outcome scoring (run 18) -----
+    # false: `reason` is the loop's TERMINAL CAUSE only (CLOSE_LABEL / POLICY_CLOSE
+    # / ENV_DONE / MAX_STEPS) — what runs 1-17 logged. That says why the loop
+    # stopped, not whether the handover worked.
+    # true:  additionally score each episode with the SAME criterion the evaluator
+    # uses, so a collection success rate is comparable to `success_rate`.
+    #
+    # Why this needs extra work rather than a spare field: on a CLOSE_LABEL the
+    # loop `break`s BEFORE executing anything, so during collection the gripper
+    # NEVER actually closes and the benchmark's success is simply not observable.
+    # With this on, the close is executed and held for `hold_steps` AFTER the
+    # labels are frozen, then `grasp_held_after_hold` decides it. The recorded
+    # (state, action) pairs are already fixed at that point, so D_i is byte-
+    # identical either way — this only observes.
+    #
+    # Cost: hold_steps(3) x steps_action_repeat(150) = 450 sim steps on the ~70%
+    # of episodes that close, against ~540,000 sim steps an iteration already
+    # spends. About +6%.
+    #
+    # It also captures `info["status"]` from env.step, which the collector used to
+    # discard — that is what splits the ENV_DONE bucket (15.8% of run 16's
+    # episodes) into HUMAN_CONTACT vs DROP vs BENCH_TIMEOUT.
+    outcome_check: bool = False
+    hold_steps: int = 3          # must match EVAL.hold_steps to stay comparable
+    # OMG's cfg.standoff_dist — a ramp EXTENT, not a distance. The effective
+    # standoff is standoff_dist * (1 - 1/reach_tail) = 0.064 m at the defaults.
+    # Mirrored from the SIM block so the derivation cannot drift out of sync with
+    # the planner that produced the waypoints.
+    standoff_dist: float = 0.08
     # ----- committed reach (see module docstring section on the endgame) -----
     # Once the EE is within `reach_commit_dist` of the standoff, freeze the
     # current plan's last `reach_tail` waypoints and follow them BY INDEX instead
@@ -232,6 +295,65 @@ class CollectParams:
     # in a step or two, which is the point.
     dart_pos_mag: float = 0.04
     dart_rot_mag: float = 0.2
+
+    # ----- DART-paper noise injection (run 18; Laskey et al. 2017, 1703.09327) --
+    # "jolt"       — runs 1-17: with probability dart_ratio, inside a distance
+    #                band, REPLACE the executed action with a uniform draw from a
+    #                fixed box (+-dart_pos_mag / +-dart_rot_mag).
+    # "dart_noise" — the paper's actual method: on every EXPERT-driven step,
+    #                execute pi*(s) + eps with eps ~ N(0, Sigma). Noise is ADDED
+    #                to the supervisor's control stream rather than replacing it,
+    #                it is Gaussian with a FULL covariance rather than a uniform
+    #                box, and its magnitude is ESTIMATED from the learner's own
+    #                error rather than hand-tuned.
+    #
+    # The label is the clean pi*(s) in BOTH modes, which is the one thing the
+    # jolt already got right (paper: "the algorithm records what the supervisor
+    # should have done, not the noisy action that was executed").
+    #
+    # Sigma is re-estimated every DAgger iteration from the learner-supervisor
+    # discrepancy (paper Eq. 3):
+    #     Sigma_hat_{k+1} = (1/T) sum_t (pi_theta(x_t) - pi*(x_t))(...)^T
+    # then trace-rescaled to a fixed anticipated error level (paper Eq. 4):
+    #     Sigma^alpha = (alpha / (T tr(Sigma_hat))) Sigma_hat
+    # with alpha = dart_alpha_scale * T * tr(Sigma_hat_1), i.e. the noise MAGNITUDE
+    # is pinned at dart_alpha_scale x the first iteration's measured error while
+    # its SHAPE keeps tracking which directions the learner is currently wrong in.
+    # That rescaling is the paper's safeguard against the estimate running away.
+    #
+    # Both quantities are already computed every step here: `policy_action[:6]`
+    # (queried unconditionally, even on expert steps) and `expert_delta`, in the
+    # same real units. So the estimator costs nothing but an outer product.
+    dart_mode: str = "jolt"
+    # Sigma^alpha for THIS iteration, 6x6, supplied by the driver. None => fall
+    # back to the jolt-equivalent bootstrap (see dart_bootstrap_sigma), which is
+    # what iteration 1 uses since no learner error has been measured yet.
+    dart_sigma: Optional[np.ndarray] = None
+    # alpha at the FIRST DAgger iteration. The paper holds alpha fixed; we anneal
+    # it to `dart_alpha_end` (see dart_alpha_at) so exploration noise shrinks as
+    # the learner improves, which is the same reasoning behind annealing beta.
+    dart_alpha_scale: float = 3.0
+    # alpha at the LAST iteration. Equal to dart_alpha_scale => the paper's fixed
+    # alpha. Noise sd scales as sqrt(alpha), so 3.0 -> 0.5 is a 2.4x reduction.
+    dart_alpha_end: float = 3.0
+    # Fraction of expert steps to perturb. 1.0 is the paper (noise on the whole
+    # control stream); lower values interpolate toward the jolt's sparse firing.
+    dart_noise_ratio: float = 1.0
+    # ----- per-phase scaling of Sigma inside the COMMITTED REACH -----
+    # The estimator pools discrepancies over the WHOLE episode, so one Sigma
+    # covers both phases — but the two phases do not tolerate the same noise. The
+    # jolt encoded that explicitly: dart_reach_pos_mag (0.01202) is 3.33x smaller
+    # than dart_pos_mag (0.04), because a 4 cm displacement 5 cm from the object
+    # knocks it out of the hand, while rotation was left alone (both 0.3 rad).
+    # Without this the reach would be perturbed at free-phase magnitude, which is
+    # a regression against tuning runs 12-17 paid for.
+    #
+    # Applied as a congruence transform D Sigma D with
+    # D = diag([pos]*3 + [rot]*3), so it scales standard deviations, preserves
+    # positive-semidefiniteness, and keeps the correlation structure intact.
+    # Defaults reproduce the jolt's own ratio: 0.01202/0.04 = 0.3005, 0.3/0.3 = 1.
+    dart_reach_pos_scale: float = 0.3005
+    dart_reach_rot_scale: float = 1.0
 
     # ----- DART inside the COMMITTED REACH (run 12) -----
     # The band above stops at `reach_commit_dist` by construction, so DART has
@@ -303,6 +425,91 @@ def _grasp_moved(prev, cur, tol: float = 1e-4) -> bool:
 def _ee_pos(obs) -> np.ndarray:
     return np.asarray(obs["panda_body"].link_state[0, obs["panda_link_ind_hand"], 0:3],
                       dtype=np.float64)
+
+
+def derived_standoff_pose(grasp_pose, standoff_dist: float, reach_tail: int):
+    """The pre-grasp standoff as a pure function of the grasp pose — no planner.
+
+    OMG builds its standoff ramp in CARTESIAN space and does not re-optimise it
+    (planner.py:356 `standoff_grasp_global = pose_grasp_global @ pose_standoff`,
+    with `pose_standoff[k, 0, 2, 3] = -standoff_dist * linspace(0, 1, n,
+    endpoint=False)[k]`). The ramp's IK chain is APPENDED to the optimised free
+    trajectory rather than folded into it — core.py:639 labels every index past
+    `cfg.timesteps` as "standoff" precisely because it sits outside the
+    optimiser's window. So `traj[-reach_tail]` is, by construction, the IK
+    solution of
+
+        grasp @ translate(0, 0, -standoff_dist * (1 - 1/reach_tail))
+
+    i.e. the grasp backed off along its own local -z, sharing the grasp's
+    rotation exactly.
+
+    Measured against `env.get_omg_standoff_pose()` over 113 replans on 4 train
+    scenes: max position gap 5.6e-7 m, max rotation gap 1.3e-6 rad, and the
+    reach-commit fired on the identical step in 4/4 scenes. It is the same pose,
+    to floating point.
+
+    The point of deriving it is AVAILABILITY, not accuracy. The planner's copy
+    only exists after a successful plan, so it is None at reset and is not
+    refreshed on a step whose replan failed. This form needs nothing but the
+    pinned grasp, which is static within an episode (measured: ||G_t - G_0|| max
+    4.1e-15 m over 150 replans), so one read at step 0 is good for the whole
+    episode — and it is equally available to the evaluator and the RL reward,
+    neither of which runs OMG at all.
+    """
+    off = float(standoff_dist) * (1.0 - 1.0 / int(reach_tail))
+    T = np.eye(4, dtype=np.float64)
+    T[2, 3] = -off
+    return np.asarray(grasp_pose, dtype=np.float64) @ T
+
+
+def dart_bootstrap_sigma(pos_mag: float, rot_mag: float) -> np.ndarray:
+    """Iteration-1 noise, before any learner error has been measured.
+
+    DART initialises with an arbitrary psi_0; the least arbitrary choice here is
+    the noise runs 1-18 already used, so iteration 1 perturbs at a magnitude this
+    project has tuned. A uniform draw on [-a, a] has variance a^2/3, so this is
+    the diagonal Gaussian with the same per-axis variance as one jolt.
+
+    Only iteration 1 uses it. From iteration 2 the covariance is measured, and
+    the trace target is anchored to that first MEASUREMENT (tr(Sigma_hat_1)), not
+    to this bootstrap — so a poor psi_0 does not propagate.
+    """
+    return np.diag(np.array(
+        [pos_mag ** 2 / 3.0] * 3 + [rot_mag ** 2 / 3.0] * 3, dtype=np.float64))
+
+
+def dart_alpha_at(iteration: int, num_iters: int,
+                  alpha_start: float, alpha_end: float) -> float:
+    """alpha for a given DAgger iteration, linear from start to end.
+
+    `iteration` is 1-based and is the iteration the noise will be USED in, so the
+    driver passes i+1 when it estimates Sigma at the end of iteration i. Returns
+    alpha_start when num_iters <= 1.
+
+    Noise sd scales as sqrt(alpha), not alpha — 3.0 -> 0.5 is 1.73x -> 0.71x the
+    measured error, a 2.4x reduction in sd across the run.
+    """
+    if num_iters <= 1:
+        return float(alpha_start)
+    frac = min(max((int(iteration) - 1) / (int(num_iters) - 1), 0.0), 1.0)
+    return float(alpha_start) + (float(alpha_end) - float(alpha_start)) * frac
+
+
+def dart_scaled_sigma(sigma_hat: np.ndarray, target_trace: float) -> np.ndarray:
+    """Paper Eq. 4: rescale Sigma_hat so its trace hits `target_trace`.
+
+        Sigma^alpha = (alpha / (T tr(Sigma_hat))) Sigma_hat,  alpha/T = target_trace
+
+    This is the safeguard that keeps the estimate from running away: the SHAPE of
+    Sigma keeps tracking which action directions the learner is currently wrong
+    in, while the overall MAGNITUDE stays pinned at a level chosen once. Without
+    it a learner that got worse would be answered with ever more noise.
+    """
+    tr = float(np.trace(sigma_hat))
+    if not np.isfinite(tr) or tr <= 1e-12:
+        return np.asarray(sigma_hat, dtype=np.float64)
+    return np.asarray(sigma_hat, dtype=np.float64) * (float(target_trace) / tr)
 
 
 # The same six Panda control points the PM loss uses (bc/losses.py), in the hand
@@ -393,8 +600,33 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     prev_act6d = np.zeros(6, dtype=np.float32)
     point_clouds, robot_states, expert_actions = [], [], []
 
+    def _standoff_for(g):
+        """Pre-grasp standoff: derived from the grasp, or read off the plan.
+
+        One place so the two call sites below cannot drift apart. Returns None
+        exactly where the old code did, so `derive_standoff: false` is the
+        pre-run-18 behaviour unchanged.
+        """
+        if params.derive_standoff:
+            if g is None:
+                return None
+            return derived_standoff_pose(g, params.standoff_dist,
+                                         params.reach_tail)
+        return env.get_omg_standoff_pose()
+
     grasp_pose = None      # OMG traj[-1]: the pose the gripper closes at
     standoff_pose = None   # OMG traj[-5]: pre-grasp standoff (horizon sizing)
+    # Seed the standoff BEFORE any plan exists, so the step-0 horizon is sized
+    # the same way every other step's is. Uses the pin table's stored pose (the
+    # only grasp available at reset) and is overwritten by the live grasp on the
+    # first successful plan — see CollectParams.derive_standoff for why a
+    # match_tol-sized error is immaterial to a horizon.
+    if params.derive_standoff and pin_table is not None:
+        entry = pin_table.entries.get(int(scene_idx))
+        if entry is not None:
+            standoff_pose = derived_standoff_pose(
+                np.asarray(entry["ee_pose_world"], dtype=np.float64),
+                params.standoff_dist, params.reach_tail)
     committed_reach = None # frozen standoff->grasp waypoints, followed by index
     reach_i = 0
     goal_idx_prev = None   # OMG's grasp SELECTION index, to detect real switches
@@ -433,6 +665,25 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     n_dart_reach = 0
     n_dart_reject = 0
     last_exec_dart = False
+    # Per-episode OUTCOME (params.outcome_check). `reason` above stays the loop's
+    # terminal cause; these are the handover's result, on the evaluator's taxonomy.
+    info = {}
+    outcome = ""
+    ep_success = 0
+    # DART Sigma estimator (paper Eq. 3): running sum of d d^T over every step
+    # where BOTH the learner's and the supervisor's action exist, and the count.
+    # Summed rather than averaged here so `collect_iteration` can pool across
+    # episodes of different lengths without weighting short ones more heavily.
+    dart_dd_sum = np.zeros((6, 6), dtype=np.float64)
+    dart_dd_n = 0
+    n_dart_noise = 0
+    # The covariance actually used this iteration. `dart_sigma` is supplied by the
+    # driver from the PREVIOUS iteration's estimate; iteration 1 has none.
+    sigma = None
+    if params.dart_mode == "dart_noise":
+        sigma = (params.dart_sigma if params.dart_sigma is not None
+                 else dart_bootstrap_sigma(params.dart_pos_mag, params.dart_rot_mag))
+        sigma = np.asarray(sigma, dtype=np.float64)
     # Magnitude of every APPROACH label recorded. This is the stall detector: the
     # standoff failure mode is labels decaying to ~0 while the EE sits 6.6 cm
     # short, which is invisible in step counts but obvious here.
@@ -450,6 +701,14 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # reach is committed (no replan, so nothing updates it) and on a step
         # whose plan failed — DART is off in both cases.
         d_standoff = None
+        # With a derived standoff the pose does not depend on THIS step's plan,
+        # so the distance is known even when the replan fails — the one case
+        # where the plan-read version leaves it None and silently disables DART.
+        # Recomputed identically inside the plan-success branch below; the grasp
+        # is static within an episode, so that is a no-op.
+        if params.derive_standoff and standoff_pose is not None:
+            d_standoff = float(np.linalg.norm(
+                _ee_pos(obs) - standoff_pose[:3, 3]))
         if committed_reach is None:
             # ----- APPROACH: pi*(s) is a FRESH OMG plan from the CURRENT
             # (drifted) config, and the label is its first waypoint. The horizon
@@ -482,7 +741,7 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                 new_grasp = env.get_omg_goal_grasp_pose()
                 if new_grasp is not None:
                     grasp_pose = new_grasp
-                new_standoff = env.get_omg_standoff_pose()
+                new_standoff = _standoff_for(grasp_pose)
                 if new_standoff is not None:
                     standoff_pose = new_standoff
 
@@ -505,7 +764,7 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                         g = env.get_omg_goal_grasp_pose()
                         if g is not None:
                             grasp_pose = g
-                        s_ = env.get_omg_standoff_pose()
+                        s_ = _standoff_for(grasp_pose)
                         if s_ is not None:
                             standoff_pose = s_
 
@@ -579,6 +838,17 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
 
         if at_grasp and params.stop_on_close_label:
             reason = "CLOSE_LABEL"
+            # The labels are already appended above, so scoring here cannot change
+            # what D_i contains — it only runs the sim forward to observe what the
+            # close the expert just LABELLED would actually have done.
+            if params.outcome_check:
+                held, obs = grasp_held_after_hold(
+                    env, obs, sim.steps_action_repeat, params.hold_steps)
+                ep_success = int(held)
+                outcome = ("GRASP_OK" if held
+                           else "DROP" if bool(getattr(env, "_dropped", False))
+                           else "NO_RELEASE" if not bool(env.ycb.released)
+                           else "GRASP_MISS")
             break
 
         # ----- the policy's own action (drives the state distribution) -----
@@ -587,6 +857,18 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # advancing exactly as it would in deployment. For the single-frame
         # policy it is simply one forward pass.
         policy_action = runner.act(pc, rs)   # [7], ch6 in {0,1}
+
+        # ----- DART Sigma estimate: (pi_theta(x) - pi*(x))(...)^T at this state.
+        # Accumulated in BOTH modes so a jolt run still reports what the noise
+        # WOULD have been — that makes the two modes comparable on the same
+        # diagnostic rather than only after switching. Both vectors are the 6-D
+        # real-unit delta (metres, radians), so the outer product is in the same
+        # units the noise is drawn in.
+        if expert_delta is not None:
+            d = (policy_action[:6].astype(np.float64)
+                 - np.asarray(expert_delta, dtype=np.float64))
+            dart_dd_sum += np.outer(d, d)
+            dart_dd_n += 1
 
         # ----- DART? drawn BEFORE the beta coin, so `dart_ratio` is the
         # unconditional per-step rate rather than a rate conditioned on who would
@@ -609,7 +891,11 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # way (an approach delta saying "do not close here"), so declining the
         # jolt costs no supervision — only the episode's continuation differs, and
         # those steps were about to end the episode anyway.
-        dart = (params.dart_ratio > 0.0
+        # `dart_mode` first, so switching to dart_noise turns the jolt paths off
+        # without touching their knobs — the two are alternative implementations
+        # of the same idea, never stacked.
+        dart = (params.dart_mode == "jolt"
+                and params.dart_ratio > 0.0
                 and committed_reach is None
                 and not at_grasp
                 and policy_action[6] >= 0.5
@@ -624,7 +910,8 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # together with the servo back to the next frozen waypoint, redrawn on a
         # refusal, and abandoned after `dart_reach_max_tries`. See CollectParams.
         dart_reach_delta = None
-        if (params.dart_reach_ratio > 0.0
+        if (params.dart_mode == "jolt"
+                and params.dart_reach_ratio > 0.0
                 and committed_reach is not None
                 and not at_grasp
                 and policy_action[6] >= 0.5
@@ -683,8 +970,64 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                 np.concatenate([exec_delta, [1.0]]).astype(np.float32), obs)
         elif use_expert:
             n_expert_steps += 1
-            target_jp = expert_target_jp
-            exec_delta = expert_delta
+            # ----- DART: noise ON the supervisor's action, not instead of it ---
+            # pi*(s) + eps, eps ~ N(0, Sigma). The label written above this line
+            # is the CLEAN expert_delta and is deliberately not touched — that
+            # asymmetry (visit the noisy state, learn the clean correction) is
+            # the whole mechanism: the supervisor is "forced to take corrective
+            # actions" from states its own noise pushed it into.
+            #
+            # Only the position/rotation channels are perturbed. The gripper is
+            # held OPEN, as the jolt did, because a binary close is terminal here
+            # and noise must never be the thing that fires it.
+            if (sigma is not None and not at_grasp
+                    and (params.dart_noise_ratio >= 1.0
+                         or rng.uniform() < params.dart_noise_ratio)):
+                # Inside the committed reach the same Sigma is scaled down (see
+                # dart_reach_pos_scale) and each draw is CLEARANCE-CHECKED against
+                # the observed cloud, exactly as the reach jolt was: 5 cm from the
+                # object an unlucky draw is what knocks it out of the hand. On the
+                # free approach neither applies — there is nothing close to hit.
+                sig_step = sigma
+                tries = 1
+                recover_delta = None
+                if committed_reach is not None:
+                    D = np.diag(np.array(
+                        [params.dart_reach_pos_scale] * 3
+                        + [params.dart_reach_rot_scale] * 3, dtype=np.float64))
+                    sig_step = D @ sigma @ D
+                    nxt = committed_reach[min(reach_i + 1,
+                                              len(committed_reach) - 1)]
+                    recover_delta = np.asarray(
+                        env.convert_target_joint_position_to_action(nxt),
+                        dtype=np.float64)
+                    tries = int(params.dart_reach_max_tries)
+
+                eps = None
+                for _ in range(max(tries, 1)):
+                    cand = rng.multivariate_normal(np.zeros(6), sig_step)
+                    if recover_delta is None or _jolt_is_safe(
+                            pc, cand, recover_delta,
+                            clearance=params.dart_reach_clearance,
+                            path_steps=params.dart_reach_path_steps):
+                        eps = cand
+                        break
+                    n_dart_reject += 1
+
+                if eps is None:
+                    # Every draw was refused: take the clean expert step rather
+                    # than force an unsafe one. Counted in n_dart_reject above.
+                    target_jp = expert_target_jp
+                    exec_delta = expert_delta
+                else:
+                    exec_delta = (np.asarray(expert_delta, dtype=np.float64)
+                                  + eps).astype(np.float32)
+                    target_jp = action_to_target_joint(
+                        np.concatenate([exec_delta, [1.0]]).astype(np.float32), obs)
+                    n_dart_noise += 1
+            else:
+                target_jp = expert_target_jp
+                exec_delta = expert_delta
         else:
             if policy_action[6] < 0.5:
                 # Count and timestamp the premature close REGARDLESS of what we
@@ -708,7 +1051,7 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         prev_act6d = np.asarray(exec_delta, dtype=np.float32).copy()
 
         for _ in range(sim.steps_action_repeat):
-            obs, _, done, _ = env.step(target_jp)
+            obs, _, done, info = env.step(target_jp)
             if done:
                 break
 
@@ -718,9 +1061,26 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
 
         if ended_on_close:
             reason = "POLICY_CLOSE"
+            # The POLICY committed this close, so unlike CLOSE_LABEL this scores
+            # the learner's own decision — the same thing the evaluator measures,
+            # just at beta > 0 and on a collection scene.
+            if params.outcome_check:
+                held, obs = grasp_held_after_hold(
+                    env, obs, sim.steps_action_repeat, params.hold_steps)
+                ep_success = int(held)
+                outcome = ("GRASP_OK" if held
+                           else "DROP" if bool(getattr(env, "_dropped", False))
+                           else "NO_RELEASE" if not bool(env.ycb.released)
+                           else "GRASP_MISS")
             break
         if done:
             reason = "ENV_DONE"
+            # `info["status"]` was discarded before run 18, which is why ENV_DONE
+            # was an undifferentiated bucket. It carries the benchmark's own
+            # failure flags, so this is where HUMAN_CONTACT / DROP / BENCH_TIMEOUT
+            # comes from — no extra simulation needed.
+            if params.outcome_check:
+                outcome = _status_name(int(info.get("status", 0)))
             # The benchmark just killed the episode — usually the object knocked
             # out of the hand by the lateral swing into the pre-grasp pose. WHO
             # drove this step decides whether the pair we just recorded is
@@ -754,6 +1114,11 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                 n_dropped_tail = 1
             break
 
+    # Loop exhausted without closing and without the benchmark ending it — the
+    # same TIMEOUT the evaluator's for/else records, so the taxonomies line up.
+    if params.outcome_check and not outcome:
+        outcome = "TIMEOUT"
+
     if len(expert_actions) == 0:
         # Reachable via the ENV_DONE pop above when the episode had exactly one
         # label and the expert's step is what ended it: nothing usable is left.
@@ -776,6 +1141,18 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         "skipped": False,
         "steps": len(expert_actions),
         "reason": reason,
+        # `reason` is WHY THE LOOP STOPPED; `outcome` is WHAT HAPPENED to the
+        # handover, on the evaluator's taxonomy (GRASP_OK / GRASP_MISS /
+        # NO_RELEASE / DROP / HUMAN_CONTACT / BENCH_TIMEOUT / TIMEOUT). Empty
+        # unless params.outcome_check. `success` is the stable-grasp criterion, so
+        # it is directly comparable to EVAL's success_rate — with the caveat that
+        # a collection episode is driven by the beta MIXTURE, not by the policy.
+        "outcome": outcome,
+        "success": int(ep_success),
+        # DART Sigma estimator, summed not averaged — see the accumulator above.
+        "dart_dd_sum": dart_dd_sum,
+        "dart_dd_n": int(dart_dd_n),
+        "n_dart_noise": int(n_dart_noise),
         "n_omg_fail": n_omg_fail,
         "n_goal_switch": n_goal_switch,
         "n_expert_steps": n_expert_steps,
@@ -933,7 +1310,17 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
            "n_close_labels": 0, "n_approach_labels": 0, "sum_label_pos": 0.0,
            "n_tiny_labels": 0, "n_revisits": 0, "n_grasp_mismatch": 0,
            "max_grasp_drift": 0.0,
-           "min_pos": [], "min_rot": [], "close_steps": [], "reasons": {}}
+           "min_pos": [], "min_rot": [], "close_steps": [], "reasons": {},
+           # params.outcome_check only. `outcomes` is keyed on the EVALUATOR's
+           # taxonomy and counted over KEPT episodes only, so its counts stack to
+           # `episodes` and can be read as fractions; `reasons` above is the
+           # terminal cause and counts skipped episodes too.
+           "outcomes": {}, "success": 0,
+           # DART: pooled sum(d d^T) and step count over the whole iteration.
+           # `sigma_hat` = sum / n is paper Eq. 3; the driver rescales it (Eq. 4)
+           # and hands it back as the NEXT iteration's dart_sigma.
+           "dart_dd_sum": np.zeros((6, 6), dtype=np.float64),
+           "dart_dd_n": 0, "n_dart_noise": 0}
 
     writer = DaggerHDF5Writer(out_path, attrs={
         "iteration": int(iteration),
@@ -983,6 +1370,14 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
                     pin_table=pin_table)
 
             agg["n_omg_fail"] += st.get("n_omg_fail", 0)
+            # Pooled OUTSIDE the `episode is None` guard: a skipped episode still
+            # produced learner-supervisor comparisons before it was dropped, and
+            # the estimator wants every one of them. (`.get` because the early
+            # returns for OMG_FAIL_STEP0 / NO_LABELS carry no estimator fields.)
+            if st.get("dart_dd_n"):
+                agg["dart_dd_sum"] += st["dart_dd_sum"]
+                agg["dart_dd_n"] += int(st["dart_dd_n"])
+            agg["n_dart_noise"] += int(st.get("n_dart_noise", 0))
             agg["reasons"][st["reason"]] = agg["reasons"].get(st["reason"], 0) + 1
             if episode is None:
                 agg["skipped"] += 1
@@ -990,6 +1385,10 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
                 writer.append(episode)
                 agg["episodes"] += 1
                 agg["steps"] += st["steps"]
+                if st.get("outcome"):
+                    agg["outcomes"][st["outcome"]] = (
+                        agg["outcomes"].get(st["outcome"], 0) + 1)
+                agg["success"] += int(st.get("success", 0))
                 agg["n_goal_switch"] += st["n_goal_switch"]
                 agg["n_expert_steps"] += st["n_expert_steps"]
                 agg["pinned"] += st["pinned"]
@@ -1045,4 +1444,11 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
                              if agg["n_approach_labels"] else float("nan"))
     agg.pop("sum_label_pos")
     agg["path"] = str(out_path)
+    # DART paper Eq. 3: Sigma_hat = (1/T) sum_t (pi_theta - pi*)(pi_theta - pi*)^T.
+    # Left UNSCALED here — Eq. 4's trace target belongs to the driver, which is
+    # the only place that knows tr(Sigma_hat_1) from the first iteration.
+    agg["dart_sigma_hat"] = (agg["dart_dd_sum"] / agg["dart_dd_n"]
+                             if agg["dart_dd_n"] else None)
+    agg["dart_sigma_trace"] = (float(np.trace(agg["dart_sigma_hat"]))
+                               if agg["dart_sigma_hat"] is not None else float("nan"))
     return agg

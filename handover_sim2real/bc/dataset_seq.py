@@ -31,7 +31,15 @@ action[6] (binary gripper) and the point cloud left untouched.
 
 from __future__ import annotations
 
-import h5py
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import h5py                                 # annotations only
+else:
+    try:
+        import h5py
+    except ModuleNotFoundError:                 # pragma: no cover - deployment only
+        h5py = None                             # see the note in dataset.py
 import numpy as np
 import torch
 from torch.utils.data import Dataset

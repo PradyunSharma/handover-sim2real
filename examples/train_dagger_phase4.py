@@ -59,6 +59,7 @@ import os
 import random
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling example modules
@@ -85,6 +86,8 @@ from handover_sim2real.dagger import (
     build_sim_cfg,
     build_sim_context,
     collect_iteration,
+    dart_alpha_at,
+    dart_scaled_sigma,
     evaluate_policy,
     export_run_dir,
     GraspRegistry,
@@ -360,9 +363,22 @@ LOG_FIELDS = [
     "omg_fail", "goal_switch", "expert_steps", "policy_closed",
     "policy_close_cmds", "dropped_tail", "dart", "dart_env_done",
     "dart_reach", "dart_reject",
+    # DART-paper noise (DAGGER.dart_mode: dart_noise). `dart_sigma_trace` is
+    # tr(Sigma_hat), the measured learner-supervisor error, and is logged in BOTH
+    # modes — in a jolt run it is the counterfactual "what the noise would have
+    # been". `dart_noise_steps` is how many expert steps were actually perturbed.
+    "dart_sigma_trace", "dart_noise_steps", "dart_alpha",
     "mean_min_pos", "mean_min_rot", "mean_policy_close_step",
     "c_close_label", "c_policy_close", "c_max_steps", "c_env_done", "c_no_labels",
     "c_omg_fail0",
+    # -- collection OUTCOME (DAGGER.outcome_check; 0 for runs that leave it off).
+    # `c_*` above is the loop's terminal cause; these are what happened to the
+    # handover, on the evaluator's taxonomy, as fractions of the kept episodes so
+    # they stack to 1.0. `c_success_rate` is the same stable-grasp criterion as
+    # `success_rate`, but measured on the beta MIXTURE, not on the policy alone.
+    "c_success_rate",
+    "co_grasp_ok", "co_grasp_miss", "co_no_release", "co_drop",
+    "co_human_contact", "co_bench_timeout", "co_timeout",
     # -- did a revisited scene still aim at the same grasp (pin verification)
     "revisits", "grasp_mismatch", "max_grasp_drift",
     # -- (4) labels
@@ -395,6 +411,14 @@ COLLECT_REASONS = {"CLOSE_LABEL": "c_close_label", "POLICY_CLOSE": "c_policy_clo
 EVAL_REASONS = {"GRASP_OK": "f_grasp_ok", "GRASP_MISS": "f_grasp_miss",
                 "NO_RELEASE": "f_no_release", "DROP": "f_drop",
                 "TIMEOUT": "f_timeout", "HUMAN_CONTACT": "f_human_contact"}
+# Collection outcomes (DAGGER.outcome_check). Same taxonomy as EVAL_REASONS plus
+# BENCH_TIMEOUT, which eval cannot produce: eval stops at EVAL.max_steps (50) well
+# inside the benchmark's own 86.7-step limit, whereas collection now runs to 70 and
+# an episode that also stalls can be killed by the benchmark instead.
+COLLECT_OUTCOMES = {"GRASP_OK": "co_grasp_ok", "GRASP_MISS": "co_grasp_miss",
+                    "NO_RELEASE": "co_no_release", "DROP": "co_drop",
+                    "HUMAN_CONTACT": "co_human_contact",
+                    "BENCH_TIMEOUT": "co_bench_timeout", "TIMEOUT": "co_timeout"}
 
 
 def reason_columns(reasons: dict, mapping: dict, denom: int | None = None) -> dict:
@@ -458,6 +482,9 @@ def collect_columns(c: dict) -> dict:
         "dart_env_done": c.get("n_dart_env_done", -1),
         "dart_reach": c.get("n_dart_reach", -1),
         "dart_reject": c.get("n_dart_reject", -1),
+        "dart_sigma_trace": _r(c.get("dart_sigma_trace"), 6),
+        "dart_noise_steps": c.get("n_dart_noise", -1),
+        "dart_alpha": _r(c.get("dart_alpha"), 4),
         "mean_min_pos": _r(c.get("mean_min_pos")),
         "mean_min_rot": _r(c.get("mean_min_rot")),
         "mean_policy_close_step": _r(c.get("mean_policy_close_step"), 2),
@@ -469,6 +496,13 @@ def collect_columns(c: dict) -> dict:
         "grasp_mismatch": c.get("n_grasp_mismatch", -1),
         "max_grasp_drift": _r(c.get("max_grasp_drift")),
         **reason_columns(c.get("reasons"), COLLECT_REASONS),
+        # Fractions of KEPT episodes (denom=episodes), so the co_* block stacks to
+        # 1.0 and is directly readable against the eval f_* block. All zero when
+        # DAGGER.outcome_check is off, which is what runs 1-17 record.
+        "c_success_rate": _r(
+            (c.get("success", 0) / c["episodes"]) if c.get("episodes") else None),
+        **reason_columns(c.get("outcomes"), COLLECT_OUTCOMES,
+                         denom=c.get("episodes") or None),
     }
 
 
@@ -650,6 +684,32 @@ def main() -> None:
         # from, so it falls back to the horizon the demonstrations were planned
         # with (collect_bc_dataset.py uses cfg.RL_MAX_STEP).
         first_horizon=int(dag.get("first_horizon") or sim_cfg.RL_MAX_STEP),
+        # Planner-free pre-grasp (run 18). Default false, so a config that omits
+        # the key collects exactly what runs 1-17 collected. standoff_dist is
+        # mirrored from the SIM block — it is OMG's own constant, not a second
+        # free parameter, and reading it from anywhere else would let the
+        # derivation disagree with the waypoints the planner actually returns.
+        derive_standoff=bool(dag.get("derive_standoff", False)),
+        standoff_dist=float(sim_cfg_d.get("standoff_dist", 0.08)),
+        # Per-episode outcome scoring (run 18). Default false => runs 1-17 spend
+        # no extra sim steps and log zeros in the co_* columns. hold_steps is
+        # taken from the EVAL block so the collection and eval criteria cannot
+        # drift apart — they are the same `grasp_held_after_hold` call.
+        outcome_check=bool(dag.get("outcome_check", False)),
+        hold_steps=int(ev.get("hold_steps", 3)),
+        # DART-paper noise (run 18). "jolt" is the runs 1-17 behaviour and the
+        # default, so an unset key changes nothing. `dart_sigma` is seeded from
+        # state.json on resume so a restarted run keeps the covariance it had
+        # rather than dropping back to the bootstrap.
+        dart_mode=str(dag.get("dart_mode", "jolt")),
+        dart_alpha_scale=float(dag.get("dart_alpha_scale", 3.0)),
+        dart_alpha_end=float(dag.get("dart_alpha_end",
+                                     dag.get("dart_alpha_scale", 3.0))),
+        dart_noise_ratio=float(dag.get("dart_noise_ratio", 1.0)),
+        dart_reach_pos_scale=float(dag.get("dart_reach_pos_scale", 0.3005)),
+        dart_reach_rot_scale=float(dag.get("dart_reach_rot_scale", 1.0)),
+        dart_sigma=(np.asarray(state["dart_sigma"], dtype=np.float64)
+                    if state.get("dart_sigma") is not None else None),
         reach_commit_dist=float(dag.get("reach_commit_dist", 0.05)),
         reach_skip_eps=float(dag.get("reach_skip_eps", 0.01)),
         expert_after_commit=bool(dag.get("expert_after_commit", False)),
@@ -903,6 +963,47 @@ def main() -> None:
                      f"(rejected={cstats.get('n_dart_reject', -1)}) "
                      if collect_params.dart_reach_ratio > 0.0 else "")
                   + f"omg_fail={cstats['n_omg_fail']} reasons={cstats['reasons']}")
+
+        # alpha governing THIS iteration's noise (iteration 1 uses the psi_0
+        # bootstrap instead, since no error has been measured yet).
+        cstats["dart_alpha"] = dart_alpha_at(
+            i, num_iters, collect_params.dart_alpha_scale,
+            collect_params.dart_alpha_end)
+
+        # --- DART: re-estimate Sigma from THIS iteration's learner-supervisor
+        # discrepancy and hand it to the next one (paper Alg. 1 steps 3-5).
+        # Runs whatever the mode, so a jolt run still records what the noise would
+        # have been; only dart_noise consumes it.
+        sig_hat = cstats.get("dart_sigma_hat")
+        if sig_hat is not None:
+            tr_hat = float(np.trace(sig_hat))
+            # The ANCHOR is the first iteration's measured error, tr(Sigma_hat_1),
+            # and never moves — so a learner that gets worse is not answered with
+            # more noise (the paper's Eq. 4 safeguard). Persisted so a resumed run
+            # re-anchors to the same value rather than to whichever iteration it
+            # happened to restart on.
+            if state.get("dart_trace_anchor") is None:
+                state["dart_trace_anchor"] = tr_hat
+                print(f"  [dart] anchoring to iteration {i:02d}: "
+                      f"tr(Sigma_hat_1)={tr_hat:.3e}")
+            # alpha is annealed across iterations (dart_alpha_scale ->
+            # dart_alpha_end), so the noise LEVEL decays as the learner improves
+            # while its SHAPE keeps tracking the current error directions. i+1
+            # because the Sigma estimated now is the one the NEXT iteration uses.
+            alpha_next = dart_alpha_at(i + 1, num_iters,
+                                       collect_params.dart_alpha_scale,
+                                       collect_params.dart_alpha_end)
+            sigma_next = dart_scaled_sigma(
+                sig_hat, alpha_next * state["dart_trace_anchor"])
+            collect_params = replace(collect_params, dart_sigma=sigma_next)
+            state["dart_sigma"] = sigma_next.tolist()
+            state["dart_alpha"] = float(alpha_next)
+            if collect_params.dart_mode == "dart_noise":
+                print(f"  [dart] tr(Sigma_hat)={tr_hat:.3e}  alpha[{i+1:02d}]="
+                      f"{alpha_next:.3f} -> Sigma^alpha diag sd "
+                      f"pos={np.sqrt(np.diag(sigma_next)[:3]).round(4).tolist()} m "
+                      f"rot={np.sqrt(np.diag(sigma_next)[3:]).round(4).tolist()} rad "
+                      f"(noised {cstats.get('n_dart_noise', 0)} expert steps)")
 
         collect_s = time.time() - t_collect
 

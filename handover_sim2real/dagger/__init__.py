@@ -52,6 +52,10 @@ from .collector import (
     collect_dagger_episode,
     collect_iteration,
     DaggerHDF5Writer,
+    dart_alpha_at,
+    dart_bootstrap_sigma,
+    dart_scaled_sigma,
+    derived_standoff_pose,
 )
 from .grasp_box import BoxParams, build_box_params, grasp_opportunity
 from .evaluator import EvalParams, evaluate_policy
@@ -79,6 +83,10 @@ __all__ = [
     "CollectParams",
     "collect_dagger_episode",
     "collect_iteration",
+    "dart_alpha_at",
+    "dart_bootstrap_sigma",
+    "dart_scaled_sigma",
+    "derived_standoff_pose",
     "DaggerHDF5Writer",
     "BoxParams",
     "build_box_params",
