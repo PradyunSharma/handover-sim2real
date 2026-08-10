@@ -65,3 +65,12 @@ venv*/*
 
 # Jupyter files
 *checkpoint.ipynb
+
+# Generated figures
+# Plots are derived artifacts — regenerate them from the tracked .csv rather
+# than storing them. The run plots under output/ are handled by output/.gitignore,
+# which is deny-all and simply stops re-including *.png; this rule covers
+# everywhere else. docs/ images are hand-written documentation, so keep those.
+# Adding a genuinely new figure elsewhere needs `git add -f`.
+*.png
+!docs/*.png

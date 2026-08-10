@@ -18,21 +18,29 @@
 !rl_runs/
 !rl_runs/*/
 !rl_runs/*/*.csv
-!rl_runs/*/*.png
 !rl_runs/*/*.yaml
 !rl_runs/*/*.npz
 rl_runs/*/checkpoints/
 
 # Same policy for dagger_runs/ — track the lightweight per-run metadata (log,
-# config, state, grasp registry, curves) but NOT the large per-iter checkpoints
-# and demo data (best/ last/ iters/ data/ — ~1 GB/run). Only files DIRECTLY in
-# the run dir are re-included; the heavy subdirs stay ignored (one level deeper).
+# config, state, grasp registry) but NOT the large per-iter checkpoints and demo
+# data (best/ last/ iters/ data/ — ~1 GB/run). Only files DIRECTLY in the run
+# dir are re-included; the heavy subdirs stay ignored (one level deeper).
+#
+# *.png is deliberately NOT re-included here (nor under rl_runs/ above).
+# curves.png, curves_diag.png and scene_eval_*.png are DERIVED — they replot the
+# dagger_log.csv / scene_eval_*.csv that ARE tracked, via plot_dagger_run.py and
+# eval_run_scenes.py — and they were 32 MB across 84 files, by far the largest
+# thing in the repo. Regenerate rather than store. Contrast normalization.npz
+# (~1.3 KB), re-included below: the checkpoint payload does NOT carry the
+# Normalizer and the .h5 it was fitted on lives on /scratch and is never
+# committed, so the .npz is the only surviving record of how to denormalize a
+# policy's output. That one is primary, not derived.
 !dagger_runs/
 !dagger_runs/*/
 !dagger_runs/*/*.csv
 !dagger_runs/*/*.json
 !dagger_runs/*/*.yaml
-!dagger_runs/*/*.png
 !dagger_runs/*/*.npz
 # per-iter logs/metadata (dagger_runs/*/iters/iter_NN/) — track the small
 # log.csv/config/normalization, but the per-iter checkpoints/ (21 MB .pt each)
