@@ -334,10 +334,33 @@ def load_state(path: Path) -> dict:
     return {"iterations": [], "best": None, "cursor": 0}
 
 
+def _json_safe(o):
+    """json.dump `default=` for numpy leaking into the state dict.
+
+    `state["iterations"][k]["collect"]` is the collector's aggregate handed
+    through verbatim, so ANY numpy value a future metric puts there would kill
+    the run at the first save — which is exactly what run 18 hit: the DART Sigma
+    estimator added two 6x6 ndarrays and json.dump raised four levels down
+    (state -> iterations -> rec -> collect). Converting here rather than only
+    fixing that one metric means the next one cannot reproduce it.
+
+    Deliberately narrow: numpy scalars and arrays only. Anything else still
+    raises, because a genuinely unserialisable object in the resume state is a
+    bug worth surfacing, not worth stringifying.
+    """
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, np.generic):      # np.float64/int64/bool_ etc.
+        return o.item()
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
 def save_state(path: Path, state: dict) -> None:
+    # tmp + atomic replace: if the dump raises, the PREVIOUS state.json is left
+    # intact rather than truncated, so a crashed run still resumes.
     tmp = path.with_suffix(".json.tmp")
     with tmp.open("w") as f:
-        json.dump(state, f, indent=2)
+        json.dump(state, f, indent=2, default=_json_safe)
     tmp.replace(path)
 
 

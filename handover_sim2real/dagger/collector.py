@@ -1449,6 +1449,12 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
     # the only place that knows tr(Sigma_hat_1) from the first iteration.
     agg["dart_sigma_hat"] = (agg["dart_dd_sum"] / agg["dart_dd_n"]
                              if agg["dart_dd_n"] else None)
+    # Drop the raw accumulator: the driver only ever reads `dart_sigma_hat`, and
+    # this dict is embedded verbatim in state.json, where 36 floats of an
+    # un-normalised intermediate are pure noise. (`dart_sigma_hat` itself stays —
+    # the covariance's evolution across iterations is worth being able to read
+    # back — and save_state's `default=` handles the array.)
+    agg.pop("dart_dd_sum", None)
     agg["dart_sigma_trace"] = (float(np.trace(agg["dart_sigma_hat"]))
                                if agg["dart_sigma_hat"] is not None else float("nan"))
     return agg
