@@ -25,10 +25,15 @@ class RealSenseCamera:
         color_size: Tuple[int, int] = (640, 480),
         depth_size: Tuple[int, int] = (640, 480),
         fps: int = 30,
+        serial: Optional[str] = None,
     ) -> None:
         self.color_size = color_size
         self.depth_size = depth_size
         self.fps = fps
+        # With more than one RealSense attached, librealsense binds whichever it
+        # enumerates first. Pin the device when it matters — the wrist and the
+        # tripod camera are not interchangeable.
+        self.serial = serial
 
         self.pipeline = rs.pipeline()
         self.config = rs.config()
@@ -39,6 +44,8 @@ class RealSenseCamera:
         self.started = False
 
     def start(self) -> None:
+        if self.serial is not None:
+            self.config.enable_device(str(self.serial))
         self.config.enable_stream(
             rs.stream.color,
             self.color_size[0],

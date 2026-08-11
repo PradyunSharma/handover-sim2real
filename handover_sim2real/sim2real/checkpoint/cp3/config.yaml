@@ -1,0 +1,73 @@
+# Deployment config for the checkpoint in this directory.
+#
+# PROVENANCE: DAgger run 16, iteration 16 (the last is_best row in
+#   output/dagger_runs/dagger4_run16/dagger_log.csv — val success_rate = 0.80,
+#   the best of the 26 iterations; iters 17-25 never beat it).
+#
+# This file is a trimmed copy of
+#   output/dagger_runs/dagger4_run16/iters/iter_16/config.yaml
+# with the training-only fields dropped, exactly as cp2/config.yaml was trimmed
+# from run 12. load_bc_policy() reads DATA.{pc_channels,robot_state_dim,
+# action_dim} and the MODEL block and nothing else, so these are dropped:
+#   DATA.train_h5 / DATA.val_h5     paths on the DelftBlue scratch filesystem
+#   DATA.reach_tail{,_weight}       training-time sampler weighting
+#   MODEL.pc_pretrained             encoder warm-start, already baked into best.pt
+#   OPTIM / LOSS / TRAIN            training-time only
+# Every field below is copied verbatim and must not be edited: each one changes
+# the tensor shapes, so a mismatch makes best.pt fail to strict-load (or, worse
+# for use_prev_act/drop_joint_state, silently feed the wrong state channels).
+#
+# ---------------------------------------------------------------------------
+# HOW cp3 DIFFERS FROM cp2 — read this before swapping the runner over.
+#
+# 1. THREE CAMERAS, NOT ONE. run 16 used SIM.cfg_file examples/
+#    pretrain_multicam_wlr.yaml, i.e. CAMERAS: ["wrist", "left", "right"] — the
+#    eye-in-hand view fused with two fixed side views. run 12 (cp2) was
+#    wrist-only. The observation the network was fit on therefore contains
+#    object and hand points that the wrist camera cannot see, which is the whole
+#    point of the config: the wrist view loses the object during the final few
+#    centimetres of the approach, and the side views do not.
+#
+#    Deployment consequence: driving this checkpoint from the wrist camera alone
+#    is an input-distribution change, not just a slightly noisier observation.
+#    Use --cameras wrist,tripod (see pointcloud_multicam.py).
+#
+# 2. THE TENSOR LAYOUT IS UNCHANGED. pretrain_multicam_wlr.yaml deliberately
+#    leaves COMPUTE_ROBOT_POINT_STATE False, so there are still exactly TWO
+#    classes ([object, hand]) and pc_channels stays 5 — xyz + object one-hot +
+#    hand one-hot, 896 object + 128 hand = 1024. Identical to cp2. The extra
+#    cameras change which points fill those slots, not how many or in what
+#    format, so build_policy_cloud() needs no per-checkpoint branch.
+#
+# 3. IT HAS AN AUX HEAD. run 16 inherits aux_head/aux_dim/aux_hidden from
+#    examples/configs/bc_phase4_all.yaml. These add state_dict keys, so they must
+#    be present here or the strict load fails. The head predicts the goal grasp
+#    in the current EE frame; the runner never reads it (BCPolicy.predict returns
+#    the action branch only), it exists so the weights load.
+
+DATA:
+  pc_channels: 5          # xyz(3) + ycb_flag(1) + hand_flag(1), EE (panda_hand) frame
+  robot_state_dim: 32     # joint_pos(9)+joint_vel(9)+ee_xyz(3)+ee_wxyz(4)+gripper(1)+prev_act(6)
+  action_dim: 7           # dpos(3) + deuler(3) + gripper_cmd(1)
+MODEL:
+  feature_dim: 256
+  robot_hidden: 128
+  policy_hidden:
+  - 256
+  - 256
+  pointnet_scale: 1
+  pointnet_radius: 0.02
+  pointnet_nclusters: 32
+  # These two trim the 32-D robot state down to the 8 channels the robot encoder
+  # was actually fit on: ee_xyz(3) + ee_wxyz(4) + gripper_norm(1), i.e. rs[18:26].
+  use_prev_act: false     # drops the trailing prev_act(6)
+  drop_joint_state: true  # drops the leading joint_pos(9)+joint_vel(9)
+  joint_state_dim: 18
+  # Auxiliary goal-grasp head — NOT present in cp2. Weights only; unused at
+  # inference, but required for the state dict to match.
+  aux_head: true
+  aux_dim: 7
+  aux_hidden:
+  - 256
+  - 256
+  freeze_pc: false

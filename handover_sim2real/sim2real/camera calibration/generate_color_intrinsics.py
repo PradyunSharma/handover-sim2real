@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
-import json
+"""Export the camera's colour intrinsics into a session.
+
+    python generate_color_intrinsics.py --session 2026-08-11 --role tripod
+
+Intrinsics are resolution-specific: whatever is exported here must match the
+capture resolution and the resolution the runner streams at.
+"""
+
+from __future__ import annotations
+
 import argparse
+import json
+
 import pyrealsense2 as rs
 
-# run like this -> python export_realsense_intrinsics.py --stream color --width 640 --height 480 --fps 30 --output color_intrinsics.json
+import calib_common as cc
+import calib_config as cfg
 
 
-def intrinsics_to_dict(intr):
+def intrinsics_to_dict(intr) -> dict:
     return {
-        "camera_matrix": [
-            [float(intr.fx), 0.0, float(intr.ppx)],
-            [0.0, float(intr.fy), float(intr.ppy)],
-            [0.0, 0.0, 1.0],
-        ],
+        "camera_matrix": [[float(intr.fx), 0.0, float(intr.ppx)],
+                          [0.0, float(intr.fy), float(intr.ppy)],
+                          [0.0, 0.0, 1.0]],
         "dist_coeffs": [float(x) for x in intr.coeffs[:5]],
         "width": int(intr.width),
         "height": int(intr.height),
@@ -20,44 +30,31 @@ def intrinsics_to_dict(intr):
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Export RealSense intrinsics to color_intrinsics.json for calibrate.py"
-    )
-    parser.add_argument("--stream", choices=["color", "depth"], default="color",
-                        help="Which stream intrinsics to export. Use color if checkerboard detection is on RGB images.")
-    parser.add_argument("--width", type=int, default=640, help="Stream width")
-    parser.add_argument("--height", type=int, default=480, help="Stream height")
-    parser.add_argument("--fps", type=int, default=30, help="Stream fps")
-    parser.add_argument("--output", type=str, default="color_intrinsics.json",
-                        help="Output json file")
-    args = parser.parse_args()
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    cc.add_session_arg(p)
+    cc.add_camera_args(p)
+    p.add_argument("--stream", choices=["color", "depth"], default="color")
+    args = p.parse_args()
+
+    session = cc.resolve_session(args.session, create=True)
+    serial = cc.resolve_serial(args.serial, args.role)
 
     pipeline = rs.pipeline()
     config = rs.config()
-
-    if args.stream == "color":
-        config.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
-    else:
-        config.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16, args.fps)
+    config.enable_device(serial)
+    stream = rs.stream.color if args.stream == "color" else rs.stream.depth
+    fmt = rs.format.bgr8 if args.stream == "color" else rs.format.z16
+    config.enable_stream(stream, cfg.STREAM.width, cfg.STREAM.height, fmt, cfg.STREAM.fps)
 
     profile = pipeline.start(config)
-
     try:
-        if args.stream == "color":
-            vsp = profile.get_stream(rs.stream.color).as_video_stream_profile()
-        else:
-            vsp = profile.get_stream(rs.stream.depth).as_video_stream_profile()
-
-        intr = vsp.get_intrinsics()
+        intr = profile.get_stream(stream).as_video_stream_profile().get_intrinsics()
         data = intrinsics_to_dict(intr)
-
-        with open(args.output, "w") as f:
-            json.dump(data, f, indent=2)
-
-        print(f"Saved intrinsics to: {args.output}")
+        session.intrinsics_json.write_text(json.dumps(data, indent=2))
+        print(f"wrote {session.intrinsics_json}")
         print(json.dumps(data, indent=2))
-
     finally:
         pipeline.stop()
 
