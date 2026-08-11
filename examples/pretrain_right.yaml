@@ -1,0 +1,93 @@
+# Simulator config for PHASE 4 — RIGHT CAMERA ONLY, TWO point classes.
+#
+# = examples/pretrain_multicam_wlr.yaml with CAMERAS reduced from
+# ["wrist", "left", "right"] to ["right"]. Pass with: SIM.cfg_file in the Phase-4
+# run config, and SIM_CFG=... when collecting the demonstrations.
+#
+# NO WRIST CAMERA. This is the substantive difference from every Phase-4 run so
+# far, not just a count. Runs 1-14 were wrist-only, runs 15-17 were wrist + two
+# side views; both always had the eye-in-hand view. Here the policy sees ONE
+# FIXED WORLD-FRAME CAMERA and nothing else.
+#
+# WHY THAT IS WORTH TESTING. It is the configuration the real robot actually has:
+# handover_sim2real/sim2real/ drives a fixed RealSense, not a wrist camera. A
+# policy trained on a wrist view has no path to that hardware, so every sim
+# number from a wrist-camera run overstates what is deployable. This run measures
+# the cost of the viewpoint the real setup can supply.
+#
+# WHAT IT COSTS, HONESTLY. The wrist camera's weakness is that it loses the object
+# in the last few centimetres, which is why the side views were added in run 15.
+# A fixed side camera has the opposite failure: it keeps object and hand in frame
+# throughout, but the ARM occludes them as it comes in, and exactly at the endgame.
+# Neither view is complete on its own; expect this to be harder than run 16 rather
+# than a free simplification, and read `co_human_contact` / `co_grasp_miss` in the
+# new collection-outcome block to see which way it fails.
+#
+# THE CLOUD IS STILL IN EE FRAME. Nothing about the frame convention changes — the
+# fixed camera deprojects to world and the env converts world -> hand link frame,
+# exactly as it does for left/right in the wlr config. So the observation contract
+# the policy sees is unchanged; only the viewpoint filling it is.
+#
+# TWO CLASSES, 5 CHANNELS — inherited deliberately from the wlr config, NOT from
+# pretrain_multicam.yaml. COMPUTE_ROBOT_POINT_STATE stays False, so:
+#   classes      [object, hand]
+#   pc_channels  3 + 2 = 5   xyz + object one-hot + hand one-hot
+# which keeps DATA.pc_channels unchanged and keeps the CVPR2023 PointNet++ warm
+# start transferring all 68/68 encoder tensors. Turning the robot class on would
+# be a second change and would cost the first SA conv.
+#
+# Leaving the robot class off matters more here than it did with three cameras:
+# with one fixed view the arm is a large foreground blob directly between the
+# camera and the object, so admitting it would spend a large share of the 1024
+# points on geometry the policy already has in robot_state.
+#
+# MERGE RATIOS. Not set, same as the wlr config: POLICY.POINT_STATE_RATIOS is
+# ignored for 2 classes (handover_sim2real/policy.py:34), so the split comes from
+# POLICY.POINT_STATE_YCB_RATIO (0.875) = 896 object + 128 hand of 1024. Identical
+# class balance to every previous run; only the viewpoint differs.
+#
+# CAMERA GEOMETRY. `right` is an elevated side view ~1 m out, placed orthogonal to
+# the robot->human +Y approach so the arm does not self-occlude it, aimed at the
+# measured DexYCB handover-object mean (0.52, 0.25, 1.23). Pose defaults live in
+# the handover config (_HCPS.CAMERA_RIGHT_POSITION/TARGET). Inspect before
+# collecting a whole dataset against it:
+#     python examples/viz_cameras_pybullet.py --sim-cfg examples/pretrain_right.yaml
+# and override below if the render shows the arm sitting in front of the object.
+#
+# CONSISTENCY — THE THING THAT WILL BITE. The demonstrations and the DAgger
+# collections MUST use this same file. There is no right-camera base dataset yet;
+# one has to be collected with SIM_CFG=examples/pretrain_right.yaml before any run
+# can use this. Pointing a run at a wrist-only or wlr base set would put two input
+# distributions in one aggregate, which is the single inconsistency DAgger cannot
+# average away.
+ENV:
+  ID: HandoverSim2RealTrainEnv-v1
+  YCB_MANO_START_FRAME: last
+  YCB_LOAD_MODE: grasp_only
+  MANO_SIMULATION_MODE: disable_control_and_move_by_reset
+  HANDOVER_HAND_CAMERA_POINT_STATE_ENV:
+    COMPUTE_MANO_POINT_STATE: True
+    COMPUTE_ROBOT_POINT_STATE: False    # NO robot class — object + hand only (2 classes)
+    CAMERAS: ["right"]                  # ONE fixed side camera, no eye-in-hand
+    # --- override the fixed pose here after inspecting a render, e.g.: ---
+    # CAMERA_RIGHT_POSITION: (-0.40, 0.25, 1.55)
+    # CAMERA_RIGHT_TARGET:   (0.52, 0.25, 1.23)
+BENCHMARK:
+  SPLIT: train
+RL_MEMORY_SIZE: 500000
+RL_TRAIN:
+  batch_size: 128
+  updates_per_step: 20
+  mix_policy_ratio_list: [0.1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
+  dagger: True
+  online_buffer_ratio: 0.7
+  onpolicy: True
+  max_epoch: 200000
+  num_remotes: 3
+  init_distance_low: 0.25
+  explore_ratio_list: [0.5]
+  DAGGER_MAX_STEP: 12
+  EXPERT_INIT_MIN_STEP: 3
+  fill_data_step: 30
+  HANDOVER_SIM2REAL:
+    stage: pretrain
