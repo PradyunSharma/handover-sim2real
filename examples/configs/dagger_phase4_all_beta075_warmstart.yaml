@@ -1,0 +1,984 @@
+# Phase-4 DAgger — RUN 16 WITH THE REFIT WARM-STARTED, NOT RESTARTED (run 20).
+#
+# = examples/configs/dagger_phase4_all_beta075.yaml (run 16) with ONE line
+# changed:
+#
+#     TRAIN.train_from_scratch: true -> false
+#
+# plus DAGGER.outcome_check: true, which is logging only — the collector executes
+# and scores the close AFTER the labels are frozen, and D_i is byte-identical
+# either way (verified 8/8 episodes in run 18). It is standard for every new run
+# and does not cost the one-variable comparison. Everything else — three-camera
+# demos, flat beta 0.75, 25 iterations, jolt DART, max_steps 50, eval — is run 16
+# byte-for-byte, so run 20 vs run 16 IS a clean A/B of the refit strategy.
+#
+# WHAT THE FLAG ACTUALLY DOES. Each iteration still fits the FULL aggregate
+# D = base u D_1 u ... u D_i for iter_epochs. The objective does not change; only
+# the initialisation does. `false` loads the previous iteration's
+# checkpoints/last.pt into the new model instead of starting from the CVPR2023
+# PointNet++ warm start with fresh heads. This is NOT sequential fine-tuning on
+# the new shard — that would be a different (and much riskier) experiment.
+#
+# WHY IT IS WORTH A RUN, measured on run 16's own per-iteration logs rather than
+# argued. Every iteration of run 16 restarts at essentially the same place and
+# never gets far:
+#
+#     iter   train_pose_pm_mm at epoch 0 -> epoch 24
+#     01     26.6 -> 10.25
+#     10     25.9 -> 14.37
+#     25     24.8 -> 14.26
+#
+# The epoch-0 column is the random-init value (iteration 0's own epoch 0 is
+# 25.53 mm), so 26 iterations in a row pay the descent from ~25 mm to ~14 mm and
+# then stop. Iteration 0, given 100 epochs on the base set alone, reaches 3.31 mm.
+# The per-iteration fits are nowhere near converged: from iter_08 onward the final
+# train loss is pinned at 0.152-0.158 for EIGHTEEN iterations while the aggregate
+# grows from 38k to 100k steps. Warm-starting begins each iteration at ~14 mm
+# instead of ~25 mm and spends its 25 epochs below run 16's floor rather than
+# re-reaching it.
+#
+# THE HONEST RISK, and the first thing to check in the logs. The optimiser and the
+# LR schedule are NOT carried over — only the weights. `_make_scheduler` builds a
+# fresh CosineAnnealingLR(T_max=25) each iteration, so every warm start is hit
+# with lr = 9.96e-4 on an already-converged model. That is a cosine warm restart
+# (SGDR), which normally dips then recovers below the previous minimum, but it can
+# also erase the advantage outright. It is directly observable: read
+# `train_pose_pm_mm` at epoch 0 in iters/iter_NN/log.csv. If it sits near 14 mm
+# the warm start held; if it springs back to ~25 mm the restart wiped it and the
+# fix is to lower OPTIM.lr for the iterations (bc_phase4_all.yaml has 1.0e-3) or
+# to cut iter_epochs, not to keep re-running this.
+#
+# THE SECOND CHANGE THAT RIDES ALONG, stated because the flag name hides it: the
+# NORMALIZER FREEZES. Warm starting loads the previous run's normalization.npz
+# rather than recomputing stats over the grown aggregate — deliberately, because
+# the network's output scale is defined by the normalizer and warm-starting under
+# fresh stats would silently reinterpret the head (train_dagger_phase4.py:178).
+# Since each iteration re-saves the one it loaded, the BASE run's statistics
+# propagate through all 25 iterations. So run 20's policy is normalised by
+# demonstration data only, while run 16 renormalised over an aggregate that ends
+# 10x larger and 70% DAgger. That is arguably the more correct choice — a fixed
+# output scale across the run — but it is not nothing, and it is the one thing
+# that could make a difference here NOT attributable to the initialisation.
+#
+# COST. Unchanged by construction: same 25 epochs on the same aggregate, so the
+# ~11.8 h of training in run 16 is what this will spend too. Warm-starting's usual
+# payoff is cutting iter_epochs, and training is 79% of the wall clock by iter 25
+# (2899 s of 3650 s) — but taking it here would confound the test. If run 20 shows
+# the warm start holding, the follow-up run is the cheap one.
+#
+# ---------------------------------------------------------------------------
+# INHERITED FROM RUN 16 (= run 15's stack with a flat beta = 0.75), verbatim:
+#
+# = examples/configs/dagger_phase4_all.yaml (run 15) with ONE line changed:
+#
+#     beta_schedule: piecewise  ->  constant     (beta_start: 1.0 -> 0.75)
+#
+# Everything else is identical — same three-camera demos, same 25 iterations,
+# same bc_phase4_all.yaml (pm loss + aux head + reach-tail weighting), same DART
+# settings, same eval. So run 16 vs run 15 IS a clean one-variable comparison of
+# the beta SCHEDULE, and it is the only clean comparison in this pair of runs:
+# both share the nine-change stack described below, so neither says anything
+# about the individual changes.
+#
+# WHAT A FLAT 0.75 DOES. Every iteration mixes 75% expert / 25% learner steps, so
+# the expert authority never anneals. Against run 15's piecewise 1.00 -> 0.50 at
+# the knee -> 0.30, that means:
+#
+#   * EARLY iterations get LESS expert (0.75 vs 1.00), so D_1 is more on-policy.
+#   * LATE iterations get MORE expert (0.75 vs 0.30), so episodes keep arriving
+#     at the standoff and close labels keep being produced right to the end.
+#     Run 1 died precisely because close labels vanished once the learner drove.
+#   * The learner is never asked to hold the endgame alone, which is the whole
+#     point of DAgger's annealing. So this trades the distribution-shift argument
+#     for label supply.
+#
+# HONEST PRIOR. DAgger's guarantee comes from beta -> 0: with beta pinned at 0.75
+# the aggregate stays dominated by states the EXPERT visits, and the policy is
+# never trained on much of the state distribution it will actually meet at
+# deployment (where beta = 0). Expect train/val loss to look good and eval to
+# lag it — the gap between them is the thing to read. `D_dagger_frac` in
+# dagger_log.csv is the direct measure: at a flat 0.75 the on-policy share of the
+# aggregate grows far more slowly than under run 15's schedule.
+#
+# Also note DART now carries more of the exploration load by default: with the
+# expert on the controls 75% of the time, the jolts (dart_ratio 0.3 over the whole
+# approach, plus the reach band) are a larger fraction of the off-distribution
+# states in D than they are in run 15's late iterations.
+#
+# ---------------------------------------------------------------------------
+# The stack inherited from run 15, unchanged:
+#
+#   flat beta = 0.75                  THIS RUN's only change vs run 15
+#   25 iterations                     new      DAGGER.num_iters: 25
+#   PM pose loss                      run 11   -> bc_phase4_all.yaml
+#   auxiliary goal-grasp head         run 13   -> bc_phase4_all.yaml
+#   reach-tail oversampling (w=2.5)   run 14   -> bc_phase4_all.yaml
+#   dart_ratio 0.3                    new      between run 14's 0.2 and 11-13's 0.5
+#   reach-band DART on                run 12   DAGGER.dart_reach_*
+#   DART from step 0                  run 14   DAGGER.dart_max_dist: 10.0
+#   wrist + left + right cameras      NEW      SIM.cfg_file -> multicam_wlr
+#
+# ============================================================================
+# READ THIS BEFORE INTERPRETING THE RESULT.
+#
+# Nine changes move together, five of them touching training and four touching
+# the observation or the collection distribution. NOTHING here is attributable:
+# if run 15 beats run 7, the result names no mechanism. Worse, the noise floor
+# measured over runs 4/6/7/8/9/10 — six runs with a VERIFIED-identical iteration-0
+# config, scoring 0.32/0.34/0.39/0.49/0.51/0.62, sd 0.115 against a binomial 0.050
+# — means even the combined effect has to clear ~2sd = 0.23 before it is
+# distinguishable from a reseed.
+#
+# That is a fine thing to run as a "does the stack help at all" probe, which is
+# what it is. It is not an experiment. Runs 11-14 are the controls that make it
+# readable, and the 20-iteration smooth_l1 baseline that runs 12/13/14 still lack
+# is worth more than this run if only one slot is free.
+#
+# THE CAMERA CHANGE NEEDS MATCHING DEMONSTRATIONS, and they already exist.
+# `*_omg_wlr_ok.h5` (collected 2026-08-05, on the cluster) is the three-camera
+# pair; the `_wlr` suffix is wrist+left+right, i.e. this file's SIM.cfg_file.
+# TRAIN.base_train_h5 / val_h5 below point at those, NOT at the wrist-only
+# `*_omg_ok.h5` runs 4-14 used. Mixing a wrist-only base set with three-camera
+# DAgger collections would put two different input distributions in one
+# aggregate, which is the one inconsistency DAgger cannot average away.
+#
+# SIM.exclude_scenes must move with them — it is the sidecar .json naming the
+# scenes whose expert failed, and it is written per collection.
+#
+# The grasp pin tables are camera-independent (they store world poses), so they
+# are reused as-is and the pinned grasps stay identical to runs 4-14. Only the
+# observations change.
+#
+# VERIFY BEFORE SUBMITTING — the file NAME is currently the only evidence of
+# which cameras produced it. The h5 attrs record pc_channels and num_pts but NOT
+# the sim cfg, so a wrist-only file renamed `_wlr` would train silently and fail
+# only at deployment. On the cluster:
+#
+#   python - <<'EOF'
+#   import h5py
+#   for f in ("train_pinned_omg_ok", "train_pinned_omg_wlr_ok"):
+#       with h5py.File(f"output/bc_dataset/{f}.h5") as h:
+#           k = sorted(h)[0]
+#           print(f, len(h), dict(h.attrs).get("num_pts"), h[k]["point_cloud"].shape)
+#   EOF
+#
+# Episode counts should differ little (benchmark failures are physics, not
+# cameras) but the clouds themselves must differ — a wrist-only cloud is confined
+# to the wrist frustum, so at a mid-approach step its object points span a much
+# smaller volume than a three-view fusion of the same scene.
+#
+# PROVENANCE GAP: CLOSED for future collections, but NOT retroactively. Both
+# collect_bc_dataset.py and dagger/collector.py now record `sim_cfg_file`,
+# `cameras` (the RESOLVED list, since a cfg path stays true while the file it
+# names is edited), `compute_mano`, `compute_robot` and `renderer`. Every h5
+# written from now on is self-describing and a mixed aggregate is detectable.
+# The wlr files above predate that, so the manual check stays the way to confirm
+# THEM — it was run, and they are genuinely three-camera: clouds differ in 8/8
+# episodes and the wlr object bounding box is 1.42x larger on average, never
+# smaller, with identical episode counts (472) and scene indices.
+# ============================================================================
+#
+# --- WHY OVERSAMPLE THE REACH (run 14's training change) ---
+# The last 5 steps of an episode are 23.8% of the data and 11.1% of the SmoothL1
+# pose gradient, because the expert's labels shrink into the reach. See the DATA
+# block in bc_phase4_reachw.yaml for the derivation of the 2.5.
+#
+# --- WHY WIDEN THE DART BAND (run 14's collection change) ---
+# `dart_max_dist` is the UPPER edge: until now jolts fired only once the EE was
+# within 0.20 m of the standoff, which is roughly the last 4-6 approach steps.
+# 10.0 is effectively unbounded (a far scene starts ~0.78 m out), so jolts fire
+# from step 0 to the reach commit. The rationale is the integration finding: run
+# 7's best checkpoint accumulates 0.0230 rad of wrist error PER STEP over ~25
+# steps, so the drift the policy needs to recover from is built over the whole
+# approach, not just its last few steps — but DART has only ever manufactured
+# recovery data for the last few.
+#
+# WIDENING AT A FIXED RATIO IS TOO EXPENSIVE, and that is measured rather than
+# argued. The band goes from ~42% of steps to ~100% of approach steps, so at
+# dart_ratio 0.5 the jolt rate goes from ~21% of all steps to ~50%. Every jolt
+# spends one of the 50, and episodes already use 28-38. Measured over 12 episodes
+# at beta = 1.0, identical seed and scenes:
+#
+#            band 0.20 / r=0.5   band inf / r=0.5   band inf / r=0.2
+#   jolts       77 (6.4/ep)        187 (15.6/ep)      62 (5.2/ep)
+#   steps          377                 453               386
+#   standoff/grasp 7 / 7               6 / 6            10 / 9
+#   CLOSE_LABEL      7                   6                 9
+#   MAX_STEPS        1                   4                 1
+#
+# Run 14 answered that by dropping the ratio to 0.2, which restored roughly the
+# narrow band's jolt budget and came out AHEAD of both alternatives on the canary.
+# RUN 15 USES 0.3 INSTEAD — about 8 jolts/episode, ~20% more step tax than run 14
+# — and additionally turns the reach band on, which adds its own jolts inside the
+# reach. So this run does NOT hold the jolt budget fixed the way run 14 did; it
+# spends more horizon on perturbation than any run so far. c_max_steps is the
+# number that tells you whether that was affordable.
+#
+# The 12-episode sample is small and beta = 1.0 is not the run's regime, so treat
+# the table as a sanity check on horizon cost, not as a result. Watch, in order:
+#   c_max_steps    already 215/1500 episodes in run 7; a sharp rise means the
+#                  horizon is gone and episodes are dying before the standoff.
+#                  Late iterations are the risk — run 7 reached ~30/100 by
+#                  iteration 13 as beta annealed and the learner drove more.
+#   reached_standoff / reached_grasp   the learner arriving at all.
+#   close_labels   THE canary — close labels only exist if episodes ARRIVE. Run 1
+#                  died exactly here (one close label across the run, after which
+#                  the policy stopped closing).
+# If those degrade further, drop the ratio again before touching the band: the
+# band is the hypothesis under test and the ratio is what pays for it.
+#
+# THE ITERATION COUNT. num_iters feeds beta_knee (a FRACTION of num_iters), so
+# run 15's 25 puts the knee back at iteration 16 and stretches the schedule to its
+# full length — the same beta trajectory run 10 had, and 5 iterations longer than
+# runs 11-14's compressed 20. Endpoints are unchanged (1.00 -> 0.50 at the knee ->
+# 0.30 at the end); only the spacing differs.
+#
+# COST: Follow-The-Leader refits the whole aggregate every iteration, so training
+# grows as N^2 and 25 is ~56% more training time than 20. Run 14 spent ~826-1365 s
+# per iteration on training alone at 20 iterations; expect materially more here,
+# on top of a collection phase slowed by two extra renders per step. Take the
+# walltime request from THIS run's first iteration, not from run 14's.
+#
+# WHAT IS ACTUALLY BEING TESTED — see the LOSS block in bc_phase4_pm.yaml for the
+# measurements and for why the honest prior is weak. Short version: across runs
+# 4/6/7/8/9 the policy never once reached the pinned grasp (near_rate 0.01-0.08 in
+# all 55 evaluations; eval_min_rot floor 0.46 rad against a 0.34 threshold and an
+# expert that reaches 0.07 rad), so every success is an off-pose grasp. PM loss is
+# one of two candidate fixes. The other — that the demonstrations never show
+# orientation correction near the object — is a data problem tested separately.
+#
+# READ IT ON: near_rate and eval_min_rot in dagger_log.csv (the quantities the
+# change targets), val_pose_rot_rad / val_pose_pm_mm in each iteration's log.csv.
+# success_rate is the WRONG primary read here: three nominally identical base fits
+# in runs 4/6/7 scored 0.51 / 0.62 / 0.32 at iteration 0, so the noise floor on a
+# 100-scene eval is about +-0.15 and a success-rate difference smaller than that
+# means nothing. near_rate has a floor near zero and much more room to move.
+#
+# WHAT DART BUYS. DAgger's off-plan coverage is whatever the CURRENT learner
+# produces. Early that is plenty; late, once beta has annealed and the policy
+# tracks the plan, it stops visiting the states where it arrives at the standoff
+# a few cm off LATERALLY — precisely run 3's diagnosed failure (reached_grasp
+# 87 -> 45 across iterations 10-15 as beta fell to 0.10, success following it
+# down). DART manufactures that coverage instead of waiting for the learner to
+# stumble into it.
+#
+# HONEST PRIOR: a second-order bet, not a rescue. run 4's drop_joint_state
+# already fixed most of run 3's collapse (f_timeout 0.21-0.63 -> 0.03-0.16, no
+# reached_grasp collapse, peak 0.51 vs 0.35), so the expected gain is modest.
+# The reason to try it is Phase 3: rl_run15, policy-side DART at ratio 0.2, was
+# the best RL run of all 47 at 0.458, and ratio 0.5 (rl_run20) was worse at 0.25
+# — which is exactly what runs 6 and 7 re-test here, in a phase where DART costs
+# none of the machinery it cost there.
+#
+# WHY THIS SCHEDULE. Run 3 died as beta annealed: reached_grasp fell 87 -> 45
+# over iterations 10-15 while beta went to 0.10, and eval success followed. Run 4
+# did not collapse, but its schedule still ends at 0.10 and still runs out of
+# iterations at 15. This run tests the other half of the hypothesis — that the
+# expert has to stay on the controls both LONGER and at a HIGHER FLOOR — by
+# holding beta above 0.5 for the first two thirds and never letting it below 0.3.
+#
+# A single `linear` cannot express "hand over slowly, then hold a floor", hence
+# the new `piecewise` schedule (train_dagger_phase4.beta_at). knee = 0.66 of
+# num_iters, so with 25 iterations the join is iteration 16:
+#
+#   1.00 0.97 0.93 0.90 0.87 0.83 0.80 0.77 0.73 0.70 0.67 0.63 0.60 0.57 0.53
+#   0.50 | 0.48 0.46 0.43 0.41 0.39 0.37 0.34 0.32 0.30
+#
+# COSTS, stated plainly. (1) At beta = 1.00 iteration 1 would be pure expert —
+# with expert_after_commit already true, nothing in it would be on the learner's
+# distribution. DART partly repairs that: the jolt coin is drawn BEFORE the beta
+# coin, so it pre-empts even a beta = 1.0 expert step and displaces the state
+# off-plan regardless. Measured on a 4-episode/iteration shakedown, iteration 1
+# still took 2 jolts at beta = 1.00. So this run keeps SOME off-distribution
+# coverage in the early iterations that run 8 does not have at all — which is an
+# interaction to remember when reading run 9 against run 8, not just DART's
+# effect in isolation.
+# (2) A 0.30 floor means the last iteration still has the expert driving 30% of
+# steps, so the aggregate keeps a permanent expert-distribution component and
+# eval (which has no expert at all) is the only honest read. (3) Follow-The-Leader
+# refits on the whole aggregate every iteration, so cost grows as N^2: 25
+# iterations is ~2.7x run 4's training time, not 1.7x.
+#
+# Falsifiable against run 4: if the higher/longer beta is what run 3 lacked,
+# reached_grasp should hold flat through the second segment instead of collapsing,
+# and eval success should still be climbing at iteration 25.
+
+SIM:
+  # THREE CAMERAS — the run-15 observation change. wrist + left + right, fused,
+  # with COMPUTE_ROBOT_POINT_STATE off so the cloud stays 2-class / 5-channel:
+  # DATA.pc_channels is unchanged and the CVPR2023 PointNet++ warm start still
+  # transfers all 68/68 encoder tensors (a 3rd robot class would have forced a
+  # 6-channel input and reinitialized the first SA conv).
+  #
+  # WHY. The wrist camera loses the object exactly when it matters — as the
+  # gripper closes the last few centimetres the object leaves the frustum, so the
+  # endgame, the phase this whole run is aimed at, is driven by a cloud that no
+  # longer contains the thing being grasped. The side views keep object and hand
+  # in frame throughout.
+  #
+  # MUST MATCH THE DEMONSTRATIONS. See the header: base_train_h5 / val_h5 have to
+  # be re-collected with this same file before this run can start.
+  cfg_file: examples/pretrain_multicam_wlr.yaml   # GA-DDPG-style simulator config
+  split: train                       # BENCHMARK.SPLIT (one env => one split)
+  egl: false                         # EGL GPU renderer for the hand camera.
+                                     # MUST match how the base dataset was
+                                     # collected — the renderer changes the cloud.
+
+  # Grasp filtering: the SAME setup Phase-3 used from run 21 onward — the paper's
+  # OFFLINE hand-collision-filtered grasp dict (~716/720 s0 scenes usable) rather
+  # than our aggressive runtime 0.08 m filter (~351). Wired into cfg.omg_config
+  # before the env is built. Leave hand_collision_filter false: stacking both
+  # filters double-prunes the goal set.
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08        # (unused while hand_collision_filter=false)
+  hand_points_radius:    0.35        # (unused while hand_collision_filter=false)
+
+  # OMG plans to the pre-grasp standoff AND the reach beyond it: traj[-5] is the
+  # standoff, traj[-1] is the pose the gripper closes at. Phase 4 labels the whole
+  # trajectory, so the reach segment has to be in the plan.
+  use_standoff: true
+
+  # NOT the standoff distance -- an EXTENT parameter. OMG builds the ramp as
+  #     offsets = -standoff_dist * linspace(0, 1, reach_tail_length, endpoint=False)
+  # (planner.py:356), so with endpoint=False the furthest pose lands at
+  #     standoff_dist * (1 - 1/reach_tail_length) = 0.08 * 4/5 = 0.064 m
+  # and the 5 waypoints sit at 0, 1.6, 3.2, 4.8, 6.4 cm from the grasp.
+  #
+  # The EFFECTIVE standoff is 6.4 cm. Two other constants are tuned against that
+  # real value, not against 0.08: reach_commit_dist (0.05) is a radius around this
+  # pose, and reach_tail (5) must equal OMG's cfg.reach_tail_length or traj[-5] is
+  # not the standoff at all. Changing standoff_dist moves both.
+  #
+  # This also explains the measurement quoted under `reach_commit_dist` below --
+  # "the EE parks 6.6 cm short of the grasp forever" is not only the plan[0] decay,
+  # it is the gripper sitting exactly ON its target, with nothing left for plan[0]
+  # to say. Hence the committed reach.
+  standoff_dist: 0.08
+
+  # ---- one committed grasp per scene ----
+  # OMG re-decides its goal every plan (argmin ||traj.start - goal_set[i]|| in
+  # JOINT space, planner.py `ol_alg='Proj'`). With the policy driving and a replan
+  # every step, the target grasp moves mid-episode: measured over 90 replans under
+  # +-15 cm perturbation, 32 switched grasp, one scene cycled through four, and the
+  # target shifted by up to 10 cm. The table pins one grasp per scene and is shared
+  # with the demonstration collector, so every phase aims at the same pose.
+  # Build with: python examples/build_grasp_pin_table.py --out output/grasp_pin_table.json
+  # REBUILD it whenever valid_grasp_dict_path / hand_collision_filter change --
+  # those change which candidates exist. null disables pinning.
+  # Named per split: scene indices are SPLIT-RELATIVE, so a train table applied
+  # to val pins the wrong grasps. Loading one built for another split is a hard
+  # error, not a warning.
+  grasp_pin_table: output/grasp_pin_table_train_omg.json
+  grasp_pin_match_tol: 0.02   # reject a pinned pose further than this from any
+                              # current candidate (catches a stale table loudly)
+
+  # ---- scenes whose EXPERT is broken ----
+  # JSON list of scene indices to drop from BOTH the collection pool and the eval
+  # set, written by examples/filter_demos.py. Those are the scenes where the OMG
+  # plan clips the object while translating laterally into the pre-grasp pose and
+  # knocks it out of the hand: the demonstration ends in a benchmark failure and
+  # carries no CLOSE label (126 of 623 episodes, 20%, on train_pinned.h5).
+  # DAgger cannot learn anything useful where the expert crashes, and scoring the
+  # policy there caps the achievable rate for no reason.
+  # CAVEAT: the remaining scenes are easier BY CONSTRUCTION, so a success rate
+  # measured with this set is not comparable to one over the full split.
+  # null disables the exclusion.
+  # MUST be the sidecar of TRAIN.base_train_h5, not the wrist-only one: it is
+  # written by filter_demos.py per collection and names that collection's failed
+  # scenes. The two lists should be near-identical (an episode fails on physics —
+  # human contact, drop, timeout — which cameras do not affect), so a large
+  # difference is itself worth investigating rather than accepting.
+  exclude_scenes: output/bc_dataset/train_pinned_omg_wlr_ok.json
+
+DAGGER:
+  # 25 for run 15. FTL refits the whole aggregate every iteration so cost grows
+  # as N^2 — 25 is ~56% more training time than run 14's 20, on top of the
+  # three-camera collection slowdown. Budget the walltime request from the FIRST
+  # iteration's wall_s, not from run 14's.
+  num_iters: 25            # N — DAgger iterations after the base run.
+                           # 20, not run 10's 25: FTL refits on the whole aggregate
+                           # every iteration so cost grows as N^2, and 20 buys back
+                           # ~36% of the training time. Still well above the 15 of
+                           # runs 4-7 — the piecewise schedule spends its first 13
+                           # iterations above beta = 0.5, so a 15-iteration budget
+                           # would end the run with the learner having driven a
+                           # majority of steps for only two iterations.
+                           # NOTE this moves beta_knee (a fraction) — see header.
+  # m — trajectories per iteration. Was 20, on the theory (the paper's) that more
+  # iterations beat bigger batches because each iteration is a NEW state
+  # distribution. That reasoning is sound but the budget assumption behind it was
+  # wrong: run 1 measured collection at 10 s/EPISODE — 3 min per iteration, 1 h
+  # across the whole 8 h run — while TRAINING took 4.9 h (61%). Collection was
+  # never the constraint, so 20 was leaving coverage on the table for nothing.
+  # 100 costs ~17 min/iteration. Run 1 visited only 261 of 620 available scenes;
+  # at 100/iteration over 720, random sampling reaches ~89% of them in 15
+  # iterations.
+  episodes_per_iter: 100
+  max_steps: 50            # policy steps per collected trajectory. NOT 30:
+                           # measured, the EE moves ~0.02 m/step (IK tracking
+                           # realises ~60% of a commanded ~0.035 m delta) and a
+                           # far-start scene is ~0.78 m out, so the standoff is
+                           # ~36 steps away. The demos need only 20 because they
+                           # follow the plan BY INDEX, not by replanning.
+  # `random` draws independently from the pool each iteration: NO repeats within
+  # an iteration (np.random.choice with replace=False), repeats allowed between
+  # them. That is intended — revisiting a scene with a changed policy samples a
+  # different trajectory through it, which is the mechanism DAgger relies on.
+  # Coverage is no longer the concern it was in run 1 (261/620 scenes) because
+  # m is now 100: 15 iterations reach ~89% of the 720 even with repeats.
+  scene_sampling: random   # random | sequential (cycles the pool deterministically)
+  seed: 0
+
+  # beta_i: per-step probability of executing the EXPERT action instead of the
+  # policy's (pi_i = beta_i*pi* + (1-beta_i)*pi_hat_i). The paper's beta_1 = 1
+  # iteration is the base run trained on the expert demonstrations, so DAgger
+  # iteration 1 here is the paper's iteration 2.
+  #   indicator   beta = 0 for every DAgger iteration (paper's beta_i = I(i=1),
+  #               reported as the best-performing choice in Section 5)
+  #   exponential beta_i = beta_p^i
+  #   linear      beta_start -> beta_end over num_iters
+  #   constant    beta_start
+  #
+  # THE headline change from run 1, and the one most likely to decide whether
+  # this works. Run 1 used `indicator` (beta = 0 from iteration 1, the paper's
+  # recommendation) and produced, across 20 iterations and ~350 episodes,
+  # EXACTLY ONE gripper-close label. `reached_grasp` was 0 in every iteration but
+  # one; `chance_rate` was 0.000 in all eleven evaluations, i.e. over 1100 eval
+  # episodes the gripper NEVER came within (0.02 m, 0.34 rad) of the pinned grasp.
+  # Closest approach averaged ~0.15 m and ~0.85 rad.
+  #
+  # The paper's beta = 0 assumes a base policy good enough to occasionally reach
+  # the goal. Ours stalls 15 cm out, so with the expert never on the controls
+  # DAgger could only ever relabel the approach phase it already knew — while
+  # diluting the close labels it needs from ~5% of D to 2.3%. The policy learned
+  # the obvious lesson and stopped closing: eval close_rate collapsed 0.20 -> 0.05.
+  #
+  # LINEAR 0.75 -> 0.10 across the 15 iterations (0.75 0.70 0.66 0.61 0.56 0.52
+  # 0.47 0.42 0.38 0.33 0.28 0.24 0.19 0.14 0.10). The expert executes most steps
+  # early, so episodes actually ARRIVE at the standoff and the grasp and those
+  # states get labelled; the handover to the learner is gradual rather than the
+  # cliff an exponential gives.
+  #
+  # Note the floor: beta never reaches 0, so even the last iteration has the
+  # expert on the controls 10% of the time. That is deliberate — an exponential
+  # is ~0 by iteration 8, and if the learner cannot yet sustain the endgame alone
+  # the close labels would vanish again exactly as they did in run 1.
+  # RUN 16: FLAT. `constant` reads beta_start and ignores every other key here
+  # (train_dagger_phase4.py:121), so 0.75 is held for all 25 iterations —
+  # 75% expert / 25% learner steps from first to last, no annealing.
+  #
+  # 0.75 is above run 15's piecewise value from iteration ~7 onward, so the
+  # second half of this run has substantially MORE expert on the controls than
+  # run 15's does. That is the mechanism being tested: keep episodes arriving so
+  # close labels keep being produced, at the cost of the distribution-shift
+  # correction beta -> 0 is supposed to provide. See the header.
+  beta_schedule: constant
+  beta_start: 0.75         # THE value — flat across all iterations
+  # Below are inert under `constant`, kept so switching schedules is one line.
+  beta_mid:   0.5
+  beta_end:   0.3
+  beta_knee:  0.66
+  beta_p:     0.7
+
+  # Gripper-close label: once the EE is within BOTH tolerances of the grasp pose
+  # the current plan aims at, the label becomes the closure command
+  # [0,0,0, 0,0,0, 0.0] instead of another approach delta.
+  close_pos_thresh: 0.02   # metres
+  close_rot_thresh: 0.34   # radians (~19.5 deg)
+  stop_on_close_label: true    # end the episode at the close label (mirrors the
+                               # single terminal close transition in the demos)
+  # The policy commanded a close. true = execute it and end the episode (faithful:
+  # in deployment the episode really is over). false = override the gripper bit
+  # back to OPEN and keep rolling.
+  #
+  # false since run 2. The correct label is written either way — the label is
+  # computed from the proximity check BEFORE the policy is queried, so a premature
+  # close is always recorded as [expert_delta, OPEN], "no, keep approaching". What
+  # `true` costs is everything AFTER that point. Run 1 measured 28 policy closes in
+  # 355 episodes with 27 of them at 0.13-0.22 m from the grasp (threshold: 0.02),
+  # so 27 episodes ended early and contributed ONE correction each for the exact
+  # error DAgger exists to fix. The state distribution stays on-policy where it
+  # matters: only the gripper bit is overridden, the 6-DoF motion is still the
+  # learner's.
+  stop_on_policy_close: false
+
+  # Distance-proportional OMG horizon: free = round(||ee - standoff|| / ee_step)
+  # waypoints for the approach, + reach_tail for the standoff->grasp reach OMG
+  # folds into the tail. Keeps the recorded plan[0] delta at the demonstrations'
+  # per-step scale at every distance.
+  ee_step: 0.04
+  reach_tail: 5
+
+  # Floor on the free portion. Its ONLY legitimate job is to stop round() from
+  # returning 0 and asking OMG for a zero-length approach (round(d/0.04) hits 0
+  # for d < 0.02). Anything above 1 is second-guessing the distance rule, and 3
+  # defeated it outright over the last 10 cm:
+  #
+  #     round(d/ee_step) < 3   <=>   d < 0.10 m
+  #
+  # so inside 10 cm the floor took over and ||plan[0]|| ~ d/3 decayed instead of
+  # holding at ee_step: 0.033 at d=0.10, 0.027 at 0.08, 0.020 at 0.06, 0.017 at
+  # 0.05. Measured it is worse than that model (0.011 at d=0.05, 0.004 at 0.018)
+  # because OMG's optimizer makes the first step shorter than uniform. The gripper
+  # therefore crept, slower the closer it got, exactly where it most needed to
+  # arrive.
+  #
+  # 1 since run 2. In practice the commit at reach_commit_dist = 0.05 means we
+  # never plan below 5 cm anyway, so free = round(d/0.04) >= 1 on its own and this
+  # floor is nearly inert -- 1 vs 2 differ only in d = (0.050, 0.058). The change
+  # that matters is dropping 3.
+  #
+  # Cost, stated honestly: fewer free waypoints is less room for OMG to curve
+  # around the object, in the 10 cm band where the lateral-approach collisions
+  # happen. Watch `dropped_tail` and the ENV_DONE share; if either climbs, this is
+  # the first thing to put back.
+  #
+  # NOTE the demonstrations are unaffected either way -- collect_bc_dataset.py
+  # plans ONCE with cfg.RL_MAX_STEP and follows by index. dynamic_replan_horizon
+  # is only used by the DAgger collector, so there is no labelling convention
+  # shared with the base dataset to keep in sync.
+  min_free: 1
+  max_horizon: 40
+  first_horizon: null      # horizon of the step-0 plan, before the standoff is
+                           # known. null => cfg.RL_MAX_STEP (20), i.e. the same
+                           # horizon collect_bc_dataset.py planned the demos with.
+
+  # ---- the endgame: committed reach ----
+  # plan[0] labelling CANNOT express the final reach. OMG puts the standoff ramp
+  # in its goal set, so once the EE is at the standoff the plan's free portion is
+  # stationary and plan[0] decays to 0 while the reach sits in the LAST
+  # reach_tail waypoints. Measured with beta=1 (pure expert): the EE parks 6.6 cm
+  # short of the grasp forever and every further label is ~0.
+  # Fix: on arrival at the standoff, freeze that plan's last `reach_tail`
+  # waypoints and follow them BY INDEX (no more replanning, so no retreat and no
+  # oscillation). The delta is still recomputed from the CURRENT EE each step, so
+  # the labels stay corrective under drift; only the target stops moving.
+  # Why the commit is needed AT ALL is structural and has nothing to do with
+  # min_free: the standoff is in OMG's goal set, so an EE sitting at the standoff
+  # has a stationary free portion and plan[0] -> 0 by construction, whatever the
+  # horizon. That argument stands unchanged.
+  #
+  # Why 0.05 specifically WAS "min_free=3 makes ||plan[0]|| ~ d/3, so the labels
+  # decay from 0.040 at d=0.12 to 0.011 at d=0.05 -- hand off before that bites".
+  # With min_free = 1 (run 2) that decay is gone and those numbers no longer apply;
+  # 0.05 now rests on the structural argument plus the geometry note below. It is
+  # ALSO what keeps the first frozen target reachable: at commit the tail's first
+  # waypoint is the standoff itself, i.e. a delta of up to reach_commit_dist, so
+  # 0.05 ~ ee_step keeps that handoff step at the normal per-step scale. Raising
+  # it to 0.10 to dodge min_free (the other candidate fix) would have made that
+  # first frozen label a 10 cm jump, 2.5x ee_step -- worse than what it fixed.
+  reach_commit_dist: 0.05  # ||ee - standoff|| at which the reach is committed
+  reach_skip_eps:    0.01  # drop leading tail waypoints closer than this to the
+                           # EE (the tail's first entry IS the standoff)
+
+  # beta = 1 for the committed reach only: once the EE is at the standoff, the
+  # EXPERT executes the frozen waypoints regardless of the beta schedule.
+  #
+  # Committing the reach only fixes the label TARGET — the beta coin still decides
+  # what actually moves the arm. Run 1 showed the consequence: 82/90/85
+  # committed-reach steps in iterations 15-17, `reached_grasp` = 0 in all of them,
+  # and ONE close label across the entire run. The labels said "go to the grasp",
+  # the policy did something else, and close_pos_thresh never fired.
+  #
+  # The cost is real: states recorded during the reach are on the expert's
+  # distribution, which is the covariate shift DAgger exists to remove, in the
+  # region that matters most. Mitigated by the takeover starting from wherever
+  # the LEARNER arrived, and by being only the last few waypoints. GA-DDPG and
+  # Phase 3 make the same trade with their tail splice.
+  #
+  # Falsifiable: if collection `reached_grasp` climbs while eval `chance_rate`
+  # stays 0, this is manufacturing labels the policy cannot use.
+  expert_after_commit: true
+
+  # ---- DART (Laskey et al. 2017; GA-DDPG env.random_perturb) ----
+  # On `dart_ratio` of APPROACH steps taken inside
+  # (reach_commit_dist, dart_max_dist] of the pre-grasp standoff, the executed
+  # action is replaced by a random task-space jump. The EE lands off-plan and the
+  # FOLLOWING steps carry the expert's recovery from there. The pair recorded on
+  # the jolt step itself is entirely ordinary: Phase 4 stores only
+  # (state, pi*(state)) and never the executed action, so unlike GA-DDPG
+  # (core/ddpg.py) and Phase 3 (rl/td3bc_trainer.py) there is no perturbed row to
+  # flag and no critic to protect from it. The replan is free too — this
+  # collector already re-queries OMG from the current configuration every step.
+  #
+  # The trigger is DISTANCE, not a step index as in GA-DDPG (DART_MIN/MAX_STEP)
+  # and Phase 3 ([15, 22)). Theirs works because the expert plays a plan BY
+  # INDEX so step count tracks progress; here every step replans and max_steps is
+  # 50, so a far scene needs ~36 steps to reach the standoff and a near one ~10.
+  # The band's lower edge is reach_commit_dist by construction — below it the
+  # reach has committed, and a jolt there would kick the EE back out of
+  # close_pos_thresh and destroy the close label. A jolt also never steals a step
+  # on which the policy asked to close, so policy_closed / c_policy_close keep
+  # meaning what they mean in the run this is compared against.
+  #
+  # WATCH, in dagger_log.csv:
+  #   dart           jolts fired. 0 with a nonzero ratio => the band is never
+  #                  entered (the reach commits before the EE arrives in it).
+  #   dart_env_done  jolts that ENDED the episode. Read as a fraction of `dart`:
+  #                  climbing means dart_pos_mag is knocking the object out of
+  #                  the hand rather than displacing the gripper.
+  #   c_max_steps    a jolt spends one of the 50 steps; a rise points here.
+  #
+  # Measured on the smoke config with a deliberately stalling stub policy, one
+  # episode took 14 jolts at ratio 0.5 — the band can be occupied far longer than
+  # the ~4-6 steps a transiting policy spends there. `dart` measures it from
+  # iteration 1, so do not tune this ratio blind.
+  # 0.2, not runs 7/10/11/12's 0.5. Paired with the wider band below to hold the
+  # jolt BUDGET roughly fixed: the band now covers ~2.4x as many steps, so the
+  # per-step rate comes down by about the same factor and the episode still takes
+  # ~5-6 jolts. Measured: 62 jolts over 12 episodes here against 77 for the narrow
+  # band at 0.5. Without this the run would test "3x more jolts" rather than
+  # "jolts in a different place".
+  #
+  # 0.3 for run 15, between run 14's 0.2 and runs 11-13's 0.5.
+  #
+  # WHAT THAT COSTS, since the band is now unbounded AND the reach band is also
+  # on. Measured over 12 episodes at beta = 1.0 on identical seed and scenes, the
+  # unbounded band fires ~15.6 jolts/episode at ratio 0.5 and ~5.2 at ratio 0.2;
+  # 0.3 lands around 8 per episode. Every jolt spends one of the 50 steps and
+  # episodes already use 28-38, so this is roughly a 20% larger step tax than run
+  # 14 paid — and `dart_reach_ratio: 0.3` adds its own jolts on top, inside the
+  # reach, where they are additionally subject to rejection sampling.
+  #
+  # WATCH c_max_steps in dagger_log.csv. It was 215/1500 episodes in run 7; a
+  # sharp rise means the step budget is being spent on jolts rather than progress,
+  # and this is the first number to lower.
+  dart_ratio:    0.3
+  # 10.0, not 0.20 — the run-14 change. This is the UPPER edge of the band; the
+  # lower edge stays `reach_commit_dist` by construction. A far scene starts
+  # ~0.78 m from the standoff, so 10.0 removes the ceiling entirely and jolts fire
+  # from step 0 through to the reach commit. See the header for the measurement.
+  dart_max_dist: 10.0      # upper edge of the band, metres from the standoff
+  dart_pos_mag:  0.04      # +- metres per axis (GA-DDPG's value, == ee_step)
+  # 0.3, matching run 12 rather than run 14's 0.2. Run 7's best checkpoint
+  # accumulates ~0.0230 rad/step over ~25 steps, so the drift the policy must
+  # recover from is ~0.56 rad; at 0.2 DART rehearses recovery from roughly a
+  # third of the real disturbance, which would explain why 42% of approach steps
+  # being jolted moved eval_min_rot not at all across runs 6/7/9/10. Also keeps
+  # the perturbation scale consistent with dart_reach_rot_mag below.
+  dart_rot_mag:  0.3       # +- radians per axis
+
+  # ---- DART inside the COMMITTED REACH — run 12's change ----
+  # Everything above fires in (reach_commit_dist, dart_max_dist] and stops dead
+  # at the reach. This block fires INSIDE it, which is where the orientation
+  # error actually lives.
+  #
+  # WHY IT IS SAFE THERE. During the committed reach the action is produced from
+  # a FROZEN joint configuration commanded absolutely (`target_jp =
+  # expert_target_jp`, with reach_i saturating at the grasp), so recovery from a
+  # jolt is a servo back to a fixed target rather than a re-plan. The label is
+  # also written BEFORE the DART coin is drawn (collector.py:435 vs :472), so a
+  # jolt can never corrupt the label of the step it fires on.
+  #
+  # 0.3, not the 0.5 used on the approach. The reach is only ~5 waypoints and is
+  # the sole source of CLOSE labels, so a rate that displaces half of them would
+  # reproduce run 1's collapse. At 0.3 an average reach takes ~1.5 jolts and
+  # still has ~3.5 clean waypoints to arrive on. Validated at these magnitudes to
+  # lose zero close labels over a 10-episode smoke test.
+  dart_reach_ratio: 0.3
+
+  # TRANSLATION matched to the demonstrations' own reach steps: over the last 5
+  # label-producing steps of every episode in train_pinned_omg_ok, per-axis mean
+  # |dpos| = 0.01202 m. Note uniform(-m, m) has mean |.| = m/2, so this gives
+  # jolts averaging half a reach step — deliberate, it keeps the displacement
+  # expressible by the next frozen waypoint.
+  #
+  # ROTATION DELIBERATELY NOT MATCHED. The demos' reach rotation is 0.01549 rad,
+  # ~0.9 deg per axis, because OMG aligns the wrist far out then reaches in a
+  # straight line. Matching it would perturb by a sixtieth of the ~0.56 rad error
+  # this run exists to teach recovery from. The whole diagnosis is that the
+  # demonstrations' near-object rotation scale IS the problem, so copying it into
+  # the jolt would reproduce the problem rather than probe it.
+  dart_reach_pos_mag: 0.01202
+  dart_reach_rot_mag: 0.3
+
+  # Rejection sampling. A candidate jolt executes only if neither the jolted pose
+  # NOR the servo back to the next frozen waypoint brings any of the 6 gripper
+  # control points within `clearance` of a hand- or object-flagged point in the
+  # observation cloud. Checking the endpoint alone is not enough: the recovery is
+  # a straight line in joint space and a lateral displacement makes it cut
+  # through the object. After `max_tries` refusals the step takes no jolt.
+  #
+  # The clearance test is RELATIVE (`min(clearance, nominal)`), not absolute: an
+  # absolute 1 cm floor refused 65 of 72 draws, because during the reach the
+  # gripper is SUPPOSED to be within a centimetre of the hand.
+  #
+  # This is not a biased noise model. A jolt that knocks the object out of the
+  # hand ENDS the episode, so it carries no expert label and was never training
+  # signal — rejecting conditions on the support where pi* is defined at all.
+  dart_reach_max_tries:  5
+  dart_reach_clearance:  0.01   # metres
+  dart_reach_path_steps: 4      # interpolation samples along the recovery segment
+
+  # ---- per-episode outcome scoring (introduced run 18; ON for every new run) ----
+  # Logs what fraction of COLLECTION episodes actually completed the handover and
+  # how the rest failed, on the evaluator's own taxonomy. Runs 1-17 logged only
+  # the loop's terminal cause (c_close_label / c_env_done / c_max_steps), which
+  # says why the loop stopped, not whether it worked — and ENV_DONE was one
+  # undifferentiated bucket hiding human contact, drops and benchmark timeouts.
+  #
+  # It has to execute the close to know: on a CLOSE_LABEL the collector breaks
+  # BEFORE executing, so during collection the gripper never actually closes and
+  # success is not observable. The close is executed and held for EVAL.hold_steps
+  # AFTER the labels are frozen, then scored by the same `grasp_held_after_hold`
+  # the evaluator calls. D_i is byte-identical either way — verified 8/8 episodes.
+  # Cost ~+6% of collection, which is ~3% of the run's wall clock (collection is
+  # only 73 s of run 16's 3650 s per iteration, so this is noise against training).
+  #
+  # Columns: c_success_rate, co_grasp_ok, co_grasp_miss, co_no_release, co_drop,
+  # co_human_contact, co_bench_timeout, co_timeout — fractions of kept episodes.
+  # Read as the beta MIXTURE's result, not the policy's; success_rate stays the
+  # only policy number.
+  outcome_check: true
+
+TRAIN:
+  # Which learner DAgger wraps. The policy kind is inferred from this file
+  # (MODEL.chunk_len present => Phase-2 ACT; otherwise Phase-1 single frame), so
+  # there is no separate switch to keep in sync.
+  #   bc_phase1.yaml          -> single-frame MLP policy (default)
+  #   bc_phase1_nojoint.yaml  -> same, with drop_joint_state: true  <- run 4
+  #   act_phase2.yaml         -> temporal transformer + action chunking
+  #   bc_phase4_pm.yaml       -> same as nojoint, LOSS.pose_loss: pm      (run 11)
+  #   bc_phase4_aux.yaml      -> same as nojoint, MODEL.aux_head: true    (run 13)
+  #   bc_phase4_reachw.yaml   -> same as nojoint, reach_tail_weight: 2.5   (run 14)
+  #   bc_phase4_all.yaml      -> pm + aux head + reach_tail_weight    <- run 15
+  # Also the only record of the robot-encoder input width and of the sampler
+  # weighting, both copied into every iteration's config.yaml.
+  train_cfg: examples/configs/bc_phase4_all.yaml
+  # D_0. The *_pinned.h5 pair was collected with SIM's grasp set AND the pin
+  # table, so the demonstrations aim at the same grasp DAgger will. The older
+  # train.h5/val.h5 had NEITHER filter: measured over 72 scenes, 21% aimed at a
+  # different grasp than DAgger picks (median 10.7 cm), and aggregating those two
+  # label sets is the one inconsistency DAgger cannot average away.
+  # 623 episodes (720 scenes - 97 OMG "empty goal set" failures), vs 656 unfiltered,
+  # then examples/filter_demos.py drops the 126 (20.2%) that ended in a benchmark
+  # FAILURE and so carry no CLOSE label — the OMG plan clips the object while
+  # translating laterally into the pre-grasp pose. 497 episodes / 10437 steps
+  # remain. Those trajectories were previously training data: the approach phase
+  # of a handover that went wrong, which is worse than no data at all.
+  # Keep SIM.exclude_scenes pointing at the matching .json so DAgger does not
+  # collect or evaluate on them either.
+  # THREE-CAMERA demonstrations (collected 2026-08-05). `_wlr` = wrist+left+right,
+  # matching SIM.cfg_file above. The wrist-only train_pinned_omg_ok.h5 that runs
+  # 4-14 used is NOT interchangeable here — see the header for the check that
+  # confirms which cameras actually produced this file.
+  base_train_h5: output/bc_dataset/train_pinned_omg_wlr_ok.h5
+  # Held-out expert data -> selects best.pt within a run (EVAL.ckpt: best), which
+  # is BOTH the checkpoint that gets evaluated and the one that drives the next
+  # iteration's collection. Filtered on the same rule as the train set: a failed
+  # episode carries no CLOSE label, so leaving those in would push the gripper
+  # channel toward OPEN on 28% of val episodes and dilute the one signal that
+  # speaks to the endgame.
+  #
+  # SMALL: 21 episodes / 441 steps, 4.2% of the train set. Same 4.8% CLOSE-label
+  # density as train, so it is representative, but with 7 batches per val epoch
+  # the loss is noisy and best.pt lands on a range of epochs (12-34 in run 1).
+  # The stronger selection layer is EVAL.select_on over 100 scenes; this only
+  # picks the epoch WITHIN an iteration. If it needs fixing later, hold out a
+  # slice of the TRAIN split instead and subtract those scenes from base_train_h5.
+  val_h5: output/bc_dataset/val_pinned_omg_wlr_ok.h5   # the matching wlr val set
+  base_run: null           # path to an existing run of the SAME policy kind to
+                           # start from. null => train the base policy here as
+                           # iteration 0.
+  base_epochs: 100         # epochs for the base run
+  # 25, down from 50 — a BUDGET adjustment, not a quality one. Epochs x |D| is
+  # what costs time, and |D| roughly triples this run (60 episodes/iteration
+  # instead of 20). 25 epochs on 3x the data is still MORE gradient steps than
+  # run 1's 50, on more diverse data. Run 1 spent 4.9 h of its 8 h training.
+  iter_epochs: 25          # epochs per DAgger iteration
+  # ---- THE ONE CHANGE vs run 16 ----
+  # false: warm-start each iteration from the previous iteration's
+  # checkpoints/last.pt and reuse its normalizer. The training SET is unchanged —
+  # still the full aggregate D = base u D_1 u ... u D_i for iter_epochs — so this
+  # alters the initialisation, not the objective. See the file header for the
+  # run-16 measurement that motivates it (~25 mm -> ~14 mm re-descended 26 times)
+  # and for the two things to watch: the cosine LR restart at 9.96e-4, and the
+  # normalizer freezing at the base run's statistics.
+  #
+  # This is no longer paper-faithful Follow-The-Leader. FTL's regret bound assumes
+  # the per-iteration argmin over the aggregate is actually found; a warm start
+  # reaches a DIFFERENT local optimum than a fresh fit would, and the sequence
+  # becomes path-dependent on the order the shards arrived. In practice run 16
+  # never found that argmin either — it stopped 25 epochs short of it every time —
+  # so the bound was not being honoured by the fresh fit to begin with.
+  #
+  # Iteration 1 warm-starts from iteration 0's base run (base_epochs: 100), since
+  # cur_run_dir is the base dir at that point. Chain: base -> 01 -> 02 -> ... -> 25.
+  #
+  # NOTE the checkpoint asymmetry: the chain carries `last.pt` forward, while
+  # collection and eval use `best.pt` (EVAL.ckpt below). So the weights that
+  # generate D_i are not exactly the weights the next fit starts from. last.pt is
+  # the right choice for the chain — it is the end of the cosine schedule, i.e.
+  # the most converged — whereas best.pt is early-stopped on a 21-episode val set.
+  train_from_scratch: false
+  num_workers: 2           # DataLoader workers. This process also holds PyBullet
+                           # + the OMG SDF cache, which the workers inherit on fork.
+  device: cuda
+
+EVAL:
+  # Eval set size vs cadence. 100 scenes resolve 1 percentage point and give a
+  # ~+-8 pt 95% CI on a mid-range rate; 40 resolved only 2.5 pt with a ~+-12 pt
+  # CI, which is wider than the differences between adjacent iterations — and
+  # `select_on` decides which checkpoint ships, so that noise lands in the
+  # deliverable. Phase 3 hit the same wall and raised eval_episodes 20 -> 50.
+  # RUN 15 USES 1, NOT 2 — and the reason is checkpoint selection, not curve
+  # resolution. `maybe_update_best` is called with emetrics=None on every skipped
+  # iteration, so at `every: 2` HALF THE ITERATIONS CAN NEVER BE SELECTED AS
+  # BEST. With select_on: success_rate that means the shipped policy is chosen
+  # from 13 candidates out of 25, and an odd-numbered peak is invisible. Runs
+  # 11-14 all had this. Collection is unaffected either way — the next iteration
+  # always collects with the freshly-refit policy, since cur_run_dir is assigned
+  # before the eval block.
+  #
+  # IT IS NOT FREE, measured rather than assumed. Runs 11/12/13/14 spent 400-566 s
+  # per eval (100 scenes, ~4.9 s/scene, no OMG calls under stable_grasp), so
+  # every: 1 over 25 iterations is ~3.4 h against ~1.8 h at every: 2 — and this
+  # run renders THREE cameras per step, so expect materially more than that.
+  # Check iteration 0's eval_s in dagger_log.csv before trusting the 24 h
+  # walltime; the job is resumable, so a timeout costs a resubmit, not the run.
+  #
+  # THE ACTUALLY-FREE OPTION, if the wall clock gets tight: set this to 0 and run
+  # examples/slurm/eval_dagger_run.sbatch alongside. That job defaults to
+  # --iters all, so it scores EVERY iteration on a separate GPU allocation while
+  # the trainer runs, and it is read-only on everything the trainer writes.
+  # Cost: a second allocation and its queue wait, plus best/ selection moves to
+  # its --publish-best pass after the fact. Runs 11-14 never used it (no
+  # eval_log.csv on any of them), so it is untested in this workflow.
+  #
+  # The last iteration is ALWAYS evaluated regardless of `every`, so the final
+  # policy is never selected on a stale score.
+  every: 1                 # evaluate every N DAgger iterations (0 disables)
+  num_scenes: 100          # scenes in the eval set
+  # false: the eval scenes stay IN the collection pool.
+  #
+  # `holdout: true` never bought what its name suggests. It excludes the eval
+  # scenes from DAgger's collection, but the DEMONSTRATIONS were collected by a
+  # separate job (collect_bc_dataset.py --split train) that swept all 720 scenes
+  # with no knowledge of this flag — so ~86 of the 100 eval scenes have a demo in
+  # train_pinned.h5 and every refit trains on them. The number was never a
+  # generalization measurement, only a smaller collection pool (620 not 720).
+  #
+  # Since the goal is performance on THESE objects, hold nothing out: the eval
+  # then honestly measures the objective being optimized, and DAgger gets the
+  # full pool. For a real generalization figure, roll the saved best/ policy out
+  # on BENCHMARK.SPLIT=test (144 scenes) as a separate job — that is what the
+  # CVPR2023 paper reports (see all_cvpr2023_results_eval.sh, all *_s0_test).
+  holdout: false
+  max_steps: 50            # must match DAGGER.max_steps — same reach budget
+  ckpt: best               # which checkpoint of the iteration's run to evaluate
+                           # and then deploy for the next collection round
+
+  # SUCCESS = THE PHASE-3 CRITERION, imported from rl/rollout_worker.py. Phase 4
+  # has no carry-to-goal, so the handover-sim benchmark's own EpisodeStatus.SUCCESS
+  # (hand dwelling inside a 15 cm ball at GOAL_CENTER) can never fire and would
+  # score every episode 0. The episode is about reaching the grasp and committing
+  # the close at the right pose, and it is scored there.
+  #   stable_grasp  after the close, hold the gripper shut for hold_steps policy
+  #                 steps, then require the object SECURED: handover-sim's release
+  #                 handshake fired AND no drop AND no human contact. Physics-based
+  #                 outcome; this is the mode every recent Phase-3 run uses.
+  #   proximity     the EE is within (close_pos_thresh, close_rot_thresh) of the
+  #                 grasp pose at the close. Pure geometry — the SAME predicate
+  #                 the collector uses to emit its CLOSE label, so it measures
+  #                 label agreement rather than task outcome. Needs a grasp pose:
+  #                 free from the pin table, else one OMG plan per eval episode.
+  success_mode: stable_grasp
+  hold_steps: 3            # stable_grasp: policy-steps held shut before scoring
+                           # (matches Phase-3's RL.hold_steps)
+
+  # Reported every iteration, ordered by how much each demands — reading them
+  # left to right localises where episodes are being lost:
+  #   close_rate    the policy committed a close at all
+  #   near_rate     ...within the CLOSE-label tolerances of the pinned grasp
+  #   grasp_rate    ...and both fingers ended the hold on the object
+  #   success_rate  ...and the object was secured (released, not dropped)
+  select_on: success_rate  # success_rate | grasp_rate | near_rate | close_rate
+  verbose: false
+
+  # ---- GEOMETRIC grasp-opportunity metric (handover_sim2real/dagger/grasp_box.py) ----
+  # WHY IT EXISTS. The older opportunity metric, `chance_rate`, asks whether the
+  # EE came within (close_pos_thresh, close_rot_thresh) of the PINNED grasp.
+  # Measured on runs 7/9/10 it averages 0.033 / 0.026 / 0.049 while success_rate
+  # in those same runs peaks at 0.69 / 0.70 / 0.60 — it says the policy almost
+  # never had a chance in runs where it secures the object two thirds of the
+  # time. It is dominated by the 0.34 rad rotation gate that eval_min_rot never
+  # clears, so it measures agreement with the pin (what near_rate measures), not
+  # opportunity. Off-pose grasps are still grasps and are most of what the policy
+  # does.
+  #
+  # WHAT REPLACES IT. Per step, cast a grid of rays across the live finger gap
+  # (ground-truth PyBullet collision geometry, not the rendered point cloud —
+  # the wrist camera is ~10 cm away with the fingers straddling the object at
+  # grasp range, so a point-cloud version would be visibility-conditioned in
+  # exactly the poses it is meant to count). The fraction of the grid that hits
+  # the YCB object is the fraction of the jaw cross-section with material behind
+  # it. Rays add no bodies, and the one piece of state they do touch (the
+  # object's collision mask, which Bullet's ray callback would otherwise skip)
+  # is restored before any physics runs — verified bit-identical rollouts with
+  # and without the cast.
+  #
+  # CAVEAT, stated up front: the MANO hand carries the same one-bit collision
+  # filter and is NOT patched, so rays pass through it and it never blocks. The
+  # metric is a pure OBJECT test, and box_chance_rate is therefore an UPPER
+  # BOUND on real opportunity — it can be true where closing would collide with
+  # the human. That is the leading failure mode in this benchmark, so read
+  # box_taken_rate against f_human_contact, not on its own.
+  #
+  # COLUMNS ADDED to dagger_log.csv:
+  #   box_chance_rate  episodes where the object was ever in the OPEN jaws
+  #   box_taken_rate   ...of those, the fraction where the close was commanded
+  #                    ON such a step  <- the headline: given a chance, took it
+  #   miss_given_box   ...of those, the fraction that never became a grasp
+  #   box_missed_rate  same, but over ALL episodes rather than conditional
+  #   mean_box_steps   how many steps the window stayed open (episodes with one)
+  #   mean_box_frac    mean best occupancy — recalibrate min_frac from logs
+  #                    without re-running eval
+  #
+  # `chance_rate` and friends are NOT removed: runs 4-14 predate this metric and
+  # would become uncomparable. Both are logged and both are plotted (the pinned
+  # pair faint, the geometric pair bold).
+  box_check: true
+  box:
+    # THE TWO KNOBS THAT DEFINE THE METRIC. Changing either makes box_* columns
+    # incomparable across runs — treat them as fixed, not as things to tune.
+    min_frac:    0.50   # fraction of the 7x7 grid that must hit the object, i.e.
+                        # how much of the CONTACT PAD has material behind it.
+                        # 0.50 = 25 of 49 rays, half the pad ~ a 12x12 mm patch.
+                        #
+                        # A STRICT reading of "opportunity": the object must be
+                        # squarely across the pad, not clipping it. Measured on a
+                        # 20-scene eval of run 7's best ckpt this keeps 13 of the
+                        # 14 episodes that actually secured the object (92.9%);
+                        # the one dropped peaked at 0.265 — a grasp that worked
+                        # on a corner. It also halves the false denominator: 33%
+                        # of failures clear 0.50 against 67% at 0.20.
+                        #
+                        # So box_chance_rate now means "had a CLEAN chance" and
+                        # slightly under-counts, where a low threshold
+                        # over-counted marginal ones. Reference distribution on
+                        # ideal pinned poses: at-grasp mean 0.949 / p10 0.798 /
+                        # min 0.592; at the 6.4 cm standoff exactly 0.000.
+    open_thresh: 0.8    # normalised finger opening (joint7/0.04, 1=open) below
+                        # which the step does not count. A step taken mid-close
+                        # is not a chance the policy is declining, and counting
+                        # it would pad the denominator with states the policy has
+                        # already committed from.
+    # ---- the cuboid itself, panda_hand frame, metres. THIS IS THE CONTACT PAD,
+    # NOT THE WHOLE FINGER. Measured off meshes/{collision,visual}/finger.obj,
+    # which agree exactly: the flat inner face spans x in [-0.0088, +0.0088] and
+    # z in [0.0362, 0.0538] finger-local — 17.5 x 17.6 mm, square, at the tip.
+    # Everything proximal of z=0.036 is recessed (min y there is 0.0116-0.0174),
+    # so the blade cannot reach the object plane and material sitting in the
+    # throat of the jaws would be shoved by a close, not gripped. Adding the
+    # finger origin (0.0584) puts the pad at z in [0.0946, 0.1122]. These
+    # describe the hardware and should not need touching.
+    half_x:  0.0088     # half the pad width
+    z_lo:    0.0946     # pad start
+    z_hi:    0.1122     # pad end / fingertip
+    inset:   0.002      # back the ray endpoints off each inner face, so a ray
+                        # never starts inside a finger mesh (undefined first hit)
+    grid_x:  7          # square region -> square grid. 7 x 7 = 49 rays at
+    grid_z:  7          # 2.93 mm spacing, finer than the 5 mm of the old
+                        # finger-length box despite 1/6 the area. Cost is
+                        # negligible next to a PointNet++ forward pass.
