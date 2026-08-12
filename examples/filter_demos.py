@@ -56,22 +56,55 @@ def main() -> None:
     scenes_out = Path(args.scenes_out) if args.scenes_out else dst.with_suffix(".json")
 
     keep, drop, drop_scenes = [], [], []
+    malformed, malformed_scenes = [], []
     with h5py.File(args.src, "r") as f:
         attrs = dict(f.attrs)
-        for key in sorted(k for k in f if k.startswith("episode")):
+        # Point count every episode must have. Taken from the file's own modal
+        # value rather than hardcoded, so this works for any uniform_num_pts.
+        keys_all = sorted(k for k in f if k.startswith("episode"))
+        widths = {}
+        for key in keys_all:
+            w = int(f[key]["point_clouds"].shape[1])
+            widths[w] = widths.get(w, 0) + 1
+        n_pts = max(widths, key=widths.get) if widths else 0
+
+        for key in keys_all:
             acts = f[key]["expert_actions"][:]
             scene = int(f[key].attrs["scene_idx"])
+            # MALFORMED CLOUD CHECK. An episode whose clouds are not [T, n_pts, C]
+            # cannot be batched: the DataLoader's collate raises
+            #     RuntimeError: Trying to resize storage that is not resizable
+            # from inside the worker, with nothing naming the episode. It killed
+            # run 19 three minutes in. The cause was a merge that produced 128
+            # points when the object contributed none (fixed in
+            # handover_sim2real/policy.py), but a dataset collected before that
+            # fix still carries the bad episodes, and any future collection can
+            # produce a short cloud some other way. Checked BEFORE the CLOSE-label
+            # rule, because a malformed episode is unusable whether or not it
+            # completed — the old filter passed it precisely because it HAD a
+            # close label.
+            if int(f[key]["point_clouds"].shape[1]) != n_pts:
+                malformed.append(key)
+                malformed_scenes.append(scene)
+                drop_scenes.append(scene)
+                continue
             if (acts[:, 6] < 0.5).any():          # has a CLOSE label -> completed
                 keep.append(key)
             else:
                 drop.append(key)
                 drop_scenes.append(scene)
 
-        n = len(keep) + len(drop)
+        n = len(keep) + len(drop) + len(malformed)
         print(f"{args.src}")
         print(f"  episodes        : {n}")
+        print(f"  cloud width     : {n_pts} pts" + (
+            f"   (mixed widths seen: {dict(sorted(widths.items()))})"
+            if len(widths) > 1 else ""))
         print(f"  kept (completed): {len(keep)}  ({100*len(keep)/max(n,1):.1f}%)")
         print(f"  dropped (failed): {len(drop)}  ({100*len(drop)/max(n,1):.1f}%)")
+        if malformed:
+            print(f"  dropped (MALFORMED cloud): {len(malformed)}  "
+                  f"-> scenes {sorted(set(malformed_scenes))}")
         print(f"  distinct scenes dropped: {len(set(drop_scenes))}")
         if args.dry_run:
             print("\n--dry-run: nothing written")
@@ -83,7 +116,8 @@ def main() -> None:
                 g.attrs[k] = v
             g.attrs["num_episodes"] = len(keep)
             g.attrs["filtered_from"] = str(args.src)
-            g.attrs["filter_rule"] = "dropped episodes with no CLOSE label (= benchmark failure)"
+            g.attrs["filter_rule"] = ("dropped episodes with no CLOSE label (= benchmark failure) "
+                                     "and episodes whose point clouds are not [T, n_pts, C]")
             steps = 0
             for i, key in enumerate(keep):
                 src_grp = f[key]

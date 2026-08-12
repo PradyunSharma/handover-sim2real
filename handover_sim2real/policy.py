@@ -97,6 +97,36 @@ class PointListener:
             else:
                 point_state = point_states[0]   # nothing in view (rare) — object slot
 
+        # ---- SHAPE GUARD (run 19). The 2-class branch above guards only
+        # `point_states[1:]` (the HAND). Nothing checks the OBJECT class, so when
+        # the object contributes 0 points while the hand does not, the "normal"
+        # merge runs and yields object[:, :896] (empty) + hand[:, :128] = 128
+        # columns — a silently short cloud, not the [num_pts, C] every consumer
+        # assumes. It surfaces as
+        #     RuntimeError: Trying to resize storage that is not resizable
+        # in the DataLoader's collate, far from the cause.
+        #
+        # Measured on scene 494 under pretrain_right.yaml: object 0 pts, hand 93
+        # -> (128, 5) for all 21 steps, which is what crashed run 19.
+        #
+        # WHY IT NEVER BIT runs 1-18: `_update_acc_points` skips empty classes,
+        # so a class keeps its LAST non-empty view. The object therefore only
+        # stays empty if it was invisible at the FIRST step and never seen since.
+        # The wrist camera always sees the object early (far away, in frame), so
+        # acc_points[0] is populated at step 0 and persists. A single FIXED
+        # camera can be occluded from the start — that is the new exposure, and
+        # it is exactly what pretrain_right.yaml's header warned about.
+        #
+        # Deliberately a post-hoc guard rather than a rewrite of the branch: it
+        # is a no-op whenever the cloud is already num_pts (both classes present:
+        # 896+128; hand empty: the object slot is already regularized to
+        # num_pts), so runs 1-18 are bit-identical. It only fires on the shape
+        # that would otherwise crash. Both classes empty leaves 0 columns and is
+        # left alone — there is no data to resample from, and silently inventing
+        # a cloud would be worse than the error.
+        if 0 < point_state.shape[1] != num_pts:
+            point_state = regularize_pc_point_count(point_state.T, num_pts).T
+
         return [(point_state, np.array([])), None, None, None]
 
     def _process_pointcloud(self, point_states, ee_pose):
