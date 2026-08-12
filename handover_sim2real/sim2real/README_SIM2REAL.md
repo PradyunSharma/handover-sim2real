@@ -123,6 +123,19 @@ Closing the 3D window does not stop the run, and the view is rate-limited
 (`--cloud-update-hz`, default 10) because Open3D re-uploads the whole buffer on
 every update.
 
+**Interactivity in `--step-mode`.** One runner iteration — camera grab,
+segmentation, policy forward, display — measures **3.7 Hz**, and the 3D window
+was originally pumped once per iteration. A trackpad drag sampled at 3.7 Hz
+barely moves the camera at all, which is why the window felt frozen rather than
+merely slow. In step mode the loop is waiting for a human anyway, so each
+iteration now spends `VIEWER_PUMP_S` (0.20 s) pumping the window's events before
+recomputing perception: **55 Hz** measured, a 15× improvement. Any keypress
+breaks the pump immediately, so SPACE is never delayed.
+
+This is deliberately **step-mode only**. In continuous mode the loop rate *is*
+the control rate, and trading it away to smooth a debug view would be the wrong
+call.
+
 **If the 3D window is ever empty while the HUD shows healthy `obj=`/`hand=`
 counts**, the view is framed somewhere the cloud isn't. That was a real bug once:
 Open3D scales its view from the bounding box of the geometry present when it was
@@ -134,6 +147,114 @@ the real extent *before* applying the viewing angle.
 and far distances to keep it from coming back; the old code scores 0 pixels on
 the far case, so the check has teeth. Dragging in the window re-frames it by
 hand in any case.
+
+### Inspecting perception on its own
+
+`test_perception_viz.py` opens the same windows without loading a policy and
+without ever publishing to a ROS topic, so it **cannot move the arm**. Use it to
+judge segmentation and cloud quality before trusting a rollout.
+
+```bash
+python test_perception_viz.py --cameras wrist,tripod --calib-session <session>
+python test_perception_viz.py --cameras wrist --no-ros     # no robot at all
+```
+
+Its 3D window draws **two** clouds at different point sizes:
+
+| cloud | size | colour | what it is |
+|---|---|---|---|
+| policy input | large | orange object / green hand | the `[1024, 5]` tensor the network would receive |
+| raw scene | small | white | every camera's full deprojected view, merged in `panda_hand` |
+
+The white cloud is the point of the script. The coloured cloud alone cannot tell
+you whether it is in the right *place* — a hand cloud rigidly displaced by a bad
+extrinsic still looks like a perfectly good hand cloud. Against the white scene
+(table, arm, background — geometry you recognise) a displacement is obvious, and
+with two cameras **the white clouds must overlap**. Where they don't, the gap is
+your calibration error.
+
+Keys, in any OpenCV window: `c` colour by class/camera, `w` white cloud on/off,
+`z`/`x` roll the view, `r` drag mode, `q` quit.
+`--context-stride` and `--context-radius` control the
+white cloud's density and how far out it extends (default 1.2 m around
+`panda_hand`, because a tripod at 1.5 m otherwise contributes the whole room and
+dominates the view scale).
+
+**Reorienting the view.** Left-drag orbits, scroll zooms, and **`z` / `x` roll
+the view** in 10° steps. Roll exists as its own key because neither built-in
+Open3D control is satisfactory alone:
+
+| mode (`r` cycles) | left-drag | drag direction |
+|---|---|---|
+| turntable *(default)* | orbits, up-vector **pinned to +z** — cannot roll | conventional |
+| arcball | tumbles freely, roll included | **inverted** |
+| rotate model | spins the geometry, not the camera | inverted |
+
+Turntable orbits perfectly well — which is why zoom, pan and
+revolve-around-a-point all work — but it pins the horizon, so a view can never
+be tilted off horizontal. The arcball reaches every orientation but Open3D drags
+it in the opposite sense, which reads as inverted controls. `z` / `x` give the
+missing degree of freedom with an unambiguous direction: they rotate only the
+camera's up-vector, leaving position and view direction untouched (verified:
+eye moves 0.0 m, view direction changes 0.0°, up rotates exactly the requested
+angle), so the view never jumps.
+
+**A fixed camera needs the live robot pose.** Its extrinsics are
+`inv(T_base_hand) @ T_base_color`, so `--no-ros` refuses to draw one rather than
+placing its points against a fictitious arm position. The wrist camera is fine
+without a robot — its extrinsics are constant.
+
+Watch for the `STALE` marker in the 2D captions and the `*` in the console
+summary. When the segmenter loses the hand, `extract_hand_object_clouds` falls
+back to the previous frame's hand cloud and then crops the object around that
+*stale* centroid — which can yield a very large, entirely bogus object cloud
+(15k points was observed on the wrist while no hand was present). A `*` means
+the observation is not fresh, whatever the point counts say.
+
+This script uses Open3D's `O3DVisualizer` rather than the legacy `Visualizer`
+that `--show-cloud` uses, because the legacy renderer has **one global point
+size** for the whole scene — "small white dots behind large coloured ones" is
+not expressible there.
+
+Two O3DVisualizer quirks are worth knowing if you edit it:
+
+* it draws a **skybox by default that renders over `set_background`**, so
+  setting a background colour alone does nothing at all — `show_skybox(False)`
+  is required first. The legacy viewer has no skybox, which is why the same
+  one-liner works there.
+* geometry colours go through Filament's **tone mapper**, so what you set is not
+  what a screenshot reads back — the object orange `(255, 115, 26)` renders as
+  roughly `(245, 180, 84)`. Don't colour-match rendered pixels against the
+  source constants.
+
+**Performance.** Perception runs on a worker thread and the main thread does
+nothing but pump events. That is not an optimisation, it is what makes the window
+usable: one perception pass takes ~70 ms, and when it shared a loop with
+`run_one_tick()` the GUI got one event tick per pass, i.e. ~14 Hz. A trackpad
+drag sampled at 14 Hz mostly gets dropped, which reads as "laggy and won't
+rotate". Measured after the change: **82 Hz event loop** with both cameras.
+Geometry is also updated in place rather than rebuilt each frame
+(`--draw-hz`, default 10) — the clouds are allocated once at a fixed size, which
+is why `--context-max` exists and why the white cloud is padded to it.
+
+**If the cloud flickers or points go black**, three things caused that and are
+fixed; they're worth knowing before touching this code:
+
+* the geometry was **hidden on any frame with no data**, and `usable` goes false
+  whenever the segmenter drops the hand for one frame — so the cloud blinked out
+  several times a second. It now *holds* the previous cloud; staleness is still
+  reported in the 2D captions and console, so nothing is concealed.
+* the policy cloud was **allocated with zero (black) colours**, so a partially
+  applied update rendered as black speckle. It is seeded with the object colour.
+* the tensor cloud passed to `update_geometry` was a **Python temporary**, freed
+  as soon as the call returned while Filament was still consuming it on the
+  render thread — garbage colours. The last few frames' clouds are now retained.
+  (`o3c.Tensor(ndarray)` does copy, so the numpy inputs were never the problem.)
+
+The worker is itself throttled (15 Hz). Left unthrottled it pinned ~2.4 cores
+and starved the render thread it exists to feed — the window stuttered again for
+an entirely different reason. Throttling *raised* the GUI from 66 to 82 Hz and
+halved CPU use, since nothing consumes snapshots faster than the draw rate.
 
 ### Keys (in the OpenCV window)
 

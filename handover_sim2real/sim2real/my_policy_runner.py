@@ -109,6 +109,7 @@ from pointcloud_multicam import (  # noqa: E402
     MultiCameraPerception,
     build_policy_cloud,
     build_rigs,
+    overlay_mask,
 )
 from cloud_viewer import PolicyCloudViewer, source_for_cloud  # noqa: E402
 from transforms import invert_transform  # noqa: E402
@@ -371,6 +372,14 @@ STEP_CONVERGE_TOL_M = 0.003
 
 MAX_POLICY_STEPS = 50   # dagger/evaluator.py EvalParams.max_steps
 
+# How long each step-mode iteration idles pumping the 3D window's events before
+# recomputing perception. One iteration of perception + policy is ~80-100 ms, so
+# without this the viewer is pumped at ~10 Hz and a trackpad drag is sampled far
+# too coarsely to orbit smoothly. Any keypress breaks the pump immediately, so
+# this never delays SPACE. Only used in --step-mode: in continuous mode the loop
+# rate is the control rate and must not be traded away for a debug view.
+VIEWER_PUMP_S = 0.20
+
 # -----------------------------------------------------------------------------
 # ROS state
 # -----------------------------------------------------------------------------
@@ -400,12 +409,8 @@ def gripper_state_cb(msg: dict) -> None:
 # them inside HandSegmenter so every camera's mask is cleaned identically.
 
 
-def overlay_mask(color_bgr: np.ndarray, mask: np.ndarray, alpha: float = 0.45) -> np.ndarray:
-    overlay = color_bgr.copy()
-    hand_color = np.zeros_like(color_bgr)
-    hand_color[:, :, 1] = 255
-    blended = (alpha * hand_color + (1.0 - alpha) * overlay).astype(np.uint8)
-    return np.where(mask[..., None] > 0, blended, overlay)
+# overlay_mask lives in pointcloud_multicam alongside normalize_mask, so the
+# runner and test_perception_viz render the mask identically.
 
 
 # -----------------------------------------------------------------------------
@@ -1039,20 +1044,15 @@ def main() -> None:
                   else T_HAND_CAM_NOMINAL)
     if T_hand_cam.shape != (4, 4):
         raise ValueError(f"--hand-eye must be 4x4, got {T_hand_cam.shape}")
-    if args.hand_eye is None:
-        print("[calib] WARNING: using the SIM's nominal wrist mount for T_hand_cam. "
-              "Pass --hand-eye <T_hand_cam.npy> once you have calibrated the D435.")
 
     camera_names = [c.strip() for c in args.cameras.split(",") if c.strip()]
     if not camera_names:
         raise SystemExit("--cameras is empty")
-    if "wrist" not in camera_names:
-        # Every training config that exists here includes the wrist view, and it
-        # is the only camera whose extrinsics do not depend on the robot pose.
-        # Dropping it is almost certainly a typo.
-        raise SystemExit(
-            f"--cameras {args.cameras!r} has no 'wrist'. No checkpoint in this "
-            "repo was trained without the eye-in-hand view.")
+    # Only warn about the wrist mount if a wrist camera is actually in use —
+    # T_hand_cam is unused otherwise, and warning about it would be noise.
+    if args.hand_eye is None and "wrist" in camera_names:
+        print("[calib] WARNING: using the SIM's nominal wrist mount for T_hand_cam. "
+              "Pass --hand-eye <T_hand_cam.npy> once you have calibrated the D435.")
     fixed_names = [c for c in camera_names if c != "wrist"]
     if fixed_names and args.calib_session is None:
         raise SystemExit(
@@ -1060,6 +1060,22 @@ def main() -> None:
             "--calib-session. A fixed camera's pose in the base frame is not "
             "guessable; without it its points land arbitrarily in the hand frame "
             "and the fused cloud is worse than the wrist camera alone.")
+    if "wrist" not in camera_names:
+        # Allowed, but it is a bigger departure than dropping one of three views,
+        # so say what changes rather than just letting it run. Not an error: the
+        # fusion is viewpoint-agnostic and this is a legitimate way to isolate
+        # the tripod path.
+        print(
+            "\n[warn] no wrist camera in --cameras. Two things change:\n"
+            "  * cp2 was trained wrist-ONLY and cp3 on wrist+left+right, so every\n"
+            "    checkpoint here saw the eye-in-hand view. Running without it is a\n"
+            "    larger input-distribution shift than dropping a side view.\n"
+            "  * the wrist camera is the only one whose extrinsics are constant.\n"
+            "    With fixed cameras alone, EVERY point is placed through\n"
+            "    inv(T_base_hand) @ T_base_color, so the hand-eye calibration and\n"
+            "    the reported EE pose now sit in series with the whole cloud —\n"
+            "    there is no pose-independent view left to anchor it.\n"
+            f"    Calibration in use: session {args.calib_session!r}.\n")
 
     print(f"Policy dir     : {policy_dir}")
     print(f"Checkpoint     : {ckpt}")
@@ -1329,10 +1345,30 @@ def main() -> None:
             # obvious which stream you are looking at. Keys are read from this
             # window (cv2.waitKey is global, but this is the one with the HUD).
             cv2.imshow(f"cam: {rigs[0].name}  [keys here]", overlay)
-            viewer.poll()
 
-            # ---- key handling ----
-            key = cv2.waitKey(1) & 0xFF
+            # ---- key handling, with the 3D window pumped while we idle ----
+            # A single poll() per iteration gives the viewer ~10 Hz, because one
+            # iteration is a camera grab plus a segmentation forward plus a
+            # policy forward. At 10 Hz a trackpad drag is sampled so coarsely
+            # that the view barely responds, which reads as "laggy and won't
+            # rotate". In STEP MODE the loop is waiting for a human anyway, so
+            # that wait is spent pumping the window at full rate instead of
+            # re-running perception nobody asked for. Any keypress breaks out
+            # immediately, so it costs no responsiveness at the keyboard.
+            #
+            # In continuous mode the pump is skipped: there the loop rate IS the
+            # control rate, and slowing it to make a debug view smoother would
+            # be the wrong trade.
+            key = 255
+            pump_until = time.time() + (VIEWER_PUMP_S if args.step_mode else 0.0)
+            while True:
+                viewer.poll()
+                k = cv2.waitKey(1) & 0xFF
+                if k != 255:
+                    key = k
+                    break
+                if time.time() >= pump_until:
+                    break
             if key in (27, ord("q")):
                 stop_reason = "user quit"
                 break

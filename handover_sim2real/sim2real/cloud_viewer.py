@@ -54,6 +54,16 @@ _FINGER_HALF_X = 0.053
 _FINGER_BASE_Z = 0.075
 _FINGER_TIP_Z = 0.105
 
+# Mid-grey. Shared by this viewer and test_perception_viz so the two windows
+# match — one definition, because they are meant to be the same picture.
+#
+# Kept on the dark side of mid deliberately: test_perception_viz draws the raw
+# scene cloud in near-white, and the lighter this gets the more those dots wash
+# out against it. This value keeps white context, orange object and green hand
+# all legible at once. Raise it toward 0.6 if you prefer a lighter field and can
+# live with fainter context dots.
+BACKGROUND = (0.38, 0.38, 0.40)
+
 CLASS_COLOURS = {
     "object": (1.00, 0.45, 0.10),   # orange
     "hand": (0.10, 0.85, 0.35),     # green
@@ -156,7 +166,7 @@ class PolicyCloudViewer:
                 o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05))
 
             opt = self._vis.get_render_option()
-            opt.background_color = np.asarray([0.10, 0.10, 0.12])
+            opt.background_color = np.asarray(BACKGROUND)
             opt.point_size = point_size
 
             self._vis.register_key_callback(ord("C"), self._toggle_colour)

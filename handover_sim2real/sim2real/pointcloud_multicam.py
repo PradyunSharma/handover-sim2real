@@ -336,6 +336,21 @@ def normalize_mask(mask: np.ndarray) -> np.ndarray:
     return mask
 
 
+def overlay_mask(color_bgr: np.ndarray, mask: np.ndarray,
+                 alpha: float = 0.45) -> np.ndarray:
+    """Tint the segmented hand green over the colour image.
+
+    Shared by the runner and test_perception_viz so both draw the mask
+    identically — a debugging view that renders differently from the thing being
+    debugged is worse than none.
+    """
+    overlay = color_bgr.copy()
+    hand_color = np.zeros_like(color_bgr)
+    hand_color[:, :, 1] = 255
+    blended = (alpha * hand_color + (1.0 - alpha) * overlay).astype(np.uint8)
+    return np.where(mask[..., None] > 0, blended, overlay)
+
+
 class HandSegmenter:
     """The hand-segmentation network, run over every camera in ONE forward pass.
 
@@ -423,7 +438,11 @@ class MultiCameraPerception:
         self._rigs = list(rigs)
         self._segment = segmenter
         self._per_camera_cap = per_camera_cap
+        # Last (colour, hand mask) and last depth per camera, kept so a viewer
+        # can draw exactly the frames this observation was computed from rather
+        # than grabbing its own — which would be a different instant.
         self.last_frames: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self.last_depths: dict[str, np.ndarray] = {}
 
     @property
     def rigs(self) -> list[CameraRig]:
@@ -454,6 +473,7 @@ class MultiCameraPerception:
         for rig_i, (rig, color_bgr, depth_m, hand_mask) in enumerate(
                 zip(self._rigs, colors, depths, masks)):
             self.last_frames[rig.name] = (color_bgr, hand_mask)
+            self.last_depths[rig.name] = depth_m
 
             p = rig.params
             result = extract_hand_object_clouds(
