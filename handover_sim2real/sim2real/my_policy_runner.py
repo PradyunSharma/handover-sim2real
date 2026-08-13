@@ -69,7 +69,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import cv2
 import numpy as np
@@ -77,7 +77,6 @@ import roslibpy
 import torch
 import yaml
 from scipy.spatial.transform import Rotation as Rot, Slerp
-from torchvision import transforms
 
 # -----------------------------------------------------------------------------
 # Directory layout
@@ -111,7 +110,12 @@ from pointcloud_multicam import (  # noqa: E402
     build_rigs,
     overlay_mask,
 )
-from cloud_viewer import PolicyCloudViewer, source_for_cloud  # noqa: E402
+from cloud_viewer import source_for_cloud  # noqa: E402
+from dual_cloud_window import (  # noqa: E402
+    DualCloudWindow,
+    context_cloud,
+    exit_without_finalizing,
+)
 from transforms import invert_transform  # noqa: E402
 from model import HandSegModel  # noqa: E402
 
@@ -226,6 +230,7 @@ HOME_STEP_ROT_DEG = 5.0
 HOME_SETTLE_TIMEOUT_S = 3.0
 HOME_REFINE_PASSES = 6      # re-command home once the droop estimate exists
 HOME_REFINE_TOL_M = 0.002   # stop refining below this (was SETTLE_POS_TOL_M=5 mm)
+HOME_WAY_TOL_M = 0.008      # intermediate waypoints are a path, not a target
 
 # z offset from panda_hand to whatever frame /cartesian_pose publishes.
 #
@@ -281,7 +286,12 @@ MAX_STEP_ROT_DEG = 20.0
 # Step-and-settle convergence.
 SETTLE_POS_TOL_M = 0.005
 SETTLE_ROT_TOL_DEG = 3.0
-SETTLE_TIMEOUT_S = 2.0
+# 3.0, not 2.0: creep does its correcting INSIDE one settle() rather than across
+# repeated calls, so the budget that used to cover one command now has to cover
+# the whole approach — initial travel, a handful of nudges at >= CREEP_DEAD_S +
+# CREEP_STALL_HOLD_S apart, and the final hold. A 39 mm step measures ~1.2 s of
+# that, so 2.0 s left no margin and would have turned slow steps into timeouts.
+SETTLE_TIMEOUT_S = 3.0
 SETTLE_POLL_S = 0.02
 
 # Motion-stopped criterion — the one that actually fires on this robot. Per-poll
@@ -369,6 +379,57 @@ MAX_DROOP_COMP_M = 0.30
 # and the passes cap keeps a step from stalling the episode if the arm is blocked.
 STEP_CONVERGE_PASSES = 3
 STEP_CONVERGE_TOL_M = 0.003
+
+# -----------------------------------------------------------------------------
+# Creep correction — why the arm used to move in stop-go-stop-go bursts
+# -----------------------------------------------------------------------------
+# The convergence above is right; the way it was applied was not. move_to() ran
+# up to STEP_CONVERGE_PASSES separate settle() calls per policy step, and every
+# settle() waits for the arm to come to a COMPLETE stop — SETTLE_STILL_HOLD_S =
+# 0.30 s with no motion at all. So one policy step executed as: lunge, dead stop,
+# twitch, dead stop, twitch, dead stop. Three full stops per step, by
+# construction, which is exactly the "moves a certain distance then does some
+# fine motions" that shows up on the robot. Logged steps are ~39 mm and pass 1
+# lands well short of that, so passes 2 and 3 fired on essentially every step.
+#
+# The fix is not a looser tolerance — that would just leave the step short. It is
+# to stop waiting for a dead stop before correcting. A Cartesian impedance
+# controller accepts a new equilibrium at any instant; it has no notion of the
+# arm being "between" commands. So when the arm STALLS short of the target —
+# still for CREEP_STALL_HOLD_S, a quarter of the full hold — the lead is
+# lengthened and republished right there, and the arm resumes from where it
+# stands. The correction becomes a decelerating creep onto the target inside one
+# continuous motion, with a single full stop at the end.
+#
+# That last stop is not negotiable: cp2/cp3 are single-frame Markov policies
+# trained on states where the sim robot had fully reached its waypoint, so the
+# observation that follows a step must be of a stationary arm.
+CREEP_STALL_HOLD_S = 0.06    # stillness that means "stalled", not "arrived"
+CREEP_DEAD_S = 0.08          # ignore stillness this long after a publish, so
+                             # round-trip latency is never read as a stall
+CREEP_GAIN = 0.6             # fraction of the remaining error added per nudge
+CREEP_MAX_NUDGES = 12        # backstop; MAX_COMMAND_LEAD_M and the settle
+                             # timeout bound this too
+
+# Feed-forward lead along the direction of travel.
+#
+# The vector droop estimate above cannot do this job, and that is the structural
+# reason three passes were needed on EVERY step rather than converging away after
+# the first few. A standing offset is a property of a POSE; the shortfall that
+# makes a commanded move fall short is a property of a DIRECTION — friction
+# opposes travel. Each policy step travels somewhere new, so a vector learned on
+# the last step's direction is stale, and can point the wrong way outright when
+# the policy reverses. Carrying it forward then costs a correction instead of
+# saving one.
+#
+# A scalar magnitude applied along the current move's own direction cannot point
+# the wrong way. At worst it is too long or too short along an axis the arm is
+# travelling anyway, and the creep closes the difference. That is the whole
+# reason this is a scalar: it exists only to make the FIRST command land close so
+# few nudges are needed, and correctness never rests on it.
+TRAVEL_LEAD_BETA = 0.5       # EMA weight on each converged move's lead
+TRAVEL_LEAD_MIN_M = 0.005    # moves shorter than this do not inform the estimate
+TRAVEL_LEAD_MAX_M = 0.05     # cap, same spirit as MAX_DROOP_COMP_M
 
 MAX_POLICY_STEPS = 50   # dagger/evaluator.py EvalParams.max_steps
 
@@ -638,20 +699,16 @@ def read_gripper_norm(assume_open: bool) -> float:
 # Model loading
 # -----------------------------------------------------------------------------
 def load_hand_segmenter(device: str, checkpoint: Path):
+    """The hand model alone. Its input transform is per camera now, so it is
+    built inside HandSegmenter (see pointcloud_multicam.make_seg_preprocess)
+    rather than fixed once here at 256."""
     if not checkpoint.exists():
         raise FileNotFoundError(f"Hand segmentation checkpoint not found: {checkpoint}")
 
     model = HandSegModel.load_from_checkpoint(str(checkpoint), map_location="cpu")
     model = model.to(device)
     model.eval()
-
-    preprocess = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    return model, preprocess
+    return model
 
 
 def load_bc_policy(policy_dir: Path, ckpt: str, device: str):
@@ -731,17 +788,32 @@ def warm_up_policy(model, device: str) -> None:
 # Control
 # -----------------------------------------------------------------------------
 class DroopCompensator:
-    """Running estimate of the impedance controller's steady-state offset.
+    """Feed-forward estimate of how far past a target to command.
 
-    `compensate` shifts a desired pose into the equilibrium command that will
-    actually land on it; `update` re-estimates from what the last command
-    achieved. Disabled, both are no-ops and behaviour is exactly as before.
+    Two estimates live here, and which one is used depends on the control path:
+
+      `d`  a standing offset VECTOR, used by the legacy multi-pass path
+           (`--no-creep`). `compensate` applies it; `update` re-estimates it by
+           integral feedback from what the last command achieved.
+
+      `s`  a lead MAGNITUDE applied along the direction of the current move,
+           used by the creep path. `initial_lead` applies it; `observe_travel`
+           re-estimates it from the lead a converged move actually needed.
+
+    They are deliberately not mixed. Under creep the standing offset is
+    re-derived within every move by the creep itself, which is strictly more
+    robust than carrying a vector across moves that go in different directions —
+    see the TRAVEL_LEAD_* block. Disabled, all four are no-ops: the creep still
+    converges, it just starts each move from a zero lead and pays a nudge or two
+    for it.
     """
 
     def __init__(self, enabled: bool = True):
         self.enabled = bool(enabled)
         self.d = np.zeros(3, dtype=np.float64)
         self.samples = 0
+        self.s = 0.0            # travel-direction lead, metres
+        self.s_samples = 0
 
     def compensate(self, T_target: np.ndarray) -> np.ndarray:
         if not self.enabled:
@@ -749,6 +821,37 @@ class DroopCompensator:
         T = T_target.copy()
         T[:3, 3] = T[:3, 3] + self.d
         return T
+
+    def initial_lead(self, travel: np.ndarray) -> np.ndarray:
+        """The lead to command before the arm has moved, for a move covering
+        `travel` (target minus current position)."""
+        if not self.enabled or self.s <= 0.0:
+            return np.zeros(3, dtype=np.float64)
+        n = float(np.linalg.norm(travel))
+        if n < 1e-9:
+            return np.zeros(3, dtype=np.float64)
+        return self.s * (np.asarray(travel, dtype=np.float64) / n)
+
+    def observe_travel(self, lead_used: np.ndarray, travel: np.ndarray) -> None:
+        """Learn from a move that converged, by projecting the lead it ended up
+        needing onto the direction it travelled.
+
+        Only the along-travel component is kept. The perpendicular part is real —
+        gravity does not care which way the arm is going — but it is not
+        separable from the direction-dependent part in a single move, and
+        carrying a mis-attributed vector forward is the failure this whole scheme
+        exists to avoid. The creep re-derives it each move for the cost of a
+        nudge.
+        """
+        if not self.enabled:
+            return
+        n = float(np.linalg.norm(travel))
+        if n < TRAVEL_LEAD_MIN_M:
+            return              # a short move says nothing about travel lead
+        along = float(np.asarray(lead_used, dtype=np.float64) @ (travel / n))
+        along = float(np.clip(along, 0.0, TRAVEL_LEAD_MAX_M))
+        self.s = (1.0 - TRAVEL_LEAD_BETA) * self.s + TRAVEL_LEAD_BETA * along
+        self.s_samples += 1
 
     def update(self, T_commanded: np.ndarray, T_measured: np.ndarray) -> None:
         """D = commanded - measured, EMA-blended and capped.
@@ -768,49 +871,92 @@ class DroopCompensator:
     def describe(self) -> str:
         if not self.enabled:
             return "droop compensation OFF"
+        if self.s_samples:
+            return f"lead={self.s*1000:.1f} mm along travel  n={self.s_samples}"
         return (f"droop=({self.d[0]*1000:+.1f}, {self.d[1]*1000:+.1f}, "
                 f"{self.d[2]*1000:+.1f}) mm  n={self.samples}")
 
 
+class SettleResult(NamedTuple):
+    settled: bool
+    pos_err: float          # to the TARGET, not to the command — the log should
+    rot_err: float          # show the standing offset rather than hide it
+    next_seq: int
+    nudges: int
+
+
 def settle(pub, template_msg: dict, T_base_ctrl_target: np.ndarray, seq: int,
-           timeout_s: float, droop: "DroopCompensator | None" = None) -> tuple[bool, float, float]:
-    """Publish a target and block until the arm stops moving.
+           timeout_s: float, droop: "DroopCompensator | None" = None,
+           tol_m: float = SETTLE_POS_TOL_M, creep: bool = True) -> SettleResult:
+    """Command a target and block until the arm has stopped ON it.
 
-    cp2 is a single-frame Markov policy trained on ~2 cm steps where the sim
-    robot fully reached each waypoint before the next observation. Streaming
-    targets at camera rate would feed it mid-motion states it never saw in
-    training, so each target is held until the motion it caused is over.
+    cp2/cp3 are single-frame Markov policies trained on steps where the sim robot
+    fully reached each waypoint before the next observation. Streaming targets at
+    camera rate would feed them mid-motion states they never saw in training, so
+    each target is held until the motion it caused is over.
 
-    "Over" is MOTION STOPPED, not TARGET REACHED. A Cartesian impedance
-    controller only generates force through position error, so holding the arm
-    against gravity requires a permanent offset — measured on this robot at
-    ~17 mm, almost all of it -z. A reached-the-target test can therefore never
-    pass, and degrades silently into a fixed sleep of `timeout_s` per step.
-    Convergence is instead declared when successive poses stop changing, which
-    is what "the arm has finished responding" actually means. The target-reached
-    test is kept as an early exit for the case where there is no droop.
+    A Cartesian impedance controller only generates force through position error,
+    so holding the arm against gravity requires a permanent offset — measured on
+    this robot at ~17 mm, almost all of it -z — and the arm will therefore STALL
+    short of any target it is simply told to go to. There are two ways to deal
+    with that and this function does both, selected by `creep`:
 
-    Returns (settled, final_pos_err_to_target, final_rot_err_to_target). The
-    errors are still measured against the target, so the caller's log shows the
-    standing offset rather than hiding it.
+      creep=True (default)
+        Accept stalling as the normal end of a command rather than the end of
+        the move. When the arm has been still for CREEP_STALL_HOLD_S but is not
+        yet within `tol_m`, lengthen the lead and republish immediately. The arm
+        resumes from where it stands, so the move reads as one decelerating
+        approach instead of a series of twitches separated by dead stops.
+        Convergence means still AND on target.
+
+      creep=False
+        The original behaviour: publish once, and declare convergence when the
+        pose stops changing, wherever that happens to be. Getting the rest of
+        the way was the caller's problem, and move_to() solved it by commanding
+        again — which is what made the motion lumpy. Kept for comparison and as
+        an escape hatch.
+
+    Convergence is judged on TRANSLATION plus stillness. Rotation is measured and
+    returned but does not gate, because the lead is translation-only (rotational
+    droop measured 0.9 deg against 3.4-4.6 deg steps): gating on a residual this
+    function cannot correct would turn every step into a timeout. This is not a
+    regression — the stillness path, the one that actually fired before, ignored
+    rotation entirely.
     """
-    # What we ASK for is the target shifted by the standing offset; what we
-    # measure success against is the target itself. The shifted command is then
-    # clamped so it never sits more than MAX_COMMAND_LEAD_M ahead of the arm's
-    # actual pose — the bound that matters for how hard the controller pulls.
-    T_command = droop.compensate(T_base_ctrl_target) if droop else T_base_ctrl_target
-    if current_msg is not None:
-        T_command = clamp_command_lead(T_command, pose_msg_to_matrix(current_msg))
-    pub.publish(roslibpy.Message(
-        matrix_to_pose_msg_like(template_msg, T_command, seq)))
-
     rot_tol = np.deg2rad(SETTLE_ROT_TOL_DEG)
     still_rot_tol = np.deg2rad(SETTLE_STILL_ROT_DEG)
+    target_xyz = T_base_ctrl_target[:3, 3]
+
+    T_start = pose_msg_to_matrix(current_msg) if current_msg is not None else None
+    travel = (target_xyz - T_start[:3, 3]) if T_start is not None else np.zeros(3)
+
+    if not creep:
+        lead = (droop.compensate(T_base_ctrl_target)[:3, 3] - target_xyz
+                if droop is not None else np.zeros(3))
+    else:
+        lead = droop.initial_lead(travel) if droop is not None else np.zeros(3)
+
+    def publish(seq: int) -> tuple[np.ndarray, int]:
+        """Command target+lead, bounded so the equilibrium never sits more than
+        MAX_COMMAND_LEAD_M ahead of where the arm actually is — the bound that
+        governs how hard the controller pulls, and the one backstop that holds
+        however wrong the lead gets."""
+        T_cmd = T_base_ctrl_target.copy()
+        T_cmd[:3, 3] = target_xyz + lead
+        if current_msg is not None:
+            T_cmd = clamp_command_lead(T_cmd, pose_msg_to_matrix(current_msg))
+        pub.publish(roslibpy.Message(
+            matrix_to_pose_msg_like(template_msg, T_cmd, seq)))
+        return T_cmd, seq + 1
+
+    T_command, seq = publish(seq)
     t0 = time.time()
+    armed_at = t0 + CREEP_DEAD_S
     dt = drot = float("inf")
     T_prev = None
     still_since = None
     settled = False
+    nudges = 0
 
     while time.time() - t0 < timeout_s:
         time.sleep(SETTLE_POLL_S)
@@ -819,68 +965,110 @@ def settle(pub, template_msg: dict, T_base_ctrl_target: np.ndarray, seq: int,
         T_now = pose_msg_to_matrix(current_msg)
         dt, drot = pose_error(T_now, T_base_ctrl_target)
 
-        # Early exit: actually arrived (no droop, or a very light arm pose).
-        if dt < SETTLE_POS_TOL_M and drot < rot_tol:
+        # Early exit: arrived outright (no droop, or a very light arm pose).
+        if dt < tol_m and drot < rot_tol:
             settled = True
             break
 
-        # Otherwise: has the pose stopped changing between polls?
+        # Nothing that happens in the first CREEP_DEAD_S after a publish is
+        # information: the command has not round-tripped yet, so the arm is
+        # legitimately still and reading that as a stall would nudge twice for
+        # one error and overshoot.
+        if time.time() < armed_at:
+            T_prev = T_now
+            still_since = None
+            continue
+
         if T_prev is not None:
             step_t, step_r = pose_error(T_prev, T_now)
             if step_t < SETTLE_STILL_POS_M and step_r < still_rot_tol:
                 if still_since is None:
                     still_since = time.time()
-                elif time.time() - still_since >= SETTLE_STILL_HOLD_S:
-                    settled = True
-                    break
             else:
                 still_since = None      # moved again; restart the quiet window
         T_prev = T_now
 
-    # Re-estimate only from a settled move: a timed-out one is still travelling,
-    # so its residual is transit, not droop, and would corrupt the estimate.
-    if droop is not None and settled and current_msg is not None:
-        droop.update(T_command, pose_msg_to_matrix(current_msg))
+        if still_since is None:
+            continue
+        quiet = time.time() - still_since
 
-    return settled, dt, drot
+        if not creep:
+            if quiet >= SETTLE_STILL_HOLD_S:
+                settled = True          # stopped == done, wherever it stopped
+                break
+            continue
+
+        if dt < tol_m:
+            if quiet >= SETTLE_STILL_HOLD_S:
+                settled = True
+                break
+            continue
+
+        # Stalled short. Lengthen the lead and go again, without waiting for the
+        # full hold: the controller does not need the arm at rest to accept a new
+        # equilibrium, and waiting for one is precisely what made the motion
+        # stop-go-stop-go.
+        if quiet >= CREEP_STALL_HOLD_S and nudges < CREEP_MAX_NUDGES:
+            lead = lead + CREEP_GAIN * (target_xyz - T_now[:3, 3])
+            n = float(np.linalg.norm(lead))
+            if n > MAX_DROOP_COMP_M:
+                lead *= MAX_DROOP_COMP_M / n
+            T_command, seq = publish(seq)
+            nudges += 1
+            armed_at = time.time() + CREEP_DEAD_S
+            still_since = None
+            T_prev = None
+
+    # Learn only from a converged move: a timed-out one is still travelling, so
+    # its lead is transit, not the offset the pose needs, and would corrupt the
+    # estimate.
+    if droop is not None and settled and current_msg is not None:
+        if creep:
+            droop.observe_travel(lead, travel)
+        else:
+            droop.update(T_command, pose_msg_to_matrix(current_msg))
+
+    return SettleResult(settled, dt, drot, seq, nudges)
 
 
 def move_to(pub, T_target_ctrl: np.ndarray, seq: int, timeout_s: float,
             droop: "DroopCompensator | None", max_passes: int, tol_m: float,
-            label: str = "") -> tuple[int, float, float, int]:
+            label: str = "", creep: bool = True) -> tuple[int, float, float, int]:
     """Command a STATIC pose until the arm actually reaches it.
 
-    One settle() is not enough. The controller under-travels by gain G (~0.4-0.74
-    measured), so a single command lands short, and a static droop offset cannot
-    fix that on its own: with a target that moves every policy step, the offset
-    is always chasing a setpoint that has already run away. Simulated against the
-    identified plant, single-command steps converge to ~46-72% of the commanded
-    displacement and stay there.
+    With creep=True a single settle() already converges, because the correction
+    happens inside the move; the extra passes then cost nothing and exist only
+    for the case where a settle timed out — the arm blocked, or the target
+    outside what MAX_COMMAND_LEAD_M will pull for. Each retry is a fresh move
+    from wherever the last one stalled, so a transient obstruction does not end
+    the episode.
 
-    Iterating on a *static* target is a different problem, and it is the one the
-    integral update actually solves — each pass re-commands the same pose with a
-    refreshed estimate. Homing showed 17.6 -> 2.97 -> 0.94 mm doing exactly this.
-    Correcting delta by 1/G would be the one-shot alternative, but G came from a
-    single measurement pair and varies over the workspace; this needs no G at all.
+    With creep=False the passes ARE the correction, and this is the loop that
+    made the motion lumpy: every pass waits for a dead stop before commanding
+    again, so a step executes as lunge / stop / twitch / stop / twitch / stop.
+    It converges — homing showed 17.6 -> 2.97 -> 0.94 mm — it just converges
+    visibly, at the joints.
 
     Returns (next_seq, pos_err, rot_err, passes_used).
     """
     dp = dr = float("inf")
     used = 0
     for i in range(max_passes):
-        _, dp, dr = settle(pub, current_msg, T_target_ctrl, seq, timeout_s, droop)
-        seq += 1
+        res = settle(pub, current_msg, T_target_ctrl, seq, timeout_s, droop,
+                     tol_m=tol_m if creep else SETTLE_POS_TOL_M, creep=creep)
+        dp, dr, seq = res.pos_err, res.rot_err, res.next_seq
         used = i + 1
         if dp < tol_m:
             break
         if label and i + 1 < max_passes:
-            print(f"{label} pass {i+1}: {dp*1000:.1f} mm out, {droop.describe() if droop else ''}",
-                  flush=True)
+            print(f"{label} pass {i+1}: {dp*1000:.1f} mm out, "
+                  f"{droop.describe() if droop else ''}", flush=True)
     return seq, dp, dr, used
 
 
 def go_home(pub, T_ctrl_hand: np.ndarray, T_hand_ctrl: np.ndarray,
-            seq: int, droop: "DroopCompensator | None" = None) -> int:
+            seq: int, droop: "DroopCompensator | None" = None,
+            creep: bool = True) -> int:
     """Drive the arm to the sim's episode-start pose, in interpolated steps.
 
     Every training episode began at ENV.PANDA_INITIAL_POSITION, so the policy
@@ -915,22 +1103,28 @@ def go_home(pub, T_ctrl_hand: np.ndarray, T_hand_ctrl: np.ndarray,
         T_way[:3, :3] = slerp(s).as_matrix()
         T_way[:3, 3] = (1 - s) * T_start[:3, 3] + s * T_BASE_HAND_HOME[:3, 3]
 
-        ok, dp, dr = settle(pub, current_msg, clamp_target_pose(T_way @ T_hand_ctrl),
-                            seq, HOME_SETTLE_TIMEOUT_S, droop)
-        seq += 1
-        if not ok:
-            print(f"[home] waypoint {i}/{n} timed out: {dp*1000:.1f} mm "
-                  f"{np.rad2deg(dr):.1f} deg residual", flush=True)
+        # Intermediate waypoints get a loose tolerance on purpose: they are a
+        # path, not a destination, and converging each one to millimetres would
+        # add a creep and a full hold per waypoint for no benefit. The refine
+        # below is where home is actually reached.
+        res = settle(pub, current_msg, clamp_target_pose(T_way @ T_hand_ctrl),
+                     seq, HOME_SETTLE_TIMEOUT_S, droop,
+                     tol_m=HOME_WAY_TOL_M, creep=creep)
+        seq = res.next_seq
+        if not res.settled:
+            print(f"[home] waypoint {i}/{n} timed out: {res.pos_err*1000:.1f} mm "
+                  f"{np.rad2deg(res.rot_err):.1f} deg residual", flush=True)
 
     # Refinement. The interpolation above commands the first waypoint before any
     # droop has been observed, so the arm lands short and the estimate is only
     # learned on the way. Re-commanding home now closes that gap — and doubles as
     # the estimator's calibration, so the policy loop starts with a converged
     # value instead of learning it during your first real steps.
-    if droop is not None and droop.enabled:
+    if creep or (droop is not None and droop.enabled):
         seq, _, _, _ = move_to(pub, clamp_target_pose(T_BASE_HAND_HOME @ T_hand_ctrl),
                                seq, HOME_SETTLE_TIMEOUT_S, droop,
-                               HOME_REFINE_PASSES, HOME_REFINE_TOL_M, "[home] refine")
+                               HOME_REFINE_PASSES, HOME_REFINE_TOL_M,
+                               "[home] refine", creep=creep)
 
     T_end = pose_msg_to_matrix(current_msg) @ T_ctrl_hand
     dp, dr = pose_error(T_end, T_BASE_HAND_HOME)
@@ -973,8 +1167,16 @@ def parse_args() -> argparse.Namespace:
                    help="command equilibrium poses raw. The impedance controller "
                         "settles ~17 mm short of any target, so each step then "
                         "executes as (delta - droop) rather than delta.")
+    p.add_argument("--no-creep", action="store_true",
+                   help="revert to the multi-pass step correction: command, wait "
+                        "for a dead stop, re-command, repeat. Converges to the "
+                        "same place but the arm visibly stops and restarts two "
+                        "or three times per policy step.")
+    p.add_argument("--settle-timeout", type=float, default=SETTLE_TIMEOUT_S,
+                   help="per-move budget. Creep corrects inside this window "
+                        "rather than across repeated calls, so it wants room: "
+                        f"default {SETTLE_TIMEOUT_S} s.")
     p.add_argument("--max-steps", type=int, default=MAX_POLICY_STEPS)
-    p.add_argument("--settle-timeout", type=float, default=SETTLE_TIMEOUT_S)
     p.add_argument("--camera-width", type=int, default=CAMERA_WIDTH)
     p.add_argument("--camera-height", type=int, default=CAMERA_HEIGHT)
     p.add_argument("--depth-width", type=int, default=DEPTH_WIDTH,
@@ -1001,20 +1203,73 @@ def parse_args() -> argparse.Namespace:
                         "union. Default (unset) matches the simulator, which "
                         "concatenates raw so a nearer view dominates.")
     p.add_argument("--show-cloud", action="store_true",
-                   help="open a live 3D view of the [1024, 5] cloud the policy "
-                        "is fed, in the panda_hand frame, with a gripper "
-                        "wireframe for reference. 'c' in that window toggles "
-                        "colouring by class (object/hand) vs by source camera. "
-                        "The 2D segmentation overlay is always shown.")
+                   help="open the same 3D window test_perception_viz.py opens: "
+                        "the [1024, 5] policy cloud in large coloured dots over "
+                        "the raw deprojected scene from every camera in small "
+                        "white ones, in panda_hand, with a gripper wireframe. "
+                        "Keys work in any window — c = colour by class/camera, "
+                        "w = white cloud on/off, z/x = roll, r = drag mode.")
     p.add_argument("--cloud-update-hz", type=float, default=10.0,
                    help="redraw rate for --show-cloud. Open3D re-uploads the "
                         "whole buffer each update, so pushing this to camera "
                         "rate costs the control loop for no readable gain.")
+    p.add_argument("--context-stride", type=int, default=6,
+                   help="pixel stride for the white raw-scene cloud. Higher is "
+                        "sparser and cheaper; it is only a backdrop.")
+    p.add_argument("--context-radius", type=float, default=1.2,
+                   help="clip the white cloud to this radius around panda_hand. "
+                        "A tripod at 1.5 m otherwise contributes the whole room, "
+                        "which dominates the view scale for no diagnostic gain.")
+    p.add_argument("--context-max", type=int, default=30000,
+                   help="hard cap on white-cloud points. The geometry is "
+                        "allocated once at this size and cannot grow later.")
+    p.add_argument("--no-context", action="store_true",
+                   help="start with the white raw-scene cloud hidden ('w' "
+                        "toggles it).")
     p.add_argument("--no-robot-exclusion", action="store_true",
                    help="keep points inside the gripper box in the object class. "
                         "The sim excluded the arm by segmentation id; without "
                         "this box a side camera labels the approaching gripper "
                         "as object.")
+    p.add_argument("--no-cluster", action="store_true",
+                   help="define the object class by the crop sphere alone, as "
+                        "before. Default is to keep only the points 3D-connected "
+                        "to the hand, which removes the table and lets the "
+                        "radius be loose enough to hold a long object. Turning "
+                        "this off also restores the old tight radii, so the two "
+                        "settings are a real A/B.")
+    p.add_argument("--hand-margin-px", type=int, default=None,
+                   help="pixels around the hand mask belonging to neither "
+                        "class (default 5 wrist / 4 fixed). Removes the shell "
+                        "of hand-surface points the mask misses, which "
+                        "otherwise bridges the held object to the forearm and "
+                        "makes arm rejection flicker. 0 disables.")
+    p.add_argument("--no-arm-rejection", action="store_true",
+                   help="keep object-class blobs behind the hand. The hand "
+                        "model segments hands, not arms, so the forearm falls "
+                        "into the object class and is anatomically connected to "
+                        "the hand — connectivity cannot remove it, only which "
+                        "side of the hand it sits on can.")
+    p.add_argument("--arm-offset", type=float, default=0.07,
+                   help="how far behind the hand, along the hand->robot-base "
+                        "axis, a blob must sit before it is called forearm. "
+                        "Larger keeps more (safer for an object held with its "
+                        "body toward the human), smaller cuts more arm.")
+    p.add_argument("--arm-lateral", type=float, default=0.12,
+                   help="how far SIDEWAYS of that axis a point may sit and "
+                        "still be object. Without this an inclined forearm "
+                        "scores near zero on the axis and survives; with it, "
+                        "the kept region is a capsule around the hand. Larger "
+                        "keeps a long object held across the view, smaller cuts "
+                        "more arm.")
+    p.add_argument("--wrist-seg-px", type=int, default=None,
+                   help="hand-segmentation input size for the wrist camera "
+                        "(default 256, what cp1 was trained at).")
+    p.add_argument("--fixed-seg-px", type=int, default=None,
+                   help="hand-segmentation input size for the fixed camera(s) "
+                        "(default 384). At ~1 m the hand is a few dozen pixels "
+                        "at 256 and its mask falls through min_hand_points. On "
+                        "this GPU 384 costs ~10 ms per pass and 512 ~25 ms.")
     p.add_argument("--dry-run", action="store_true",
                    help="run perception + policy and print targets, publish nothing")
     return p.parse_args()
@@ -1083,12 +1338,13 @@ def main() -> None:
     print(f"EE offset z    : {args.ee_offset_z:.4f} m (panda_hand -> published frame)")
     print(f"Gripper        : {'ENABLED' if args.enable_gripper else 'disabled'}")
     print(f"Droop comp     : {'off' if args.no_droop_compensation else 'on'}")
+    print(f"Step motion    : {'multi-pass (stops between passes)' if args.no_creep else 'creep (one stop per step)'}")
     print(f"Cameras        : {', '.join(camera_names)}"
           + (f"  (calib session {args.calib_session})" if fixed_names else ""))
 
     droop = DroopCompensator(enabled=not args.no_droop_compensation)
 
-    hand_seg_model, hand_seg_preprocess = load_hand_segmenter(device, hand_seg_ckpt)
+    hand_seg_model = load_hand_segmenter(device, hand_seg_ckpt)
     policy, run_cfg = load_bc_policy(policy_dir, ckpt, device)
     _assert_state_layout(run_cfg)
     warm_up_policy(policy, device)
@@ -1105,6 +1361,117 @@ def main() -> None:
     publish_seq = 0   # shared by homing and the policy loop
 
     try:
+        # ---- cameras ----
+        # BEFORE ROS AND BEFORE HOMING, deliberately. Opening a camera is
+        # reversible and costs nothing; homing MOVES THE ARM. With the order
+        # reversed, asking for a camera that is not plugged in meant the robot
+        # drove to the home pose, sat there, and only then did the run die on
+        # "No device connected" — leaving the arm somewhere it was moved to for
+        # a run that never started. Everything that can be checked without
+        # touching the robot is now checked first.
+        #
+        # With more than one RealSense attached, librealsense binds whichever
+        # device enumerates first, and opening the wrong one is silent: the
+        # policy just receives a viewpoint it never saw in training. Serials come
+        # from calib_config.CAMERA_SERIALS so the wrist/tripod assignment has one
+        # definition on this machine; --camera-serial overrides the wrist entry
+        # for the single-camera case.
+        serials = None
+        if args.camera_serial is not None:
+            if camera_names != ["wrist"]:
+                raise SystemExit(
+                    "--camera-serial names one device but --cameras asks for "
+                    f"{', '.join(camera_names)}. Set the serials in "
+                    "'camera calibration/calib_config.py' instead — that is "
+                    "where every other script reads them from.")
+            serials = {"wrist": args.camera_serial}
+        elif camera_names == ["wrist"]:
+            import pyrealsense2 as _rs
+            _devs = [(d.get_info(_rs.camera_info.serial_number),
+                      d.get_info(_rs.camera_info.usb_type_descriptor))
+                     for d in _rs.context().query_devices()]
+            if len(_devs) > 1:
+                listing = "\n  ".join(f"{s}  usb {u}" for s, u in _devs)
+                print(f"[camera] {len(_devs)} RealSense devices attached:\n  "
+                      f"{listing}\n[camera] using the 'wrist' serial from "
+                      "calib_config.CAMERA_SERIALS.")
+
+        rigs = build_rigs(
+            camera_names,
+            T_hand_cam_wrist=T_hand_cam,
+            fixed_session=args.calib_session,
+            serials=serials,
+            color_size=(args.camera_width, args.camera_height),
+            depth_size=(args.depth_width, args.depth_height),
+            fps=args.camera_fps,
+            exclude_robot=not args.no_robot_exclusion,
+            cluster=not args.no_cluster,
+            wrist_seg_px=args.wrist_seg_px,
+            fixed_seg_px=args.fixed_seg_px,
+            hand_margin_px=args.hand_margin_px,
+        )
+
+        for rig in rigs:
+            try:
+                rig.camera.start()
+            except RuntimeError as err:
+                # librealsense's two failure modes here look alike but mean
+                # opposite things, and neither message names the stream at fault.
+                modes = (f"color {args.camera_width}x{args.camera_height} + depth "
+                         f"{args.depth_width}x{args.depth_height} @ {args.camera_fps}fps")
+                if "no device connected" in str(err).lower():
+                    # NOT a link fault, whatever the generic message below says.
+                    # librealsense raises this when the requested SERIAL is not
+                    # among the attached devices, so the useful answer is which
+                    # ones are — the previous wording sent the reader off
+                    # checking cables for a camera that was simply unplugged.
+                    try:
+                        import pyrealsense2 as _rs
+                        attached = [
+                            (d.get_info(_rs.camera_info.serial_number),
+                             d.get_info(_rs.camera_info.name))
+                            for d in _rs.context().query_devices()]
+                    except Exception:
+                        attached = []
+                    listing = ("\n  ".join(f"{s}  {n}" for s, n in attached)
+                               if attached else "(none)")
+                    hint = (f"no device with that serial is attached. Attached "
+                            f"now:\n  {listing}\n"
+                            "Serials come from 'camera calibration/"
+                            "calib_config.py'. If the camera you want IS in that "
+                            f"list, ask for it by role: --cameras <role> (this "
+                            f"run asked for {', '.join(camera_names)}).")
+                elif "resolve" in str(err).lower():
+                    hint = ("the device does not offer that combination. Color "
+                            "and depth mode lists differ — the D435 has 424x240 "
+                            "color but no 424x240 depth. `rs-enumerate-devices "
+                            "-m` lists both.")
+                elif len(rigs) > 1:
+                    hint = ("the modes were accepted but no frames arrived. With "
+                            "two D435s this is usually USB BANDWIDTH, not the "
+                            "cable: two 640x480 colour+depth streams at 30 fps "
+                            "exceed what one USB3 controller reliably carries. "
+                            "Put the cameras on separate controllers (not just "
+                            "separate ports), or drop --camera-fps to 15. Check "
+                            "usb_type_descriptor reads 3.x for BOTH.")
+                else:
+                    hint = ("the modes were accepted but no frames arrived, which "
+                            "is a link/power fault rather than a config one. "
+                            "Check that usb_type_descriptor reads 3.x: a D435 "
+                            "that enumerates at 2.1 (charge-only cable, USB2 "
+                            "port, or a hub) often advertises modes it then "
+                            "cannot stream at all.")
+                raise RuntimeError(
+                    f"RealSense '{rig.name}' (serial {rig.serial}) failed to "
+                    f"start {modes} ({err}) — {hint}") from err
+            p = rig.params
+            print(f"[camera] {rig.name:8s} serial={rig.serial}  {rig.kind}  "
+                  f"seg={p.seg_input_px}px  "
+                  + (f"cluster={p.cluster_voxel_m * 1e3:.0f}mm" if p.cluster_voxel_m
+                     else "cluster=off")
+                  + f"  margin={p.hand_margin_px}px"
+                  + f"  r_obj={p.object_max_radius_m:.2f}m")
+
         if not args.dry_run:
             client = roslibpy.Ros(host=args.rosbridge_host, port=args.rosbridge_port)
             client.run()
@@ -1148,89 +1515,30 @@ def main() -> None:
                     print("Homing declined; exiting without moving.")
                     return
                 publish_seq = go_home(pub, T_ctrl_hand, T_hand_ctrl, publish_seq,
-                                      droop)
+                                      droop, creep=not args.no_creep)
                 if args.home_only:
                     return
 
-        # ---- cameras ----
-        # With more than one RealSense attached, librealsense binds whichever
-        # device enumerates first, and opening the wrong one is silent: the
-        # policy just receives a viewpoint it never saw in training. Serials come
-        # from calib_config.CAMERA_SERIALS so the wrist/tripod assignment has one
-        # definition on this machine; --camera-serial overrides the wrist entry
-        # for the single-camera case.
-        serials = None
-        if args.camera_serial is not None:
-            if camera_names != ["wrist"]:
-                raise SystemExit(
-                    "--camera-serial names one device but --cameras asks for "
-                    f"{', '.join(camera_names)}. Set the serials in "
-                    "'camera calibration/calib_config.py' instead — that is "
-                    "where every other script reads them from.")
-            serials = {"wrist": args.camera_serial}
-        elif camera_names == ["wrist"]:
-            import pyrealsense2 as _rs
-            _devs = [(d.get_info(_rs.camera_info.serial_number),
-                      d.get_info(_rs.camera_info.usb_type_descriptor))
-                     for d in _rs.context().query_devices()]
-            if len(_devs) > 1:
-                listing = "\n  ".join(f"{s}  usb {u}" for s, u in _devs)
-                print(f"[camera] {len(_devs)} RealSense devices attached:\n  "
-                      f"{listing}\n[camera] using the 'wrist' serial from "
-                      "calib_config.CAMERA_SERIALS.")
-
-        rigs = build_rigs(
-            camera_names,
-            T_hand_cam_wrist=T_hand_cam,
-            fixed_session=args.calib_session,
-            serials=serials,
-            color_size=(args.camera_width, args.camera_height),
-            depth_size=(args.depth_width, args.depth_height),
-            fps=args.camera_fps,
-            exclude_robot=not args.no_robot_exclusion,
-        )
-
-        for rig in rigs:
-            try:
-                rig.camera.start()
-            except RuntimeError as err:
-                # librealsense's two failure modes here look alike but mean
-                # opposite things, and neither message names the stream at fault.
-                modes = (f"color {args.camera_width}x{args.camera_height} + depth "
-                         f"{args.depth_width}x{args.depth_height} @ {args.camera_fps}fps")
-                if "resolve" in str(err).lower():
-                    hint = ("the device does not offer that combination. Color "
-                            "and depth mode lists differ — the D435 has 424x240 "
-                            "color but no 424x240 depth. `rs-enumerate-devices "
-                            "-m` lists both.")
-                elif len(rigs) > 1:
-                    hint = ("the modes were accepted but no frames arrived. With "
-                            "two D435s this is usually USB BANDWIDTH, not the "
-                            "cable: two 640x480 colour+depth streams at 30 fps "
-                            "exceed what one USB3 controller reliably carries. "
-                            "Put the cameras on separate controllers (not just "
-                            "separate ports), or drop --camera-fps to 15. Check "
-                            "usb_type_descriptor reads 3.x for BOTH.")
-                else:
-                    hint = ("the modes were accepted but no frames arrived, which "
-                            "is a link/power fault rather than a config one. "
-                            "Check that usb_type_descriptor reads 3.x: a D435 "
-                            "that enumerates at 2.1 (charge-only cable, USB2 "
-                            "port, or a hub) often advertises modes it then "
-                            "cannot stream at all.")
-                raise RuntimeError(
-                    f"RealSense '{rig.name}' (serial {rig.serial}) failed to "
-                    f"start {modes} ({err}) — {hint}") from err
-            print(f"[camera] {rig.name:8s} serial={rig.serial}  {rig.kind}")
-
         perception = MultiCameraPerception(
             rigs,
-            HandSegmenter(hand_seg_model, hand_seg_preprocess, device),
+            HandSegmenter(hand_seg_model, device),
             per_camera_cap=args.per_camera_cap,
+            arm_rejection=not args.no_arm_rejection,
+            arm_offset_m=args.arm_offset,
+            arm_lateral_m=args.arm_lateral,
         )
+        print(f"[perception] arm rejection: "
+              + (f"on, capsule {args.arm_offset:.3f} m behind the hand / "
+                 f"{args.arm_lateral:.3f} m sideways"
+                 if not args.no_arm_rejection else "off"))
 
-        viewer = PolicyCloudViewer(
-            enabled=args.show_cloud,
+        # The SAME window test_perception_viz.py opens, from the same module.
+        # These were two implementations that drew the same data differently
+        # until the runner's lacked the white raw-scene cloud, which is the one
+        # thing that shows whether the coloured cloud is in the right PLACE. A
+        # debug view that renders unlike the thing being debugged is worth less
+        # than one that renders identically, so there is now only one.
+        viewer = DualCloudWindow(
             camera_names=[r.name for r in rigs],
             # Draw the box only when it is actually filtering, so what you see
             # is what is running.
@@ -1238,8 +1546,15 @@ def main() -> None:
                            if (not args.no_robot_exclusion
                                and any(r.exclude_robot for r in rigs))
                            else None),
-            update_hz=args.cloud_update_hz,
+            context_max=args.context_max,
+            enabled=args.show_cloud,
         )
+        viewer.show_context = not args.no_context
+        cloud_min_dt = 1.0 / max(args.cloud_update_hz, 1e-3)
+        last_cloud_draw = 0.0
+        if args.show_cloud:
+            print("cloud keys (in ANY window): c = colour by class/camera   "
+                  "w = white scene cloud on/off   z / x = roll   r = drag mode")
 
         if args.step_mode:
             print(f"STEP MODE ({args.max_steps} policy steps max). The overlay "
@@ -1287,9 +1602,26 @@ def main() -> None:
                 # is otherwise where provenance is lost.
                 pc, oi, hi = build_policy_cloud(object_policy, hand_policy,
                                                 return_index=True)
-                viewer.update(pc, source_for_cloud(
-                    oi, hi, fused.object_source, fused.hand_source,
-                    NUM_OBJECT_POINTS, NUM_HAND_POINTS))
+                if viewer.enabled and time.time() - last_cloud_draw >= cloud_min_dt:
+                    # Deprojecting every camera's full depth frame is the one
+                    # genuinely expensive part of drawing, so it is behind the
+                    # same throttle as the redraw and skipped entirely when the
+                    # white cloud is hidden. It reuses perception.last_depths —
+                    # the exact frames this observation came from, rather than a
+                    # fresh grab, which would be a different instant.
+                    ctx = None
+                    if viewer.show_context:
+                        parts = [context_cloud(rig, perception.last_depths[rig.name],
+                                               T_base_hand, args.context_stride,
+                                               args.context_radius)
+                                 for rig in rigs
+                                 if rig.name in perception.last_depths]
+                        parts = [q for q in parts if len(q)]
+                        ctx = np.concatenate(parts) if parts else None
+                    viewer.update(pc, source_for_cloud(
+                        oi, hi, fused.object_source, fused.hand_source,
+                        NUM_OBJECT_POINTS, NUM_HAND_POINTS), ctx)
+                    last_cloud_draw = time.time()
                 rs = build_robot_state(T_base_hand, read_gripper_norm(assume_open=True))
 
                 action = policy_act(policy, pc, rs, device)   # [7], ch6 in {0, 1}
@@ -1310,6 +1642,11 @@ def main() -> None:
                 view = overlay_mask(color_bgr, hand_mask)
                 d = fused.per_camera[rig.name]
                 cv2.putText(view, f"{rig.name}  obj={d['object']} hand={d['hand']}"
+                            + (f"  -{d['cluster_dropped']} declust"
+                               if d["cluster_dropped"] else "")
+                            + (f"  [{d['cluster_fallback']}]"
+                               if d["cluster_fallback"] not in (None, "disabled")
+                               else "")
                             + (f"  -{d['robot_pts_removed']} robot"
                                if d["robot_pts_removed"] else "")
                             + ("  STALE" if d["used_last_hand"] or d["used_last_object"]
@@ -1360,16 +1697,49 @@ def main() -> None:
             # control rate, and slowing it to make a debug view smoother would
             # be the wrong trade.
             key = 255
+            view_keys: list = []
             pump_until = time.time() + (VIEWER_PUMP_S if args.step_mode else 0.0)
             while True:
-                viewer.poll()
+                viewer.tick()
+                # The 3D window's keys are drained into the same list the OpenCV
+                # windows feed, so every action works from whichever window has
+                # focus. Without this the roll keys only worked while a camera
+                # view was focused, which meant clicking away from the cloud to
+                # rotate the cloud.
+                view_keys.extend(viewer.drain_keys())
                 k = cv2.waitKey(1) & 0xFF
-                if k != 255:
+                if k != 255 or view_keys:
                     key = k
                     break
                 if time.time() >= pump_until:
                     break
-            if key in (27, ord("q")):
+
+            pressed = [chr(key)] if 32 <= key < 127 else []
+            if key == 27:
+                pressed.append("q")
+            pressed.extend(view_keys)
+
+            # View-only keys never touch the robot, so they are handled here and
+            # dropped before the step keys below see them.
+            for k in pressed:
+                if k == "c":
+                    viewer.colour_mode = ("camera" if viewer.colour_mode == "class"
+                                          else "class")
+                    print(f"colour by {viewer.colour_mode}")
+                    last_cloud_draw = 0.0
+                elif k == "w":
+                    viewer.show_context = not viewer.show_context
+                    print(f"white scene cloud "
+                          f"{'on' if viewer.show_context else 'off'}")
+                    last_cloud_draw = 0.0
+                elif k == "r":
+                    viewer.cycle_rotate_mode()
+                elif k == "z":
+                    viewer.roll(-10.0)
+                elif k == "x":
+                    viewer.roll(+10.0)
+
+            if "q" in pressed:
                 stop_reason = "user quit"
                 break
             if key == ord("h"):
@@ -1377,7 +1747,8 @@ def main() -> None:
                     print("[home] ignored in --dry-run")
                 else:
                     publish_seq = go_home(pub, T_ctrl_hand, T_hand_ctrl,
-                                          publish_seq, droop)
+                                          publish_seq, droop,
+                                          creep=not args.no_creep)
                 continue
 
             # ---- EXECUTE ----
@@ -1396,15 +1767,20 @@ def main() -> None:
                 break
 
             pos = T_base_ctrl_target[:3, 3]
+            # fused.summary() carries the per-camera split and the declustered
+            # count. Without it a clean object cloud and one that fell back to
+            # the sphere every frame print identically.
             print(f"[{step:02d}] target xyz=({pos[0]:+.3f}, {pos[1]:+.3f}, "
                   f"{pos[2]:+.3f})  |d|={np.linalg.norm(delta6[:3]):.4f}m "
                   f"obj={len(object_policy):4d} hand={len(hand_policy):4d}"
+                  f"  {fused.summary()}"
                   f"{'  CLAMPED' if clamped else ''}", flush=True)
 
             if not args.dry_run:
                 publish_seq, dpos, drot, passes = move_to(
                     pub, T_base_ctrl_target, publish_seq, args.settle_timeout,
-                    droop, STEP_CONVERGE_PASSES, STEP_CONVERGE_TOL_M)
+                    droop, STEP_CONVERGE_PASSES, STEP_CONVERGE_TOL_M,
+                    creep=not args.no_creep)
                 if dpos >= STEP_CONVERGE_TOL_M:
                     print(f"     step short by {dpos*1000:.1f}mm "
                           f"{np.rad2deg(drot):.1f}deg after {passes} passes",
@@ -1442,3 +1818,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    # Only on a clean return: an exception must still print its traceback and
+    # exit normally. See exit_without_finalizing for why this is not just exit().
+    exit_without_finalizing()

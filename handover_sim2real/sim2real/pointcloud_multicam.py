@@ -46,10 +46,14 @@ faithful port and being merely a plausible one:
     closes on the object it enters the crop radius and gets labelled "object" —
     a class the training data never contained. `ROBOT_EXCLUSION` below removes
     the gripper body using the pose we already know exactly.
-  * "Object" here means "non-hand within `object_max_radius_m` of the hand
-    centroid". A distant camera sees more of the scene through that sphere than
-    a wrist camera does, so its object cloud is dirtier. The radius is therefore
-    a per-camera parameter, not a global one.
+  * "Object" here means "non-hand points forming one connected body with the
+    hand, within `object_max_radius_m` of its centroid". The connectivity test
+    (`pointcloud_pipeline.hand_connected_object_points`) is what keeps the table
+    and the background out; before it existed the radius alone had to, and it
+    could not do that and contain a long object at the same time. A distant
+    camera sees more of the scene through the same sphere and its depth is
+    noisier, so both the radius and the clustering voxel are per-camera
+    parameters, not global ones.
 
 WHY NO PER-CAMERA BALANCING, given the temptation to add it. The sim renders all
 three cameras at 224x224, so a close camera contributes many more points per
@@ -65,7 +69,7 @@ longer the neutral choice.
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
@@ -78,6 +82,7 @@ if str(_SIM2REAL_DIR) not in sys.path:
 from pointcloud_pipeline import (  # noqa: E402
     _sample_or_pad_points,
     extract_hand_object_clouds,
+    reject_arm_clusters,
 )
 from transforms import invert_transform, transform_points  # noqa: E402
 
@@ -204,6 +209,51 @@ class RobotExclusionBox:
 ROBOT_EXCLUSION = RobotExclusionBox()
 
 
+@dataclass(frozen=True)
+class GraspRegion:
+    """The volume between the fingers, in the panda_hand frame.
+
+    The counterpart to RobotExclusionBox: that says where the robot IS, this
+    says where the object must be. Anything here at grasp time is the thing
+    being grasped — that is what the fingers closing on it means — so no
+    heuristic downstream is allowed to reason it away.
+
+    It exists because one did. `reject_arm_clusters` discards a blob whole when
+    enough of it scores as arm, and as the gripper converges on the object the
+    two clouds necessarily touch and merge into one blob. The robot's own links
+    run laterally and behind, so they score as arm in bulk; past the threshold
+    the object went out with them, and the object class emptied exactly as the
+    grasp became possible. Approaching is when the filter matters and contact is
+    when it must not fire.
+
+    The bounds are deliberately loose. GA-DDPG's control points put the
+    fingertips at z = 0.075..0.105 and the fingers open to 0.08 total, so a tight
+    box would be |xy| < 0.04, z in 0.075..0.105. Every bound here is wider,
+    because this region only ever KEEPS points: being generous costs a little
+    arm surviving in the object class, while being tight costs the object at the
+    moment it matters most. That asymmetry also makes it robust to the
+    calibration error it has to survive — with a fixed camera alone, the cloud
+    is placed through inv(T_base_hand) @ T_base_color and moves relative to this
+    box by the full hand-eye and pose error.
+    """
+    half_xy: float = 0.055
+    z_min: float = 0.050
+    z_max: float = 0.130
+
+    def contains(self, points_hand: np.ndarray) -> np.ndarray:
+        if len(points_hand) == 0:
+            return np.zeros(0, dtype=bool)
+        return (
+            (np.abs(points_hand[:, 0]) < self.half_xy)
+            & (np.abs(points_hand[:, 1]) < self.half_xy)
+            & (points_hand[:, 2] > self.z_min)
+            & (points_hand[:, 2] < self.z_max)
+        )
+
+
+GRASP_REGION = GraspRegion()
+
+
 # ── per-camera extraction parameters ─────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -213,10 +263,23 @@ class ExtractionParams:
     Split per camera because a wrist view at 0.3 m and a tripod view at 1.0 m
     are not the same measurement problem: the D435's depth noise grows roughly
     with the square of range, so the far camera needs a looser crop to keep the
-    object at all, and a stride that does not drown the near camera in points.
+    object at all, a stride that does not drown the near camera in points, and
+    more segmentation resolution to find a hand that subtends a tenth of the
+    pixels.
     """
-    crop_radius_m: float = 0.12
-    object_max_radius_m: float = 0.10
+    crop_radius_m: float = 0.25
+    object_max_radius_m: float = 0.22
+    # 0 disables clustering and restores the pure radius behaviour. See
+    # WRIST_PARAMS_LEGACY.
+    cluster_voxel_m: float = 0.010
+    cluster_min_hand_frac: float = 0.05
+    # Pixels around the hand mask belonging to neither class. Kills the shell of
+    # hand-surface points that otherwise bridges the held object to the forearm.
+    # In pixels rather than metres because the cause — mask erosion and nearest-
+    # neighbour upsampling from the segmenter's square input — is pixel-scale
+    # and does not care how far away the hand is.
+    hand_margin_px: int = 5
+    seg_input_px: int = 256
     min_depth_m: float = 0.10
     max_depth_m: float = 1.50
     full_cloud_stride: int = 2
@@ -225,21 +288,72 @@ class ExtractionParams:
     min_object_points: int = 80
 
 
+# THE RADII ARE LOOSE ON PURPOSE, and only safe because clustering is on. With
+# the object defined by a sphere alone, `object_max_radius_m` had to do two
+# incompatible jobs: exclude the table (wants to be small) and contain the whole
+# object (wants to be large). At 0.10 m the first job won, and any object longer
+# than about 20 cm held at one end — the drill, the wood block, a banana — had
+# its far half deleted every frame. Connectivity now does the excluding, so the
+# radius can be set past the biggest object we expect to see and act purely as a
+# workspace bound.
 WRIST_PARAMS = ExtractionParams()
 
 # Tripod, ~1 m out. Wider crop and object radius because at that range a 1 cm
-# depth error is normal and a 0.10 m sphere around a noisy hand centroid starts
+# depth error is normal and a sphere around a noisy hand centroid starts
 # clipping the object itself. Point counts scale with solid angle, so the same
 # object subtends far fewer pixels here — the minimum-points floors drop
 # accordingly, otherwise every frame would fall through to the stale-cloud
 # fallback and the fusion would quietly become wrist-only again.
+#
+# The voxel is coarser for the same reason the radii are: connectivity has to
+# survive the range noise, and a gap opened by a few millimetres of depth error
+# would otherwise disconnect the object from the hand that is holding it.
+#
+# `seg_input_px` is where most of the difference lives. The hand model sees the
+# frame downscaled to a square, so a hand at 1.5 m lands on a few dozen pixels
+# at 256 and the mask thins out until the hand class stops meeting its floor.
+# Measured on the RTX 2000 Ada in this machine, per perception pass:
+#   2 cams @256 batched            15.5 ms   (what this replaces)
+#   wrist @256 + tripod @384       26.0 ms
+#   wrist @256 + tripod @512       40.8 ms
+# against a runner step of roughly 270 ms. 384 buys 2.25x the pixels for 4% of
+# the step; 512 buys 4x for 9%. 384 is the default and --fixed-seg-px moves it.
 FIXED_PARAMS = ExtractionParams(
-    crop_radius_m=0.16,
-    object_max_radius_m=0.13,
+    crop_radius_m=0.30,
+    object_max_radius_m=0.26,
+    cluster_voxel_m=0.012,
+    # One pixel less than the wrist's. The shell the band removes is a
+    # pixel-scale artefact and is the same width here, but what it COSTS is
+    # metric: at 640x480 a pixel spans roughly 0.8 mm at the wrist's 0.4 m and
+    # 2.5 mm at the tripod's 1.5 m, so the same 5 px eats 4 mm of object surface
+    # near the wrist and 12 mm here. On a small object at range that is a real
+    # fraction of what the camera can see of it.
+    hand_margin_px=4,
+    seg_input_px=384,
     min_depth_m=0.25,
     max_depth_m=2.50,
     full_cloud_stride=2,
     hand_cloud_stride=1,
+    min_hand_points=40,
+    min_object_points=30,
+)
+
+# Pre-clustering behaviour, kept so `--no-cluster` is a real A/B and not an
+# approximation of one: turning connectivity off without also restoring the
+# tight radii would leave the object class bounded by a 0.22 m sphere with
+# nothing filtering it, which is worse than either configuration on its own.
+WRIST_PARAMS_LEGACY = ExtractionParams(
+    crop_radius_m=0.12, object_max_radius_m=0.10, cluster_voxel_m=0.0,
+    hand_margin_px=0)
+
+FIXED_PARAMS_LEGACY = ExtractionParams(
+    crop_radius_m=0.16,
+    object_max_radius_m=0.13,
+    cluster_voxel_m=0.0,
+    hand_margin_px=0,
+    seg_input_px=384,
+    min_depth_m=0.25,
+    max_depth_m=2.50,
     min_hand_points=40,
     min_object_points=30,
 )
@@ -351,38 +465,87 @@ def overlay_mask(color_bgr: np.ndarray, mask: np.ndarray,
     return np.where(mask[..., None] > 0, blended, overlay)
 
 
+DEFAULT_SEG_INPUT_PX = 256
+
+
+def make_seg_preprocess(px: int):
+    """The hand model's input transform at a given square resolution.
+
+    256 is what cp1 was trained and previously run at; the network is fully
+    convolutional so a larger input is a legitimate inference-time choice, not a
+    reinterpretation of the weights. ImageNet normalization is fixed by the
+    ResNet-50 backbone and is not a tunable.
+    """
+    from torchvision import transforms
+
+    return transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((px, px)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+
+
 class HandSegmenter:
-    """The hand-segmentation network, run over every camera in ONE forward pass.
+    """The hand-segmentation network, run over every camera in one pass per size.
 
     Batching is not a micro-optimisation here. The runner's step is
-    observe-then-act, and with two cameras a per-image forward doubles the
-    latency between the depth frames and the action computed from them — which
-    is a real position error while the arm is moving, not just slowness. One
-    batched call keeps it at roughly the single-camera cost.
+    observe-then-act, and a per-image forward puts the whole network latency
+    between the depth frames and the action computed from them — which is a real
+    position error while the arm is moving, not just slowness.
+
+    Cameras at the same `seg_input_px` still share one forward. Cameras at
+    different resolutions cannot: a batch is one tensor and one tensor has one
+    spatial size. Running the wrist at 256 and the tripod at 384 therefore costs
+    two forwards, 26.0 ms against the 15.5 ms of a single batched pair — paid
+    because the tripod's hand mask at 256 was thin enough to fall through the
+    `min_hand_points` floor, and everything downstream is anchored on the hand
+    centroid. Give both cameras the same size and this collapses back to one
+    call with no code change.
     """
 
-    def __init__(self, model, preprocess, device: str):
+    def __init__(self, model, device: str, default_px: int = DEFAULT_SEG_INPUT_PX):
         self._model = model
-        self._preprocess = preprocess
         self._device = device
+        self._default_px = int(default_px)
+        self._preprocess: dict[int, Any] = {}
 
-    def __call__(self, images_rgb: Sequence[np.ndarray]) -> list[np.ndarray]:
+    def _transform(self, px: int):
+        if px not in self._preprocess:
+            self._preprocess[px] = make_seg_preprocess(px)
+        return self._preprocess[px]
+
+    def __call__(self, images_rgb: Sequence[np.ndarray],
+                 sizes: Optional[Sequence[int]] = None) -> list[np.ndarray]:
         import cv2
         import torch
 
         if not images_rgb:
             return []
-        batch = torch.stack([self._preprocess(img) for img in images_rgb])
-        batch = batch.to(self._device, non_blocking=True)
-        with torch.inference_mode():
-            pred = self._model(batch).argmax(1).cpu().numpy().astype(np.uint8)
+        if sizes is None:
+            sizes = [self._default_px] * len(images_rgb)
+        if len(sizes) != len(images_rgb):
+            raise ValueError(
+                f"got {len(images_rgb)} images but {len(sizes)} input sizes")
 
-        out = []
-        for img, mask in zip(images_rgb, pred):
-            m = cv2.resize(mask, (img.shape[1], img.shape[0]),
-                           interpolation=cv2.INTER_NEAREST)
-            out.append(normalize_mask(m))
-        return out
+        groups: dict[int, list[int]] = {}
+        for i, px in enumerate(sizes):
+            groups.setdefault(int(px), []).append(i)
+
+        out: list[Optional[np.ndarray]] = [None] * len(images_rgb)
+        for px, indices in groups.items():
+            transform = self._transform(px)
+            batch = torch.stack([transform(images_rgb[i]) for i in indices])
+            batch = batch.to(self._device, non_blocking=True)
+            with torch.inference_mode():
+                pred = self._model(batch).argmax(1).cpu().numpy().astype(np.uint8)
+            for slot, i in enumerate(indices):
+                img = images_rgb[i]
+                m = cv2.resize(pred[slot], (img.shape[1], img.shape[0]),
+                               interpolation=cv2.INTER_NEAREST)
+                out[i] = normalize_mask(m)
+        return out  # type: ignore[return-value]
 
 
 # ── fusion ───────────────────────────────────────────────────────────────────
@@ -400,6 +563,19 @@ class FusedObservation:
     hand_source: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int8))
     camera_names: tuple = ()
 
+    # Arm rejection is fusion-wide, not per camera, so it is reported here.
+    # `arm_clusters` is (size, signed offset toward the robot) per blob, biggest
+    # first — the numbers to look at when tuning the offset threshold, since a
+    # forearm and a held object are only separable if their offsets differ.
+    arm_dropped: int = 0
+    arm_fallback: Optional[str] = None
+    arm_clusters: tuple = ()
+    # Points sitting between the fingers, and how many blobs that saved from the
+    # whole-blob arm drop. A veto firing is the interesting event: it means the
+    # object had merged with the robot and would otherwise have gone with it.
+    grasp_points: int = 0
+    grasp_vetoed: int = 0
+
     @property
     def usable(self) -> bool:
         """Both classes non-empty.
@@ -413,11 +589,29 @@ class FusedObservation:
         return len(self.object_xyz) > 0 and len(self.hand_xyz) > 0
 
     def summary(self) -> str:
-        return "  ".join(
-            f"{name}:o{d['object']}/h{d['hand']}"
-            + ("*" if d["used_last_hand"] or d["used_last_object"] else "")
-            for name, d in self.per_camera.items()
-        )
+        """e.g. `tripod:o517-284/h63` — 517 object points kept, 284 declustered.
+
+        The subtraction is the number worth watching: it is the table and
+        background mass that used to be fed to the policy as object points, and
+        it going to zero every frame means clustering is not doing anything.
+        """
+        parts = []
+        for name, d in self.per_camera.items():
+            dropped = d.get("cluster_dropped", 0)
+            parts.append(
+                f"{name}:o{d['object']}"
+                + (f"-{dropped}" if dropped else "")
+                + f"/h{d['hand']}"
+                + ("*" if d["used_last_hand"] or d["used_last_object"] else "")
+            )
+        if self.arm_dropped:
+            parts.append(f"arm-{self.arm_dropped}")
+        if self.grasp_points:
+            parts.append(f"grasp{self.grasp_points}"
+                         + (f"!veto{self.grasp_vetoed}" if self.grasp_vetoed else ""))
+        if self.arm_fallback not in (None, "disabled"):
+            parts.append(f"[arm:{self.arm_fallback}]")
+        return "  ".join(parts)
 
 
 class MultiCameraPerception:
@@ -432,12 +626,25 @@ class MultiCameraPerception:
     """
 
     def __init__(self, rigs: Sequence[CameraRig], segmenter: Callable,
-                 per_camera_cap: Optional[int] = None):
+                 per_camera_cap: Optional[int] = None,
+                 arm_rejection: bool = True,
+                 arm_voxel_m: float = 0.012,
+                 arm_offset_m: float = 0.07,
+                 arm_lateral_m: float = 0.12):
         if not rigs:
             raise ValueError("need at least one camera rig")
         self._rigs = list(rigs)
         self._segment = segmenter
         self._per_camera_cap = per_camera_cap
+        # Arm rejection runs on the FUSED cloud, after every camera has been
+        # brought into the hand frame, for two reasons. It needs the robot base,
+        # which only exists once the pose is applied; and a blob seen by two
+        # cameras is one blob only after the union — per camera, the same
+        # forearm would be scored twice from two partial views.
+        self._arm_rejection = arm_rejection
+        self._arm_voxel_m = arm_voxel_m
+        self._arm_offset_m = arm_offset_m
+        self._arm_lateral_m = arm_lateral_m
         # Last (colour, hand mask) and last depth per camera, kept so a viewer
         # can draw exactly the frames this observation was computed from rather
         # than grabbing its own — which would be a different instant.
@@ -464,7 +671,9 @@ class MultiCameraPerception:
             colors.append(color_bgr)
             depths.append(depth_m)
 
-        masks = self._segment([cv2.cvtColor(c, cv2.COLOR_BGR2RGB) for c in colors])
+        masks = self._segment(
+            [cv2.cvtColor(c, cv2.COLOR_BGR2RGB) for c in colors],
+            sizes=[rig.params.seg_input_px for rig in self._rigs])
 
         object_parts, hand_parts = [], []
         object_src, hand_src = [], []
@@ -485,6 +694,9 @@ class MultiCameraPerception:
                 last_object_xyz=rig._last_object_xyz,
                 crop_radius_m=p.crop_radius_m,
                 object_max_radius_m=p.object_max_radius_m,
+                cluster_voxel_m=p.cluster_voxel_m,
+                cluster_min_hand_frac=p.cluster_min_hand_frac,
+                hand_margin_px=p.hand_margin_px,
                 min_depth_m=p.min_depth_m,
                 max_depth_m=p.max_depth_m,
                 full_cloud_stride=p.full_cloud_stride,
@@ -527,6 +739,13 @@ class MultiCameraPerception:
                 "robot_pts_removed": int(n_before - len(obj_hand)) if rig.exclude_robot else 0,
                 "used_last_hand": bool(result.debug["used_last_hand"]),
                 "used_last_object": bool(result.debug["used_last_object"]),
+                # How much table and background connectivity threw away, and why
+                # it did not run when it did not. Worth surfacing rather than
+                # burying: a cluster step that silently falls back every frame
+                # looks exactly like one that is working.
+                "cluster_dropped": int(result.debug["cluster_dropped"]),
+                "cluster_fallback": result.debug["cluster_fallback"],
+                "margin_band": int(result.debug["margin_band_points"]),
             }
 
         # 3. Raw per-class union across cameras — see the module docstring on why
@@ -535,14 +754,41 @@ class MultiCameraPerception:
                       else np.zeros((0, 3), dtype=np.float32))
         hand_xyz = (np.concatenate(hand_parts, axis=0) if hand_parts
                     else np.zeros((0, 3), dtype=np.float32))
+        object_source = (np.concatenate(object_src) if object_src
+                         else np.zeros(0, np.int8))
+
+        # 4. Drop the human forearm. It reaches here because it is anatomically
+        #    continuous with the hand, so no connectivity test can separate it —
+        #    only where it lies relative to the robot can.
+        arm_debug: dict[str, Any] = {"dropped": 0, "fallback": "disabled",
+                                     "clusters": [], "grasp_points": 0,
+                                     "grasp_vetoed": 0}
+        if self._arm_rejection:
+            # The base origin, in the hand frame the cloud already lives in.
+            robot_origin = invert_transform(T_base_hand)[:3, 3]
+            keep, arm_debug = reject_arm_clusters(
+                object_xyz, hand_xyz, robot_origin,
+                voxel_m=self._arm_voxel_m, min_offset_m=self._arm_offset_m,
+                max_lateral_m=self._arm_lateral_m,
+                # Both are in the panda_hand frame already, so the grasp volume
+                # is a fixed box here — no pose needed, and it is the one thing
+                # in this function the robot knows exactly.
+                grasp_mask=GRASP_REGION.contains(object_xyz))
+            if not keep.all():
+                object_xyz = object_xyz[keep]
+                object_source = object_source[keep]
 
         return FusedObservation(
             object_xyz=object_xyz, hand_xyz=hand_xyz, per_camera=per_camera,
-            object_source=(np.concatenate(object_src) if object_src
-                           else np.zeros(0, np.int8)),
+            object_source=object_source,
             hand_source=(np.concatenate(hand_src) if hand_src
                          else np.zeros(0, np.int8)),
-            camera_names=tuple(r.name for r in self._rigs))
+            camera_names=tuple(r.name for r in self._rigs),
+            arm_dropped=int(arm_debug["dropped"]),
+            arm_fallback=arm_debug["fallback"],
+            arm_clusters=tuple(arm_debug["clusters"]),
+            grasp_points=int(arm_debug["grasp_points"]),
+            grasp_vetoed=int(arm_debug["grasp_vetoed"]))
 
 
 def _cap(points: np.ndarray, cap: int) -> np.ndarray:
@@ -593,6 +839,10 @@ def build_rigs(
     depth_size: tuple[int, int] = (640, 480),
     fps: int = 30,
     exclude_robot: bool = True,
+    cluster: bool = True,
+    wrist_seg_px: Optional[int] = None,
+    fixed_seg_px: Optional[int] = None,
+    hand_margin_px: Optional[int] = None,
 ) -> list[CameraRig]:
     """Build rigs for the requested camera names, resolving serials and extrinsics.
 
@@ -609,6 +859,16 @@ def build_rigs(
         import calib_config as cfg  # noqa: E402
         serials = dict(cfg.CAMERA_SERIALS)
 
+    wrist_params = WRIST_PARAMS if cluster else WRIST_PARAMS_LEGACY
+    fixed_params = FIXED_PARAMS if cluster else FIXED_PARAMS_LEGACY
+    if wrist_seg_px is not None:
+        wrist_params = replace(wrist_params, seg_input_px=int(wrist_seg_px))
+    if fixed_seg_px is not None:
+        fixed_params = replace(fixed_params, seg_input_px=int(fixed_seg_px))
+    if hand_margin_px is not None:
+        wrist_params = replace(wrist_params, hand_margin_px=int(hand_margin_px))
+        fixed_params = replace(fixed_params, hand_margin_px=int(hand_margin_px))
+
     rigs: list[CameraRig] = []
     for name in names:
         serial = serials.get(name)
@@ -617,7 +877,7 @@ def build_rigs(
         if name == "wrist":
             rigs.append(CameraRig(
                 name=name, kind="eye_in_hand", camera=camera,
-                params=WRIST_PARAMS, T_hand_cam=T_hand_cam_wrist,
+                params=wrist_params, T_hand_cam=T_hand_cam_wrist,
                 exclude_robot=False, serial=serial))
         else:
             if fixed_session is None:
@@ -626,7 +886,7 @@ def build_rigs(
                     "session (--calib-session)")
             rigs.append(CameraRig(
                 name=name, kind="fixed", camera=camera,
-                params=FIXED_PARAMS,
+                params=fixed_params,
                 T_base_cam=load_fixed_extrinsics(fixed_session),
                 exclude_robot=exclude_robot, serial=serial))
     return rigs

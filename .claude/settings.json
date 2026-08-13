@@ -17,11 +17,20 @@
       "Bash(timeout 60 git ls-remote --heads origin)",
       "Bash(timeout 60 git ls-remote origin)",
       "Bash(timeout 100 du -sh output/dagger_runs/dagger4_run7)",
-      "Bash(timeout 100 du -sh output/dagger_runs/dagger4_run7/*)"
+      "Bash(timeout 100 du -sh output/dagger_runs/dagger4_run7/*)",
       "Bash(python -c ' *)",
       "Bash(nvidia-smi --query-gpu=name,memory.total --format=csv)",
       "Bash(grep -n \"^#\\\\{1,3\\\\} \" README_PHASE4.md)",
-      "Bash(grep -n \"not\\\\*\\\\* pass \\\\`BASE=\\\\`\\\\|do \\\\*\\\\*not\\\\*\\\\* pass\" README_PHASE4.md)"
+      "Bash(grep -n \"not\\\\*\\\\* pass \\\\`BASE=\\\\`\\\\|do \\\\*\\\\*not\\\\*\\\\* pass\" README_PHASE4.md)",
+      "Bash(python3 -m json.tool /home/pradyun/h2r/handover-sim2real/.claude/settings.json)",
+      "Bash(/home/pradyun/anaconda3/envs/handover-rs/bin/python -m py_compile cloud_viewer.py my_policy_runner.py test_perception_viz.py test_multicam_fusion.py dual_cloud_window.py)",
+      "Bash(/home/pradyun/anaconda3/envs/handover-rs/bin/python -c ' *)",
+      "Bash(/home/pradyun/anaconda3/envs/handover-rs/bin/python -m py_compile pointcloud_pipeline.py)",
+      "Bash(/home/pradyun/anaconda3/envs/handover-rs/bin/python -m py_compile pointcloud_multicam.py)",
+      "Bash(/home/pradyun/anaconda3/envs/handover-rs/bin/python -m py_compile test_multicam_fusion.py)",
+      "Bash(/home/pradyun/anaconda3/envs/handover-rs/bin/python test_multicam_fusion.py)",
+      "Bash(python -c \"import ast,sys; ast.parse\\(open\\('my_policy_runner.py'\\).read\\(\\)\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('my_policy_runner.py'\\).read\\(\\)\\)\")"
     ]
   }
 }

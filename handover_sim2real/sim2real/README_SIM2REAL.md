@@ -74,11 +74,29 @@ Once you trust it, drop `--step-mode` for continuous operation, and add
 
 ### Seeing what the policy sees
 
-`--show-cloud` opens a live 3D view of the **literal `[1024, 5]` tensor** being
-fed to the network, in the `panda_hand` frame, next to the 2D segmentation
-overlay that is always on. The two answer different questions and neither
-replaces the other: the overlay says whether the hand was *segmented*, the 3D
-view says whether the resulting points landed in the right *place*.
+`--show-cloud` opens **the same 3D window `test_perception_viz.py` opens** —
+literally the same class, `dual_cloud_window.DualCloudWindow` — next to the 2D
+segmentation overlay that is always on. The two answer different questions and
+neither replaces the other: the overlay says whether the hand was *segmented*,
+the 3D view says whether the resulting points landed in the right *place*.
+
+It draws **two** clouds. Large coloured dots are the literal `[1024, 5]` tensor
+fed to the network (orange object, green hand); small white dots behind them are
+the raw deprojected scene from every camera, merged in the same frame. The white
+cloud is what makes the coloured one legible: a hand cloud rigidly displaced by a
+bad extrinsic still looks like a perfectly good hand cloud on its own, but
+against recognisable geometry — table, arm, background — the displacement is
+obvious, and with two cameras the white clouds must *overlap*.
+
+These were two separate implementations until they drifted: the runner's never
+gained the white cloud, so `--show-cloud` could not answer the question the view
+exists for. The old `PolicyCloudViewer` is gone; `cloud_viewer.py` now holds only
+the shared colours, wireframes and `source_for_cloud`.
+
+`--context-stride`, `--context-radius`, `--context-max` and `--no-context`
+control the white cloud, same as in the viewer script. Deprojecting full depth
+frames is the expensive part of drawing, so it is skipped entirely when the white
+cloud is hidden and otherwise runs behind `--cloud-update-hz`.
 
 ```bash
 python my_policy_runner.py --show-cloud --dry-run
@@ -173,8 +191,29 @@ extrinsic still looks like a perfectly good hand cloud. Against the white scene
 with two cameras **the white clouds must overlap**. Where they don't, the gap is
 your calibration error.
 
-Keys, in any OpenCV window: `c` colour by class/camera, `w` white cloud on/off,
-`z`/`x` roll the view, `r` drag mode, `q` quit.
+Keys, in **any** window including the 3D one: `c` colour by class/camera, `w`
+white cloud on/off, `z`/`x` roll the view, `r` drag mode, `q` quit.
+
+They used to work only while an OpenCV window had focus — you had to click a
+camera view to rotate the cloud. The cause was structural: `O3DVisualizer`
+derives from `WindowBase`, not `gui.Window`, so it has no `set_on_key` and
+exposes no `SceneWidget`, and there was nowhere to attach a handler. The 3D
+window is now built on `gui.Window` + `SceneWidget` directly, which costs manual
+layout and camera setup but can receive keys. Presses are queued and drained by
+the main loop, so both windows drive one set of actions rather than two handlers
+that can drift apart. Unrecognised keys are reported unhandled, so arrow keys and
+modifiers still reach the widget.
+
+**The handler must return a plain `bool`.** The two overloads disagree:
+`gui.Window.set_on_key` is `Callable[[KeyEvent], bool]` (True = stop
+dispatching), while `gui.SceneWidget.set_on_key` takes an
+`EventCallbackResult`. Returning the enum from the *Window* handler fails to
+convert back into C++ and **tears the window down on every keypress** — which
+looked like "pressing z or x closes the window". Note that calling `_on_key`
+from Python cannot detect this, because that path never crosses the binding and
+the enum comes back happily; only the return *type* distinguishes them.
+`python test_perception_viz.py --selftest` asserts it, with no camera, ROS or
+display needed.
 `--context-stride` and `--context-radius` control the
 white cloud's density and how far out it extends (default 1.2 m around
 `panda_hand`, because a tripod at 1.5 m otherwise contributes the whole room and
@@ -256,13 +295,20 @@ and starved the render thread it exists to feed — the window stuttered again f
 an entirely different reason. Throttling *raised* the GUI from 66 to 82 Hz and
 halved CPU use, since nothing consumes snapshots faster than the draw rate.
 
-### Keys (in the OpenCV window)
+### Keys (in any window, including the 3D one)
 
 | key | action |
 |---|---|
 | `SPACE` | execute the previewed step (`--step-mode` only) |
 | `h` | re-home mid-run |
 | `q` / `Esc` | quit |
+| `c` | colour the policy cloud by class vs by source camera |
+| `w` | white raw-scene cloud on/off |
+| `z` / `x` | roll the view (the one axis the turntable cannot reach) |
+| `r` | cycle drag mode: turntable → arcball → rotate model |
+
+The last four need `--show-cloud`. `SPACE` and `h` are read from the OpenCV
+window only — they move the robot, and the 3D window is for looking.
 
 ---
 
@@ -598,9 +644,10 @@ python test_multicam_fusion.py --live --calib-session <session>
 
 ### What it does
 
-Per camera: segment the hand, deproject to the camera frame, label non-hand
-points near the hand centroid as object, then transform into `panda_hand`. Then
-concatenate **per class across cameras** and sample 896 object + 128 hand.
+Per camera: segment the hand, deproject to the camera frame, label as object the
+non-hand points that form one connected body with the hand, then transform into
+`panda_hand`. Then concatenate **per class across cameras** and sample 896
+object + 128 hand.
 
 That mirrors `handover_env._get_point_states` + `PointListener` step for step,
 including the deliberate absence of per-camera balancing — the sim concatenates
@@ -611,8 +658,11 @@ different resolutions.
 The wrist camera's extrinsics are constant, so its cloud needs no robot pose and
 cannot be corrupted by a stale one. The tripod's chain is
 `inv(T_base_hand) @ T_base_color`, so it inherits the error of **both** the
-hand-eye calibration and the reported EE pose. That is why the wrist stays the
-anchor view and `--cameras` refuses to drop it.
+hand-eye calibration and the reported EE pose. That is why the wrist is the
+anchor view. `--cameras` will run without it — the fusion is viewpoint-agnostic
+— but it warns, because with fixed cameras alone every point in the cloud is
+placed through that chain and there is no pose-independent view left to check it
+against.
 
 ### Two honest caveats
 
@@ -627,27 +677,274 @@ opposite side is the fix, not more tuning.
 
 **No segmentation oracle.** In sim, "which points are the object" is a lookup by
 body id, and `COMPUTE_ROBOT_POINT_STATE: False` excludes the arm for free. Here
-the object is defined *negatively* — non-hand points within a radius of the hand
-centroid — so the robot's own gripper gets labelled "object" as it closes, a
-class the training data never contained. `ROBOT_EXCLUSION` removes a box around
-the gripper using the pose we already know exactly. Its ceiling is `z = +0.02` in
-`panda_hand`, which clears the hand housing and wrist while **sparing the finger
-volume** where a grasped object sits (fingertips are at `z = 0.075…0.105`) — a
-box that swallowed the fingers would delete the object at exactly the moment the
-side view exists to see it. `--no-robot-exclusion` disables it.
+the object is defined *negatively*, from a hand mask, so the robot's own gripper
+gets labelled "object" as it closes — a class the training data never contained.
+`ROBOT_EXCLUSION` removes a box around the gripper using the pose we already
+know exactly. Its ceiling is `z = +0.02` in `panda_hand`, which clears the hand
+housing and wrist while **sparing the finger volume** where a grasped object sits
+(fingertips are at `z = 0.075…0.105`) — a box that swallowed the fingers would
+delete the object at exactly the moment the side view exists to see it.
+`--no-robot-exclusion` disables it.
 
 **Third caveat, found while testing: hand segmentation at range.** `HandSegModel`
-resizes every input to 256×256 before inference. From the wrist at ~0.4 m a hand
-fills a large part of the frame and survives that downscale comfortably. From the
-tripod at ~1.5 m the same hand is a small patch, and after the resize it is
-smaller still. In a live capture with a bare forearm visible in the tripod view,
-the segmenter returned an **entirely empty mask** — the hand itself was out of
-frame there, so this is not yet evidence of failure, but it is the failure mode
-to watch. If `tripod:o0/h0` persists in the overlay while a hand is plainly in
-that camera's view, the segmenter is the cause, not the geometry. The tripod's
-`min_hand_points` floor is already lowered to 40 (from the wrist's 100) for this
-reason; the real fix is to move the tripod closer or crop-and-upscale the region
-of interest before segmenting.
+resizes its input to a square before inference. From the wrist at ~0.4 m a hand
+fills a large part of the frame and survives a 256×256 downscale comfortably.
+From the tripod at ~1.5 m the same hand is a small patch, and after the resize it
+is smaller still — a tripod-only run produced hand counts falling 103 → 63 → 40
+across three steps, against a `min_hand_points` floor of 40. The fixed cameras
+now segment at **384×384** for this reason (see below). If `tripod:o0/h0`
+persists in the overlay while a hand is plainly in that camera's view, the
+segmenter is still the cause, not the geometry, and `--fixed-seg-px 512` or
+moving the tripod closer are the next levers. The model also segments *hands,
+not arms* — see the forearm section below, which is a separate problem with a
+separate fix.
+
+### Defining the object class
+
+The object class owns 896 of the policy's 1024 rows, and in training it came
+from a segmentation-buffer lookup on the YCB body id: the object and nothing
+else. Reproducing that from a hand mask is the largest remaining sim2real gap in
+perception, larger than the calibration.
+
+Until now "object" meant *non-hand points within `object_max_radius_m` of the
+hand centroid*, which made a single radius do two incompatible jobs — exclude
+the table (wants to be small) and contain the whole object (wants to be large).
+At 0.10 m the first job won, so any object longer than ~20 cm held at one end had
+its far half deleted every frame, and the table still leaked in.
+
+The object is *being held*, so it is one connected body with the hand while the
+table and background are not. `pointcloud_pipeline.hand_connected_object_points`
+voxelizes both classes together, takes 26-connected components, and keeps only
+the object points sharing a component with the hand. Connectivity does the
+excluding, so the radius is now a loose workspace bound (0.22 m wrist / 0.26 m
+tripod) rather than the segmentation itself.
+
+Measured (`test_multicam_fusion.py`), on a staged scene of a hand holding a
+0.24 m bar over a table with a distractor blob nearby:
+
+| | wrist, 10 mm voxel | tripod, 12 mm voxel |
+|---|---|---|
+| bar kept | 100 % (to 0.240 m) | 100 % |
+| table + distractor kept | 0 % | 0 % |
+| gap it can bridge to its own object | 10 mm | 15 mm |
+| table standoff before it separates | 17.5 mm | 22.5 mm |
+| cost per camera per frame | ~2.7 ms | ~1.7 ms |
+
+Two things follow from that table. First, **nothing is dilated.** Growing the
+hand by one voxel before labelling looks like cheap insurance against a gap, and
+it doubles the reach downward too — it pulled in half the tabletop on the scene
+above, while removing it cost nothing, because the two classes partition the
+cropped pixels and are therefore pixel-adjacent wherever they meet. Second, the
+last row of the table is the limit: **a hand within ~2 cm of the table still
+merges with it**, and there this is a no-op. RANSAC plane removal is the answer
+to that case and is not implemented.
+
+`--no-cluster` restores the previous behaviour *including* the tight radii, so
+the two settings are a real A/B rather than an unfiltered loose sphere.
+
+### The forearm, which connectivity provably cannot remove
+
+`HandSegModel` segments **hands, not arms**, so everything past the wrist falls
+out of the hand mask and into the object class. Clustering cannot help: the
+forearm is anatomically continuous with the hand, so it is in the hand's
+component by construction. In sim there was no counterpart — the human is a MANO
+mesh, wrist to fingertips — so the arm is not a kind of object point the policy
+handles badly, it is one it has never seen.
+
+What separates them is *where they sit relative to the robot*. With the hand
+excluded from its own class, the object and the forearm are two blobs with the
+hand between them, and `pointcloud_pipeline.reject_arm_clusters` scores each by
+
+```
+s = (blob centroid − hand centroid) · unit(robot base − hand centroid)
+```
+
+dropping blobs with `s < −0.07 m`. It runs on the **fused** cloud, after every
+camera is in the hand frame, because that is where the robot pose exists and
+where a blob seen by two cameras is finally one blob.
+
+Three choices in that line, each of which could reasonably have gone the other
+way:
+
+- **Robot base, not end effector.** The EE is where the policy is driving, so
+  scoring against it closes a feedback loop — one frame that picks the forearm
+  pulls the EE toward the forearm, which makes the forearm score better next
+  frame. The base cannot be moved by a perception error.
+- **A threshold, not "keep the nearest blob".** Argmin deletes half an object
+  whenever occlusion splits it, which fingers and depth dropouts do. The test
+  asserts a deliberately split object survives whole.
+- **The threshold is well negative, not zero.** An object need not be offered
+  forward — a mug gripped by the handle has its body on the human's side and
+  scores about −0.03, against a forearm's −0.20. This is the one number here
+  tuned from geometry rather than measured, so verify it before trusting it.
+
+`test_perception_viz.py` prints every blob as `points@offset/lateral/arm-frac` —
+that table *is* the tuning surface for `--arm-offset` and `--arm-lateral`, and if
+the object and the arm do not separate in it, no threshold will separate them.
+`--no-arm-rejection` disables the whole step.
+
+#### The flicker, and why the first version had it
+
+Reported from hardware as *"sometimes the arm appears as object, most times it
+does not"*. The cause is not the threshold. The hand mask sits slightly inside
+the true silhouette — morphological opening eats the boundary, and the mask is
+upsampled from 384 by nearest neighbour — so a thin shell of genuine
+**hand-surface** points falls outside it into the object class. That shell wraps
+the hand, and in wrapping it, it connects the held object to the forearm. Staged
+and swept:
+
+| shell surviving | blobs | arm kept, before | after |
+|---|---|---|---|
+| 0 % | 2 | 0 % | 0 % |
+| 20 % | 1 | 100 % | 2 % |
+| 60 % | 1 | 100 % | 2 % |
+| 100 % | 1 | 100 % | 2 % |
+
+**20 % coverage is enough to fuse them**, and the merged blob scores −0.025 —
+nowhere near −0.07, so no tuning would have helped. Mask jitter flipping that
+ring in and out of continuity is the flicker exactly.
+
+Two fixes, because the first alone would leave the method depending on it:
+
+1. **`hand_margin_px`** (5 wrist, 4 fixed) — pixels around the mask belonging to
+   *neither* class, which removes the shell at source. Those pixels still seed
+   the connectivity test, because dropping them outright would open a gap
+   between the hand and the object it holds. The margin is in pixels because its
+   cause is pixel-scale, but its cost is metric: 5 px is 4 mm of object surface
+   at the wrist's 0.4 m and 12 mm at the tripod's 1.5 m, hence the smaller value
+   for fixed cameras. `--hand-margin-px 0` restores the old behaviour, flicker
+   included.
+2. **Mixed blobs are cut point by point.** A blob at most 5 % behind the
+   threshold is kept whole, at least 95 % behind is dropped whole, and anything
+   between is two things stuck together — decided per point instead. The bar is
+   low deliberately: splitting a long object loses only its tail, while keeping a
+   merged blob admits the entire arm. At 15 % a heavily-bridged blob still read
+   as coherent-forward, because the bridge is itself forward mass that dilutes
+   the arm out of the fraction.
+
+After both, the sweep is flat: object 100 % kept and arm ≤ 2 % at every
+coverage, bridged or not. The residual 2 % is the sliver of forearm within
+7 cm of the hand centroid, which no threshold at that offset can remove.
+
+One limit remains: scoring is per blob, so an object **resting against the
+forearm** is one blob with it — the point-by-point rule then handles it, but less
+cleanly than separate blobs would.
+
+#### `[arm:all-arm]` — nothing in frame looks like a held object
+
+When no blob survives, the object class goes **empty** and the caller holds the
+frame: `FusedObservation.usable` is false, the runner does not step, and the
+viewer prints `NOT USABLE`.
+
+This is deliberate and replaces the opposite behaviour. The first version kept
+the "least-bad" blob on the reasoning that an empty class is unusable while a
+dirty one is only degraded. On hardware that fired on **every frame** and quietly
+promoted an 862-point, 87 %-arm blob into the object class — the exact
+contamination the rest of the filter exists to prevent, now invisible, because
+downstream an arm-shaped object cloud looks like any other. A stall is visible
+and recoverable; an arm labelled "object" steers the policy into it.
+
+So `[arm:all-arm]` on every frame is the **correct** answer when there is no
+object in the scene — waving a bare arm at the camera should produce exactly
+that. If it persists while you *are* holding something, read the blob table:
+
+```
+blobs: 862@-0.092/lat0.031/0.87    <- 9.2 cm behind the hand: --arm-offset
+       61@+0.054/lat0.180/1.00     <- inside the offset but 18 cm off-axis: --arm-lateral
+```
+
+The three numbers are offset along the hand→robot axis, median distance off that
+axis, and the fraction of the blob counted as arm. The lateral column was added
+because a blob can sit well inside `--arm-offset` and still be 100 % arm-like,
+which is otherwise inexplicable from the log.
+
+#### The grasp region overrides all of it
+
+Reported next as *"the object-labelled cloud disappears as the gripper closes on
+the object, even though hand and object are clearly visible in the image"* —
+tripod-only, so the cloud was fine and the filter was not.
+
+As the gripper converges, its points and the object's necessarily touch and merge
+into one blob. The robot's own links run laterally, so they score as arm in bulk
+and carry the merged blob past `_BLOB_ARM_FRAC`; the whole-blob drop then took
+the object out with them. The object class emptied exactly when the grasp became
+possible. Staged and measured — one blob, 1240 points, 82 % arm-like:
+
+| | object kept | arm mass kept |
+|---|---|---|
+| before | **0 %** (`[arm:all-arm]`) | 0 % |
+| after | 100 % | 0 % |
+
+`GraspRegion` is the fix: a box between the fingers (`|x|,|y| < 0.055`,
+`z` 0.05–0.13 in `panda_hand`). A point inside it is **never** scored as arm, and
+a blob holding at least 10 such points is **never** dropped whole — at worst it
+is cut point by point, which then keeps every grasp point. Anything between the
+fingers at grasp time is the thing being grasped; that is what the fingers
+closing on it means.
+
+Three things about those numbers. The bounds are looser than the hardware — the
+fingertips are at `z` 0.075–0.105 and the fingers open to 0.08 total — because
+this region only ever *keeps* points: generous costs a little robot surviving in
+the object class, tight costs the object at the moment it matters most. That
+asymmetry is also what makes it survive the calibration error it has to, since
+with a fixed camera alone the cloud moves relative to this box by the full
+hand-eye and pose error. And the 10-point floor exists so a single stray point —
+which depth noise puts between the fingers on any frame — cannot rescue an entire
+arm.
+
+The summary prints `grasp<N>` when points are in the region and `!veto<N>` when
+that saved a blob. A veto firing is the interesting event: it means the object
+had merged with the robot and would otherwise have gone with it.
+
+#### An inclined forearm needs the lateral bound
+
+Reported next as *"fine if my forearm is horizontal, but at some inclination I do
+see the forearm labelled as object"*. A signed projection measures only the
+component along the hand→robot axis, so it ranks an arm by how nearly it points
+away from the robot. Swept against inclination, with only that term:
+
+| tilt | 0° | 15° | 30° | 45° | 60° | 75° | 90° |
+|---|---|---|---|---|---|---|---|
+| arm kept | 6 % | 9 % | 11 % | 23 % | 42 % | 86 % | **100 %** |
+
+A forearm hanging straight down from the hand is at 90° and scores about −0.05 —
+inside any threshold that also keeps a mug.
+
+So the kept region is now a **capsule**, not a half-space: a point is arm when
+`s < −arm_offset` **or** `r > arm_lateral`, where `r` is distance from the
+hand→robot axis. An arm at any inclination is 0.15 m or more off that axis the
+whole time. With it, the same sweep is 0 % arm kept and 100 % object kept at
+every tilt.
+
+`--arm-lateral` (default 0.12 m) trades the two directly: smaller cuts more arm,
+larger keeps a long object held across the robot's line of sight. That is the
+same tension `object_max_radius_m` used to carry alone, moved somewhere it can be
+anisotropic — the direction an object is plausibly *offered* stays generous.
+
+One caveat measured while fixing this: the clean result depends on the arm being
+its **own blob**. When the mask shell fuses it to the object, the per-point rule
+still cuts most of it but leaves the wedge between the hand and the lateral
+bound — about 30 % of the arm at worst tilt. That is the case `hand_margin_px`
+exists to prevent.
+
+### Segmentation resolution per camera
+
+`ExtractionParams.seg_input_px` is per camera: 256 for the wrist (what cp1 was
+trained at), **384 for fixed cameras**. `HandSegModel` is fully convolutional, so
+a larger input is a legitimate inference-time choice, not a reinterpretation of
+the weights. Cameras sharing a size still share one batched forward; different
+sizes cost one forward each. Measured on the RTX 2000 Ada in this machine:
+
+| | ms per perception pass |
+|---|---|
+| 1 cam @256 (cp2 wrist-only) | 9.3 |
+| 2 cams @256 batched (previous default) | 15.5 |
+| wrist @256 + tripod @384 | 26.0 |
+| wrist @256 + tripod @512 | 40.8 |
+| tripod alone @512 | 32.0 |
+
+Against a runner step of roughly 270 ms, 384 costs 4 % and 512 costs 9 %.
+`--wrist-seg-px` and `--fixed-seg-px` override both.
 
 ### USB bandwidth
 
@@ -813,6 +1110,27 @@ Also verified offline: the 3D viewer renders both colour modes, and per-point
 camera provenance survives the 896/128 sampling with **zero mislabelled rows**
 (checked against two clouds made disjoint in x, so a mix-up cannot hide).
 
+Forearm rejection is verified offline: the held object kept at 100 % and the
+forearm at 0 %, a deliberately split object surviving whole (the case an argmin
+rule fails), a mug-by-the-handle at −0.03 kept while a forearm at −0.20 is
+dropped, and the class never emptied. The flicker seen on hardware is covered by
+a regression sweep that asserts the answer is flat across shell coverage *and*
+that the bridge actually forms — the first version of that sweep passed by never
+bridging at all, which proved nothing.
+
+It runs on hardware without error, but **the flicker fix has not been confirmed
+against a real arm** — that is the next thing to do, with `test_perception_viz.py`.
+Watch `blob-count changed Nx`: on a still scene it should stop climbing.
+
+Object-class clustering is verified offline on a staged scene and on hardware:
+100 % of a held 0.24 m bar kept out to its far end, 0 % of the table and a
+nearby distractor, and every failure path returning the input untouched rather
+than an empty class. The gap-bridging and table-standoff reaches are asserted at
+the shipped voxel sizes, so changing one silently changes both and the test says
+so. On a live tripod run it drops 70–190 points per frame. Its **real** accuracy
+against a held object is not yet measured — that needs a labelled recording, and
+the two bags in `recordings/` are the material for it.
+
 **cp3 runs end to end**: loaded, both cameras fused, three policy steps at
 3.4–4.0 cm, clean shutdown, under `--dry-run --show-cloud`.
 
@@ -826,3 +1144,13 @@ Blocked / outstanding:
   cp3 alike.
 * `franka_gripper`'s action server was not advertised when last probed, so
   `--enable-gripper` would send goals nowhere.
+* Clustering is a no-op when the hand comes within ~2 cm of the table. Plane
+  removal is the fix and is not implemented.
+* `test_perception_viz.py` exits via `os._exit` rather than returning from
+  `main()`. Open3D's Filament threads and roslibpy's Twisted reactor outlive
+  `main()` and re-enter Python during interpreter finalization, which either
+  hangs the process or aborts it with
+  `Fatal Python error: take_gil ... state: finalizing` — after all work is done
+  and `stopped.` has printed. This is not specific to the current window: the
+  O3DVisualizer used previously hangs identically in the same environment.
+  Streams are flushed first; nothing else is pending by that point.
