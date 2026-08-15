@@ -95,6 +95,7 @@ from handover_sim2real.dagger import (
     load_policy_runner,
     policy_kind,
 )
+from handover_sim2real.dagger.pregrasp import forward_dist_default
 from handover_sim2real.dagger.setup import build_phase4_context, scene_pools
 
 
@@ -402,6 +403,13 @@ LOG_FIELDS = [
     "c_success_rate",
     "co_grasp_ok", "co_grasp_miss", "co_no_release", "co_drop",
     "co_human_contact", "co_bench_timeout", "co_timeout",
+    # -- the blind endgame (DAGGER.target: pregrasp; blank in every other run).
+    # Where the feed-forward push landed relative to the grasp it could not see.
+    # Read against `mean_min_pos`, which in that mode is the distance to the
+    # PRE-GRASP: a small mean_min_pos with a large c_reach_pos means the policy
+    # is arriving correctly and `forward_dist` is wrong, which is a one-line fix
+    # rather than a failed run.
+    "c_reach_pos", "c_reach_rot",
     # -- did a revisited scene still aim at the same grasp (pin verification)
     "revisits", "grasp_mismatch", "max_grasp_drift",
     # -- (4) labels
@@ -416,6 +424,12 @@ LOG_FIELDS = [
     "close_success_rate", "chance_rate", "missed_rate", "miss_given_chance",
     "box_chance_rate", "box_taken_rate", "box_missed_rate", "miss_given_box",
     "mean_box_steps", "mean_box_frac",
+    # DAGGER.target: pregrasp only. `box_after_rate` is that mode's conversion
+    # measure: of the episodes where the policy committed, how many had the
+    # object between the open jaws AFTER the blind push. `box_chance_rate` is
+    # near 0 there by construction — the policy stops 6.4 cm short, so the object
+    # is never in the jaws while it is still deciding.
+    "mean_reach_pos_err", "mean_reach_rot_err", "box_after_rate",
     "eval_min_pos", "eval_min_rot",
     "mean_dist", "mean_pos_err", "mean_rot_err", "mean_close_step",
     # -- (2) eval outcome breakdown, fractions of the eval set
@@ -482,6 +496,7 @@ def eval_columns(m: dict | None) -> dict:
         "close_success_rate", "chance_rate", "missed_rate", "miss_given_chance",
         "box_chance_rate", "box_taken_rate", "box_missed_rate", "miss_given_box",
         "mean_box_steps", "mean_box_frac",
+        "mean_reach_pos_err", "mean_reach_rot_err", "box_after_rate",
         "eval_min_pos", "eval_min_rot",
         "mean_dist", "mean_pos_err", "mean_rot_err", "mean_close_step")}
     out.update(reason_columns(m.get("reasons"), EVAL_REASONS, denom=m.get("n") or None))
@@ -510,6 +525,8 @@ def collect_columns(c: dict) -> dict:
         "dart_alpha": _r(c.get("dart_alpha"), 4),
         "mean_min_pos": _r(c.get("mean_min_pos")),
         "mean_min_rot": _r(c.get("mean_min_rot")),
+        "c_reach_pos": _r(c.get("mean_reach_pos_err")),
+        "c_reach_rot": _r(c.get("mean_reach_rot_err")),
         "mean_policy_close_step": _r(c.get("mean_policy_close_step"), 2),
         "close_labels": c.get("n_close_labels", -1),
         "approach_labels": c.get("n_approach_labels", -1),
@@ -720,6 +737,15 @@ def main() -> None:
         # drift apart — they are the same `grasp_held_after_hold` call.
         outcome_check=bool(dag.get("outcome_check", False)),
         hold_steps=int(ev.get("hold_steps", 3)),
+        # Where the episode ends (run 21). "grasp" is runs 1-20, so a config that
+        # omits the key labels exactly what they labelled. forward_dist defaults
+        # to the standoff offset itself rather than to a literal, so it tracks
+        # standoff_dist / reach_tail instead of silently disagreeing with them.
+        target=str(dag.get("target", "grasp")),
+        forward_dist=float(dag.get("forward_dist") or forward_dist_default(
+            float(sim_cfg_d.get("standoff_dist", 0.08)),
+            int(dag.get("reach_tail", 5)))),
+        forward_steps=int(dag.get("forward_steps", 4)),
         # DART-paper noise (run 18). "jolt" is the runs 1-17 behaviour and the
         # default, so an unset key changes nothing. `dart_sigma` is seeded from
         # state.json on resume so a restarted run keeps the covariance it had
@@ -793,6 +819,15 @@ def main() -> None:
         close_rot_thresh=collect_params.close_rot_thresh,
         box_check=bool(ev.get("box_check", True)),
         box=box_params,
+        # Taken from the COLLECTION params, not re-read from the EVAL block: a
+        # policy trained to stop at the pre-grasp and evaluated as if it stopped
+        # at the grasp would score 0 for a reason that has nothing to do with the
+        # policy, and there is no configuration in which the two should differ.
+        target=collect_params.target,
+        forward_dist=collect_params.forward_dist,
+        forward_steps=collect_params.forward_steps,
+        standoff_dist=collect_params.standoff_dist,
+        reach_tail=collect_params.reach_tail,
         verbose=bool(ev.get("verbose", False)))
     eval_every = int(ev.get("every", 1))
     eval_ckpt = str(ev.get("ckpt", "best"))

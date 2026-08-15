@@ -378,7 +378,22 @@ MAX_DROOP_COMP_M = 0.30
 # well inside what the closed-loop policy corrects for on the next observation,
 # and the passes cap keeps a step from stalling the episode if the arm is blocked.
 STEP_CONVERGE_PASSES = 3
-STEP_CONVERGE_TOL_M = 0.003
+# 5 mm, not 3. This is the other half of the smoothness fix and it is the half
+# the symptom actually pointed at: "the arm moves a certain distance and then it
+# does some fine motions" IS the tail of a 39 mm step being chased down to 3 mm.
+# The last few millimetres are the expensive part — the arm has to be led far
+# enough past the target to break loose at all, so every millimetre down there
+# costs a correction — and swept across the plausible plants, tightening 5 mm to
+# 3 mm roughly triples the corrections per step and quadruples the time the arm
+# spends stopped mid-move, to buy about 1.5 mm.
+#
+# It is not accuracy that is being given up, because the loop is closed: the next
+# observation is of where the arm actually IS, so a 5 mm residual is not an error
+# the policy is blind to, it is a slightly shorter step. Measured, 95% of each
+# commanded step is still executed. 5 mm is also well inside cp2's own action
+# scale (action_std 16-21 mm), so it is small compared with the resolution at
+# which the policy is steering in the first place.
+STEP_CONVERGE_TOL_M = 0.005
 
 # -----------------------------------------------------------------------------
 # Creep correction — why the arm used to move in stop-go-stop-go bursts
@@ -404,12 +419,84 @@ STEP_CONVERGE_TOL_M = 0.003
 # That last stop is not negotiable: cp2/cp3 are single-frame Markov policies
 # trained on states where the sim robot had fully reached its waypoint, so the
 # observation that follows a step must be of a stationary arm.
-CREEP_STALL_HOLD_S = 0.06    # stillness that means "stalled", not "arrived"
-CREEP_DEAD_S = 0.08          # ignore stillness this long after a publish, so
-                             # round-trip latency is never read as a stall
+# The nudge fires off a STALL — the arm stopped — and not off deceleration,
+# which would be the obvious way to remove the pause entirely. Deceleration was
+# rejected on purpose: while the arm is still travelling, (target - position)
+# overstates what is left to do, because the command already outstanding is going
+# to close most of it. Leading by a fraction of that overstated error commands
+# past the target, and the correction for an overshoot is a REVERSAL — a twitch,
+# which is the exact thing being removed. Predicting the landing point instead
+# would need the controller's time constant, which is not identified. Waiting for
+# the stall costs CREEP_STALL_HOLD_S of dead time and buys an error term that
+# needs no prediction at all.
+CREEP_STALL_HOLD_S = 0.05    # stillness that means "stalled", not "arrived"
 CREEP_GAIN = 0.6             # fraction of the remaining error added per nudge
 CREEP_MAX_NUDGES = 12        # backstop; MAX_COMMAND_LEAD_M and the settle
                              # timeout bound this too
+
+# Minimum lead increment when a nudge produced NO MOTION AT ALL.
+#
+# A proportional nudge is the right shape while the arm is still responding, and
+# useless once it is not: if the arm is 3 mm from the target and will not move
+# until the equilibrium is ~17 mm past it, then adding 0.6 x 3 mm buys 1.8 mm of
+# an 14 mm gap, and the next nudge buys 1.8 mm again. Measured, that is a dozen
+# nudges to finish the last few millimetres, each paying its own latency wait —
+# the last mile costing more than the whole rest of the move.
+#
+# No motion is a different piece of information from a short move: it says the
+# lead is under the break-away threshold, and nothing about how far under. So it
+# gets an absolute floor instead of a proportional one, and the arm walks up to
+# break-away in a bounded number of steps regardless of how small the remaining
+# error is.
+#
+# 10 mm, and the size is the whole point — 4 mm was tried first and measured to
+# do NOTHING. The floor has to be a real fraction of the standing offset it is
+# walking up to (~17 mm on this robot) or the settle times out before it gets
+# there: on a 25 mm standing offset with 6 mm to travel, a 4 mm floor timed out
+# after 9 nudges still 5.9 mm short, and a 10 mm floor converged in 4 nudges and
+# 1.9 s. Across the plant sweep the same change cut the worst plant's mid-move
+# dead time from 585 ms to 253 ms and its reversals from 1.9 per step to 0.6.
+CREEP_BREAKAWAY_M = 0.010
+# Stall detection is armed by SEEING THE ARM MOVE, not by a fixed delay. A fixed
+# delay long enough to cover the worst round trip is dead time on every nudge;
+# "it moved, then it stopped" is unambiguous the moment it happens. The delay
+# survives only as the fallback for a command that produces no motion at all —
+# already at the equilibrium, or blocked — where there is no motion to wait for.
+#
+# It is a CEILING on a self-calibrating gate, not a fixed wait. Fixed is the
+# wrong shape: short enough to be cheap (0.12 s) and a 0.15 s round trip nudges
+# before the arm has moved at all, applies two leads to one error and overshoots
+# by 22 mm with a reversal to correct it — measured. Long enough to be safe
+# (0.30 s) and every nudge that fails to break the arm loose pays 0.30 s of dead
+# time, which on the last few millimetres of a step is most of the step —
+# measured too, at ~1 s per step.
+#
+# So the gate is the round trip the link has actually shown, once one command has
+# been seen to land; this only bounds it before that and if the link is slow.
+CREEP_DEAD_S = 0.30
+CREEP_LATENCY_MARGIN_S = 0.02   # added to the observed round trip
+
+# THERE IS DELIBERATELY NO CAP TYING THE LEAD TO THE REMAINING ERROR.
+#
+# One was written and removed, and it is worth saying why, because it is an
+# appealing idea: the lead accumulates while the error shrinks, so a lead sized
+# for a 39 mm step is oversized for the 4 mm at the end of it, and bounding it by
+# "what the remaining distance can absorb" reads as obviously right.
+#
+# It is not right. The lead a move needs is set by the controller's break-away
+# threshold, which has nothing to do with how far is left to go — an arm 4 mm
+# from its target with a 25 mm standing offset needs a lead of 25 mm, and a cap
+# that forbids it deadlocks. Swept across the plants consistent with this robot's
+# measurements, no slack value was uniformly good: 20 mm fixed the low-friction
+# case and made a 25 mm standing offset fail to converge on every single step;
+# 35 mm fixed that and broke the low-friction case instead. That is the signature
+# of a constant tuned to a plant, and the plant is not identified. See the
+# MAX_COMMAND_LEAD_M note above for the same conclusion reached the same way.
+#
+# What bounds the lead instead is MAX_COMMAND_LEAD_M — how far the equilibrium
+# may sit ahead of where the arm actually IS — which is a statement about how
+# hard the controller is asked to pull, and true regardless of which plant model
+# is right.
 
 # Feed-forward lead along the direction of travel.
 #
@@ -849,8 +936,16 @@ class DroopCompensator:
         if n < TRAVEL_LEAD_MIN_M:
             return              # a short move says nothing about travel lead
         along = float(np.asarray(lead_used, dtype=np.float64) @ (travel / n))
-        along = float(np.clip(along, 0.0, TRAVEL_LEAD_MAX_M))
-        self.s = (1.0 - TRAVEL_LEAD_BETA) * self.s + TRAVEL_LEAD_BETA * along
+        if along <= 0.0:
+            # The move finished needing a lead pointing BACKWARDS along the way
+            # it went, which happens when it overshot and the corrections walked
+            # the lead back past zero. That is evidence about that move, not
+            # evidence that no lead is needed, and folding it in as a zero halves
+            # a perfectly good estimate: measured, one such move dropped a
+            # converged 22 mm lead to 11 mm and cost seven commands to rebuild.
+            return
+        self.s = ((1.0 - TRAVEL_LEAD_BETA) * self.s
+                  + TRAVEL_LEAD_BETA * min(along, TRAVEL_LEAD_MAX_M))
         self.s_samples += 1
 
     def update(self, T_commanded: np.ndarray, T_measured: np.ndarray) -> None:
@@ -950,8 +1045,10 @@ def settle(pub, template_msg: dict, T_base_ctrl_target: np.ndarray, seq: int,
         return T_cmd, seq + 1
 
     T_command, seq = publish(seq)
-    t0 = time.time()
+    t0 = t_pub = time.time()
+    latency = None              # round trip, once the link has demonstrated one
     armed_at = t0 + CREEP_DEAD_S
+    moved = False               # has the arm responded to the live command yet?
     dt = drot = float("inf")
     T_prev = None
     still_since = None
@@ -965,19 +1062,16 @@ def settle(pub, template_msg: dict, T_base_ctrl_target: np.ndarray, seq: int,
         T_now = pose_msg_to_matrix(current_msg)
         dt, drot = pose_error(T_now, T_base_ctrl_target)
 
-        # Early exit: arrived outright (no droop, or a very light arm pose).
-        if dt < tol_m and drot < rot_tol:
-            settled = True
-            break
-
-        # Nothing that happens in the first CREEP_DEAD_S after a publish is
-        # information: the command has not round-tripped yet, so the arm is
-        # legitimately still and reading that as a stall would nudge twice for
-        # one error and overshoot.
-        if time.time() < armed_at:
-            T_prev = T_now
-            still_since = None
-            continue
+        # There is deliberately NO in-tolerance early exit here. One used to
+        # exist — "arrived, stop waiting" — and it was unsound: being within
+        # tolerance at one sample says nothing about whether the arm is stopping
+        # there or passing through at speed. It could never fire before, because
+        # an uncompensated command always stalls short and never reaches
+        # tolerance at all; with the lead sized to actually arrive, it fires
+        # mid-transit, and returning there hands the policy an observation of a
+        # moving arm — the exact thing this function exists to prevent. Measured
+        # with an oversized CREEP_GAIN, it let a heavy overshoot report 2.5 mm.
+        # Convergence is in tolerance AND stopped, below, with no shortcut.
 
         if T_prev is not None:
             step_t, step_r = pose_error(T_prev, T_now)
@@ -985,6 +1079,13 @@ def settle(pub, template_msg: dict, T_base_ctrl_target: np.ndarray, seq: int,
                 if still_since is None:
                     still_since = time.time()
             else:
+                if not moved:
+                    # First motion after this command: the round trip is at most
+                    # this, so later commands need not assume the worst. It is an
+                    # over-estimate — it includes however long the arm took to
+                    # move a measurable amount — which is the safe direction.
+                    latency = time.time() - t_pub
+                moved = True
                 still_since = None      # moved again; restart the quiet window
         T_prev = T_now
 
@@ -1004,18 +1105,38 @@ def settle(pub, template_msg: dict, T_base_ctrl_target: np.ndarray, seq: int,
                 break
             continue
 
+        # Stillness before the arm has reacted to the live command is latency,
+        # not a stall, and nudging on it would apply two leads to one error and
+        # overshoot. Once motion has been seen, a stop is a stop immediately.
+        # This gates only the NUDGE: in tolerance and stopped is unambiguous
+        # whenever it happens, and delaying that would be dead time for nothing.
+        if not moved and time.time() < armed_at:
+            continue
+
         # Stalled short. Lengthen the lead and go again, without waiting for the
         # full hold: the controller does not need the arm at rest to accept a new
         # equilibrium, and waiting for one is precisely what made the motion
         # stop-go-stop-go.
         if quiet >= CREEP_STALL_HOLD_S and nudges < CREEP_MAX_NUDGES:
-            lead = lead + CREEP_GAIN * (target_xyz - T_now[:3, 3])
+            err_vec = target_xyz - T_now[:3, 3]
+            step = CREEP_GAIN * err_vec
+            if not moved and float(np.linalg.norm(step)) < CREEP_BREAKAWAY_M:
+                # The last command moved the arm not at all, so the lead is under
+                # break-away and the remaining error says nothing about by how
+                # much.
+                step = err_vec / max(float(np.linalg.norm(err_vec)), 1e-12)
+                step = step * CREEP_BREAKAWAY_M
+            lead = lead + step
             n = float(np.linalg.norm(lead))
             if n > MAX_DROOP_COMP_M:
                 lead *= MAX_DROOP_COMP_M / n
             T_command, seq = publish(seq)
             nudges += 1
-            armed_at = time.time() + CREEP_DEAD_S
+            t_pub = time.time()
+            gate = (CREEP_DEAD_S if latency is None
+                    else min(latency + CREEP_LATENCY_MARGIN_S, CREEP_DEAD_S))
+            armed_at = t_pub + gate
+            moved = False
             still_since = None
             T_prev = None
 

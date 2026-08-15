@@ -26,6 +26,7 @@ from handover_sim2real.dagger.env_setup import build_sim_cfg, build_sim_context
 from handover_sim2real.dagger.evaluator import EvalParams
 from handover_sim2real.dagger.grasp_box import build_box_params
 from handover_sim2real.dagger.grasp_pin import load_grasp_pin_table
+from handover_sim2real.dagger.pregrasp import forward_dist_default
 
 
 def scene_pools(num_scenes: int, ev: dict,
@@ -131,6 +132,18 @@ def build_phase4_context(cfg4: dict, *, seed: int = 0,
         close_rot_thresh=float(dag.get("close_rot_thresh", 0.34)),
         box_check=bool(ev.get("box_check", True)),
         box=build_box_params(ev),
+        # Also from the DAGGER block, and for a stronger version of the same
+        # reason: a policy trained to stop at the pre-grasp and evaluated as if
+        # it stopped at the grasp scores 0 for a reason that has nothing to do
+        # with the policy. There is no configuration in which these should differ
+        # between collection and eval, so there is only one place to set them.
+        target=str(dag.get("target", "grasp")),
+        forward_dist=float(dag.get("forward_dist") or forward_dist_default(
+            float(sim_cfg_d.get("standoff_dist", 0.08)),
+            int(dag.get("reach_tail", 5)))),
+        forward_steps=int(dag.get("forward_steps", 4)),
+        standoff_dist=float(sim_cfg_d.get("standoff_dist", 0.08)),
+        reach_tail=int(dag.get("reach_tail", 5)),
         verbose=bool(ev.get("verbose", False)))
 
     return Phase4Context(

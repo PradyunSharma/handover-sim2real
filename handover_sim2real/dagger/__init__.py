@@ -32,6 +32,7 @@ Modules:
     collector  Phase-4 DAgger episode collection -> BC-schema HDF5
     evaluator  closed-loop eval (Phase-3 criterion) for best-policy selection
     grasp_box  ray-cast "is the object in the open jaws" opportunity test
+    pregrasp   the CVPR2023 blind endgame, for DAGGER.target: pregrasp
 """
 
 from .env_setup import SimContext, build_sim_cfg, build_sim_context
@@ -57,6 +58,7 @@ from .collector import (
     dart_scaled_sigma,
     derived_standoff_pose,
 )
+from .pregrasp import forward_dist_default, open_loop_reach
 from .grasp_box import BoxParams, build_box_params, grasp_opportunity
 from .evaluator import EvalParams, evaluate_policy
 from .setup import Phase4Context, build_phase4_context, scene_pools
@@ -87,6 +89,8 @@ __all__ = [
     "dart_bootstrap_sigma",
     "dart_scaled_sigma",
     "derived_standoff_pose",
+    "forward_dist_default",
+    "open_loop_reach",
     "DaggerHDF5Writer",
     "BoxParams",
     "build_box_params",

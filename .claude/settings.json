@@ -30,7 +30,13 @@
       "Bash(/home/pradyun/anaconda3/envs/handover-rs/bin/python -m py_compile test_multicam_fusion.py)",
       "Bash(/home/pradyun/anaconda3/envs/handover-rs/bin/python test_multicam_fusion.py)",
       "Bash(python -c \"import ast,sys; ast.parse\\(open\\('my_policy_runner.py'\\).read\\(\\)\\)\")",
-      "Bash(python3 -c \"import ast; ast.parse\\(open\\('my_policy_runner.py'\\).read\\(\\)\\)\")"
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('my_policy_runner.py'\\).read\\(\\)\\)\")",
+      "Bash(grep -rn \"train_pinned_omg_right_ok\\\\|dataset\\\\|h5\" examples/configs/bc_phase4_all.yaml | head -20; echo \"=== run16 BASE ===\"; sed -n '/^TRAIN:/,/^EVAL:/p' examples/configs/dagger_phase4_all_beta075.yaml | grep -n \"base\\\\|dataset\\\\|h5\" | head -20)",
+      "Bash(~/anaconda3/envs/pch2r_dev/bin/python -c ' *)",
+      "Bash(~/anaconda3/envs/pch2r_dev/bin/python examples/make_pregrasp_demos.py --input output/bc_dataset/train_pinned_omg_ok.h5 --output /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/c790be60-5e96-4232-9970-349c38e20b3d/scratchpad/pregrasp_smoke.h5)"
+    ],
+    "additionalDirectories": [
+      "/home/pradyun/h2r/handover-sim2real/examples/configs"
     ]
   }
 }

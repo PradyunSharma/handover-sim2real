@@ -99,6 +99,26 @@ What differs from the Phase-1/2 collectors (`collect_dagger_*_dataset.py`):
     that budget is the reason: the alternative is to execute the chosen action
     first and jolt at the END of the loop body (after the `env.step` block), so
     the next iteration reads the perturbed state and the step budget is untouched.
+
+EVERYTHING ABOVE DESCRIBES `CollectParams.target == "grasp"`, which is what runs
+1-20 collected and remains the default. Under `target: "pregrasp"` (run 21) the
+episode ends 6.4 cm earlier — at the standoff — and the reach is not
+demonstrated at all, because it is executed open loop at deployment
+(`pregrasp.py`). Three things change, and only three:
+
+  * the close label is compared against the STANDOFF, not the grasp;
+  * the committed reach degenerates to holding the standoff waypoint, so the
+    frozen tail is one entry long instead of `reach_tail`. Every rule that keys
+    off `committed_reach is not None` — the DART band floor, the reach-jolt and
+    its servo-back target, `expert_after_commit` — carries over untouched, which
+    is why this is a slice rather than a second code path;
+  * `outcome_check` runs the blind push before the hold, since the close the
+    label commits to is a reach-then-close.
+
+The recorded schema, the DART machinery, the horizon sizing, the pin and the
+beta mixture are all identical. The reach-tail structure of the OMG plan is still
+what locates the standoff, so `reach_tail` remains a mirror of the planner's
+constant in both modes.
 """
 
 from __future__ import annotations
@@ -137,6 +157,10 @@ from handover_sim2real.rl.rollout_worker import (  # noqa: E402
     _status_name,
     grasp_held_after_hold,
 )
+# The blind endgame of CollectParams.target == "pregrasp". Shared with the
+# evaluator for the same reason grasp_held_after_hold is: a collection outcome
+# and an eval outcome must be decided by identical code.
+from handover_sim2real.dagger.pregrasp import open_loop_reach  # noqa: E402
 # 'sxyz' axes — the same convention the actions are built with (train_env.py uses
 # transforms3d's mat2euler default), so this inverts the label exactly.
 from transforms3d.euler import euler2mat  # noqa: E402
@@ -236,6 +260,38 @@ class CollectParams:
     # Mirrored from the SIM block so the derivation cannot drift out of sync with
     # the planner that produced the waypoints.
     standoff_dist: float = 0.08
+    # ----- WHERE THE EPISODE ENDS (run 21) -----
+    # "grasp"    runs 1-20: the learner owns the whole motion. The close label
+    #            fires within (close_pos_thresh, close_rot_thresh) of OMG
+    #            traj[-1], and the committed reach supervises the last 6.4 cm.
+    # "pregrasp" the CVPR2023 split (`policy.py: grasp_and_back`): the learner
+    #            owns the APPROACH only. The close label fires within the same
+    #            tolerances of the STANDOFF (traj[-reach_tail]), the episode ends
+    #            there, and the last 6.4 cm are a blind feed-forward push
+    #            (`pregrasp.open_loop_reach`) that the policy neither produces
+    #            nor is scored on producing.
+    #
+    # Everything else about the schema is unchanged: still 7-D actions, still a
+    # binary channel 6, still one terminal 0. Only the STATE at which that 0 is
+    # correct moves 6.4 cm back along the approach — so no model, loss or dataset
+    # code changes, and a pre-grasp aggregate is loadable by the same
+    # `BCSequenceDataset`. Channel 6 stops meaning "close the fingers" and starts
+    # meaning "commit the endgame".
+    #
+    # What this buys: the reach is the part runs 1-20 could not learn (run 16
+    # reached the standoff constantly and the grasp rarely), and it is also the
+    # part that needs no learning — it is a straight line whose length is a
+    # planner constant. What it costs is measured in `pregrasp.py`: the expert's
+    # own reach carries ~9 mm of lateral correction (p90 15 mm) that a blind push
+    # cannot make.
+    target: str = "grasp"
+    # The blind push, in metres along the gripper's local +z, and how many
+    # sub-steps to spread it over. Defaults are the standoff offset itself
+    # (0.08 * (1 - 1/5) = 0.064) in 4 steps of 1.6 cm — which is exactly OMG's
+    # own ramp spacing, standoff_dist / reach_tail. `pregrasp.py` documents why
+    # this is 0.064 and not the paper's 0.08. Ignored when target == "grasp".
+    forward_dist: float = 0.064
+    forward_steps: int = 4
     # ----- committed reach (see module docstring section on the endgame) -----
     # Once the EE is within `reach_commit_dist` of the standoff, freeze the
     # current plan's last `reach_tail` waypoints and follow them BY INDEX instead
@@ -599,6 +655,10 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
 
     prev_act6d = np.zeros(6, dtype=np.float32)
     point_clouds, robot_states, expert_actions = [], [], []
+    # Run 21. Moves the terminal state 6.4 cm back along the approach; see
+    # CollectParams.target. Read once so every branch below asks the same
+    # question the same way.
+    pregrasp = str(params.target) == "pregrasp"
 
     def _standoff_for(g):
         """Pre-grasp standoff: derived from the grasp, or read off the plan.
@@ -688,6 +748,44 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     # standoff failure mode is labels decaying to ~0 while the EE sits 6.6 cm
     # short, which is invisible in step counts but obvious here.
     label_pos_mags: list[float] = []
+    # Where the BLIND push landed, against the grasp it was aiming at. Only
+    # defined in pre-grasp mode with outcome_check on, and it is the diagnostic
+    # that mode lives or dies by: a pre-grasp label is only as good as the reach
+    # it makes possible, and this says whether the feed-forward motion arrives.
+    # A systematic bias here is a `forward_dist` to re-tune, not a policy to
+    # blame — which `success` alone cannot distinguish.
+    reach_pos_err = reach_rot_err = float("nan")
+
+    def _score(obs):
+        """The handover's OUTCOME, on the evaluator's taxonomy. Returns
+        (outcome, success, obs).
+
+        Called only after the labels for this episode are frozen, so D_i is
+        byte-identical whether or not it runs — it observes, it does not steer.
+        In pre-grasp mode the open-loop reach runs FIRST, because the close the
+        policy committed to is the reach-then-close, not a close in place.
+        """
+        nonlocal reach_pos_err, reach_rot_err
+        if pregrasp:
+            obs, pushed_done, st = open_loop_reach(
+                env, obs, sim.steps_action_repeat,
+                dist=params.forward_dist, num_steps=params.forward_steps)
+            if grasp_pose is not None:
+                reach_pos_err, reach_rot_err = ee_grasp_pose_error(obs, grasp_pose)
+            if pushed_done:
+                # The push itself ended the episode — the swing into the grasp
+                # knocked the object out of the hand, or tripped human contact.
+                # That is the benchmark's failure, not a grasp that missed, and
+                # filing it as GRASP_MISS would hide a `forward_dist` that is
+                # too long behind the policy's success rate.
+                return _status_name(st), 0, obs
+        held, obs = grasp_held_after_hold(
+            env, obs, sim.steps_action_repeat, params.hold_steps)
+        return (("GRASP_OK" if held
+                 else "DROP" if bool(getattr(env, "_dropped", False))
+                 else "NO_RELEASE" if not bool(env.ycb.released)
+                 else "GRASP_MISS"),
+                int(held), obs)
 
     for step in range(params.max_steps):
         # ----- state exactly as the policy / dataset sees it -----
@@ -786,6 +884,19 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                         and len(plan) >= params.reach_tail
                         and d_standoff <= params.reach_commit_dist):
                     committed_reach = np.asarray(plan[-params.reach_tail:])
+                    # In pre-grasp mode the endgame is not ours to demonstrate,
+                    # so the frozen tail is truncated to its FIRST entry — the
+                    # standoff. `reach_i` is clamped to it below and the "past
+                    # the end, hold the final waypoint" branch then holds the
+                    # standoff instead of the grasp: the label keeps saying "go
+                    # to the pre-grasp" and shrinks monotonically until
+                    # close_pos_thresh fires. Everything downstream that keys off
+                    # `committed_reach is not None` — the DART band floor, the
+                    # reach-jolt rule and its servo-back target,
+                    # expert_after_commit — carries over unchanged, which is the
+                    # whole reason this is a slice and not a separate code path.
+                    if pregrasp:
+                        committed_reach = committed_reach[:1]
                     # The tail's first entry IS the standoff, i.e. where the EE
                     # already is — skip leading no-ops so the first reach label
                     # is a real step.
@@ -814,9 +925,15 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # Uses the grasp the CURRENT plan aims at, so the close decision and the
         # approach labels always refer to the same target. Survives a failed
         # replan via the cached pose.
+        # In pre-grasp mode the terminal pose is the STANDOFF, so the same
+        # thresholds are applied 6.4 cm earlier. `min_pos` / `min_rot` follow the
+        # target, so `mean_min_pos` keeps meaning "how close did it get to the
+        # thing it was asked to reach" in both modes — at the cost of not being
+        # comparable across them, which is correct: they are different targets.
+        target_pose = standoff_pose if pregrasp else grasp_pose
         at_grasp = False
-        if grasp_pose is not None:
-            pos_err, rot_err = ee_grasp_pose_error(obs, grasp_pose)
+        if target_pose is not None:
+            pos_err, rot_err = ee_grasp_pose_error(obs, target_pose)
             min_pos, min_rot = min(min_pos, pos_err), min(min_rot, rot_err)
             at_grasp = (pos_err <= params.close_pos_thresh
                         and rot_err <= params.close_rot_thresh)
@@ -842,13 +959,7 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
             # what D_i contains — it only runs the sim forward to observe what the
             # close the expert just LABELLED would actually have done.
             if params.outcome_check:
-                held, obs = grasp_held_after_hold(
-                    env, obs, sim.steps_action_repeat, params.hold_steps)
-                ep_success = int(held)
-                outcome = ("GRASP_OK" if held
-                           else "DROP" if bool(getattr(env, "_dropped", False))
-                           else "NO_RELEASE" if not bool(env.ycb.released)
-                           else "GRASP_MISS")
+                outcome, ep_success, obs = _score(obs)
             break
 
         # ----- the policy's own action (drives the state distribution) -----
@@ -1065,13 +1176,7 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
             # the learner's own decision — the same thing the evaluator measures,
             # just at beta > 0 and on a collection scene.
             if params.outcome_check:
-                held, obs = grasp_held_after_hold(
-                    env, obs, sim.steps_action_repeat, params.hold_steps)
-                ep_success = int(held)
-                outcome = ("GRASP_OK" if held
-                           else "DROP" if bool(getattr(env, "_dropped", False))
-                           else "NO_RELEASE" if not bool(env.ycb.released)
-                           else "GRASP_MISS")
+                outcome, ep_success, obs = _score(obs)
             break
         if done:
             reason = "ENV_DONE"
@@ -1149,6 +1254,11 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # a collection episode is driven by the beta MIXTURE, not by the policy.
         "outcome": outcome,
         "success": int(ep_success),
+        # Pre-grasp mode only (and only with outcome_check): how far the BLIND
+        # push ended up from the grasp it could not see. NaN otherwise — there
+        # was no push to measure.
+        "reach_pos_err": float(reach_pos_err),
+        "reach_rot_err": float(reach_rot_err),
         # DART Sigma estimator, summed not averaged — see the accumulator above.
         "dart_dd_sum": dart_dd_sum,
         "dart_dd_n": int(dart_dd_n),
@@ -1311,6 +1421,10 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
            "n_tiny_labels": 0, "n_revisits": 0, "n_grasp_mismatch": 0,
            "max_grasp_drift": 0.0,
            "min_pos": [], "min_rot": [], "close_steps": [], "reasons": {},
+           # params.target == "pregrasp" + outcome_check only: where the blind
+           # push landed relative to the grasp. Empty otherwise, so `_mean`
+           # yields NaN and the columns blank out rather than reading 0.
+           "reach_pos_err": [], "reach_rot_err": [],
            # params.outcome_check only. `outcomes` is keyed on the EVALUATOR's
            # taxonomy and counted over KEPT episodes only, so its counts stack to
            # `episodes` and can be read as fractions; `reasons` above is the
@@ -1331,6 +1445,15 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
         "ee_step": float(params.ee_step),
         "reach_tail": int(params.reach_tail),
         "reach_commit_dist": float(params.reach_commit_dist),
+        # WHICH POSE THE TERMINAL LABEL AIMS AT. A pre-grasp shard and a grasp
+        # shard have the identical schema and are silently mixable, and mixing
+        # them puts two contradictory close labels on the same states — the one
+        # inconsistency the aggregate cannot average away. Recorded on every
+        # shard, including "grasp" ones, so a shard's target is a fact about the
+        # file and not an inference from its run name.
+        "target": str(params.target),
+        "forward_dist": float(params.forward_dist),
+        "forward_steps": int(params.forward_steps),
         "stop_on_close_label": bool(params.stop_on_close_label),
         "stop_on_policy_close": bool(params.stop_on_policy_close),
         # Recorded even when off, so a DART-free shard is provably DART-free
@@ -1410,6 +1533,9 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
                     agg["min_pos"].append(st["min_pos"])
                 if np.isfinite(st["min_rot"]):
                     agg["min_rot"].append(st["min_rot"])
+                if np.isfinite(st.get("reach_pos_err", float("nan"))):
+                    agg["reach_pos_err"].append(st["reach_pos_err"])
+                    agg["reach_rot_err"].append(st["reach_rot_err"])
                 if st["policy_close_step"] >= 0:
                     agg["close_steps"].append(st["policy_close_step"])
                 if registry is not None:
@@ -1437,6 +1563,8 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
 
     agg["mean_min_pos"] = _mean("min_pos")
     agg["mean_min_rot"] = _mean("min_rot")
+    agg["mean_reach_pos_err"] = _mean("reach_pos_err")
+    agg["mean_reach_rot_err"] = _mean("reach_rot_err")
     agg["mean_policy_close_step"] = _mean("close_steps")
     # Mean approach-label displacement. The demonstrations sit at ~ee_step; a
     # collapse towards 0 means the expert has stopped producing usable labels.

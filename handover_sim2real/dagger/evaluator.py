@@ -42,6 +42,16 @@ Protocol per scene:
   * the first time the policy commands a close, score it (hold + secured check),
     and end the episode
   * otherwise step until the horizon or a benchmark failure (human contact/drop)
+
+WITH `target: pregrasp` (run 21) THE CLOSE IS A COMMIT. The policy is only asked
+for the approach, so its channel-6 zero triggers the CVPR2023 endgame — a blind
+6.4 cm push along the gripper's own +z (`pregrasp.open_loop_reach`) — and only
+then the hold. `success_rate` is the identical `grasp_held_after_hold` call in
+both modes, which is the point: run 21's headline number is directly comparable
+to run 16's even though the policy is producing 6.4 cm less of the motion. The
+GEOMETRIC scores do move, because the pose the policy steers to has moved:
+`pos_err` / `min_pos` / `had_chance` are measured against the standoff, and the
+new `reach_pos_err` reports where the push ended up relative to the grasp.
 """
 
 from __future__ import annotations
@@ -68,8 +78,14 @@ from handover_sim2real.rl.rollout_worker import (  # noqa: E402
 from handover_sim2real.dagger.grasp_box import (  # noqa: E402
     BoxParams, grasp_opportunity,
 )
+# Pre-grasp mode (EvalParams.target). Both imported, never reimplemented, so the
+# pose the evaluator scores against and the endgame it executes are the same ones
+# the collector labelled towards.
+from handover_sim2real.dagger.collector import derived_standoff_pose  # noqa: E402
+from handover_sim2real.dagger.pregrasp import open_loop_reach  # noqa: E402
 
 SUCCESS_MODES = ("stable_grasp", "proximity")
+TARGETS = ("grasp", "pregrasp")
 
 
 @dataclass
@@ -79,6 +95,23 @@ class EvalParams:
     hold_steps: int = 3                  # stable_grasp: policy-steps held shut
     close_pos_thresh: float = 0.02       # proximity: metres
     close_rot_thresh: float = 0.34       # proximity: radians (~19.5 deg)
+    # ---- where the episode ends (run 21); mirrors CollectParams.target ----
+    # "grasp"    the policy's close is a close: hold it and score.
+    # "pregrasp" the policy's close is a COMMIT: run the blind feed-forward reach
+    #            (`pregrasp.open_loop_reach`) first, then hold and score. Success
+    #            is the same `grasp_held_after_hold` in both modes, so the
+    #            headline number stays directly comparable to run 16's — the
+    #            policy is simply being asked for less of the motion.
+    # The geometric scores move with it: `pos_err`, `min_pos` and `had_chance`
+    # are measured against the STANDOFF, since that is the pose the policy is
+    # steering to. `reach_pos_err` then reports where the blind push ended up
+    # relative to the grasp, which is what separates "the policy stopped in the
+    # wrong place" from "forward_dist is mis-set".
+    target: str = "grasp"
+    forward_dist: float = 0.064          # metres along the gripper's local +z
+    forward_steps: int = 4               # sub-steps to spread the push over
+    standoff_dist: float = 0.08          # OMG's ramp extent, for the derivation
+    reach_tail: int = 5                  # OMG's cfg.reach_tail_length
     # Geometric opportunity test (see dagger/grasp_box.py). Runs ALONGSIDE the
     # pinned-pose `had_chance`, never replacing it, so `chance_rate` keeps the
     # meaning it had in runs 4-14 and the two remain comparable.
@@ -90,6 +123,9 @@ class EvalParams:
         if self.success_mode not in SUCCESS_MODES:
             raise ValueError(f"success_mode must be one of {SUCCESS_MODES}, "
                              f"got {self.success_mode!r}")
+        if self.target not in TARGETS:
+            raise ValueError(f"target must be one of {TARGETS}, "
+                             f"got {self.target!r}")
         if self.box is None:
             self.box = BoxParams()
 
@@ -115,8 +151,14 @@ def _resolve_grasp_pose(sim, scene_idx: int, pin_table):
 
 
 def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
-                  grasp_pose=None) -> dict:
+                  grasp_pose=None, target_pose=None) -> dict:
+    """`grasp_pose` is what the gripper must end up on; `target_pose` is what the
+    POLICY is steering to. They are the same pose in grasp mode and 6.4 cm apart
+    in pre-grasp mode, where the difference is covered by the blind push."""
     env = sim.env
+    pregrasp = str(params.target) == "pregrasp"
+    if target_pose is None:
+        target_pose = grasp_pose
     obs = env.reset(idx=scene_idx)
     sim.point_listener.reset()
     runner.reset()
@@ -142,6 +184,14 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
     box_taken = False
     box_steps = 0
     box_frac_max = 0.0
+    # Pre-grasp mode only. `reach_*` is where the BLIND push ended up relative to
+    # the grasp — the one thing that cannot be inferred from the policy's own
+    # pose — and `box_after` asks the same question the box test asks during a
+    # grasp-mode approach, but at the only pose in this mode where the answer can
+    # be yes: after the push, with the fingers still open.
+    reach_pos_err = reach_rot_err = float("nan")
+    box_after = False
+    box_after_frac = float("nan")
     close_step = -1
     success = False
     grasped = False
@@ -168,23 +218,44 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
         ycb_pos = env.ycb.bodies[env.ycb.ids[0]].link_state[0, 6, 0:3].numpy()
         dist = float(np.linalg.norm(ee_pos - ycb_pos))
 
-        if grasp_pose is not None:
-            pe, re_ = ee_grasp_pose_error(obs, grasp_pose)
+        if target_pose is not None:
+            pe, re_ = ee_grasp_pose_error(obs, target_pose)
             min_pos, min_rot = min(min_pos, pe), min(min_rot, re_)
             if pe <= params.close_pos_thresh and re_ <= params.close_rot_thresh:
                 had_chance = True
 
         if action[6] < 0.5:
-            # ---- the policy committed a close: score it (Phase-3 criterion) ----
+            # ---- the policy committed: score it (Phase-3 criterion) ----
+            # In pre-grasp mode "committed" means the blind reach, not the close,
+            # so the endgame runs between the geometry read and the hold.
             close_step = step
             box_taken = bool(opportunity)
 
-            # Geometry FIRST, from the pose the close was committed at — the hold
-            # moves the fingers, so this has to be read before it runs.
-            if grasp_pose is not None:
-                pos_err, rot_err = ee_grasp_pose_error(obs, grasp_pose)
+            # Geometry FIRST, from the pose the commit was made at — the reach and
+            # the hold both move the arm, so this has to be read before either.
+            if target_pose is not None:
+                pos_err, rot_err = ee_grasp_pose_error(obs, target_pose)
             near = bool(pos_err <= params.close_pos_thresh
                         and rot_err <= params.close_rot_thresh)
+
+            if pregrasp:
+                obs, pushed_done, st = open_loop_reach(
+                    env, obs, sim.steps_action_repeat,
+                    dist=params.forward_dist, num_steps=params.forward_steps)
+                if grasp_pose is not None:
+                    reach_pos_err, reach_rot_err = ee_grasp_pose_error(
+                        obs, grasp_pose)
+                if params.box_check and not pushed_done:
+                    box_after, box_after_frac = grasp_opportunity(env, params.box)
+                if pushed_done:
+                    # The push ended the episode: the swing into the grasp knocked
+                    # the object out of the hand, or tripped human contact. That is
+                    # the benchmark's failure, not a grasp that missed — recording
+                    # it as GRASP_MISS would hide an over-long forward_dist behind
+                    # the policy's success rate.
+                    status = st
+                    reason = _status_name(st)
+                    break
 
             # The hold runs in BOTH modes: it does not affect the proximity score
             # (already read above) and it is what makes `grasped` meaningful.
@@ -240,6 +311,11 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
         "box_steps": int(box_steps),        # how long the window stayed open
         "box_frac_max": float(box_frac_max),  # best jaw occupancy seen, for
                                               # recalibrating min_frac offline
+        # ---- pre-grasp mode: what the BLIND push achieved (NaN/0 otherwise) ----
+        "reach_pos_err": float(reach_pos_err),
+        "reach_rot_err": float(reach_rot_err),
+        "box_after": int(box_after),
+        "box_after_frac": float(box_after_frac),
         "status": int(status),
         "reason": reason,
     }
@@ -266,6 +342,7 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
     measuring pin agreement); the second counts off-pose grasps as the
     opportunities they are. `box_taken_rate` is the conversion of the latter.
     """
+    pregrasp = str(params.target) == "pregrasp"
     rows = []
     for i, scene in enumerate(scenes):
         # proximity needs a grasp pose; stable_grasp only wants one if a pin
@@ -277,13 +354,25 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
                 print(f"    [eval] scene {scene}: no grasp pose (OMG failed and no "
                       f"pin entry) — proximity cannot score it; counted as failure")
 
+        # The pose the POLICY is steering to. Derived, never planned for: it is a
+        # fixed function of the grasp (`derived_standoff_pose`, 5.6e-7 m from the
+        # planner's own traj[-reach_tail]), so eval still makes no OMG call it
+        # was not already making.
+        target_pose = grasp_pose
+        if pregrasp and grasp_pose is not None:
+            target_pose = derived_standoff_pose(
+                grasp_pose, params.standoff_dist, params.reach_tail)
+
         row = _eval_episode(sim, runner, int(scene), params=params,
-                            grasp_pose=grasp_pose)
+                            grasp_pose=grasp_pose, target_pose=target_pose)
         rows.append(row)
         if params.verbose:
+            reach = (f"reach={row['reach_pos_err']:.3f}/{row['box_after']} "
+                     if pregrasp else "")
             print(f"    eval [{i+1:3d}/{len(scenes)}] scene={scene:4d} "
                   f"success={row['success']} grasped={row['grasped']} "
                   f"close@{row['close_step']} pos_err={row['pos_err']:.3f} "
+                  f"{reach}"
                   f"ee->ycb={row['dist']:.3f} "
                   f"box={row['box_chance']}/{row['box_taken']}"
                   f"@{row['box_steps']}st({row['box_frac_max']:.2f}) "
@@ -357,6 +446,20 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
         # `box.min_frac` can be recalibrated from logs without re-running eval.
         "mean_box_frac": (_mean("box_frac_max") if params.box_check
                           else float("nan")),
+        # ---- pre-grasp mode: did the BLIND push finish the job ----
+        # Averaged over the episodes that COMMITTED, since an episode with no
+        # commit has no push to measure. `mean_reach_pos_err` against
+        # `mean_pos_err` splits the two failures this mode can have: a large
+        # pos_err is a policy that stopped in the wrong place, a small pos_err
+        # with a large reach_pos_err is a `forward_dist` that needs re-tuning.
+        # `box_after_rate` is the conversion — of the commits, how many put the
+        # object between the open jaws.
+        "mean_reach_pos_err": _mean("reach_pos_err"),
+        "mean_reach_rot_err": _mean("reach_rot_err"),
+        "box_after_rate": ((sum(r["box_after"] for r in rows) / n_closed)
+                           if (n_closed and params.box_check
+                               and str(params.target) == "pregrasp")
+                           else float("nan")),
         # Closest approach over the whole episode — defined even when the policy
         # never closes, so it still moves while every rate above reads 0.
         "eval_min_pos": _mean("min_pos"),
