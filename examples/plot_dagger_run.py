@@ -77,6 +77,26 @@ DIAGNOSTIC (<run>/curves_diag.png) — 2x3 grid, "is the machinery healthy":
   • cost       — wall-clock split by phase, so the expensive part is visible.
 
 Saves both (and shows them with --show).
+
+TARGET AWARENESS (run 21 on). `DAGGER.target` is read from <run>/config.yaml,
+because under `pregrasp` several columns keep their NAMES and change their
+MEANING — the episode ends 6.4 cm short of the grasp, so `eval_min_pos`,
+`mean_pos_err` and `chance_rate` are measured against the PRE-GRASP. A pre-grasp
+min-pos-err of 0.005 is not twenty times better than run 16's 0.10; it is a
+different quantity, and plotting the two under one label invites exactly the
+wrong comparison. Every affected panel is relabelled, and three things are added:
+
+  • `mean_reach_pos_err` on the approach panel (diamonds) — where the BLIND push
+    ended up relative to the GRASP. THIS is the line comparable to a grasp-mode
+    run's min pos err, because it is the only one measured against the pose the
+    gripper actually has to end up on.
+  • `box_after_rate` on the opportunity panel — of the episodes that committed,
+    how many had the object between the open jaws after the push. In this mode
+    `box_chance_rate` reads ~0 by construction (the policy stops 6.4 cm short, so
+    the jaws are never occupied while it is still deciding) and `box_taken_rate`
+    is NaN with it; neither is a regression.
+  • `settle_steps` on the endgame panel — how much convergence servo the episodes
+    actually got, against `commit_settle_steps` x the episodes that committed.
 """
 
 from __future__ import annotations
@@ -87,6 +107,7 @@ from pathlib import Path
 
 import matplotlib
 import numpy as np
+import yaml
 matplotlib.use("Agg")  # headless-safe; overridden by --show below
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
@@ -226,6 +247,23 @@ def main() -> None:
         raise SystemExit(f"{log_path} has no rows yet")
     it = num("iter")
 
+    # ---- which pose the run was steering to (DAGGER.target, run 21 on) ----
+    # Under target: pregrasp the episode ends 6.4 cm short of the grasp, so
+    # eval_min_pos / mean_pos_err / chance_rate are measured against the PRE-GRASP
+    # and box_chance_rate is ~0 by construction. Plotting those under the labels
+    # this file used for runs 1-20 would invite exactly the wrong comparison —
+    # a pre-grasp "min pos err" of 0.005 is not twenty times better than run 16's
+    # 0.10, it is a different quantity. Read from the run's own saved config so a
+    # log can never be plotted under the wrong labels.
+    target = "grasp"
+    cfg_path = run / "config.yaml"
+    if cfg_path.exists():
+        with cfg_path.open() as f:
+            target = str(((yaml.safe_load(f) or {}).get("DAGGER", {}) or {})
+                         .get("target", "grasp"))
+    pregrasp = target == "pregrasp"
+    TGT = "pre-grasp" if pregrasp else "grasp"
+
     # ── MAIN ────────────────────────────────────────────────────────────────
     fig, ax = plt.subplots(2, 4, figsize=(21, 8))
 
@@ -262,7 +300,16 @@ def main() -> None:
         ys = num(key)
         if _finite(ys):
             _plot(a, it, ys, style, marker="o", ms=3, color=col, label=label, lw=lw)
-    for key, label, col in (("chance_rate", "at pinned pose (ref)", "tab:blue"),
+    # Pre-grasp mode: the jaws cannot contain the object while the policy is
+    # still deciding — it stops 6.4 cm short — so box_chance_rate above reads ~0
+    # BY CONSTRUCTION and box_taken_rate is NaN with it. `box_after_rate` is this
+    # mode's conversion measure: of the episodes that committed, how many had the
+    # object between the open jaws once the blind push had run.
+    ys = num("box_after_rate")
+    if _finite(ys):
+        _plot(a, it, ys, "-D", ms=4, color="tab:purple", lw=2.0,
+              label="in jaws AFTER push | committed")
+    for key, label, col in (("chance_rate", f"at pinned {TGT} (ref)", "tab:blue"),
                             ("miss_given_chance", "missed | pinned (ref)", "tab:red")):
         ys = num(key)
         if _finite(ys):
@@ -277,10 +324,23 @@ def main() -> None:
     mp, mr = num("eval_min_pos"), num("eval_min_rot")
     pe, re_ = num("mean_pos_err"), num("mean_rot_err")
     if _finite(mp):
-        _plot(a, it, mp, "-o", ms=3, color="tab:blue", label="min pos err (m)")
+        _plot(a, it, mp, "-o", ms=3, color="tab:blue",
+              label=f"min pos err to {TGT} (m)")
     if _finite(pe):
         _plot(a, it, pe, "--o", ms=3, color="tab:cyan", alpha=0.8,
-               label="pos err at close (m)")
+               label=f"pos err to {TGT} at commit (m)"
+                     if pregrasp else "pos err at close (m)")
+    # Pre-grasp mode: where the BLIND push ended up relative to the GRASP. This,
+    # not `mp` above, is the quantity comparable to a grasp-mode run's min pos
+    # err — it is the only line on this panel measured against the pose the
+    # gripper actually has to end up on. The gap between it and `mp` is the
+    # push's own contribution, which should be small: the two differ only by
+    # forward_dist's mismatch with the true reach and by the orientation error
+    # projected over 6.4 cm.
+    rp, rr = num("mean_reach_pos_err"), num("mean_reach_rot_err")
+    if _finite(rp):
+        _plot(a, it, rp, "-D", ms=3, color="tab:purple",
+              label="pos err to GRASP after blind push (m)")
     # Auxiliary goal-grasp head (run 13 on): how far the network's BELIEF about
     # the grasp is from the pinned pose. Plotted on the same axes as the gripper's
     # actual error on purpose — the comparison is the whole point. If the head
@@ -300,10 +360,15 @@ def main() -> None:
     a.tick_params(axis="y", labelcolor="tab:blue")
     a2 = a.twinx()
     if _finite(mr):
-        _plot(a2, it, mr, "-s", ms=3, color="tab:red", label="min rot err (rad)")
+        _plot(a2, it, mr, "-s", ms=3, color="tab:red",
+              label=f"min rot err to {TGT} (rad)")
     if _finite(re_):
         _plot(a2, it, re_, "--s", ms=3, color="tab:orange", alpha=0.8,
-                label="rot err at close (rad)")
+                label=f"rot err to {TGT} at commit (rad)"
+                      if pregrasp else "rot err at close (rad)")
+    if _finite(rr):
+        _plot(a2, it, rr, "-D", ms=3, color="tab:brown", alpha=0.9,
+              label="rot err to GRASP after blind push (rad)")
     ar = num("aux_rot_deg")
     if _finite(ar):
         _plot(a2, it, np.radians(np.asarray(ar, dtype=float)).tolist(), ":^", ms=3,
@@ -314,7 +379,9 @@ def main() -> None:
     a2.set_ylim(bottom=0)
     a2.set_ylabel("rotation error (rad)", fontsize=8, color="tab:red")
     a2.tick_params(axis="y", labelcolor="tab:red", labelsize=7)
-    _grid(a, "EE -> grasp: closest reached (solid) vs at the close (dashed)")
+    _grid(a, f"EE -> {TGT}: closest reached (solid) vs at the "
+             + ("commit (dashed), and -> grasp after the push (diamond)"
+                if pregrasp else "close (dashed)"))
     h1, l1 = a.get_legend_handles_labels()
     h2, l2 = a2.get_legend_handles_labels()
     if h1 or h2:
@@ -338,8 +405,11 @@ def main() -> None:
     a = ax[1][0]
     eps = num("episodes")
     for key, label in (("reached_standoff", "reached standoff"),
-                       ("reached_grasp", "reached grasp (CLOSE fired)"),
-                       ("policy_closed", "closed on its own")):
+                       ("reached_grasp", "reached pre-grasp (COMMIT fired)"
+                        if pregrasp else "reached grasp (CLOSE fired)"),
+                       ("policy_closed",
+                        "committed on its own" if pregrasp
+                        else "closed on its own")):
         ys = num(key)
         frac = [(y / e if (e and e > 0 and y == y and y >= 0) else float("nan"))
                 for y, e in zip(ys, eps)]
@@ -416,7 +486,10 @@ def main() -> None:
         a.legend(h1 + h2, l1 + l2, fontsize=7, loc="lower left")
 
     _fix_x(fig, it)
-    fig.suptitle(f"Phase-4 DAgger — {run.name}", fontsize=12)
+    fig.suptitle(f"Phase-4 DAgger — {run.name}"
+                 + (f"   [target: {target} — geometry is measured to the "
+                    f"PRE-GRASP, not the grasp]" if pregrasp else ""),
+                 fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     main_out = run / "curves.png"
     fig.savefig(main_out, dpi=140)
@@ -448,9 +521,19 @@ def main() -> None:
 
     # endgame coverage
     a = bx[0][1]
-    for key, label in (("close_labels", "CLOSE labels"),
-                       ("reach_steps", "committed-reach steps"),
-                       ("policy_close_cmds", "premature close cmds")):
+    for key, label in (("close_labels", "COMMIT labels" if pregrasp
+                        else "CLOSE labels"),
+                       ("reach_steps", "committed pre-grasp hold steps"
+                        if pregrasp else "committed-reach steps"),
+                       # Of those hold steps, how many were the convergence
+                       # servo. Read against commit_settle_steps x the episodes
+                       # that committed: a shortfall means episodes are entering
+                       # the tolerance ball and then being ended before they can
+                       # settle, which puts the arrival error — and therefore the
+                       # landing error — straight back.
+                       ("settle_steps", "settle steps"),
+                       ("policy_close_cmds", "premature commit cmds"
+                        if pregrasp else "premature close cmds")):
         ys = num(key)
         if _finite(ys):
             _plot(a, it, ys, "-o", ms=3, label=label)
@@ -489,7 +572,8 @@ def main() -> None:
     if _finite(ys):
         _plot(a, it, ys, "--s", ms=3, color="tab:gray",
               label="opportunity window (steps)")
-    _grid(a, "step at which the policy closes", ylabel="policy step")
+    _grid(a, "step at which the policy commits" if pregrasp
+             else "step at which the policy closes", ylabel="policy step")
     _legend(a, loc="upper left")
 
     # beta / expert mixing
@@ -574,7 +658,8 @@ def main() -> None:
     _legend(a, loc="lower left")
 
     _fix_x(fig2, it)
-    fig2.suptitle(f"Phase-4 DAgger diagnostics — {run.name}", fontsize=12)
+    fig2.suptitle(f"Phase-4 DAgger diagnostics — {run.name}"
+                  + (f"   [target: {target}]" if pregrasp else ""), fontsize=12)
     fig2.tight_layout(rect=[0, 0, 1, 0.97])
     diag_out = run / "curves_diag.png"
     fig2.savefig(diag_out, dpi=140)

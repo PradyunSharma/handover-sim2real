@@ -169,7 +169,7 @@ def sample_scenes(pool: list[int], m: int, mode: str, rng, cursor: int) -> tuple
 def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | None,
                        run_dir: Path, *, epochs: int, device: str,
                        num_workers: int, init_from: Path | None = None,
-                       seed: int = 0) -> Path:
+                       init_ckpt: str = "last", seed: int = 0) -> Path:
     """Train one model on D = base_train_h5 u all D_i collected so far.
 
     Works for either learner: the Phase-1 single-frame policy (BCDataset +
@@ -180,6 +180,16 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
     reuses that run's normalizer — the network's output scale is defined by the
     normalizer, so warm-starting under freshly recomputed stats would silently
     reinterpret the head. Pass None for the paper-faithful fresh fit.
+
+    `init_ckpt` picks WHICH of that run's checkpoints seeds the chain:
+        "last"  the end of the cosine schedule — the most converged fit on the
+                aggregate, and what run 20 used.
+        "best"  the epoch with the lowest val loss, i.e. early-stopped.
+    "best" is the one that matches the rest of the loop: EVAL.ckpt is `best`, so
+    collection and evaluation already run on best.pt. With "last" the weights
+    carried forward are not the weights the next shard was collected with, which
+    makes the chain and the data come from two different policies. Falls back to
+    last.pt when best.pt is absent (a run with no val set never writes one).
 
     Returns the run dir. Resumes automatically from checkpoints/last.pt.
     """
@@ -263,9 +273,18 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
 
     if not resume:
         if init_from is not None:
-            payload = torch.load(Path(init_from) / "checkpoints" / "last.pt",
-                                 map_location="cpu")
+            ckpt_path = Path(init_from) / "checkpoints" / f"{init_ckpt}.pt"
+            if not ckpt_path.exists():
+                # Only reachable for init_ckpt="best" on a run with no val set.
+                # Announced rather than silent: a chain seeded from last.pt when
+                # best.pt was asked for is a different experiment.
+                print(f"[train] {ckpt_path.name} absent — warm starting from "
+                      f"last.pt instead")
+                ckpt_path = Path(init_from) / "checkpoints" / "last.pt"
+            payload = torch.load(ckpt_path, map_location="cpu")
             model.load_state_dict(payload["model"])
+            print(f"[train] warm start weights from {ckpt_path} "
+                  f"(epoch {payload.get('epoch', '?')})")
         else:
             pc_pre = cfg.get("MODEL", {}).get("pc_pretrained")
             if pc_pre and os.path.exists(pc_pre):
@@ -273,6 +292,12 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
             elif pc_pre:
                 print(f"[train] WARNING pc_pretrained not found, PC encoder from "
                       f"scratch: {pc_pre}")
+            else:
+                # Deliberate (run 21): MODEL.pc_pretrained left empty. Logged so
+                # the run's stdout distinguishes "chose a random encoder" from
+                # "the checkpoint path was quietly dropped from the config".
+                print("[train] MODEL.pc_pretrained empty — PointNet++ encoder "
+                      "initialised FROM SCRATCH")
 
     trainer_cls = BCTrainer if kind == "bc" else ACTTrainer
     trainer = trainer_cls(model, train_dl, val_dl, cfg, run_dir=str(run_dir))
@@ -383,7 +408,7 @@ LOG_FIELDS = [
     "iter", "beta", "m",
     # -- (3) collection: what the learner's own rollouts looked like
     "episodes", "steps", "skipped", "pinned",
-    "reached_standoff", "reached_grasp", "reach_steps",
+    "reached_standoff", "reached_grasp", "reach_steps", "settle_steps",
     "omg_fail", "goal_switch", "expert_steps", "policy_closed",
     "policy_close_cmds", "dropped_tail", "dart", "dart_env_done",
     "dart_reach", "dart_reject",
@@ -512,6 +537,7 @@ def collect_columns(c: dict) -> dict:
         "reached_standoff": c.get("reached_standoff", -1),
         "reached_grasp": c.get("reached_grasp", -1),
         "reach_steps": c.get("n_reach_steps", -1),
+        "settle_steps": c.get("n_settle_steps", -1),
         "omg_fail": c["n_omg_fail"], "goal_switch": c["n_goal_switch"],
         "expert_steps": c["n_expert_steps"], "policy_closed": c["policy_closed"],
         "policy_close_cmds": c.get("n_policy_close_cmds", -1),
@@ -708,6 +734,20 @@ def main() -> None:
     pool, eval_scenes = scene_pools(sim.num_scenes, ev, usable=usable)
 
     train_cfg = load_yaml(trn["train_cfg"])
+    # TRAIN.pc_pretrained overrides MODEL.pc_pretrained in the train config. Same
+    # mechanism examples/train_bc.py exposes as `--pc-pretrained none`: an empty
+    # value means initialise the PointNet++ encoder RANDOMLY instead of from the
+    # CVPR2023 state-feat checkpoint. Exposed here so a run can make that choice
+    # without forking a 230-line train config for one key — the key is absent by
+    # default, so every existing run is untouched.
+    #
+    # Only iteration 0 is affected. With TRAIN.train_from_scratch: false the later
+    # iterations warm-start from the previous iteration's checkpoint, and that
+    # path never consults pc_pretrained.
+    if "pc_pretrained" in trn:
+        train_cfg.setdefault("MODEL", {})["pc_pretrained"] = trn["pc_pretrained"] or None
+        print(f"[cfg] TRAIN.pc_pretrained override -> "
+              f"{trn['pc_pretrained'] or 'NONE (encoder from scratch)'}")
     learner = policy_kind(train_cfg)   # "bc" (single frame) | "act" (chunking)
 
     collect_params = CollectParams(
@@ -746,6 +786,8 @@ def main() -> None:
             float(sim_cfg_d.get("standoff_dist", 0.08)),
             int(dag.get("reach_tail", 5)))),
         forward_steps=int(dag.get("forward_steps", 4)),
+        # 0 = commit on the step the tolerance is first met, i.e. runs 1-20.
+        commit_settle_steps=int(dag.get("commit_settle_steps", 0)),
         # DART-paper noise (run 18). "jolt" is the runs 1-17 behaviour and the
         # default, so an unset key changes nothing. `dart_sigma` is seeded from
         # state.json on resume so a restarted run keeps the covariance it had
@@ -1074,11 +1116,16 @@ def main() -> None:
         t_train = time.time()
         iter_dir = run_root / "iters" / f"iter_{i:02d}"
         init_from = None if bool(trn.get("train_from_scratch", True)) else cur_run_dir
+        # Which checkpoint seeds the warm start. "last" is run 20's behaviour and
+        # the default, so a config that omits the key is unchanged; "best" makes
+        # the chain carry forward the same weights EVAL.ckpt and the collector
+        # already use. Inert when train_from_scratch is true.
+        init_ckpt = str(trn.get("init_ckpt", "last"))
         train_on_aggregate(
             train_cfg, [trn["base_train_h5"]] + dagger_files, trn.get("val_h5"),
             iter_dir, epochs=int(trn["iter_epochs"]), device=device,
             num_workers=int(trn.get("num_workers", 2)), init_from=init_from,
-            seed=seed + i)
+            init_ckpt=init_ckpt, seed=seed + i)
         cur_run_dir = iter_dir
         train_s = time.time() - t_train
 

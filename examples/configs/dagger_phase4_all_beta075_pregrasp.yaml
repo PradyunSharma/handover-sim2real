@@ -335,7 +335,23 @@ SIM:
   #
   # MUST MATCH THE DEMONSTRATIONS. See the header: base_train_h5 / val_h5 have to
   # be re-collected with this same file before this run can start.
-  cfg_file: examples/pretrain_multicam_wlr.yaml   # GA-DDPG-style simulator config
+  # ---- RUN 21: WRIST + RIGHT, the LEFT camera dropped ----
+  # = pretrain_multicam_wlr.yaml with CAMERAS ["wrist","left","right"] ->
+  # ["wrist","right"]. Same 2 classes, same 5 channels, same 896/128 object/hand
+  # split, so the cloud's shape and class balance are untouched; only the
+  # viewpoints feeding those classes change.
+  #
+  # Deployment is the reason: `sim2real/` drives ONE fixed RealSense plus the
+  # wrist view, so three-camera numbers overstate what the real rig can reach.
+  # Run 19 measured the fixed side camera alone (0.72 peak); this is the pairing
+  # the hardware actually has.
+  #
+  # THE DEMONSTRATIONS MUST BE COLLECTED THROUGH THIS FILE TOO. They are —
+  # `collect_pregrasp_demos.py` reads SIM.cfg_file from this config — but that is
+  # the reason the base set has to be re-collected for THIS run and cannot be
+  # borrowed from run 16's wlr datasets. Mixing camera rigs in one aggregate
+  # fails silently: every other attr of the two files is identical.
+  cfg_file: examples/pretrain_multicam_wr.yaml    # GA-DDPG-style simulator config
   split: train                       # BENCHMARK.SPLIT (one env => one split)
   egl: false                         # EGL GPU renderer for the hand camera.
                                      # MUST match how the base dataset was
@@ -520,6 +536,102 @@ DAGGER:
   # -standoff_dist * (1 - 1/reach_tail). 0.08 would drive 1.6 cm past the grasp.
   forward_dist: 0.064
   forward_steps: 4
+
+  # ---- settle on the pre-grasp before committing ----
+  # Keep servoing the frozen standoff for this many extra steps after the close
+  # tolerance is FIRST met, then write the commit label. 0 (runs 1-20) commits on
+  # the step the EE first enters the ball — which is exactly when the tracking
+  # lag is largest.
+  #
+  # This is the single most consequential parameter of the whole mode, because
+  # the landing error of the blind push IS the arrival error. Measured over the
+  # 472 kept demos:
+  #
+  #     expert arrival error vs the derived standoff   mean 0.0128  p90 0.0209
+  #     blind 0.064 push from there -> pinned grasp    mean 0.0127  p90 0.0204
+  #     corr(arrival, landing) = 0.990
+  #
+  # `standoff + forward_dist * z == grasp` exactly, so the push adds nothing of
+  # its own: every millimetre of arrival slop is a millimetre of grasp slop. And
+  # that 11.6 mm median is the EXPERT playing its own plan by index — it is
+  # IK/position-control lag, not policy error, so DAgger cannot train it away.
+  # Holding the same target lets it converge.
+  #
+  # WHY 4 IS ENOUGH, and why the lag decays rather than persisting. Measured over
+  # 9,440 commanded steps of the demonstrations, the fraction of a commanded EE
+  # translation actually realised in one policy step is
+  #
+  #     0.775, and it is FLAT in the command size:
+  #       1-1.5 cm  0.781      2-3 cm  0.777      5-8 cm  0.772
+  #       1.5-2 cm  0.780      3-5 cm  0.775      >8 cm   0.769
+  #     per-step spread p1 0.740 .. p99 0.809; worst episode mean 0.668
+  #
+  # A constant gain with no small-command deadband means this is a clean
+  # first-order lag: hold the SAME target and the remaining error is multiplied by
+  # 0.225 every step. It is not a floor, it is a transient that only persists
+  # because the collector commands a NEW target before the previous one is
+  # reached. From the worst arrival error in the demos (49.5 mm) at the worst
+  # per-episode gain (0.668):
+  #
+  #     1 step 16.4 mm   2 steps 5.5 mm   3 steps 1.8 mm   4 steps 0.60 mm
+  #
+  # and from the median arrival (11.6 mm) at the median gain, 4 steps leaves
+  # 0.03 mm. So 4 buys sub-millimetre arrival on every episode, not just typical
+  # ones, for 4 policy steps out of a 50-step budget.
+  #
+  # THE TARGET DOES NOT ADVANCE DURING THE SETTLE. `committed_reach` is a
+  # ONE-element array in this mode and `reach_i` is re-clamped to 0 at the top of
+  # every iteration, so the frozen target is `plan[-reach_tail]` — the pre-grasp —
+  # held. `convert_target_joint_position_to_action` recomputes the delta from the
+  # CURRENT EE each step, so this is a servo onto a fixed pose. The EE converges
+  # to the pre-grasp; it cannot walk forward into the straight line, because no
+  # waypoint past the standoff is ever commanded.
+  #
+  # A tolerance-based exit was considered and rejected: with a gain this tight a
+  # fixed count is provably sufficient, and a tolerance can demand a precision the
+  # controller does not reach on some configuration and then never commit at all.
+  # `mean_min_pos` is the readout that confirms it; if `settle_steps` in
+  # dagger_log.csv falls short of 4 x the committing episodes, episodes are being
+  # ended before they converge and the step budget is the problem instead.
+  #
+  # ---- WHY 1 AND NOT MORE ----
+  # The gripper channel is a BINARY CLASSIFIER trained with BCE (1 = keep
+  # approaching, 0 = commit), and the policy commits when its prediction drops
+  # below 0.5. For that to work the COMMIT states have to be distinguishable FROM
+  # THE OBSERVATION from the APPROACH states — and the observation is a
+  # 1024-point cloud, which on a ~10 cm object means point spacing of order a
+  # millimetre. Differences much below that are not representable.
+  #
+  # The settle decays the error 4.4x per step, so N sets how far apart the two
+  # classes end up:
+  #
+  #     N=0:  50 mm approach -> 11 mm COMMIT               margin ~39 mm
+  #     N=1:  50, 11 mm approach -> 2.5 mm COMMIT          margin ~9 mm
+  #     N=4:  ... 0.6, 0.13 mm approach -> 0.03 mm COMMIT  margin ~0.1 mm
+  #
+  # At N=4 the last three APPROACH states and the COMMIT state are one input as
+  # far as the network is concerned — three labelled 1, one labelled 0 — so the
+  # best prediction there is ~0.75, which reads as "keep approaching". The policy
+  # never commits and every episode times out. N=1 keeps a 9 mm margin, which the
+  # cloud resolves easily, and still takes the landing error to ~2.5 mm — better
+  # than the demonstrations' own CLOSED-LOOP reach, which ends a median 4.6 mm
+  # from the pinned grasp.
+  #
+  # ---- THIS REQUIRES THE RE-COLLECTED D_0 ----
+  # A settle is incompatible with the TRUNCATED base set. The demonstrations
+  # never hold the pre-grasp (the base collector plays the plan by index and
+  # moves on after one 150 ms window, in which the arm covers only ~77.5% of the
+  # commanded distance), so `make_pregrasp_demos.py`'s terminal row sits 11.6 mm
+  # short and is labelled COMMIT. With a settle the shards label that same state
+  # APPROACH. Same state, opposite labels, one aggregate — the inconsistency
+  # DAgger cannot average away, on the one decision this run is about.
+  #
+  # `examples/collect_pregrasp_demos.py` removes it by producing D_0 through this
+  # same collector at beta = 1, so every commit label in the aggregate is written
+  # by one rule at one distance. See TRAIN.base_train_h5 below. Setting this
+  # non-zero while still pointing at a truncated file is the one configuration
+  # that is actively broken.
+  commit_settle_steps: 1
 
   # Gripper-close label: once the EE is within BOTH tolerances of the pose the
   # episode is targeting — the STANDOFF under target: pregrasp, the grasp
@@ -734,7 +846,36 @@ DAGGER:
   # reproduce run 1's collapse. At 0.3 an average reach takes ~1.5 jolts and
   # still has ~3.5 clean waypoints to arrive on. Validated at these magnitudes to
   # lose zero close labels over a 10-episode smoke test.
-  dart_reach_ratio: 0.3
+  #
+  # ---- OFF FOR RUN 21 (0.3 -> 0.0) ----
+  # ONE THING TO BE CLEAR ABOUT FIRST, because the name is now misleading: under
+  # target: pregrasp this block does NOT fire in the reach tail. The reach tail is
+  # not collected at all. The gate is `committed_reach is not None`, which in this
+  # mode means "inside reach_commit_dist (5 cm) of the PRE-GRASP" — squarely
+  # inside what the policy has to learn. So switching it off is not removing DART
+  # from a region we no longer train on; it is removing the only off-distribution
+  # coverage in the last 5 cm of the approach.
+  #
+  # It is off anyway, for two reasons that do hold. The magnitudes were derived
+  # for the reach: dart_reach_pos_mag 0.01202 is 1/3.33 of the free jolt because
+  # the reach steps are 1.6 cm, and the clearance check exists because the gripper
+  # is 5 cm from a hand-held object there. Neither derivation survives the move to
+  # a window that ends 11.4 cm from the object. And the settle below is a
+  # convergence guarantee that a jolt at 2-5 cm would partly undo, costing settle
+  # steps to re-close a gap that was manufactured.
+  #
+  # WHAT IT COSTS, stated plainly: with expert_after_commit also true, the last
+  # 5 cm before the pre-grasp becomes 100% expert funnel — exactly the covariate
+  # shift DAgger exists to remove, in the region this run is about. The free band
+  # still perturbs everything beyond 5 cm, so the policy's ENTRY into the ball is
+  # still varied; only its behaviour inside is unseen off-funnel. If arrival
+  # precision is the thing that fails, the lever is `reach_commit_dist` — drop it
+  # to ~0.02 so the learner drives right up to the settle — not turning this back
+  # on at magnitudes tuned for a different geometry.
+  #
+  # dart_reach_pos_mag / _rot_mag / _max_tries / _clearance / _path_steps below
+  # are inert at ratio 0 and are left at their values as a record.
+  dart_reach_ratio: 0.0
 
   # TRANSLATION matched to the demonstrations' own reach steps: over the last 5
   # label-producing steps of every episode in train_pinned_omg_ok, per-axis mean
@@ -817,6 +958,29 @@ TRAIN:
   # re-deriving it would be a second variable — but it is a candidate for the
   # follow-up alongside expert_after_commit.
   train_cfg: examples/configs/bc_phase4_all.yaml
+
+  # ---- RUN 21: PointNet++ FROM SCRATCH ----
+  # Overrides MODEL.pc_pretrained in the train config above. Empty means
+  # initialise the encoder RANDOMLY — the same thing examples/train_bc.py has
+  # always exposed as `--pc-pretrained none`, routed through the config because
+  # the Phase-4 driver has no CLI for it. Absent by default, so every other run
+  # keeps the warm start.
+  #
+  # WHY. Every run from 1 to 20 initialised this encoder from the CVPR2023
+  # state-feat checkpoint (all 68/68 tensors transfer — it is a 5-channel
+  # xyz+ycb+hand encoder trained on this exact task). But it was trained on a
+  # different camera rig and a different objective, THIS run changes the rig
+  # again, and no run has ever tested whether the transfer helps at all. The
+  # project has been carrying one unmeasured inherited prior under every result.
+  #
+  # ONLY ITERATION 0 IS AFFECTED. From iteration 1 the warm start below supplies
+  # the weights and this key is never consulted.
+  #
+  # WHAT TO READ. `iters/iter_00/log.csv` — run 16's base fit reached 3.31 mm
+  # train_pose_pm_mm in the same 100 epochs WITH the borrowed encoder. Materially
+  # worse here means a random encoder needs more than 100 epochs, and
+  # `base_epochs` should rise before anything else in this run is interpreted.
+  pc_pretrained:
   # D_0. The *_pinned.h5 pair was collected with SIM's grasp set AND the pin
   # table, so the demonstrations aim at the same grasp DAgger will. The older
   # train.h5/val.h5 had NEITHER filter: measured over 72 scenes, 21% aimed at a
@@ -835,27 +999,40 @@ TRAIN:
   # 4-14 used is NOT interchangeable here — see the header for the check that
   # confirms which cameras actually produced this file.
   #
-  # ---- PRE-GRASP D_0 (run 21) ----
-  # NOT a re-collection: derived from train_pinned_omg_wlr_ok.h5 itself by
+  # ---- PRE-GRASP D_0 (run 21), RE-COLLECTED ----
+  # Produced by the Phase-4 collector itself at beta = 1 (pure expert, no learner
+  # in the loop), with THIS config's target, tolerances and commit_settle_steps:
   #
-  #   python examples/make_pregrasp_demos.py \
-  #       --input  output/bc_dataset/train_pinned_omg_wlr_ok.h5 \
-  #       --output output/bc_dataset/train_pinned_omg_wlr_ok_pregrasp.h5
+  #   python examples/collect_pregrasp_demos.py \
+  #       --cfg examples/configs/dagger_phase4_all_beta075_pregrasp.yaml \
+  #       --output output/bc_dataset/train_pregrasp_settled.h5
   #
-  # The pre-grasp episode is a PREFIX of the grasp episode — the base collector
-  # plays the plan by index and appends one close, so the state recorded after
-  # waypoint len(plan)-reach_tail IS the state at the standoff, with the cloud it
-  # observed there. Keeping rows 0..len(plan)-reach_tail+1 and rewriting that last
-  # action as CLOSE is the whole conversion (21 steps -> 17). Clouds, states and
-  # approach labels are bit-identical to run 16's, so run 21 vs run 16 differs
-  # ONLY in the endgame.
+  # WHY NOT THE CHEAP ROUTE. examples/make_pregrasp_demos.py derives a pre-grasp
+  # set by truncating the grasp demos, for free, keeping the approach data
+  # bit-identical to run 16's — but it cannot produce a SETTLED terminal state,
+  # because the demonstrations never hold the pre-grasp. Its terminal row is
+  # 11.6 mm short and labelled COMMIT, which contradicts every settled shard.
+  # With commit_settle_steps > 0 that file is the one thing this config must not
+  # point at. It remains the right tool for a settle-free variant.
+  #
+  # WHAT IT COSTS. D_0 is no longer a bit-identical prefix of run 16's demos: it
+  # is labelled by replan-every-step rather than play-by-index, so run 21 vs
+  # run 16 is no longer purely an endgame comparison. Bought deliberately —
+  # internal coherence of the aggregate is worth more than a clean diff against a
+  # run whose endgame is different anyway.
+  #
+  # IT IS ALSO THE SMOKE TEST. With outcome_check on, the collector executes the
+  # blind push and the close on every episode and scores it. The summary it
+  # prints is the expert's own success rate with no learner involved — the
+  # CEILING for this run. Read it before submitting: if it is low, the geometry
+  # is wrong and no policy recovers it.
   #
   # MIXING A PRE-GRASP FILE WITH A GRASP FILE IS THE ONE FATAL MISTAKE HERE: the
   # schemas are identical and h5py will not complain, but the aggregate then holds
-  # two contradictory close labels for the same states. Both the derived file and
-  # every DAgger shard carry a `target` attr for exactly this reason — check it
-  # before pointing a run at a dataset.
-  base_train_h5: output/bc_dataset/train_pinned_omg_wlr_ok_pregrasp.h5
+  # two contradictory commit labels for the same states. Every file carries a
+  # `target` attr, and re-collected ones a `commit_settle_steps` attr, for exactly
+  # this reason — check both before pointing a run at a dataset.
+  base_train_h5: output/bc_dataset/train_pregrasp_settled.h5
   # Held-out expert data -> selects best.pt within a run (EVAL.ckpt: best), which
   # is BOTH the checkpoint that gets evaluated and the one that drives the next
   # iteration's collection. Filtered on the same rule as the train set: a failed
@@ -869,13 +1046,16 @@ TRAIN:
   # The stronger selection layer is EVAL.select_on over 100 scenes; this only
   # picks the epoch WITHIN an iteration. If it needs fixing later, hold out a
   # slice of the TRAIN split instead and subtract those scenes from base_train_h5.
-  # Converted the same way, and it MUST be — best.pt is selected on this loss, and
-  # a val set that still closes at the grasp would select the checkpoint that best
-  # contradicts the training labels:
-  #   python examples/make_pregrasp_demos.py \
-  #       --input  output/bc_dataset/val_pinned_omg_wlr_ok.h5 \
-  #       --output output/bc_dataset/val_pinned_omg_wlr_ok_pregrasp.h5
-  val_h5: output/bc_dataset/val_pinned_omg_wlr_ok_pregrasp.h5
+  # Collected the same way, and it MUST be — best.pt is selected on this loss, so
+  # a val set whose commit labels sit at a different distance would select the
+  # checkpoint that best contradicts the training labels. Note the SPLIT-RELATIVE
+  # pin table: scene indices are numbered within a split, so the train table
+  # applied to val scenes pins the wrong grasp on every one of them.
+  #   python examples/collect_pregrasp_demos.py \
+  #       --cfg examples/configs/dagger_phase4_all_beta075_pregrasp.yaml \
+  #       --split val --grasp-pin-table output/grasp_pin_table_val_omg.json \
+  #       --output output/bc_dataset/val_pregrasp_settled.h5
+  val_h5: output/bc_dataset/val_pregrasp_settled.h5
   base_run: null           # path to an existing run of the SAME policy kind to
                            # start from. null => train the base policy here as
                            # iteration 0.
@@ -885,10 +1065,51 @@ TRAIN:
   # instead of 20). 25 epochs on 3x the data is still MORE gradient steps than
   # run 1's 50, on more diverse data. Run 1 spent 4.9 h of its 8 h training.
   iter_epochs: 25          # epochs per DAgger iteration
-  train_from_scratch: true # paper-faithful Follow-The-Leader: refit on the whole
-                           # aggregate each iteration. false warm-starts from the
-                           # previous iteration (cheaper, reuses its normalizer,
-                           # no longer FTL).
+  # ---- RUN 21: WARM START, as in run 20 ----
+  # false: each iteration initialises from the PREVIOUS iteration's weights
+  # instead of re-initialising. The training SET is unchanged — still the full
+  # aggregate D = base u D_1 u ... u D_i for iter_epochs — so this alters the
+  # initialisation, not the objective, and it is NOT sequential fine-tuning on
+  # the new shard.
+  #
+  # Motivated by run 16's own per-iteration logs: `train_pose_pm_mm` starts at
+  # ~25 mm on every one of its 26 iterations (a random init measures 25.53 mm)
+  # and ends at ~14 mm, while iteration 0 given 100 epochs reaches 3.31 mm. The
+  # per-iteration fits stop far short of the aggregate's argmin and re-pay the
+  # same descent 26 times. Run 20 tested this in isolation and peaked at 0.76.
+  #
+  # It also matters more here than it did in run 20, because the encoder is no
+  # longer pretrained: a from-scratch PointNet++ refit for 25 epochs on every
+  # iteration would never get past the descent that iteration 0's 100 epochs
+  # bought. The warm start is what carries that investment forward.
+  #
+  # TWO KNOWN SIDE EFFECTS, both inherited from run 20 and neither fixed here.
+  # The optimiser and scheduler are NOT carried over — `_make_scheduler` builds a
+  # fresh CosineAnnealingLR(T_max=iter_epochs) each iteration, so every warm start
+  # is hit with lr = 9.96e-4, an SGDR-style restart. Check epoch-0
+  # `train_pose_pm_mm` in iters/iter_NN/log.csv: near the previous iteration's
+  # final value means the warm start held, ~25 mm means the restart wiped it, and
+  # the fix is a lower OPTIM.lr rather than another run. And the NORMALIZER
+  # freezes — a warm start reloads the previous run's normalization.npz rather
+  # than recomputing over the grown aggregate (deliberate: the output scale is
+  # defined by the normalizer), so the base run's statistics propagate through
+  # every iteration.
+  #
+  # This is also no longer Follow-The-Leader: FTL's regret bound assumes the
+  # per-iteration argmin over the aggregate is found, and a warm start reaches a
+  # different local optimum, making the sequence path-dependent on shard order.
+  # Run 16 never found that argmin either.
+  train_from_scratch: false
+  # WHICH checkpoint seeds the chain. "last" — the end of the cosine schedule,
+  # i.e. the most converged fit on the aggregate — as in run 20. Stated
+  # explicitly rather than left to the default, because the alternative is real:
+  # EVAL.ckpt is `best`, so the evaluation and the next shard's COLLECTION both
+  # run on best.pt, which means the weights carried forward by "last" are not the
+  # weights the next shard's data was collected with. Chosen anyway: best.pt is
+  # early-stopped on a 21-episode val set (best epoch ranged 12-34 in run 1), so
+  # seeding the chain from it would compound a noisy per-iteration selection 25
+  # times, where "last" is the same point on the schedule every iteration.
+  init_ckpt: last
   num_workers: 2           # DataLoader workers. This process also holds PyBullet
                            # + the OMG SDF cache, which the workers inherit on fork.
   device: cuda

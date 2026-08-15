@@ -292,6 +292,52 @@ class CollectParams:
     # this is 0.064 and not the paper's 0.08. Ignored when target == "grasp".
     forward_dist: float = 0.064
     forward_steps: int = 4
+    # ----- settle before committing -----
+    # Extra steps to keep servoing the frozen target after the close condition
+    # FIRST fires, before the terminal label is written. 0 = commit on the step
+    # the EE first enters the tolerance ball, which is what runs 1-20 did.
+    #
+    # This exists because in pre-grasp mode the landing error of the blind push
+    # IS the arrival error, one for one. Measured over the 472 kept demos:
+    #
+    #     expert arrival error vs the derived standoff   mean 0.0128  p90 0.0209
+    #     blind 0.064 push from there -> pinned grasp    mean 0.0127  p90 0.0204
+    #     corr(arrival, landing) = 0.990
+    #
+    # The push contributes nothing of its own — `standoff + forward_dist * z ==
+    # grasp` exactly — so every millimetre of arrival slop is a millimetre of
+    # grasp slop. And that 11.6 mm median is the EXPERT playing its own plan by
+    # index: it is IK/position-control tracking lag, largest at exactly the
+    # moment the EE first enters the ball, because each policy step commands a
+    # new target before the previous one is reached.
+    #
+    # That lag is a TRANSIENT, not a floor. Over 9,440 commanded demonstration
+    # steps the realised fraction of a commanded EE translation is 0.775 and is
+    # flat in the command size (0.781 at 1-1.5 cm, 0.769 above 8 cm; per-step
+    # spread p1 0.740 .. p99 0.809). A constant gain with no small-command
+    # deadband is a clean first-order lag, so holding the SAME target multiplies
+    # the remaining error by 0.225 per step: from the worst arrival in the demos
+    # (49.5 mm) at the worst per-episode gain (0.668), four steps leaves 0.60 mm.
+    #
+    # The target does not move while this runs. In pre-grasp mode
+    # `committed_reach` is one element and `reach_i` is re-clamped to 0 every
+    # iteration, so this is a servo onto a fixed pose — the EE converges to the
+    # pre-grasp and cannot walk forward into the straight line, because no
+    # waypoint past the standoff is ever commanded.
+    #
+    # The steps are ordinary labelled steps, not dead time: the state at 1.5 cm
+    # out is genuinely labelled "move the remaining 1.5 cm", and only the settled
+    # state is labelled "commit". That is the honest supervision — it moves the
+    # learned decision boundary from "within 2 cm" to "actually there" — and it
+    # is why this is preferable to simply tightening close_pos_thresh, which can
+    # demand a precision the controller cannot deliver and then never fire at all.
+    # Expect `n_tiny_labels` to rise; here that is the mechanism working, not the
+    # standoff stall it was written to detect.
+    #
+    # The expert is forced for the duration regardless of `expert_after_commit`,
+    # since the point is to converge on the target rather than to sample the
+    # learner. DART is already blocked throughout by its own `not at_grasp` guard.
+    commit_settle_steps: int = 0
     # ----- committed reach (see module docstring section on the endgame) -----
     # Once the EE is within `reach_commit_dist` of the standoff, freeze the
     # current plan's last `reach_tail` waypoints and follow them BY INDEX instead
@@ -693,6 +739,10 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     pinned = False
     n_omg_fail = n_goal_switch = n_expert_steps = n_close_labels = 0
     n_reach_steps = 0
+    # Settle countdown (CollectParams.commit_settle_steps). None until the close
+    # tolerance is first met; 0 or less means "commit on this step".
+    settle_left = None
+    n_settle_steps = 0
     min_pos, min_rot = float("inf"), float("inf")
     # `n_policy_close_cmds` counts every premature close the policy commands;
     # `ended_on_close` is only whether one of them ENDED the episode, which is
@@ -938,8 +988,24 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
             at_grasp = (pos_err <= params.close_pos_thresh
                         and rot_err <= params.close_rot_thresh)
 
+        # ----- settle before committing (see CollectParams.commit_settle_steps) --
+        # Arm the countdown the first time the tolerance is met, then keep
+        # servoing the same frozen target while it runs down. `at_grasp` stays
+        # true throughout — which is what keeps DART off, via its own guard — but
+        # the label written below is an ordinary approach delta until the counter
+        # reaches zero. `settle_left is None` means "not yet armed", so a run with
+        # commit_settle_steps = 0 arms it at 0 and commits on the same step it
+        # always did.
+        if at_grasp and settle_left is None:
+            settle_left = int(params.commit_settle_steps)
+        commit_now = at_grasp and (settle_left or 0) <= 0
+        settling = at_grasp and not commit_now
+
         # ----- record the labelled (state, expert action) pair -----
-        if at_grasp:
+        # `commit_now`, not `at_grasp`: during the settle the honest label is
+        # still "close the remaining gap", and only the converged state is
+        # labelled "commit".
+        if commit_now:
             label = CLOSE_LABEL.copy()
             n_close_labels += 1
         elif expert_delta is not None:
@@ -953,7 +1019,7 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
             robot_states.append(rs)
             expert_actions.append(label)
 
-        if at_grasp and params.stop_on_close_label:
+        if commit_now and params.stop_on_close_label:
             reason = "CLOSE_LABEL"
             # The labels are already appended above, so scoring here cannot change
             # what D_i contains — it only runs the sim forward to observe what the
@@ -1051,7 +1117,13 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # pi_i = beta*pi* + (1-beta)*pi_hat, except that the committed reach can
         # be forced onto the expert (see CollectParams.expert_after_commit): the
         # endgame is where the close labels live and where a weak learner stalls.
-        forced_expert = bool(params.expert_after_commit and committed_reach is not None)
+        # `settling` forces the expert regardless of expert_after_commit: the
+        # whole point of the settle is to CONVERGE on the frozen target, and
+        # letting the learner drive it would reintroduce the arrival error the
+        # settle exists to remove.
+        forced_expert = bool(settling
+                             or (params.expert_after_commit
+                                 and committed_reach is not None))
         # A reach jolt PRE-EMPTS the forced expert, exactly as an approach jolt
         # pre-empts the beta coin. Placed before the beta draw so a
         # dart_reach_ratio: 0 run consumes the rng identically to runs 4-11.
@@ -1169,6 +1241,9 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # advance along the committed reach (clamped at the grasp above)
         if committed_reach is not None:
             reach_i += 1
+        if settling:
+            settle_left -= 1
+            n_settle_steps += 1
 
         if ended_on_close:
             reason = "POLICY_CLOSE"
@@ -1276,6 +1351,11 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                        if grasp_pose is not None else None),
         "reached_standoff": int(committed_reach is not None),
         "reached_grasp": int(n_close_labels > 0),
+        # Steps spent converging on the target after the tolerance was first met.
+        # Read against commit_settle_steps x the episodes that committed: a
+        # shortfall means episodes are entering the ball and then being ended by
+        # the benchmark or the step budget before they can settle.
+        "n_settle_steps": int(n_settle_steps),
         # Episodes in which the policy commanded a close at least once. Under
         # stop_on_policy_close this also ended the episode; without it the
         # episode kept going, so `n_policy_close_cmds` (how MANY steps it wanted
@@ -1418,6 +1498,7 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
            "n_dart": 0, "n_dart_env_done": 0,
            "n_dart_reach": 0, "n_dart_reject": 0,
            "n_close_labels": 0, "n_approach_labels": 0, "sum_label_pos": 0.0,
+           "n_settle_steps": 0,
            "n_tiny_labels": 0, "n_revisits": 0, "n_grasp_mismatch": 0,
            "max_grasp_drift": 0.0,
            "min_pos": [], "min_rot": [], "close_steps": [], "reasons": {},
@@ -1454,6 +1535,7 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
         "target": str(params.target),
         "forward_dist": float(params.forward_dist),
         "forward_steps": int(params.forward_steps),
+        "commit_settle_steps": int(params.commit_settle_steps),
         "stop_on_close_label": bool(params.stop_on_close_label),
         "stop_on_policy_close": bool(params.stop_on_policy_close),
         # Recorded even when off, so a DART-free shard is provably DART-free
@@ -1518,6 +1600,7 @@ def collect_iteration(sim, runner, scenes, out_path, *, rng,
                 agg["reached_standoff"] += st["reached_standoff"]
                 agg["reached_grasp"] += st["reached_grasp"]
                 agg["n_reach_steps"] += st["n_reach_steps"]
+                agg["n_settle_steps"] += st.get("n_settle_steps", 0)
                 agg["policy_closed"] += st["policy_closed"]
                 agg["n_policy_close_cmds"] += st["n_policy_close_cmds"]
                 agg["n_dropped_tail"] += st["n_dropped_tail"]

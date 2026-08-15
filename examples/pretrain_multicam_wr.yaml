@@ -1,0 +1,126 @@
+# Simulator config for PHASE 4 — WRIST + RIGHT cameras, TWO point classes (run 21).
+#
+# = examples/pretrain_multicam_wlr.yaml with the LEFT camera dropped:
+#
+#     CAMERAS: ["wrist", "left", "right"]  ->  ["wrist", "right"]
+#
+# Everything else — COMPUTE_ROBOT_POINT_STATE off, 2 classes, 5 channels, the
+# 896/128 object/hand split, the camera poses — is unchanged, so a cloud from
+# this config is the same SHAPE and the same class balance as a wlr one. Only the
+# viewpoints feeding those classes differ, which is exactly the variable being
+# moved.
+#
+# WHY DROP ONE. Two reasons pull the same way. Deployment: `sim2real/` drives one
+# fixed RealSense plus the wrist view, so a policy trained on three viewpoints is
+# trained on an observation the real rig cannot produce — run 19 measured what a
+# fixed side camera alone can do (0.72 peak), and this is the middle ground that
+# keeps the eye-in-hand view the wrist camera is good at while adding the one
+# external view the real setup actually has. Cost: one fewer 224x224 depth +
+# segmentation render per step, so collection is cheaper than wlr and dearer than
+# wrist-only.
+#
+# The left/right cameras are symmetric about the handover-object mean, so keeping
+# `right` rather than `left` is a free choice made to match run 19 and the
+# physical rig; nothing in the geometry prefers one.
+#
+# BOTH THE DEMONSTRATIONS AND THE DAgger SHARDS MUST USE THIS FILE. A base set
+# collected with three cameras mixed with two-camera DAgger data puts two input
+# distributions in one aggregate — the inconsistency DAgger cannot average away,
+# and it fails silently because every other attr of the two files is identical.
+# `cameras` is recorded in each HDF5's attrs for exactly this check.
+#
+# ---------------------------------------------------------------------------
+# INHERITED FROM pretrain_multicam_wlr.yaml — its header verbatim from here down.
+# ---------------------------------------------------------------------------
+#
+# Simulator config for PHASE 4 — WRIST + LEFT + RIGHT cameras, TWO point classes.
+#
+# = examples/pretrain.yaml + the two fixed external side cameras fused with the dynamic
+# wrist eye-in-hand camera. Pass with:  SIM.cfg_file in the Phase-4 run config, and
+# SIM_CFG=... when collecting the demonstrations.
+#
+# HOW THIS DIFFERS FROM THE PHASE-3 MULTICAM CONFIGS. run33 (pretrain_multicam.yaml,
+# [left,right]) and run37 (pretrain_multicam_wl.yaml, [wrist,left]) both turn on
+# COMPUTE_ROBOT_POINT_STATE, giving a 3rd "robot" class and a 6-channel cloud. This
+# config deliberately leaves it OFF:
+#
+#   classes      [object, hand]                      (NOT [object, hand, robot])
+#   pc_channels  3 + 2 = 5   xyz + object one-hot + hand one-hot
+#
+# Two consequences of keeping 2 classes, both of which are why it is worth doing:
+#
+#   1. pc_channels stays 5, so DATA.pc_channels in bc_phase1*.yaml is unchanged AND
+#      the CVPR2023 PointNet++ warm start still transfers ALL 68/68 encoder tensors.
+#      The Phase-3 6-channel runs had to reinitialize the first SA conv, which threw
+#      away part of the pretrained encoder on top of changing the input.
+#   2. The panda's own geometry never enters the cloud. With three viewpoints the arm
+#      is a large, moving, high-variance blob that carries no information the policy
+#      cannot get from robot_state — and in the [ee_pos, ee_orn, gripper] variant
+#      (bc_phase1_nojoint.yaml) it would sneak the joint configuration back in through
+#      the point cloud, defeating the point of dropping it.
+#
+# The fixed cameras segment strictly by body id (multicam.FixedSegCamera.class_points_world),
+# so with COMPUTE_ROBOT_POINT_STATE off the arm's pixels are simply never deprojected.
+# Table, background and everything else were already excluded the same way.
+#
+# CAMERA GEOMETRY. left/right are elevated side views ~1 m out, symmetric about the
+# measured DexYCB handover-object mean (0.52, 0.25, 1.23), orthogonal to the robot->human
+# +Y approach so the arm does not self-occlude them. Poses default in the handover config
+# (_HCPS.CAMERA_LEFT/RIGHT_POSITION/TARGET); override below after inspecting a render:
+#     python examples/viz_cameras_pybullet.py --sim-cfg examples/pretrain_multicam_wlr.yaml
+#
+# WHY ADD THE SIDE VIEWS AT ALL. The wrist camera loses the object exactly when it
+# matters: as the gripper closes the last few centimetres the object leaves the frustum,
+# so the endgame — the phase Phase-4 DAgger exists to fix — is driven by a cloud that no
+# longer contains the thing being grasped. The two side views keep object AND hand in
+# frame throughout, at the cost of two extra renders per step.
+#
+# MERGE RATIOS. Not set here on purpose. POLICY.POINT_STATE_RATIOS only takes effect
+# when it has MORE than 2 entries (handover_sim2real/policy.py:34) — a 2-element list is
+# silently ignored. With 2 classes the split comes from POLICY.POINT_STATE_YCB_RATIO
+# (0.875), i.e. 896 object + 128 hand = exactly the 1024 uniform_num_pts. That is the
+# same split the wrist-only demonstrations used, so the class balance the policy sees is
+# unchanged; only the viewpoints feeding each class are.
+#
+# COST. Two extra 224x224 depth+segmentation renders every step. With SIM.egl false these
+# go through PyBullet's CPU TinyRenderer, so budget noticeably longer collection than the
+# wrist-only runs and check the first iteration's wall time before trusting the walltime
+# request.
+#
+# CONSISTENCY. The demonstrations and the DAgger collections MUST use this same file.
+# A base dataset collected wrist-only mixed with 3-camera DAgger data puts two different
+# input distributions in one aggregate, which is the one inconsistency DAgger cannot
+# average away — the same argument as the grasp pinning.
+ENV:
+  ID: HandoverSim2RealTrainEnv-v1
+  YCB_MANO_START_FRAME: last
+  YCB_LOAD_MODE: grasp_only
+  MANO_SIMULATION_MODE: disable_control_and_move_by_reset
+  HANDOVER_HAND_CAMERA_POINT_STATE_ENV:
+    COMPUTE_MANO_POINT_STATE: True
+    COMPUTE_ROBOT_POINT_STATE: False    # NO robot class — object + hand only (2 classes)
+    CAMERAS: ["wrist", "right"]         # dynamic eye-in-hand + ONE fixed side camera
+    # --- override the fixed poses here after inspecting a render, e.g.: ---
+    # CAMERA_LEFT_POSITION:  (1.45, 0.25, 1.55)
+    # CAMERA_LEFT_TARGET:    (0.52, 0.25, 1.23)
+    # CAMERA_RIGHT_POSITION: (-0.40, 0.25, 1.55)
+    # CAMERA_RIGHT_TARGET:   (0.52, 0.25, 1.23)
+BENCHMARK:
+  SPLIT: train
+RL_MEMORY_SIZE: 500000
+RL_TRAIN:
+  batch_size: 128
+  updates_per_step: 20
+  mix_policy_ratio_list: [0.1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
+  dagger: True
+  online_buffer_ratio: 0.7
+  onpolicy: True
+  max_epoch: 200000
+  num_remotes: 3
+  init_distance_low: 0.25
+  explore_ratio_list: [0.5]
+  DAGGER_MAX_STEP: 12
+  EXPERT_INIT_MIN_STEP: 3
+  fill_data_step: 30
+  HANDOVER_SIM2REAL:
+    stage: pretrain
