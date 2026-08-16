@@ -70,8 +70,33 @@ mkdir -p slurm_logs
 module load miniconda3 2>/dev/null || true
 source "$(conda info --base 2>/dev/null || echo /apps/generic/miniforge3/25.11.0)/etc/profile.d/conda.sh"
 conda activate pch2r_dev
-export OMG_PLANNER_DIR="${OMG_PLANNER_DIR:-$PWD/OMG-Planner}"
-export GADDPG_DIR="${GADDPG_DIR:-$PWD/GA-DDPG}"
+# DO NOT TRUST AN INHERITED VALUE. `${VAR:-default}` only fires when VAR is
+# UNSET, and sbatch --export=ALL carries the submitting shell's environment onto
+# the compute node — so an OMG_PLANNER_DIR exported from some other directory in
+# that login session silently wins over the $PWD default and travels with the
+# job. add_sys_path_from_env (utils.py:10) then asserts only that the variable
+# EXISTS and appends it verbatim, so the run gets as far as printing its config
+# banner and dies at `import omg` inside gym.make() with
+# "ModuleNotFoundError: No module named 'omg'" — a message that names a
+# dependency when the real problem is a path. Validate, then fall back.
+for _v in OMG_PLANNER_DIR:omg GADDPG_DIR:core; do
+    _name="${_v%%:*}"; _pkg="${_v##*:}"
+    _cur="$(eval echo "\${${_name}:-}")"
+    _def="$PWD/$( [ "$_name" = OMG_PLANNER_DIR ] && echo OMG-Planner || echo GA-DDPG )"
+    if [ -n "${_cur}" ] && [ ! -d "${_cur}/${_pkg}" ]; then
+        echo "WARNING: inherited ${_name}=${_cur} has no ${_pkg}/ — using ${_def}" >&2
+        _cur=""
+    fi
+    export "${_name}=${_cur:-${_def}}"
+    _res="$(eval echo "\${${_name}}")"
+    if [ ! -d "${_res}/${_pkg}" ]; then
+        echo "ERROR: ${_name}=${_res} has no ${_pkg}/ package." >&2
+        echo "  If the directory is empty this is an unpopulated git submodule:" >&2
+        echo "    git submodule update --init --recursive" >&2
+        exit 1
+    fi
+    echo "${_name}=${_res}  (${_pkg}/ present)"
+done
 export PYTHONPATH="$PWD:$PWD/handover-sim:$PWD/handover-sim/mano_pybullet:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$PWD/OMG-Planner/orocos_kinematics_dynamics/orocos_kdl/release/lib:${LD_LIBRARY_PATH:-}"
 export TORCH_CUDA_ARCH_LIST="7.0"

@@ -7,9 +7,39 @@ import sys
 
 
 def add_sys_path_from_env(name):
+    """Append $`name` to sys.path so a vendored tree (GA-DDPG, OMG-Planner) imports.
+
+    VALIDITY IS CHECKED, NOT JUST PRESENCE. Asserting only `name in os.environ`
+    and appending the value verbatim lets a set-but-wrong variable through, and
+    the resulting failure names the wrong thing: the path lands on sys.path, the
+    process runs on, and the crash arrives later as
+    `ModuleNotFoundError: No module named 'omg'` — which reads as a missing
+    dependency when it is a typo in a path.
+
+    That is not hypothetical. A submitting shell once held
+    OMG_PLANNER_DIR=".../OMG-Plannersbatch" (a paste accident), and because every
+    sbatch writes `export OMG_PLANNER_DIR="${OMG_PLANNER_DIR:-$PWD/OMG-Planner}"`
+    — where `:-` fires only when the variable is UNSET — that value beat the
+    correct $PWD default and rode onto the compute node under `--export=ALL`. The
+    job printed its config banner and died 12 s later inside gym.make().
+
+    The directory check cannot change the behaviour of anything that works today:
+    a run that imports successfully necessarily has a real directory here, so the
+    assert is a no-op for it. It only converts a later, misleading failure into an
+    immediate, accurate one.
+    """
     assert name in os.environ, "Environment variable '{}' is not set".format(name)
-    if os.environ[name] not in sys.path:
-        sys.path.append(os.environ[name])
+    path = os.environ[name]
+    assert os.path.isdir(path), (
+        "Environment variable '{0}' is set to '{1}', which is not a directory. "
+        "Nothing there can ever be imported. Check for a typo, a stale value "
+        "exported from another directory (sbatch --export=ALL carries the "
+        "submitting shell's environment onto the compute node, and the "
+        "${{{0}:-$PWD/...}} default only fires when the variable is UNSET), or an "
+        "unpopulated git submodule (`git submodule update --init --recursive`)."
+        .format(name, path))
+    if path not in sys.path:
+        sys.path.append(path)
 
 
 def resolve_valid_grasp_dict_path(rl_cfg, setup):

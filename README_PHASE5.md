@@ -392,19 +392,28 @@ An unexpected path is cause 1 (`unset OMG_PLANNER_DIR` before submitting). The
 right path with an empty listing is cause 2 (`git submodule update --init
 --recursive OMG-Planner`).
 
-Both are now caught before they can waste a job. `dagger5/env_setup.py` adds
-`OMG_PLANNER_DIR` to `sys.path` at **import** rather than leaving it to
-`train_env.py`'s lazy load under the gym registry, and `assert_omg_importable()`
-runs immediately after with a message naming both causes and listing what the
-directory actually holds. The Phase-5 sbatch scripts validate both variables
-before `srun`, refusing an inherited value that has no package in it and hard
-failing on an empty submodule. `preflight()` logs both resolved paths on every
-run, so the GA-DDPG-works/OMG-doesn't signature is on the record even when
-nothing breaks.
+Both are now caught before they can waste a job, in three places:
 
-Note the Phase-4 sbatch scripts still have the unguarded
-`${OMG_PLANNER_DIR:-...}` form and are equally exposed; they were left alone to
-keep Phase 4 byte-reproducible.
+`handover_sim2real/utils.py` — `add_sys_path_from_env` asserts `os.path.isdir`
+as well as presence, so a set-but-invalid variable fails immediately and by name
+instead of surfacing later as a missing module. This cannot change the behaviour
+of anything that works today: a run that imports successfully necessarily has a
+real directory there, so the assert is a no-op for it.
+
+**All 11 sbatch scripts** (Phase 1–5) validate both variables before `srun`. An
+inherited value whose package directory is missing is *discarded with a warning*
+and the `$PWD` default used instead — a paste accident should not kill a job that
+waited in the queue — while a `$PWD` default that is itself empty hard-fails with
+the `git submodule update` command. Both resolved paths are echoed into every job
+log.
+
+`dagger5/env_setup.py` adds `OMG_PLANNER_DIR` to `sys.path` at **import** rather
+than leaving it to `train_env.py`'s lazy load under the gym registry, and
+`assert_omg_importable()` runs immediately after — it checks for the `omg`
+package specifically, which `isdir` alone cannot do (an unpopulated submodule is
+a perfectly good directory). `preflight()` logs both resolved trees on every run,
+so the GA-DDPG-works/OMG-doesn't signature is on the record even when nothing
+breaks.
 
 ## Deferred
 
