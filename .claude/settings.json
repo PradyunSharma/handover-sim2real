@@ -33,10 +33,23 @@
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('my_policy_runner.py'\\).read\\(\\)\\)\")",
       "Bash(grep -rn \"train_pinned_omg_right_ok\\\\|dataset\\\\|h5\" examples/configs/bc_phase4_all.yaml | head -20; echo \"=== run16 BASE ===\"; sed -n '/^TRAIN:/,/^EVAL:/p' examples/configs/dagger_phase4_all_beta075.yaml | grep -n \"base\\\\|dataset\\\\|h5\" | head -20)",
       "Bash(~/anaconda3/envs/pch2r_dev/bin/python -c ' *)",
-      "Bash(~/anaconda3/envs/pch2r_dev/bin/python examples/make_pregrasp_demos.py --input output/bc_dataset/train_pinned_omg_ok.h5 --output /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/c790be60-5e96-4232-9970-349c38e20b3d/scratchpad/pregrasp_smoke.h5)"
+      "Bash(~/anaconda3/envs/pch2r_dev/bin/python examples/make_pregrasp_demos.py --input output/bc_dataset/train_pinned_omg_ok.h5 --output /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/c790be60-5e96-4232-9970-349c38e20b3d/scratchpad/pregrasp_smoke.h5)",
+      "Bash(python3)",
+      "Bash(awk -F, 'NR==1{for\\(i=1;i<=NF;i++\\) if\\($i==\"success_rate\"\\) c=i} NR>1{print $1, $c}' output/dagger_runs/dagger4_run2/dagger_log.csv)",
+      "Bash(sed -i 's|target=pregrasp |target=pregrasp, settle=1 |' docs/run_index.md)",
+      "Bash(sed -i 's|`dagger_phase4_all_beta075_pregrasp.yaml` \\\\| dagger4_run21 \\\\||`dagger_phase4_all_beta075_pregrasp.yaml` \\\\| dagger4_run21 \\\\||' docs/run_index.md)",
+      "Bash(git rm *)",
+      "Bash(chmod +x examples/slurm/collect_pregrasp_demos.sbatch)",
+      "Bash(bash -n examples/slurm/collect_pregrasp_demos.sbatch)",
+      "Bash(~/anaconda3/envs/pch2r_dev/bin/python examples/check_pregrasp_demos.py /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/c790be60-5e96-4232-9970-349c38e20b3d/scratchpad/pregrasp_smoke.h5 --cfg /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/c790be60-5e96-4232-9970-349c38e20b3d/scratchpad/cfg_local.yaml)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(sed -i 's/Phase4Context/Phase5Context/g; s/build_phase4_context/build_phase5_context/g' handover_sim2real/dagger5/*.py examples/train_dagger_phase5.py examples/eval_dagger_run_p5.py examples/rollout_bc_policy_p5.py && grep -rn \"Phase4Context\\\\|build_phase4_context\" handover_sim2real/dagger5/ examples/*_p5.py examples/train_dagger_phase5.py; echo \"renamed\"; grep -rn \"phase4\\\\|Phase4\" handover_sim2real/dagger5/__init__.py)",
+      "Bash(git ls-files *)",
+      "Bash(git check-ignore *)"
     ],
     "additionalDirectories": [
-      "/home/pradyun/h2r/handover-sim2real/examples/configs"
+      "/home/pradyun/h2r/handover-sim2real/examples/configs",
+      "/home/pradyun/h2r/handover-sim2real/handover_sim2real/dagger5"
     ]
   }
 }

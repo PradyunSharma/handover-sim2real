@@ -180,6 +180,32 @@ joint state was breaking.
 
 ---
 
+## Phase 5 — grasp conditioning and regrasping (`output/dagger_runs/`)
+
+Runbook and design notes: [`README_PHASE5.md`](../README_PHASE5.md). Code is a
+full fork (`handover_sim2real/dagger5/`, `bc5/`, `examples/*_p5.py`), so nothing
+above changes.
+
+| run | config | camera | iters | m | grasps/scene | init | model flags | best iter | final | Δ from predecessor |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **p5_run1** | `dagger_phase5_run1.yaml` | wrist+right | 25 | 200 | **4** | warm-start (best.pt), PointNet++ from scratch | nojoint, reach-tail ×2.5, pm (w=7), **grasp_cond**, **no aux head**, head [512,256] | not yet run | not yet run | = run 16, with the goal grasp as a policy INPUT and four pinned grasps per scene. Attacks the standing finding directly: over runs 4–16 `near_rate` never exceeded 0.08 while success reached 0.80, because nothing in the observation named the pose to arrive at. Run 13's aux head was the weak test of that (predict the grasp); this hands it over as an input. Four grasps per scene then make retry-under-a-different-grasp possible, which is the actual goal. **Conditioning is load-bearing, not decoration**: with four demos per scene the same observation carries four labels, so an unconditioned fit can only regress their mean and would be *worse* than run 16 — the trainer refuses to start on that combination. The aux head goes off with it and cannot be held fixed (its target becomes its own input), so this is a combination run: conditioning, aux head, cameras, encoder init and epoch budget all move at once. Selection uses a **flip-invariant** control-point metric — `augment_flip_grasp` appends π-about-approach-axis twins that are the same physical grasp at maximal rotation distance, and a naive max-min selector would pick four poses that are really two. K=8 candidates are collected and the best 4 that *planned successfully* are kept, because demanding 4-of-4 up front would keep only ~0.76⁴ ≈ 33% of scenes. |
+
+**Read `cond_track` before anything else.** It is the mean pairwise spread of the
+four final EE poses over the spread of the four commanded grasps. Near 0 means
+the policy does the same thing whatever it is told — the multi-modal averaging
+failure — and regrasping is inert however good `success_rate` looks; the fix is
+then FiLM rather than concatenation. `cond_track` high with `near_rate` still low
+means the policy separates the conditions but tracks none of them, which is a
+reach-endgame problem and points at merging in run 21's open-loop pre-grasp
+commit. `retry_at_k` is the regrasping headline and is derived from the same
+episodes at no extra cost, on the assumption that each retry restarts from home —
+read it as a ceiling.
+
+The ±0.115 noise floor below applies unchanged, which is another reason the
+headline for this phase is `near_rate` and `cond_track` rather than success.
+
+---
+
 ## Phase 3 — online RL, TD3+BC (`output/rl_runs/`)
 
 `peak` / `final` are `eval_succ`. Run 44 was never launched.
@@ -327,6 +353,9 @@ Configs without a numbered run file were shared across several runs.
 | `bc_phase4_reachw.yaml` | run 14 `TRAIN.train_cfg` — `DATA.reach_tail_weight: 2.5` |
 | `bc_phase4_all.yaml` | runs 15, 16 `TRAIN.train_cfg` — pm + aux + reach-tail weighting |
 | `bc_phase4_all_prevact.yaml` | run 17 `TRAIN.train_cfg` — same, `MODEL.use_prev_act: true` |
+| `dagger_phase5_run1.yaml` | p5_run1 (`examples/train_dagger_phase5.py`) |
+| `dagger_phase5_smoke.yaml` | Phase-5 shakedown — 2 iters, m=8, 3 eval scenes |
+| `bc_phase5_cond.yaml` | p5_run1 `TRAIN.train_cfg` — `MODEL.grasp_cond`, aux head off, head `[512,256]` |
 
 ---
 
