@@ -19,7 +19,9 @@ and drops ~half the scenes).
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import gym
@@ -36,6 +38,102 @@ from handover_sim2real.utils import add_sys_path_from_env, resolve_valid_grasp_d
 add_sys_path_from_env("GADDPG_DIR")
 
 from experiments.config import cfg_from_file  # noqa: E402
+
+# OMG_PLANNER_DIR is added here too, not left to handover_sim2real/train_env.py.
+#
+# WHY. train_env.py:15 adds it at MODULE level, but train_env is only imported
+# when gym.make() resolves the registry entry point — i.e. deep inside
+# build_sim_context, ~60 lines and one config load after the process started. So
+# a broken OMG_PLANNER_DIR surfaced as a ModuleNotFoundError from the middle of
+# environment construction, after the run had already printed its banner and
+# looked healthy. Doing it at import makes the path setup a fact about process
+# startup instead of a side effect of a lazy registration.
+#
+# THIS IS HYGIENE, NOT A FIX. add_sys_path_from_env only asserts that the
+# variable EXISTS (utils.py:10) and then appends its value verbatim — it never
+# checks that the directory contains an `omg` package. A variable pointing at the
+# wrong place passes that assert and fails at `import omg` regardless of when the
+# path was added. `assert_omg_importable` below is the part that actually catches
+# it, and it is called right after.
+add_sys_path_from_env("OMG_PLANNER_DIR")
+
+
+def assert_omg_importable() -> str:
+    """Fail loudly, and specifically, when $OMG_PLANNER_DIR has no omg package.
+
+    The failure this exists for looks like a missing dependency and is not one:
+    `sys.path` DOES contain $OMG_PLANNER_DIR (the assert in add_sys_path_from_env
+    passed), the directory it names simply has no `omg/` in it. Two ways that
+    happens on a cluster, and the message distinguishes them:
+
+      * the variable was INHERITED. Every sbatch here writes
+        `export OMG_PLANNER_DIR="${OMG_PLANNER_DIR:-$PWD/OMG-Planner}"`, and `:-`
+        only fires when the variable is unset — so with `--export=ALL`, a stale
+        value exported from some other directory in the submitting shell wins
+        over the $PWD default and is carried onto the compute node.
+      * the SUBMODULE is not populated. OMG-Planner is a git submodule; `git
+        pull` moves the recorded gitlink but does not fetch its contents, so the
+        directory can exist and be empty after a clone without --recursive.
+
+    Returns the resolved root so a caller can log it. Raises rather than printing,
+    because this runs at IMPORT — 20 collection workers each printing a banner is
+    noise, and the exception text below already carries everything a preflight
+    print would have shown. `preflight()` is the opt-in success log.
+    """
+    root = os.environ.get("OMG_PLANNER_DIR", "")
+    if not root:
+        raise RuntimeError("OMG_PLANNER_DIR is not set")
+    pkg = Path(root) / "omg" / "__init__.py"
+    if pkg.exists():
+        return root
+
+    exists = Path(root).is_dir()
+    listing = ""
+    if exists:
+        try:
+            entries = sorted(p.name for p in Path(root).iterdir())[:12]
+            listing = f"\n  it contains: {entries or '(EMPTY)'}"
+        except OSError:
+            pass
+    raise RuntimeError(
+        f"OMG_PLANNER_DIR={root!r} has no omg/__init__.py, so `import omg` will "
+        f"fail once gym.make() loads handover_sim2real/train_env.py.\n"
+        f"  the directory {'exists' if exists else 'DOES NOT EXIST'}{listing}\n"
+        f"  cwd is {os.getcwd()}\n"
+        f"This is NOT a missing dependency. Two causes, both cluster-specific:\n"
+        f"  1. INHERITED VALUE. The sbatch default is "
+        f"${{OMG_PLANNER_DIR:-$PWD/OMG-Planner}}, and `:-` does not fire when the "
+        f"variable is already set. With --export=ALL a stale value from the "
+        f"submitting shell overrides the $PWD default. Fix: `unset "
+        f"OMG_PLANNER_DIR` before sbatch, or re-export it from the repo root.\n"
+        f"  2. UNPOPULATED SUBMODULE. OMG-Planner is a git submodule; `git pull` "
+        f"moves the gitlink but does not fetch contents. Fix: `git submodule "
+        f"update --init --recursive OMG-Planner`.\n"
+        f"Check which: `ls $OMG_PLANNER_DIR/omg | head` on the SAME node.")
+
+
+assert_omg_importable()
+
+
+def preflight() -> None:
+    """Log where the two vendored trees actually resolved. Call once from an
+    entry point (not from the workers).
+
+    Worth having in every job log even when nothing is wrong: the signature of
+    the failure this module guards against is GADDPG_DIR resolving fine while
+    OMG_PLANNER_DIR does not, IN THE SAME PROCESS, and that is only visible if
+    both are recorded. `has <pkg>/` is the line that matters —
+    `add_sys_path_from_env` (utils.py:10) asserts only that the variable exists,
+    never that it points anywhere useful.
+    """
+    for var, pkg in (("GADDPG_DIR", "core"), ("OMG_PLANNER_DIR", "omg")):
+        root = os.environ.get(var)
+        if root is None:
+            print(f"[preflight] {var:16s} = <UNSET>")
+            continue
+        print(f"[preflight] {var:16s} = {root}   is_dir={Path(root).is_dir()}  "
+              f"has {pkg}/={(Path(root) / pkg / '__init__.py').exists()}")
+    print(f"[preflight] cwd = {os.getcwd()}")
 
 
 @dataclass

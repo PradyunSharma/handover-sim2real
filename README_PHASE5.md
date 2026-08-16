@@ -350,6 +350,62 @@ hardware needs a grasp proposer regardless — but a Phase-5 checkpoint cannot b
 deployed without one. `goal_target_from_state`'s `valid` channel is kept so the
 branch stays maskable.
 
+## Troubleshooting
+
+### `ModuleNotFoundError: No module named 'omg'` from inside `gym.make()`
+
+This is a **path** problem wearing a dependency's clothes, and the message is
+misleading in a specific way: `sys.path` is not missing `$OMG_PLANNER_DIR`. It has
+it. `add_sys_path_from_env` ([`utils.py:10`](handover_sim2real/utils.py#L10))
+asserts only that the *variable exists* and then appends its value verbatim — it
+never checks that the directory contains an `omg/` package. So a variable pointing
+anywhere at all passes the assert and fails at `import omg` a moment later.
+
+The tell is in the same job log: `handover_sim2real/policy.py` and
+`dagger5/env_setup.py` both do `add_sys_path_from_env("GADDPG_DIR")` followed by a
+*real* import from GA-DDPG, and those succeed. Same process, same node, same
+`$PWD`-derived default — so if GA-DDPG resolves and OMG-Planner does not, the two
+variables are not equally trustworthy. Two causes:
+
+**The value was inherited.** Every sbatch writes
+`export OMG_PLANNER_DIR="${OMG_PLANNER_DIR:-$PWD/OMG-Planner}"`, and `:-` fires
+only when the variable is *unset*. With `--export=ALL`, whatever was in the
+submitting shell wins and rides onto the compute node — so an
+`export OMG_PLANNER_DIR=$PWD/OMG-Planner` run from a directory other than the repo
+root, once, in that login session, poisons every job submitted afterwards. This
+also explains a failure that will not reproduce on the login node: re-exporting
+"the sbatch environment" by hand from the repo root exercises the *default*
+branch, not the inherited one.
+
+**The submodule is not populated.** `OMG-Planner` is a git submodule
+(`git submodule status`). `git pull` moves the recorded gitlink but does not fetch
+its contents, so after a clone without `--recursive` the directory exists and is
+empty — again a valid path with no `omg/` in it, and again no assert error.
+
+One command on the affected node tells you which:
+
+```bash
+srun --partition=gpu-v100 --account=education-me-msc-ro --qos=normal --time=00:02:00 --nodes=1 --ntasks=1 --cpus-per-task=1 --gpus-per-task=1 bash -c 'echo "$OMG_PLANNER_DIR"; ls "$OMG_PLANNER_DIR" | head'
+```
+
+An unexpected path is cause 1 (`unset OMG_PLANNER_DIR` before submitting). The
+right path with an empty listing is cause 2 (`git submodule update --init
+--recursive OMG-Planner`).
+
+Both are now caught before they can waste a job. `dagger5/env_setup.py` adds
+`OMG_PLANNER_DIR` to `sys.path` at **import** rather than leaving it to
+`train_env.py`'s lazy load under the gym registry, and `assert_omg_importable()`
+runs immediately after with a message naming both causes and listing what the
+directory actually holds. The Phase-5 sbatch scripts validate both variables
+before `srun`, refusing an inherited value that has no package in it and hard
+failing on an empty submodule. `preflight()` logs both resolved paths on every
+run, so the GA-DDPG-works/OMG-doesn't signature is on the record even when
+nothing breaks.
+
+Note the Phase-4 sbatch scripts still have the unguarded
+`${OMG_PLANNER_DIR:-...}` form and are equally exposed; they were left alone to
+keep Phase 4 byte-reproducible.
+
 ## Deferred
 
 **True chained retry**, where attempt 2 starts from where attempt 1 stopped rather

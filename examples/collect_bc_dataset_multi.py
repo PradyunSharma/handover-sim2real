@@ -325,6 +325,13 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # This script reaches gym.make() without importing dagger5.env_setup,
+    # so the OMG_PLANNER_DIR guard has to be asked for explicitly. Without
+    # it a bad path surfaces as `ModuleNotFoundError: No module named 'omg'`
+    # from inside the gym registry, which names a dependency when the real
+    # problem is a path.
+    from handover_sim2real.dagger5.env_setup import preflight
+    preflight()
 
     cfg = get_cfg()
     cfg_from_file(filename=args.cfg_file, dict=cfg, merge_to_cn_dict=True)

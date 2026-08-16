@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -64,6 +65,7 @@ import numpy as np
 import yaml
 
 from handover_sim2real.dagger5 import build_sim_cfg, build_sim_context
+from handover_sim2real.dagger5.env_setup import preflight
 from handover_sim2real.dagger5.grasp_select import (
     grasp_distance_matrix,
     select_diverse_grasps,
@@ -91,6 +93,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    preflight()
     cfg5 = yaml.safe_load(open(args.cfg_file))
     sim_d = dict(cfg5["SIM"])
     if args.split:
