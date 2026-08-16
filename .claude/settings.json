@@ -45,7 +45,9 @@
       "Bash(echo \"exit=$?\")",
       "Bash(sed -i 's/Phase4Context/Phase5Context/g; s/build_phase4_context/build_phase5_context/g' handover_sim2real/dagger5/*.py examples/train_dagger_phase5.py examples/eval_dagger_run_p5.py examples/rollout_bc_policy_p5.py && grep -rn \"Phase4Context\\\\|build_phase4_context\" handover_sim2real/dagger5/ examples/*_p5.py examples/train_dagger_phase5.py; echo \"renamed\"; grep -rn \"phase4\\\\|Phase4\" handover_sim2real/dagger5/__init__.py)",
       "Bash(git ls-files *)",
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(grep -n \"sbatch\\\\|\\\\\\\\\\\\\\\\$\" README_PHASE5.md)",
+      "Bash(awk '/sbatch/ && /\\\\\\\\$/ {print NR\": \"$0}' README_PHASE5.md)"
     ],
     "additionalDirectories": [
       "/home/pradyun/h2r/handover-sim2real/examples/configs",

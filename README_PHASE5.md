@@ -72,8 +72,7 @@ python examples/build_grasp_pin_table_multi.py \
     --out output/grasp_cand_table_train_p5.json
 
 # SLURM
-sbatch --export=ALL,SPLIT=train,OUT=output/grasp_cand_table_train_p5.json \
-    examples/slurm/build_pin_table_multi.sbatch
+sbatch --export=ALL,SPLIT=train,OUT=output/grasp_cand_table_train_p5.json examples/slurm/build_pin_table_multi.sbatch
 ```
 
 Repeat with `--split val`. Slot 0 is seeded with `env.get_omg_goal_idx()`, so it
@@ -103,10 +102,7 @@ python examples/collect_bc_dataset_multi.py \
     --output output/bc_dataset/train_p5_k8.h5
 
 # SLURM, chained on the table
-PIN=$(sbatch --parsable --export=ALL,SPLIT=train examples/slurm/build_pin_table_multi.sbatch) \
-  && sbatch --dependency=afterok:$PIN \
-     --export=ALL,SPLIT=train,SIM_CFG=examples/pretrain_multicam_wr.yaml,OUT=output/bc_dataset/train_p5_k8.h5,PIN=output/grasp_cand_table_train_p5.json \
-     examples/slurm/collect_bc_demos_p5.sbatch
+PIN=$(sbatch --parsable --export=ALL,SPLIT=train examples/slurm/build_pin_table_multi.sbatch) && sbatch --dependency=afterok:$PIN --export=ALL,SPLIT=train,SIM_CFG=examples/pretrain_multicam_wr.yaml,OUT=output/bc_dataset/train_p5_k8.h5,PIN=output/grasp_cand_table_train_p5.json examples/slurm/collect_bc_demos_p5.sbatch
 ```
 
 `--cfg-file` must equal `SIM.cfg_file` in the Phase-5 config. Budget K× Phase 4:
@@ -177,12 +173,10 @@ apply or the slots collapsed onto one grasp, and that is a bug to find here.
 
 ```bash
 # shakedown FIRST — see the checklist below
-sbatch --time=01:00:00 --export=ALL,RUN=dagger5_smoke,CFG=examples/configs/dagger_phase5_smoke.yaml \
-    examples/slurm/train_dagger_phase5.sbatch
+sbatch --time=01:00:00 --export=ALL,RUN=dagger5_smoke,CFG=examples/configs/dagger_phase5_smoke.yaml examples/slurm/train_dagger_phase5.sbatch
 
 # run 1 — eval split off into its own job
-sbatch --time=20:00:00 --export=ALL,RUN=dagger5_run1,\
-SCRATCH_ROOT=/scratch/$USER/handover-sim2real examples/slurm/train_dagger_phase5.sbatch
+sbatch --time=20:00:00 --export=ALL,RUN=dagger5_run1,SCRATCH_ROOT=/scratch/$USER/handover-sim2real examples/slurm/train_dagger_phase5.sbatch
 sbatch --export=ALL,RUN=dagger5_run1 examples/slurm/eval_dagger_run_p5.sbatch
 ```
 
