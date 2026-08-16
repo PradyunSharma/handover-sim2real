@@ -48,12 +48,17 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Direct module import, not through the package — see select_pinned_grasps.py
+# for why (dagger5/__init__.py pulls gym/pybullet/handover; this script needs
+# neither, and should run on a login node with a bare env).
+_REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(_REPO / "handover_sim2real" / "dagger5"))
 
 import h5py
 import numpy as np
 
-from handover_sim2real.dagger5.grasp_select import pairwise_mean_distance
+from grasp_select import pairwise_mean_distance
 
 
 def parse_args() -> argparse.Namespace:

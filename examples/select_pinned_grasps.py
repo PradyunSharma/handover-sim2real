@@ -61,15 +61,21 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Import grasp_select DIRECTLY, not as handover_sim2real.dagger5.grasp_select.
+# The module itself needs only numpy, but `from pkg.mod import ...` executes the
+# package __init__ first, and dagger5/__init__.py pulls gym, pybullet and the
+# handover envs — so a stage-3 prune that touches nothing but HDF5 and numpy
+# would otherwise demand the full simulator PYTHONPATH. Putting the package
+# directory on sys.path bypasses __init__ entirely and keeps this script (and
+# analyze_grasp_separation.py) runnable on a login node with a bare env.
+_REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(_REPO / "handover_sim2real" / "dagger5"))
 
 import h5py
 import numpy as np
 
-from handover_sim2real.dagger5.grasp_select import (
-    grasp_distance_matrix,
-    select_diverse_grasps,
-)
+from grasp_select import grasp_distance_matrix, select_diverse_grasps
 
 
 def parse_args() -> argparse.Namespace:

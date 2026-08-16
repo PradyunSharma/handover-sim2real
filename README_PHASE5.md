@@ -28,9 +28,26 @@ conda activate pch2r_dev
 export GADDPG_DIR=$PWD/GA-DDPG OMG_PLANNER_DIR=$PWD/OMG-Planner
 ```
 
-Everything needs a GPU (`OMG-Planner/omg/config.py` calls `.cuda()` at import, and
-PointNet++ has no CPU kernel). Exceptions: `select_pinned_grasps.py`,
-`analyze_grasp_separation.py` and the plotters.
+Anything that touches the simulator needs a GPU **and** the full `PYTHONPATH`
+(`OMG-Planner/omg/config.py` calls `.cuda()` at import, PointNet++ has no CPU
+kernel, and `import handover` needs `handover-sim` on the path):
+
+```bash
+export PYTHONPATH=$PWD:$PWD/handover-sim:$PWD/handover-sim/mano_pybullet:$PYTHONPATH
+```
+
+`select_pinned_grasps.py`, `analyze_grasp_separation.py` and the plotters are
+genuinely exempt — no GPU, no `PYTHONPATH`, no env vars at all. They import
+`grasp_select` by putting `handover_sim2real/dagger5/` on `sys.path` directly
+rather than as `handover_sim2real.dagger5.grasp_select`, because the latter runs
+the package `__init__` and drags in gym, pybullet and the handover envs for a
+script that only needs h5py and numpy. Run them on a login node.
+
+> **Paste these one line at a time.** `export A=$PWD/X` followed immediately by a
+> command on the next line will, if the newline is lost, produce
+> `A=$PWD/Xpython` — a *valid* assignment that bash accepts silently, leaving a
+> corrupted path that fails much later as `ModuleNotFoundError`. This has now
+> happened twice in this project; see the troubleshooting section.
 
 ## The two design decisions worth understanding first
 
