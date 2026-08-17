@@ -1,0 +1,496 @@
+{
+  "iterations": [
+    {
+      "iter": 0,
+      "run_dir": "output/dagger_runs/dagger5_smoke/iters/iter_00",
+      "dagger_h5": null,
+      "beta": 1.0,
+      "eval": {
+        "n": 12,
+        "success_rate": 0.8333333333333334,
+        "grasp_rate": 0.8333333333333334,
+        "close_rate": 1.0,
+        "near_rate": 0.6666666666666666,
+        "close_success_rate": 0.8333333333333334,
+        "chance_rate": 0.6666666666666666,
+        "missed_rate": 0.08333333333333333,
+        "miss_given_chance": 0.125,
+        "box_chance_rate": 0.75,
+        "box_taken_rate": 1.0,
+        "box_missed_rate": 0.0,
+        "miss_given_box": 0.0,
+        "mean_box_steps": 2.111111111111111,
+        "mean_box_frac": 0.7431972789115645,
+        "mean_reach_pos_err": NaN,
+        "mean_reach_rot_err": NaN,
+        "box_after_rate": NaN,
+        "eval_min_pos": 0.016200690929486505,
+        "eval_min_rot": 0.0655963880674282,
+        "mean_dist": 0.1622288922468821,
+        "mean_pos_err": 0.01703294585902372,
+        "mean_rot_err": 0.08414737974836663,
+        "mean_close_step": 22.5,
+        "reasons": {
+          "GRASP_OK": 10,
+          "DROP": 2
+        },
+        "num_grasps": 4,
+        "succ_g0": 1.0,
+        "near_g0": 1.0,
+        "succ_g1": 1.0,
+        "near_g1": 0.3333333333333333,
+        "succ_g2": 0.3333333333333333,
+        "near_g2": 0.6666666666666666,
+        "succ_g3": 1.0,
+        "near_g3": 0.6666666666666666,
+        "retry_at_1": 1.0,
+        "retry_at_2": 1.0,
+        "retry_at_3": 1.0,
+        "retry_at_4": 1.0,
+        "cond_track": 0.9722636942444378,
+        "cond_ee_spread": 0.09255041962330467,
+        "cond_goal_spread": 0.09506042696812438
+      },
+      "is_best": true
+    },
+    {
+      "iter": 1,
+      "run_dir": "output/dagger_runs/dagger5_smoke/iters/iter_01",
+      "dagger_h5": "output/dagger_runs/dagger5_smoke/data/dagger_iter_01.h5",
+      "beta": 0.75,
+      "pairs": [
+        [
+          371,
+          0
+        ],
+        [
+          371,
+          1
+        ],
+        [
+          371,
+          2
+        ],
+        [
+          371,
+          3
+        ],
+        [
+          711,
+          0
+        ],
+        [
+          711,
+          1
+        ],
+        [
+          711,
+          2
+        ],
+        [
+          711,
+          3
+        ]
+      ],
+      "collect": {
+        "episodes": 8,
+        "steps": 301,
+        "skipped": 0,
+        "n_omg_fail": 0,
+        "n_goal_switch": 0,
+        "n_expert_steps": 156,
+        "pinned": 8,
+        "reached_standoff": 6,
+        "reached_grasp": 5,
+        "n_reach_steps": 35,
+        "policy_closed": 0,
+        "n_policy_close_cmds": 0,
+        "n_dropped_tail": 0,
+        "n_dart": 72,
+        "n_dart_env_done": 1,
+        "n_dart_reach": 11,
+        "n_dart_reject": 1,
+        "n_close_labels": 5,
+        "n_approach_labels": 296,
+        "n_settle_steps": 0,
+        "n_tiny_labels": 0,
+        "n_revisits": 0,
+        "n_grasp_mismatch": 0,
+        "max_grasp_drift": 0.0,
+        "reasons": {
+          "MAX_STEPS": 1,
+          "CLOSE_LABEL": 5,
+          "ENV_DONE": 2
+        },
+        "outcomes": {
+          "TIMEOUT": 1,
+          "GRASP_OK": 5,
+          "DROP": 2
+        },
+        "success": 5,
+        "dart_dd_n": 296,
+        "n_dart_noise": 0,
+        "mean_min_pos": 0.04230074378237228,
+        "mean_min_rot": 0.22474495952309542,
+        "mean_reach_pos_err": NaN,
+        "mean_reach_rot_err": NaN,
+        "mean_policy_close_step": NaN,
+        "mean_label_pos": 0.03700534234175811,
+        "path": "output/dagger_runs/dagger5_smoke/data/dagger_iter_01.h5",
+        "dart_sigma_hat": [
+          [
+            0.000397287883219299,
+            -0.00010056996280354573,
+            1.5579660257345658e-05,
+            -0.0012020903534436843,
+            -0.00041159682774079737,
+            0.00025909547690441525
+          ],
+          [
+            -0.00010056996280354573,
+            0.000649191939097879,
+            0.0003936310847792435,
+            6.441478807108063e-05,
+            -0.00020125814922755198,
+            0.00047105961173642065
+          ],
+          [
+            1.5579660257345658e-05,
+            0.0003936310847792435,
+            0.0011091480166517105,
+            0.00035459685591977705,
+            -0.0007439768061465738,
+            0.00039706646415014015
+          ],
+          [
+            -0.0012020903534436843,
+            6.441478807108063e-05,
+            0.00035459685591977705,
+            0.02532421644453405,
+            0.001920212567569811,
+            -0.004517865058996574
+          ],
+          [
+            -0.00041159682774079737,
+            -0.00020125814922755198,
+            -0.0007439768061465738,
+            0.001920212567569811,
+            0.004749075994382138,
+            -0.002177538118294569
+          ],
+          [
+            0.00025909547690441525,
+            0.00047105961173642065,
+            0.00039706646415014015,
+            -0.004517865058996574,
+            -0.002177538118294569,
+            0.008252347781787572
+          ]
+        ],
+        "dart_sigma_trace": 0.04048126805967264,
+        "dart_alpha": 3.0
+      },
+      "eval": {
+        "n": 12,
+        "success_rate": 0.75,
+        "grasp_rate": 0.75,
+        "close_rate": 0.9166666666666666,
+        "near_rate": 0.8333333333333334,
+        "close_success_rate": 0.8181818181818182,
+        "chance_rate": 0.8333333333333334,
+        "missed_rate": 0.16666666666666666,
+        "miss_given_chance": 0.2,
+        "box_chance_rate": 0.5833333333333334,
+        "box_taken_rate": 1.0,
+        "box_missed_rate": 0.0,
+        "miss_given_box": 0.0,
+        "mean_box_steps": 2.0,
+        "mean_box_frac": 0.6751700680272109,
+        "mean_reach_pos_err": NaN,
+        "mean_reach_rot_err": NaN,
+        "box_after_rate": NaN,
+        "eval_min_pos": 0.013128913400508363,
+        "eval_min_rot": 0.04769521113991649,
+        "mean_dist": 0.16285492603977522,
+        "mean_pos_err": 0.011812224356625834,
+        "mean_rot_err": 0.03708944467207887,
+        "mean_close_step": 24.727272727272727,
+        "reasons": {
+          "GRASP_OK": 9,
+          "DROP": 2,
+          "HUMAN_CONTACT": 1
+        },
+        "num_grasps": 4,
+        "succ_g0": 1.0,
+        "near_g0": 1.0,
+        "succ_g1": 0.3333333333333333,
+        "near_g1": 0.6666666666666666,
+        "succ_g2": 0.6666666666666666,
+        "near_g2": 1.0,
+        "succ_g3": 1.0,
+        "near_g3": 0.6666666666666666,
+        "retry_at_1": 1.0,
+        "retry_at_2": 1.0,
+        "retry_at_3": 1.0,
+        "retry_at_4": 1.0,
+        "cond_track": 0.9900552761711441,
+        "cond_ee_spread": 0.09355328291110449,
+        "cond_goal_spread": 0.09506042696812438
+      },
+      "is_best": false,
+      "wall_s": 141.3
+    },
+    {
+      "iter": 2,
+      "run_dir": "output/dagger_runs/dagger5_smoke/iters/iter_02",
+      "dagger_h5": "output/dagger_runs/dagger5_smoke/data/dagger_iter_02.h5",
+      "beta": 0.75,
+      "pairs": [
+        [
+          410,
+          0
+        ],
+        [
+          410,
+          1
+        ],
+        [
+          410,
+          2
+        ],
+        [
+          410,
+          3
+        ],
+        [
+          288,
+          0
+        ],
+        [
+          288,
+          1
+        ],
+        [
+          288,
+          2
+        ],
+        [
+          288,
+          3
+        ]
+      ],
+      "collect": {
+        "episodes": 8,
+        "steps": 267,
+        "skipped": 0,
+        "n_omg_fail": 0,
+        "n_goal_switch": 0,
+        "n_expert_steps": 140,
+        "pinned": 8,
+        "reached_standoff": 4,
+        "reached_grasp": 4,
+        "n_reach_steps": 25,
+        "policy_closed": 0,
+        "n_policy_close_cmds": 0,
+        "n_dropped_tail": 2,
+        "n_dart": 72,
+        "n_dart_env_done": 0,
+        "n_dart_reach": 5,
+        "n_dart_reject": 0,
+        "n_close_labels": 4,
+        "n_approach_labels": 263,
+        "n_settle_steps": 0,
+        "n_tiny_labels": 1,
+        "n_revisits": 0,
+        "n_grasp_mismatch": 0,
+        "max_grasp_drift": 0.0,
+        "reasons": {
+          "CLOSE_LABEL": 4,
+          "ENV_DONE": 3,
+          "MAX_STEPS": 1
+        },
+        "outcomes": {
+          "DROP": 4,
+          "HUMAN_CONTACT": 1,
+          "TIMEOUT": 1,
+          "GRASP_OK": 2
+        },
+        "success": 2,
+        "dart_dd_n": 265,
+        "n_dart_noise": 0,
+        "mean_min_pos": 0.06292600197158499,
+        "mean_min_rot": 0.24551881040467427,
+        "mean_reach_pos_err": NaN,
+        "mean_reach_rot_err": NaN,
+        "mean_policy_close_step": NaN,
+        "mean_label_pos": 0.03618721470782115,
+        "path": "output/dagger_runs/dagger5_smoke/data/dagger_iter_02.h5",
+        "dart_sigma_hat": [
+          [
+            0.0006181324555605105,
+            0.00028525931778519725,
+            0.00027460709719306535,
+            0.0009642904554082657,
+            -0.0022690916726316674,
+            0.0009351484325048499
+          ],
+          [
+            0.00028525931778519725,
+            0.0007348511854419188,
+            0.000143322107942482,
+            0.002296022690674904,
+            -0.000992528021095528,
+            0.0004153946227940162
+          ],
+          [
+            0.00027460709719306535,
+            0.000143322107942482,
+            0.0009264996441746479,
+            0.0012688043762538027,
+            -0.000601309118688966,
+            9.565316745801524e-05
+          ],
+          [
+            0.0009642904554082657,
+            0.002296022690674904,
+            0.0012688043762538027,
+            0.014882792597939712,
+            -0.00256221451392052,
+            0.002912692083275051
+          ],
+          [
+            -0.0022690916726316674,
+            -0.000992528021095528,
+            -0.000601309118688966,
+            -0.00256221451392052,
+            0.012980550632962193,
+            -0.000725820411012053
+          ],
+          [
+            0.0009351484325048499,
+            0.0004153946227940162,
+            9.565316745801524e-05,
+            0.002912692083275051,
+            -0.000725820411012053,
+            0.014205097757070184
+          ]
+        ],
+        "dart_sigma_trace": 0.04434792427314917,
+        "dart_alpha": 3.0
+      },
+      "eval": {
+        "n": 12,
+        "success_rate": 0.8333333333333334,
+        "grasp_rate": 0.8333333333333334,
+        "close_rate": 1.0,
+        "near_rate": 0.8333333333333334,
+        "close_success_rate": 0.8333333333333334,
+        "chance_rate": 0.8333333333333334,
+        "missed_rate": 0.08333333333333333,
+        "miss_given_chance": 0.1,
+        "box_chance_rate": 0.75,
+        "box_taken_rate": 1.0,
+        "box_missed_rate": 0.0,
+        "miss_given_box": 0.0,
+        "mean_box_steps": 1.6666666666666667,
+        "mean_box_frac": 0.7210884353741497,
+        "mean_reach_pos_err": NaN,
+        "mean_reach_rot_err": NaN,
+        "box_after_rate": NaN,
+        "eval_min_pos": 0.014834173240901463,
+        "eval_min_rot": 0.026289915753211924,
+        "mean_dist": 0.16285563011964163,
+        "mean_pos_err": 0.014834173240901463,
+        "mean_rot_err": 0.028000406009650966,
+        "mean_close_step": 23.25,
+        "reasons": {
+          "GRASP_OK": 10,
+          "DROP": 2
+        },
+        "num_grasps": 4,
+        "succ_g0": 1.0,
+        "near_g0": 0.6666666666666666,
+        "succ_g1": 0.6666666666666666,
+        "near_g1": 1.0,
+        "succ_g2": 0.6666666666666666,
+        "near_g2": 0.6666666666666666,
+        "succ_g3": 1.0,
+        "near_g3": 1.0,
+        "retry_at_1": 1.0,
+        "retry_at_2": 1.0,
+        "retry_at_3": 1.0,
+        "retry_at_4": 1.0,
+        "cond_track": 0.9772575257290702,
+        "cond_ee_spread": 0.09321985353346936,
+        "cond_goal_spread": 0.09506042696812438
+      },
+      "is_best": true,
+      "wall_s": 137.6
+    }
+  ],
+  "best": {
+    "iter": 2,
+    "metric": "success_rate",
+    "score": 0.8333333333333334,
+    "score_tuple": [
+      0.8333333333333334,
+      0.8333333333333334,
+      0.8333333333333334,
+      -0.16285563011964163
+    ],
+    "run_dir": "output/dagger_runs/dagger5_smoke/iters/iter_02"
+  },
+  "cursor": 0,
+  "dart_trace_anchor": 0.04048126805967264,
+  "dart_sigma": [
+    [
+      0.0016927141037632943,
+      0.0007811634320463703,
+      0.0007519930432882697,
+      0.002640644475646878,
+      -0.006213754742116869,
+      0.0025608410083850365
+    ],
+    [
+      0.0007811634320463703,
+      0.0020123404855627164,
+      0.00039247794111593206,
+      0.006287503521460859,
+      -0.0027179711477295287,
+      0.0011375302013437673
+    ],
+    [
+      0.0007519930432882697,
+      0.00039247794111593206,
+      0.0025371568839626726,
+      0.003474535341545669,
+      -0.001646644528644476,
+      0.00026193975768347996
+    ],
+    [
+      0.002640644475646878,
+      0.006287503521460859,
+      0.003474535341545669,
+      0.04075552530415606,
+      -0.007016451903738791,
+      0.007976211125831632
+    ],
+    [
+      -0.006213754742116869,
+      -0.0027179711477295287,
+      -0.001646644528644476,
+      -0.007016451903738791,
+      0.03554636378234589,
+      -0.001987610317929831
+    ],
+    [
+      0.0025608410083850365,
+      0.0011375302013437673,
+      0.00026193975768347996,
+      0.007976211125831632,
+      -0.001987610317929831,
+      0.03889970361922728
+    ]
+  ],
+  "dart_alpha": 3.0
+}

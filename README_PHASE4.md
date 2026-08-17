@@ -4,7 +4,7 @@
 Python loop. Sim, OMG planner and model stay resident across iterations.
 
 Design notes: [`docs/thesis_phase4_dagger.md`](docs/thesis_phase4_dagger.md).
-Everything else (env setup, Phases 1–3, cluster sync): [`README_MY.md`](README_MY.md).
+Everything else (envf setup, Phases 1–3, cluster sync): [`README_MY.md`](README_MY.md).
 
 ## Setup
 
