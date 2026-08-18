@@ -47,7 +47,21 @@
       "Bash(git ls-files *)",
       "Bash(git check-ignore *)",
       "Bash(grep -n \"sbatch\\\\|\\\\\\\\\\\\\\\\$\" README_PHASE5.md)",
-      "Bash(awk '/sbatch/ && /\\\\\\\\$/ {print NR\": \"$0}' README_PHASE5.md)"
+      "Bash(awk '/sbatch/ && /\\\\\\\\$/ {print NR\": \"$0}' README_PHASE5.md)",
+      "Bash(grep -n 'EXTRA=\\\\|${EXTRA}' examples/slurm/build_pin_table_multi.sbatch)",
+      "Bash(python3 p5progress.py)",
+      "Bash(grep -n 'pool={args.scenes}\\\\|scene_eval_{args.scenes}\\\\|args.scenes, run_root' examples/eval_run_scenes.py)",
+      "Bash(pkill -f \"eval_run_scenes.py --run-dir output/dagger_runs/dagger4_run16\")",
+      "Bash(~/anaconda3/envs/pch2r_dev/bin/python -m py_compile examples/eval_run_scenes.py)",
+      "Bash(ps -eo pid,etimes,cmd)",
+      "Bash(~/anaconda3/envs/pch2r_dev/bin/python -c \"import easysim,os;print\\(os.path.dirname\\(easysim.__file__\\)\\)\")",
+      "Bash(find / -name \"bullet.py\" -path \"*easysim*\")",
+      "Bash(~/anaconda3/envs/pch2r_dev/bin/python -m py_compile handover_sim2real/dagger/grasp_probe.py handover_sim2real/dagger/evaluator.py handover_sim2real/dagger/setup.py handover_sim2real/dagger/__init__.py examples/eval_run_scenes.py examples/train_dagger_phase4.py)",
+      "Bash(xargs ls -la)",
+      "Bash(awk -F, 'NR>1 && $2==1 && $14==0 {print $18}' scene_eval_test_probe.csv)",
+      "Bash(awk '{a[NR]=$1; s+=$1} END {print \"n =\", NR; print \"min =\", a[1]; print \"p25 =\", a[int\\(NR*0.25\\)+1]; print \"median =\", a[int\\(NR*0.5\\)+1]; print \"p75 =\", a[int\\(NR*0.75\\)+1]; print \"max =\", a[NR]; print \"mean =\", s/NR}')",
+      "Bash(awk -F, 'NR>1 && $2==1 && $14==0 {f=$18; if\\(f==0\\) b=\"exactly 0.00\"; else if\\(f<0.10\\) b=\"0.00-0.10\"; else if\\(f<0.25\\) b=\"0.10-0.25\"; else if\\(f<0.40\\) b=\"0.25-0.40\"; else if\\(f<0.50\\) b=\"0.40-0.50 \\(just under\\)\"; else b=\">=0.50 \\(?!\\)\"; c[b]++} END {for\\(k in c\\) printf \"%-24s %3d\\\\n\", k, c[k]}' scene_eval_test_probe.csv)",
+      "Bash(~/anaconda3/envs/pch2r_dev/bin/python -m py_compile examples/rollout_bc_policy.py)"
     ],
     "additionalDirectories": [
       "/home/pradyun/h2r/handover-sim2real/examples/configs",

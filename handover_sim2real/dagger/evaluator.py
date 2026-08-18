@@ -31,10 +31,13 @@ every DAgger iteration.
 OPPORTUNITY IS MEASURED TWO WAYS. `chance_rate` gates on proximity to the pinned
 grasp and is therefore a pin-agreement measure, not an opportunity measure — it
 reads 0.03-0.05 in runs that succeed 60-70% of the time, because the policy's
-grasps are real but off-pose. `box_chance_rate` / `box_taken_rate` instead ask,
-per step, whether object material actually sits between the open finger pads
-(`dagger/grasp_box.py`, ray-cast against ground-truth collision geometry). Both
-are reported; the geometric pair is the honest one, the pinned pair is kept so
+grasps are real but off-pose. `opportunity_rate` / `box_taken_rate` instead ask,
+per step, whether grasping RIGHT HERE would have worked — as a two-tier test: a
+ray cast for object material between the open finger pads (`dagger/grasp_box.py`,
+against ground-truth collision geometry) as the cheap gate, then, when
+`EvalParams.box_probe` is on, an actual close-hold-score with the simulator
+rewound afterwards (`dagger/grasp_probe.py`) as the verdict. Both definitions are
+reported; the opportunity pair is the honest one, the pinned pair is kept so
 runs 4-14 stay comparable.
 
 Protocol per scene:
@@ -83,6 +86,8 @@ from handover_sim2real.dagger.grasp_box import (  # noqa: E402
 # the collector labelled towards.
 from handover_sim2real.dagger.collector import derived_standoff_pose  # noqa: E402
 from handover_sim2real.dagger.pregrasp import open_loop_reach  # noqa: E402
+# Second-tier opportunity confirmation (EvalParams.box_probe).
+from handover_sim2real.dagger.grasp_probe import probe_grasp_here  # noqa: E402
 
 SUCCESS_MODES = ("stable_grasp", "proximity")
 TARGETS = ("grasp", "pregrasp")
@@ -116,6 +121,25 @@ class EvalParams:
     # pinned-pose `had_chance`, never replacing it, so `chance_rate` keeps the
     # meaning it had in runs 4-14 and the two remain comparable.
     box_check: bool = True
+    # ---- second tier: confirm a geometric chance by actually taking it ----
+    # false (default, and what every run so far logged): an opportunity is the
+    # ray test alone — material between the open pads.
+    # true: the ray test becomes a cheap GATE, and every step that passes it is
+    # confirmed by closing the gripper for real, holding, and scoring with the
+    # evaluator's own `grasp_held_after_hold`. The step counts as an opportunity
+    # only if that close would have secured the object, so the metric folds in
+    # everything the geometry cannot see — the human hand (invisible to the
+    # rays), the object's mass and friction, whether the fingers would shove it.
+    # `dagger/grasp_probe.py` rewinds the simulator afterwards and verifies the
+    # rewind, so the episode is unaffected.
+    #
+    # COST. Each confirmation is hold_steps * steps_action_repeat sim steps
+    # (~0.5 s wall clock), and how many run is set by how permissive the gate is.
+    # At the old min_frac 0.50 the gate let ~1.4 through per episode and the
+    # probe added ~13% to eval wall clock; at the current one-ray gate it lets
+    # through far more, so budget closer to 2x. That trade is the point: the gate
+    # is cheap and must not MISS anything, and this is what supplies precision.
+    box_probe: bool = False
     box: BoxParams = None
     verbose: bool = False
 
@@ -176,14 +200,22 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
     # `min_pos <= t and min_rot <= t`, which can be satisfied at two different
     # steps and would over-report the opportunity.
     had_chance = False
-    # The GEOMETRIC opportunity: was the object ever really between the open
-    # jaws (dagger/grasp_box.py), independent of the pin. `box_taken` is the one
-    # that answers "given a chance, did it take it" — it is only set when the
-    # close is commanded ON such a step, not merely in an episode that had one.
-    box_chance = False
+    # OPPORTUNITY: was there ever a step at which grasping would actually have
+    # worked, independent of the pin. With `box_probe` on this is the full
+    # hierarchy — the ray cast said the object was between the open pads AND a
+    # real close there secured it — and with the probe off it is the geometric
+    # upper bound alone. `box_taken` is the one that answers "given an
+    # opportunity, did it take it": it is set only when the close is commanded ON
+    # such a step, not merely in an episode that had one somewhere.
+    opportunity_seen = False
     box_taken = False
     box_steps = 0
     box_frac_max = 0.0
+    # How many times the geometric gate passed and the expensive confirmation
+    # ran. Read against box_steps: the difference is the steps the geometry
+    # called a chance and an actual close refuted, which is the whole reason the
+    # second tier exists. 0 unless box_probe.
+    n_probes = 0
     # Pre-grasp mode only. `reach_*` is where the BLIND push ended up relative to
     # the grasp — the one thing that cannot be inferred from the policy's own
     # pose — and `box_after` asks the same question the box test asks during a
@@ -210,8 +242,17 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
         if params.box_check:
             opportunity, box_frac = grasp_opportunity(env, params.box)
             box_frac_max = max(box_frac_max, box_frac)
+            # Tier two: the ray test was the GATE, this is the verdict. Only
+            # steps that already look geometrically plausible pay for it, and a
+            # step is an opportunity only if closing there really would have
+            # worked. The probe rewinds the sim, so `obs` and everything below
+            # are unaffected — see grasp_probe.probe_grasp_here.
+            if opportunity and params.box_probe:
+                opportunity = probe_grasp_here(
+                    env, obs, sim.steps_action_repeat, params.hold_steps)
+                n_probes += 1
             if opportunity:
-                box_chance = True
+                opportunity_seen = True
                 box_steps += 1
 
         ee_pos = obs["panda_body"].link_state[0, obs["panda_link_ind_hand"], 0:3].numpy()
@@ -304,13 +345,19 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
         # either never closed there, or closed and lost it. Separates "never got
         # there" from "got there and blew it", which a success rate cannot.
         "missed": int(had_chance and not success),
-        # ---- geometric opportunity (grasp_box.py), pin-independent ----
-        "box_chance": int(box_chance),      # object was ever in the open jaws
+        # ---- OPPORTUNITY (grasp_box.py [+ grasp_probe.py]), pin-independent ----
+        # `box_chance` is kept as a byte-identical alias so that every
+        # dagger_log.csv written before the rename, and every plotting script
+        # that reads one, keeps working untouched. `opportunity` is the name to
+        # use in new code.
+        "opportunity": int(opportunity_seen),
+        "box_chance": int(opportunity_seen),
         "box_taken": int(box_taken),        # ...and the close was commanded there
-        "box_missed": int(box_chance and not success),
+        "box_missed": int(opportunity_seen and not success),
         "box_steps": int(box_steps),        # how long the window stayed open
         "box_frac_max": float(box_frac_max),  # best jaw occupancy seen, for
                                               # recalibrating min_frac offline
+        "n_probes": int(n_probes),          # gate passes (>= box_steps when probing)
         # ---- pre-grasp mode: what the BLIND push achieved (NaN/0 otherwise) ----
         "reach_pos_err": float(reach_pos_err),
         "reach_rot_err": float(reach_rot_err),
@@ -336,11 +383,35 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
 
     Opportunity is reported TWICE, against two different definitions, because
     they disagree and the disagreement is itself the finding:
-        chance_rate     the EE was within tolerance of the PINNED grasp
-        box_chance_rate the object was geometrically between the open jaws
+        chance_rate       the EE was within tolerance of the PINNED grasp
+        opportunity_rate  grasping there would actually have worked
     The first is near-zero in runs that succeed 60-70% of the time (it is really
     measuring pin agreement); the second counts off-pose grasps as the
-    opportunities they are. `box_taken_rate` is the conversion of the latter.
+    opportunities they are.
+
+    WHAT `opportunity_rate` MEANS depends on one flag, and the printed reports
+    say which was in force:
+        box_probe: true   the fraction of episodes with at least one step where
+                          the ray cast found the object between the open pads AND
+                          closing right there really did secure it. This is the
+                          honest reading of the word — a counterfactual over the
+                          evaluator's own success criterion.
+        box_probe: false  the ray cast alone, which is a strict UPPER BOUND: the
+                          human hand is invisible to those rays, so poses where
+                          closing would collide with it still count.
+
+    Given an opportunity, the conditionals form a CHAIN, each one adding a
+    condition to the last, so the gaps between them localise the failure:
+        opportunity_rate  a graspable moment existed at some step
+        box_taken_rate    ...and the close was COMMANDED on such a step
+        box_success_rate  ...and that close SECURED the object
+    A gap at the first step is a policy that does not recognise the moment; a gap
+    at the second is one that recognises it and fumbles the grasp.
+    `miss_given_box` is a separate, looser measure (any failure to secure, taken
+    or not) and is NOT the complement of box_success_rate.
+
+    `box_chance_rate` is emitted alongside `opportunity_rate` as a byte-identical
+    alias, so pre-rename logs and the scripts that plot them keep working.
     """
     pregrasp = str(params.target) == "pregrasp"
     rows = []
@@ -393,7 +464,7 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
 
     n_closed = sum(r["closed"] for r in rows)
     n_chance = sum(r["had_chance"] for r in rows)
-    n_box = sum(r["box_chance"] for r in rows)
+    n_box = sum(r["opportunity"] for r in rows)
 
     return {
         "n": len(rows),
@@ -414,15 +485,19 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
         "missed_rate": sum(r["missed"] for r in rows) / n,
         "miss_given_chance": (sum(r["missed"] for r in rows) / n_chance
                               if n_chance else float("nan")),
-        # ---- the GEOMETRIC opportunity, pin-independent (grasp_box.py) ----
-        # Unlike chance_rate this does not require agreement with the pinned
-        # pose, so an off-pose grasp — which is most of what the policy does —
-        # counts as the opportunity it is.
+        # ---- OPPORTUNITY, pin-independent (grasp_box.py [+ grasp_probe.py]) ----
+        # The fraction of episodes with at least one step that was a real chance
+        # to grasp. Unlike chance_rate this does not require agreement with the
+        # pinned pose, so an off-pose grasp — which is most of what the policy
+        # does — counts as the opportunity it is. See the docstring for how
+        # `box_probe` changes this from an upper bound into the real thing.
         #
         # NaN, not 0, when the check is disabled: a 0 here would read as "the
         # policy never got a chance", which is a claim about the policy rather
         # than about what was measured. NaN writes a BLANK cell (see `_r` in
         # train_dagger_phase4) and plots as a gap.
+        "opportunity_rate": (n_box / n) if params.box_check else float("nan"),
+        # Pre-rename alias, kept so existing logs and plotters are unaffected.
         "box_chance_rate": (n_box / n) if params.box_check else float("nan"),
         # THE headline: given that the object really was between the open jaws,
         # how often did the policy command the close there. Conditional on the
@@ -436,6 +511,22 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
                             if params.box_check else float("nan")),
         "miss_given_box": (sum(r["box_missed"] for r in rows) / n_box
                            if (n_box and params.box_check) else float("nan")),
+        # ONE STEP BEYOND box_taken_rate. That rate asks whether the close was
+        # COMMANDED on an in-jaws step; this asks whether that close then
+        # SECURED the object. Numerator is `box_taken AND success`, so both
+        # conditions are on the same episode: the chance existed, the policy
+        # committed on it, and the handover completed.
+        #
+        # Deliberately NOT `success | box_chance`, which would also count
+        # episodes that succeeded from a step the box test never called a chance
+        # — that number measures the box test's coverage as much as the policy,
+        # and it is not the complement of miss_given_box either. The three
+        # conditionals form a chain: box_chance_rate (a chance existed) ->
+        # box_taken_rate (it was taken) -> box_success_rate (it paid off), and
+        # each gap localises a different failure.
+        "box_success_rate": (sum(int(bool(r["box_taken"]) and bool(r["success"]))
+                                 for r in rows) / n_box
+                             if (n_box and params.box_check) else float("nan")),
         # How many policy-steps the window stayed open, over the episodes that
         # had one. A long declined window is a much stronger indictment of the
         # close decision than a one-step flicker, and the two are indistinguish-
@@ -446,6 +537,15 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
         # `box.min_frac` can be recalibrated from logs without re-running eval.
         "mean_box_frac": (_mean("box_frac_max") if params.box_check
                           else float("nan")),
+        # EvalParams.box_probe only. `probe_pass_rate` is the fraction of
+        # geometric gate passes that a real close CONFIRMED — the direct measure
+        # of how much the ray test over-counts. NaN when not probing.
+        "n_probes": sum(r["n_probes"] for r in rows),
+        "probe_pass_rate": ((sum(r["box_steps"] for r in rows)
+                             / sum(r["n_probes"] for r in rows))
+                            if (params.box_probe
+                                and sum(r["n_probes"] for r in rows))
+                            else float("nan")),
         # ---- pre-grasp mode: did the BLIND push finish the job ----
         # Averaged over the episodes that COMMITTED, since an episode with no
         # commit has no push to measure. `mean_reach_pos_err` against

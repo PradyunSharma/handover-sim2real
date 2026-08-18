@@ -60,6 +60,7 @@ from .collector import (
 )
 from .pregrasp import forward_dist_default, open_loop_reach
 from .grasp_box import BoxParams, build_box_params, grasp_opportunity
+from .grasp_probe import probe_grasp_here
 from .evaluator import EvalParams, evaluate_policy
 from .setup import Phase4Context, build_phase4_context, scene_pools
 # NOT imported here: .parallel. It spawns worker processes that re-import this
@@ -95,6 +96,7 @@ __all__ = [
     "BoxParams",
     "build_box_params",
     "grasp_opportunity",
+    "probe_grasp_here",
     "EvalParams",
     "evaluate_policy",
     "Phase4Context",

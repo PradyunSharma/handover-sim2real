@@ -131,6 +131,9 @@ def build_phase4_context(cfg4: dict, *, seed: int = 0,
         close_pos_thresh=float(dag.get("close_pos_thresh", 0.02)),
         close_rot_thresh=float(dag.get("close_rot_thresh", 0.34)),
         box_check=bool(ev.get("box_check", True)),
+        # Off by default, so every existing run's `box_chance_rate` keeps the
+        # geometry-only meaning it was logged with.
+        box_probe=bool(ev.get("box_probe", False)),
         box=build_box_params(ev),
         # Also from the DAGGER block, and for a stronger version of the same
         # reason: a policy trained to stop at the pre-grasp and evaluated as if

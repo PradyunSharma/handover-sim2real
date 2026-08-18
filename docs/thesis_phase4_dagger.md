@@ -470,7 +470,176 @@ horizon or the endgame is the bottleneck, not the aggregation.
 
 ---
 
-## 6. Where this sits relative to the other phases
+## 6. Scoring a finished run on the **test** split
+
+**Nothing in `dagger_log.csv` is a generalisation number.** Every Phase-4 run
+sets `SIM.split: train`, and every run after the first sets `EVAL.holdout:
+false`, which puts the eval scenes back into the collection pool. So the
+`success_rate` column is the policy's performance on scenes it was trained on.
+Measured on run 16, that gap is about eleven points: 80.0% logged, **69.2%** on
+the test split.
+
+`examples/eval_run_scenes.py` rolls a run's checkpoint over a whole split, one
+row per scene. It reuses `build_phase4_context(<run>/config.yaml)` — the same
+call the training loop makes — so the simulator, the thresholds and the success
+criterion cannot drift from what the run itself used. Only the split changes.
+
+```bash
+export OMG_PLANNER_DIR=$PWD/OMG-Planner GADDPG_DIR=$PWD/GA-DDPG
+export PYTHONPATH="$PWD:$PWD/handover-sim:$PWD/handover-sim/mano_pybullet"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$PWD/OMG-Planner/orocos_kinematics_dynamics/orocos_kdl/release/lib"
+
+python examples/eval_run_scenes.py \
+    --run-dir output/dagger_runs/dagger4_run16 \
+    --split test \
+    --grasp-pin-table output/grasp_pin_table_test_omg.json \
+    --exclude-scenes none \
+    --box-probe \
+    --out-prefix output/dagger_runs/dagger4_run16/scene_eval_test
+```
+
+`--run-dir` is the RUN root, not a checkpoint directory; the script resolves
+`best/` itself (`--from last` for the last policy). Roughly 6 s per scene with
+`--box-probe`, so ~13 min for the 130 usable test scenes.
+
+**Scene indices are split-relative.** `HandoverBenchmarkWrapper` rebuilds
+`_scene_ids` per split, so scene 7 of test is not scene 7 of train. Two inputs
+are numbered in that space and both must move with the split:
+
+* `--grasp-pin-table` — a train table applied to test pins an unrelated grasp on
+  every scene, and it doubles as the usable-scene filter, so it changes the
+  denominator as well as the target. Build one per split with
+  `examples/slurm/build_pin_table.sbatch`.
+* `--exclude-scenes` — the failed-expert list is train-relative and has no test
+  equivalent, so pass `none`.
+
+### 6.1 Reading the report
+
+```
+  success_rate           69.2%   secured grasps / all scenes
+  close_rate             76.9%   the policy committed a close at all (100/130)
+  close_success_rate     90.0%   of those closes, how many held
+  grasp_rate             66.9%   fingers on the object after the hold
+  ------------------------------------------------------------------
+  opportunity            77.7%   >=1 ray(s) hit the object AND a real close there secured it (101/130)
+  success | opportunity  89.1%   ...and the policy converted it  <- conversion
+  miss | opportunity     10.9%   ...and it did not
+  probe_pass_rate        80.2%   of 339 geometric gate passes, how many a REAL close confirmed
+  ok success ⊆ opportunity holds on every scene.
+```
+
+The top block is the nested chain — read left to right to localise where
+episodes are lost.
+
+**`opportunity` is a two-tier counterfactual**, not a geometric test. Tier one
+is a 7x7 grid of rays cast pad-to-pad across the open jaws
+(`dagger/grasp_box.py`), thresholded at a single ray (`--min-rays`, default 1).
+Tier two, enabled by `--box-probe`, settles every step that clears the gate by
+**actually closing the gripper**, holding it, scoring it with the evaluator's own
+criterion, and then rewinding the simulator to the exact prior state
+(`dagger/grasp_probe.py`). A step counts only if grasping right there would
+genuinely have secured the object — which folds in everything the rays cannot
+see, above all the human hand, which carries a collision filter that makes it
+invisible to them.
+
+Two consequences worth knowing before quoting these numbers:
+
+* **Without `--box-probe` the figure is an upper bound**, since a pose where
+  closing would collide with the human still counts. The report labels which
+  definition produced it.
+* **With `--box-probe`, `success | opportunity` is tautologically equal to the
+  "closed on an opportunity step" rate**, because an opportunity is *defined* as
+  a step where closing secures the object. Quote one of them, not both. The
+  informative content is the gap between `opportunity` and `success_rate`: on run
+  16's test split, 101 of 130 episodes had a real chance, 90 converted, and the
+  other 29 never manufactured one at all — 15 of those died on human contact and
+  13 on a drop, mostly before ever commanding a close. The bottleneck is the
+  approach, not the grasp decision.
+
+The invariant **success ⊆ opportunity** must hold scene by scene: the policy's
+own successful close is itself proof that a graspable moment existed. When it
+breaks, the report names the offending `scene_idx` values so they can be replayed
+one at a time. Historically it broke because the gate was set at half the pad
+(`--min-frac 0.5`, what runs 1-20 logged), which recovers only 80% of the
+episodes that actually secured the object. Pass `--min-frac 0.5 --min-rays 1`
+without `--box-probe` to reproduce a `dagger_log.csv`-comparable figure.
+
+**In pre-grasp mode the opportunity block does not apply.** With
+`DAGGER.target: pregrasp` the episode ends 6.4 cm short of the object, so the
+jaws are never around it while the policy is still deciding and `opportunity`
+reads near zero *by construction*. Every conditional on it then rests on a
+denominator of one or two episodes and swings between 0 and 1. Read
+`box_after_rate` instead — the same question asked after the blind push, with
+the fingers still open — and expect the invariant warning to fire legitimately.
+
+Outputs are `<prefix>.csv` (one row per scene), `.json` (the aggregate, including
+the gate settings that produced it) and `.png` (six diagnostic panels).
+
+---
+
+## 7. Watching a single scene
+
+`examples/rollout_bc_policy.py` drives the simulator with the policy's own
+actions and a PyBullet window. Use it to see *why* a scene in the CSV failed.
+
+```bash
+python examples/rollout_bc_policy.py \
+    --run-dir output/dagger_runs/dagger4_run16/best \
+    --cfg-file examples/pretrain_multicam_wlr.yaml \
+    --split test --scene 30 --max-steps 50 \
+    --grasp-pin-table output/grasp_pin_table_test_omg.json --show-goal-grasp
+```
+
+Here `--run-dir` is a CHECKPOINT directory (`<run>/best`, `<run>/last`, or an
+`<run>/iters/iter_NN`), not the run root. `--cfg-file` must be the sim config the
+run trained with (`SIM.cfg_file` in `<run>/config.yaml`) — a different camera set
+feeds the policy a point cloud it never saw. `--split` matters for the same
+reason it does above: without it, scene 30 of test is silently scene 30 of train.
+`--show-goal-grasp` draws the pinned grasp in green; pass the same pin table, or
+OMG re-picks its own goal and a correct rollout looks like a miss.
+
+Pass several scenes with `--scenes 30,86,32` and step through them in the window:
+**N** = next scene, **R** = re-roll the same one, **Q** = quit.
+
+### 7.1 Pre-grasp policies need the open-loop endgame
+
+For a run with `DAGGER.target: pregrasp` (run 21 onward), channel 6 of the action
+does **not** mean "close the fingers". It means "I am at the standoff — commit
+the endgame", and the CVPR2023 open-loop push must run before the hold. Closing
+in place instead shuts the jaws 6.4 cm short of the object and scores every
+episode a miss, which looks exactly like a policy that cannot grasp.
+
+`--target` controls this and defaults to `auto`, which walks up from `--run-dir`
+looking for the Phase-4 config (the one with a `DAGGER` block) and reads
+`DAGGER.target`, `forward_dist` and `forward_steps` out of it. The resolved
+endgame is printed at startup, so check that line before trusting a rollout:
+
+```
+Endgame: PRE-GRASP — channel 6 commits a blind 0.064 m push over 4 sub-steps, then the hold
+```
+
+So run 21 needs nothing extra beyond the right sim config:
+
+```bash
+python examples/rollout_bc_policy.py \
+    --run-dir output/dagger_runs/dagger4_run21/best \
+    --cfg-file examples/pretrain_multicam_wr.yaml \
+    --split test --scene 21 --max-steps 50 \
+    --grasp-pin-table output/grasp_pin_table_test_omg.json --show-goal-grasp
+```
+
+Force it with `--target pregrasp` (and optionally `--forward-dist` /
+`--forward-steps`) when the config is not where auto-detection can find it, e.g.
+a checkpoint copied out of its run directory.
+
+If the push itself ends the episode — a lateral swing into the pre-grasp can hit
+the hand or knock the object loose — that is reported under the benchmark's own
+status rather than as `GRASP_MISS`, so an over-long `forward_dist` cannot hide
+behind the policy's success rate.
+
+---
+
+## 8. Where this sits relative to the other phases
 
 | | Phase 1/2 | Phase 3 | **Phase 4** |
 |---|---|---|---|

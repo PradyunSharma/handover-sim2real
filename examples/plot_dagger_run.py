@@ -294,6 +294,11 @@ def main() -> None:
     for key, label, style, col, lw in (
             ("box_chance_rate", "object in jaws", "-", "tab:blue", 1.4),
             ("box_taken_rate", "closed | in jaws", "-", "tab:green", 2.0),
+            # The DECISION (closed | in jaws) against the OUTCOME (success | in
+            # jaws), on one axis on purpose: the vertical gap between them is
+            # every chance the policy recognised and then lost, which neither
+            # line says alone.
+            ("box_success_rate", "success | in jaws", "-", "tab:purple", 2.0),
             ("miss_given_box", "no grasp | in jaws", "-", "tab:red", 1.4),
             ("close_success_rate", "success | closed", "--", "tab:olive", 1.2),
             ("mean_box_frac", "mean jaw occupancy", ":", "tab:gray", 1.0)):

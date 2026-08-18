@@ -15,6 +15,36 @@
         --split test --grasp-pin-table output/grasp_pin_table_test_omg.json \
         --exclude-scenes none
 
+    # the honest opportunity metric: one-ray gate + a real close to confirm it
+    python examples/eval_run_scenes.py --run-dir ... --split test \
+        --grasp-pin-table output/grasp_pin_table_test_omg.json \
+        --exclude-scenes none --box-probe
+
+OPPORTUNITY IS A TWO-TIER TEST, and the threshold on the first tier is now ONE
+RAY. `--min-rays` (default 1) is how many of the 7x7 pad-to-pad rays must hit the
+object for a step to clear the geometric gate; `--min-frac` is an optional
+fraction floor on top, default 0.0 and inert. `--box-probe` then settles every
+step that clears the gate by closing the gripper for real, holding it, scoring it
+with the evaluator's own success criterion, and rewinding the simulator. With
+both on, `opportunity_rate` means what the word says: the fraction of episodes
+with at least one step where the object was between the open pads AND grasping
+there would genuinely have secured it.
+
+WHY THE GATE IS NOT 0.50 ANY MORE. Runs 1-20 used a half-pad threshold. Measured
+on run 16's best checkpoint over the 130-scene test split it reported a chance in
+80 of 130 episodes while 90 secured the object — an opportunity rate BELOW the
+success rate, which is impossible if the name is accurate. Recounting the 18
+secured-but-unreported episodes off `box_frac_max` found not one at 0.0: their
+peaks spread smoothly from 0.02 to 0.49, six of them just under the old gate. So
+the rays did see the object every time; the threshold was refusing to call a thin
+or small object a chance, because occupancy measures how CENTRED the object is on
+the pad, not whether a grasp was available. Recall against secured episodes: 80%
+at 0.50, 87% at 0.40, 97% at 0.10, and 100% only at one ray. Precision, which the
+old threshold was really buying, now comes from `--box-probe` instead.
+`print_summary` still asserts the invariant and names the scenes that break it.
+The settings in force are recorded in the summary JSON, because two runs with
+different gates are otherwise indistinguishable on disk.
+
 WHY THIS EXISTS, next to eval_dagger_run.py. That script answers "how did the run
 progress" — one aggregate row per ITERATION, over the held-out eval pool.
 This one answers "where does the best policy actually fail" — one row per SCENE,
@@ -43,13 +73,16 @@ block at a different benchmark split (for SETUP s0: subjects 2-9 instead of 0-9,
 at the sequence indices train never uses). See `apply_split_override` — the pin
 table and exclusion list are numbered WITHIN a split and must be replaced too.
 
-THE OPPORTUNITY COLUMNS WORK ON OLD RUNS. `box_chance` / `box_taken` are computed
-by ray-casting the live simulator during the rollout (`dagger/grasp_box.py`), not
-read from anything the run recorded — so runs 1-14, which predate the metric
-entirely, can be scored with it retroactively. Only the checkpoint has to exist.
+THE OPPORTUNITY COLUMNS WORK ON OLD RUNS. `opportunity` / `box_taken` are
+computed by ray-casting the live simulator during the rollout
+(`dagger/grasp_box.py`), not read from anything the run recorded — so runs 1-14,
+which predate the metric entirely, can be scored with it retroactively. Only the
+checkpoint has to exist.
 
 COST. One episode is ~2-3 s, so a 350-scene training pool is ~15-20 min on a GPU.
-Read-only on the run directory apart from the three output files it writes.
+`--box-probe` adds ~0.5 s per gate pass on top, which at the one-ray gate is the
+larger share of the run. Read-only on the run directory apart from the three
+output files it writes.
 """
 
 from __future__ import annotations
@@ -82,7 +115,8 @@ SCENE_FIELDS = [
     "pos_err", "rot_err",          # reach AT THE CLOSE (NaN if it never closed)
     "min_pos", "min_rot",          # closest reach over the WHOLE episode
     "had_chance", "missed",        # pinned-pose opportunity (see the caveat below)
-    "box_chance", "box_taken", "box_missed", "box_steps", "box_frac_max",
+    # `opportunity` replaces the old `box_chance` column. Same field, honest name.
+    "opportunity", "box_taken", "box_missed", "box_steps", "box_frac_max",
     "status", "reason",
 ]
 
@@ -195,7 +229,13 @@ def summarise(m: dict, rows: list[dict], scenes: list[int], which: str,
               run_root: Path, ckpt_dir: Path, ckpt: str) -> dict:
     """Aggregate block, printed and saved as JSON."""
     n_close = sum(r["closed"] for r in rows)
-    n_box = sum(r["box_chance"] for r in rows)
+    n_box = sum(r["opportunity"] for r in rows)
+    # The scenes that break the success ⊆ opportunity invariant: the policy came
+    # away with the object, yet no step of the episode was ever called an
+    # opportunity. Listed by scene index (SPLIT-RELATIVE) so they can be replayed
+    # one at a time — see the rollout command in print_summary's warning.
+    broken = sorted(int(r["scene_idx"]) for r in rows
+                    if r["success"] and not r["opportunity"])
     return {
         "run": str(run_root), "ckpt_dir": str(ckpt_dir), "ckpt": ckpt,
         "scene_set": which, "n_scenes": len(scenes),
@@ -208,13 +248,28 @@ def summarise(m: dict, rows: list[dict], scenes: list[int], which: str,
         "n_closed": int(n_close),
         "grasp_rate": m["grasp_rate"],
         "near_rate": m["near_rate"],
+        "opportunity_rate": m["opportunity_rate"],
+        # Pre-rename alias, so anything already parsing these JSONs keeps working.
         "box_chance_rate": m["box_chance_rate"],
-        "box_taken_rate": m["box_taken_rate"],
+        # THE conversion: of the scenes that had a real opportunity, how many the
+        # policy came away from with the object secured. `miss_given_box` is its
+        # exact complement, kept because a failure count reads more directly.
+        #
+        # `box_taken_rate`, `mean_box_steps` and `chance_rate` are dropped here
+        # on purpose — see the note in print_summary. They are still computed by
+        # `evaluate_policy` and still logged to dagger_log.csv, so nothing about
+        # the training curves changes.
+        "box_success_rate": m["box_success_rate"],
         "miss_given_box": m["miss_given_box"],
+        "n_opportunity": int(n_box),
         "n_box_chance": int(n_box),
-        "mean_box_steps": m["mean_box_steps"],
+        # Scenes where success=1 but opportunity=0 — the invariant violations,
+        # for replay. Empty is what a correct opportunity measure looks like.
+        "success_without_opportunity": broken,
         "mean_box_frac": m["mean_box_frac"],
-        "chance_rate": m["chance_rate"],
+        # box_probe only: gate passes, and the fraction a real close confirmed.
+        "n_probes": m.get("n_probes", 0),
+        "probe_pass_rate": m.get("probe_pass_rate", float("nan")),
         "eval_min_pos": m["eval_min_pos"], "eval_min_rot": m["eval_min_rot"],
         "mean_pos_err": m["mean_pos_err"], "mean_rot_err": m["mean_rot_err"],
         "mean_close_step": m["mean_close_step"], "mean_dist": m["mean_dist"],
@@ -228,26 +283,84 @@ def print_summary(s: dict, params) -> None:
     print("\n" + "=" * 78)
     print(f"{s['n_scenes']} {s['scene_set']} scenes   {s['ckpt']}.pt from {s['ckpt_dir']}")
     print("-" * 78)
-    print(f"  success_rate        {pct(s['success_rate'])}   "
-          f"secured grasps / all scenes")
-    print(f"  close_rate          {pct(s['close_rate'])}   "
-          f"the policy committed a close at all ({s['n_closed']}/{s['n_scenes']})")
-    print(f"  close_success_rate  {pct(s['close_success_rate'])}   "
-          f"of those closes, how many held")
-    print(f"  grasp_rate          {pct(s['grasp_rate'])}   "
-          f"fingers on the object after the hold")
+    # One padding width for every metric line in the report, so the percentages
+    # form a single column. 21 is set by the longest label, "success | opportunity".
+    def row(label, value, note):
+        print(f"  {label:<21} {pct(value)}   {note}")
+
+    row("success_rate", s["success_rate"], "secured grasps / all scenes")
+    row("close_rate", s["close_rate"],
+        f"the policy committed a close at all ({s['n_closed']}/{s['n_scenes']})")
+    row("close_success_rate", s["close_success_rate"],
+        "of those closes, how many held")
+    row("grasp_rate", s["grasp_rate"], "fingers on the object after the hold")
     print("-" * 78)
-    print(f"  box_chance_rate     {pct(s['box_chance_rate'])}   "
-          f"object was between the open pads at some step "
-          f"({s['n_box_chance']}/{s['n_scenes']})")
-    print(f"  box_taken_rate      {pct(s['box_taken_rate'])}   "
-          f"...and the close was commanded ON such a step")
-    print(f"  miss_given_box      {pct(s['miss_given_box'])}   "
-          f"...and it still did not become a grasp")
-    print(f"  mean_box_steps      {s['mean_box_steps']:6.1f}    "
-          f"how long the window stayed open, when it did")
-    print(f"  chance_rate         {pct(s['chance_rate'])}   "
-          f"(pinned-pose opportunity — measures pin agreement, not opportunity)")
+    # Spell out which definition produced the number, because the two differ by
+    # a lot and a bare percentage does not say which one it is.
+    if params.box_probe:
+        defn = (f">={params.box.min_rays} ray(s) hit the object AND a real close "
+                f"there secured it")
+    else:
+        defn = (f">={params.box.min_rays} ray(s) hit the object (UPPER BOUND — "
+                f"no probe, the human hand is invisible to the rays)")
+    # DELIBERATELY NOT REPORTED HERE, though `evaluate_policy` still computes
+    # them and the training loop still logs them:
+    #   box_taken_rate ("closed | opportunity")  With the probe on this is the
+    #       SAME NUMBER as success | opportunity, by construction rather than by
+    #       coincidence: opportunity means "closing here secures the object", so
+    #       a close commanded on such a step must secure it in a deterministic
+    #       sim — the probe ran the identical close-hold-score procedure. Two
+    #       lines, one fact.
+    #   mean_box_steps   How many steps the window stayed open. It counts steps
+    #       that cleared the gate, not anything the policy could act on, and its
+    #       value moves with the gate threshold rather than with behaviour.
+    #   chance_rate      Proximity to the PINNED grasp. Reads 0.0% on runs that
+    #       succeed 69% of the time, because the policy's grasps are real but
+    #       nowhere near OMG's pose — it measures pin agreement, which near_rate
+    #       already reports.
+    row("opportunity", s["opportunity_rate"],
+        f"{defn} ({s['n_opportunity']}/{s['n_scenes']})")
+    row("success | opportunity", s["box_success_rate"],
+        "...and the policy converted it  <- conversion")
+    row("miss | opportunity", s["miss_given_box"],
+        "...and it did not (the exact complement of the line above)")
+    if s.get("n_probes"):
+        row("probe_pass_rate", s["probe_pass_rate"],
+            f"of {s['n_probes']} geometric gate passes, how many a REAL close "
+            f"confirmed")
+
+    # THE INVARIANT. A grasp cannot secure the object without there having been a
+    # step at which grasping would secure the object — the policy's own close IS
+    # such a step — so success ⊆ opportunity must hold, scene by scene. Any scene
+    # that breaks it is a defect in the MEASURE, not in the policy, and every
+    # conditional printed above rests on a denominator that excludes it. So name
+    # the offenders individually rather than reporting an aggregate discrepancy:
+    # they are few enough to replay, and replaying one is what settles the cause.
+    broken = s.get("success_without_opportunity", [])
+    bc, sr = s.get("opportunity_rate", float("nan")), s.get("success_rate", 0.0)
+    if broken:
+        print(f"  !! {len(broken)} scene(s) secured the object with NO step ever "
+              f"counted as an opportunity ({pct(bc)} opportunity vs "
+              f"{pct(sr)} success). Treat the conditionals above as conditioned "
+              f"on a selected subset.")
+        print(f"     scene_idx (split-relative): "
+              f"{', '.join(str(x) for x in broken)}")
+        print(f"     Replay one with rollout_bc_policy.py --scene <idx> to see "
+              f"where the object actually sits at the close. The CSV's "
+              f"box_frac_max says which cause: >0 means the rays DID see it and "
+              f"the gate or the probe rejected it anyway; exactly 0 means the "
+              f"object never intersected the ray volume, i.e. it was gripped "
+              f"outside the pad's z-window (only the distal 17.6 mm, "
+              f"z 0.0946-0.1122, is sampled).")
+        if params.box.min_rays > 1 or params.box.min_frac > 0:
+            print(f"     The gate is not at its most permissive "
+                  f"(min_rays={params.box.min_rays}, "
+                  f"min_frac={params.box.min_frac:.2f}); try --min-rays 1 "
+                  f"--min-frac 0 first, or recount offline from box_frac_max in "
+                  f"the CSV — a step clears fraction t exactly when "
+                  f"box_frac_max >= t.")
+    elif bc == bc:
+        print(f"  ok success ⊆ opportunity holds on every scene.")
     print("-" * 78)
     print(f"  min reach           pos {s['eval_min_pos']:.4f} m   "
           f"rot {s['eval_min_rot']:.4f} rad   (closest approach, every episode)")
@@ -350,22 +463,46 @@ def make_plots(rows: list[dict], s: dict, params, out_png: Path,
     # one — and min_frac can be recalibrated off this plot without re-running.
     a = ax[4]
     bf = np.array([r["box_frac_max"] for r in R], dtype=float)
-    chance = np.array([bool(r["box_chance"]) for r in R])
+    chance = np.array([bool(r["opportunity"]) for r in R])
     taken = np.array([bool(r["box_taken"]) for r in R])
     a.bar(x, bf, width=1.0, linewidth=0,
           color=np.where(chance, "#1565c0", "#bdbdbd"))
-    a.scatter(x[taken], bf[taken] + 0.04, s=22, marker="v",
-              c=REASON_COLOR["GRASP_OK"], label="close commanded in the window")
+    # Per-scene outcome of every opportunity. The middle category is empty
+    # WHENEVER --box-probe is on and non-empty otherwise, which is itself the
+    # readable difference between the two definitions: a probed opportunity
+    # cannot be closed on and lost, because it was confirmed by that very close.
+    held = taken & ok
+    lost = taken & ~ok
     declined = chance & ~taken
+    a.scatter(x[held], bf[held] + 0.04, s=22, marker="v",
+              c=REASON_COLOR["GRASP_OK"], label="opportunity converted")
+    if lost.any():
+        a.scatter(x[lost], bf[lost] + 0.04, s=22, marker="v",
+                  c=REASON_COLOR["GRASP_MISS"], label="closed on it, lost it")
     a.scatter(x[declined], bf[declined] + 0.04, s=22, marker="v",
-              c=REASON_COLOR["DROP"], label="window opened, close declined")
-    a.axhline(params.box.min_frac, color="k", ls="--", lw=1,
-              label=f"min_frac {params.box.min_frac:.2f}")
+              c=REASON_COLOR["DROP"], label="opportunity declined")
+    # The gate line, drawn where it actually bites: the binding constraint is
+    # whichever of the two thresholds is higher in fraction terms, and at the
+    # default (1 ray, no floor) that is a single grid cell.
+    n_rays = int(params.box.grid_x) * int(params.box.grid_z)
+    gate = max(float(params.box.min_frac), params.box.min_rays / n_rays)
+    a.axhline(gate, color="k", ls="--", lw=1,
+              label=f"gate {gate:.3f} ({params.box.min_rays}/{n_rays} rays"
+                    + (f", floor {params.box.min_frac:.2f}"
+                       if params.box.min_frac > 0 else "") + ")")
     a.set_ylim(0, 1.15)
     a.set_ylabel("max jaw occupancy")
     a.set_xlabel(f"scene (sorted by {sort_by}; see the CSV for scene_idx)")
-    a.set_title("Grasp opportunity — fraction of the pad-to-pad rays that hit "
-                "the object, best step of the episode", fontsize=10, loc="left")
+    # NaN when --no-box, or when no episode ever presented a chance; "n/a" says
+    # "not measured" where a printed 0% would read as "never converted one".
+    def _p(v):
+        return "n/a" if v != v else f"{100 * v:.0f}%"
+    a.set_title(
+        f"Grasp opportunity — fraction of the pad-to-pad rays that hit the "
+        f"object, best step of the episode   "
+        f"[opportunity {_p(s['opportunity_rate'])}, "
+        f"success | opportunity {_p(s['box_success_rate'])}]",
+        fontsize=10, loc="left")
     a.legend(fontsize=8, loc="upper right")
 
     handles = [Line2D([], [], marker="s", ls="", color=REASON_COLOR.get(c, _OTHER_COLOR),
@@ -408,6 +545,33 @@ def parse_args() -> argparse.Namespace:
                         "(evenly spread, not a prefix)")
     p.add_argument("--max-steps", type=int, default=None,
                    help="override EVAL.max_steps for this sweep")
+    p.add_argument("--min-rays", type=int, default=1,
+                   help="how many of the 49 pad-to-pad rays must hit the object "
+                        "for a step to clear the GEOMETRIC GATE. Default 1: the "
+                        "gate's job is to be cheap and to miss nothing, with "
+                        "precision supplied by --box-probe. Raising it re-"
+                        "introduces the under-count that made opportunity read "
+                        "BELOW success on run 16's test split.")
+    p.add_argument("--min-frac", type=float, default=0.0,
+                   help="optional fraction floor on top of --min-rays, i.e. what "
+                        "share of the 7x7 grid must hit. Default 0.0 (inert). "
+                        "Pass 0.5 to reproduce the gate runs 1-20 used, which is "
+                        "what dagger_log.csv's box_* columns were logged with — "
+                        # NB argparse %-expands help strings, so a literal
+                        # percent sign must be doubled or --help raises.
+                        "but note it recovers only 80%% of the episodes that "
+                        "actually secured the object.")
+    p.add_argument("--box-probe", action="store_true",
+                   help="HIERARCHICAL opportunity test. The ray grid becomes a "
+                        "cheap gate; every step that passes it is confirmed by "
+                        "actually closing the gripper, holding, and scoring with "
+                        "the evaluator's own success criterion — so a step "
+                        "counts only if a close there would really have secured "
+                        "the object. Folds in what geometry cannot see (the "
+                        "human hand is invisible to the rays; mass and friction "
+                        "are not modelled by them). The simulator is rewound "
+                        "afterwards and the rewind is verified, so the episode "
+                        "is unaffected. Roughly doubles wall clock.")
     p.add_argument("--no-box", action="store_true",
                    help="skip the ray-cast opportunity test (its columns go NaN)")
     p.add_argument("--device", default="cuda")
@@ -437,6 +601,13 @@ def main() -> None:
         ev["max_steps"] = int(args.max_steps)
     if args.no_box:
         ev["box_check"] = False
+    if args.box_probe:
+        ev["box_probe"] = True
+    # Threaded through the config rather than set on BoxParams afterwards, so it
+    # goes through the same `build_box_params` the training loop uses and the two
+    # cannot end up measuring against differently-constructed cuboids.
+    ev.setdefault("box", {})["min_frac"] = float(args.min_frac)
+    ev["box"]["min_rays"] = int(args.min_rays)
     seed = int(args.seed if args.seed is not None
                else cfg4.get("DAGGER", {}).get("seed", 0))
 
@@ -488,8 +659,32 @@ def main() -> None:
     print(f"  success mode: {ctx.eval_params.success_mode}   "
           f"max_steps={ctx.eval_params.max_steps}   "
           f"hold={ctx.eval_params.hold_steps}")
-    print(f"  opportunity : "
-          f"{'ON  min_frac=%.2f' % ctx.eval_params.box.min_frac if ctx.eval_params.box_check else 'OFF'}")
+    bx = ctx.eval_params.box
+    if not ctx.eval_params.box_check:
+        print("  opportunity : OFF")
+    else:
+        n_rays = int(bx.grid_x) * int(bx.grid_z)
+        print(f"  opportunity : gate >= {bx.min_rays}/{n_rays} rays"
+              + (f" and frac >= {bx.min_frac:.2f}" if bx.min_frac > 0 else "")
+              + ("  + PROBE (every gate pass confirmed by actually closing)"
+                 if ctx.eval_params.box_probe else
+                 "  (NO probe — geometry only, an UPPER BOUND)"))
+        # Runs 1-20 logged box_* at min_frac 0.50 with no probe. Anything else is
+        # a different definition of the word, and mixing the two on one axis is
+        # the mistake this note exists to prevent.
+        if abs(bx.min_frac - 0.50) > 1e-9 or ctx.eval_params.box_probe:
+            print(f"                NOTE this is NOT the definition "
+                  f"dagger_log.csv was logged with (min_frac 0.50, no probe), so "
+                  f"the opportunity block below is not comparable to the "
+                  f"training curves. Pass --min-frac 0.5 --min-rays 1 without "
+                  f"--box-probe for a comparable figure.")
+        if bx.min_frac > 0.95:
+            print(f"                WARNING at 1.00 every one of the {n_rays} "
+                  f"rays must hit. Measured on IDEAL pinned grasp poses, pad "
+                  f"occupancy is mean 0.949 / p10 0.798 / min 0.592, so ~10%+ of "
+                  f"scenes cannot register a chance even when perfectly "
+                  f"positioned. Expect opportunity to collapse and the "
+                  f"conditionals below to rest on a small denominator.")
     print(f"  pinning     : {ctx.pin_table.describe() if ctx.pin_table else 'OFF'}")
     print("=" * 78)
 
@@ -508,6 +703,14 @@ def main() -> None:
 
     s = summarise(m, rows, scenes, pool_label, run_root, ckpt_dir, ckpt)
     s["eval_s"] = round(dt, 1)
+    # Saved so the JSON says which definition of "an opportunity" produced its
+    # numbers. Without it a gated-and-probed result and a bare geometric one are
+    # indistinguishable on disk and will eventually be plotted on one axis.
+    s["min_frac"] = (float(ctx.eval_params.box.min_frac)
+                     if ctx.eval_params.box_check else None)
+    s["min_rays"] = (int(ctx.eval_params.box.min_rays)
+                     if ctx.eval_params.box_check else None)
+    s["box_probe"] = bool(ctx.eval_params.box_probe)
     with prefix.with_suffix(".json").open("w") as f:
         json.dump(s, f, indent=2)
 

@@ -136,6 +136,61 @@ def resolve_scenes(args, num_scenes: int):
     return ids
 
 
+def resolve_endgame(run_dir: Path, args):
+    """(target, forward_dist, forward_steps) for this checkpoint.
+
+    `--run-dir` points at a CHECKPOINT directory (`<run>/best`, or an
+    `<run>/iters/iter_NN`), whose config.yaml is the BC training config and says
+    nothing about the endgame. The Phase-4 run config that does — the one with a
+    DAGGER block — sits one or two levels up, so walk up looking for it.
+
+    Worth the trouble because the failure mode is silent: point a pre-grasp
+    policy at the default 'grasp' handling and it shuts the jaws 6.4 cm short of
+    the object on every episode, which looks exactly like a policy that cannot
+    grasp. An explicit --target always wins over what is found here.
+    """
+    cfg4, src = None, None
+    for up in (run_dir.parent, run_dir.parent.parent, run_dir.parent.parent.parent):
+        p = up / "config.yaml"
+        if not p.exists():
+            continue
+        try:
+            with p.open() as f:
+                c = yaml.safe_load(f)
+        except Exception:
+            continue
+        if isinstance(c, dict) and "DAGGER" in c:
+            cfg4, src = c, p
+            break
+
+    dag = (cfg4 or {}).get("DAGGER", {})
+    sim = (cfg4 or {}).get("SIM", {})
+    target = args.target if args.target != "auto" else str(dag.get("target", "grasp"))
+
+    dist = args.forward_dist
+    if dist is None:
+        dist = dag.get("forward_dist")
+    if dist is None:
+        # Same derivation as dagger/pregrasp.forward_dist_default, so this cannot
+        # drift from what collection and evaluation used.
+        dist = float(sim.get("standoff_dist", 0.08)) * (
+            1.0 - 1.0 / int(dag.get("reach_tail", 5)))
+    steps = args.forward_steps
+    if steps is None:
+        steps = int(dag.get("forward_steps", 4))
+
+    if target == "pregrasp":
+        print(f"Endgame: PRE-GRASP — channel 6 commits a blind {float(dist):.3f} m "
+              f"push over {int(steps)} sub-steps, then the hold"
+              + (f"  [from {src}]" if src and args.target == "auto" else ""))
+    elif args.target == "auto" and src is not None:
+        print(f"Endgame: grasp (close in place)  [from {src}]")
+    elif args.target == "auto":
+        print("Endgame: grasp (close in place)  [no Phase-4 config found above "
+              "--run-dir; pass --target explicitly if this policy is a pre-grasp one]")
+    return target, float(dist), int(steps)
+
+
 def load_policy(run_dir: Path, device: str):
     from handover_sim2real.bc import BCPolicy, Normalizer
 
@@ -254,7 +309,8 @@ def rollout(env, model, point_listener, scene_idx, device,
             R_base, panda_base_pos, draw=True,
             show_goal_grasp=False, show_grasp_set=False,
             omg_steps=None, goal_marker_ids=None, pin_table=None,
-            hold_steps=3, dwell_steps=20, show_pred_grasp=False):
+            hold_steps=3, dwell_steps=20, show_pred_grasp=False,
+            target="grasp", forward_dist=0.064, forward_steps=4):
     obs = env.reset(idx=scene_idx)
 
     # Optionally overlay the grasp the policy is supposed to be aiming at. Drawn
@@ -367,10 +423,41 @@ def rollout(env, model, point_listener, scene_idx, device,
         if action[6] < 0.5:
             # Lazy: rollout_worker imports action_to_target_joint from THIS
             # module, so a top-level import here would be circular.
-            from handover_sim2real.rl.rollout_worker import grasp_held_after_hold
+            from handover_sim2real.rl.rollout_worker import (
+                grasp_held_after_hold, _status_name)
             close_step = step
-            print(f"  step {step:3d}  GRASP commanded  ee→ycb={dist:.3f} m  "
-                  f"→ close + hold {hold_steps}")
+
+            # PRE-GRASP MODE (DAGGER.target: pregrasp, e.g. run 21). Channel 6
+            # does NOT mean "close the fingers" there — it means "commit the
+            # blind endgame": the policy has decided it is AT the pre-grasp
+            # standoff, and the CVPR2023 open-loop push takes over from here.
+            # Closing in place instead would shut the jaws 6.4 cm short of the
+            # object and score every episode a miss, so the target has to match
+            # the run or the rollout is meaningless. Same call, same defaults as
+            # dagger/evaluator.py, so what you watch here is what the eval scored.
+            if str(target) == "pregrasp":
+                from handover_sim2real.dagger.pregrasp import open_loop_reach
+                print(f"  step {step:3d}  COMMIT (pre-grasp reached)  "
+                      f"ee→ycb={dist:.3f} m  → blind push {forward_dist:.3f} m "
+                      f"in {forward_steps} steps, then hold {hold_steps}")
+                obs, pushed_done, st = open_loop_reach(
+                    env, obs, steps_action_repeat,
+                    dist=float(forward_dist), num_steps=int(forward_steps))
+                if pushed_done:
+                    # The push itself ended the episode — it swung into the hand
+                    # or knocked the object loose. That is the benchmark's
+                    # failure, not a grasp that missed, and calling it GRASP_MISS
+                    # would hide an over-long forward_dist behind the policy.
+                    # Fall through to the shared reporting path rather than
+                    # returning here, so the debug-line cleanup still runs.
+                    reason = _status_name(st)
+                    success, grasped = False, False
+                    print(f"           the push ended the episode: {reason}")
+                    break
+            else:
+                print(f"  step {step:3d}  GRASP commanded  ee→ycb={dist:.3f} m  "
+                      f"→ close + hold {hold_steps}")
+
             held, obs = grasp_held_after_hold(
                 env, obs, steps_action_repeat, hold_steps)
             grasped = bool(env.grasped_active())
@@ -445,6 +532,30 @@ def parse_args():
     p.add_argument("--run-dir",  required=True, help="output/bc_runs/<name>")
     p.add_argument("--cfg-file", required=True, help="simulator config (e.g. examples/pretrain.yaml)")
     p.add_argument("--scene",    type=int, default=0, help="scene index to roll out")
+    p.add_argument("--split", default=None, choices=["train", "val", "test"],
+                   help="benchmark split to draw the scene from. SCENE INDICES "
+                        "ARE SPLIT-RELATIVE — HandoverBenchmarkWrapper rebuilds "
+                        "_scene_ids per split, so scene 7 of test is not scene 7 "
+                        "of train. Needed to replay a scene named by "
+                        "examples/eval_run_scenes.py --split test. Defaults to "
+                        "whatever --cfg-file sets.")
+    p.add_argument("--target", default="auto",
+                   choices=["auto", "grasp", "pregrasp"],
+                   help="what channel 6 of the action MEANS for this policy. "
+                        "'grasp' (runs 1-20): close the fingers here. 'pregrasp' "
+                        "(run 21+, DAGGER.target: pregrasp): the policy is at the "
+                        "standoff and this commits the CVPR2023 open-loop push, "
+                        "which is executed before the hold. Getting it wrong "
+                        "scores every episode a miss — 'auto' reads DAGGER.target "
+                        "out of the Phase-4 run config above --run-dir, and falls "
+                        "back to 'grasp' if there is none.")
+    p.add_argument("--forward-dist", type=float, default=None,
+                   help="pregrasp only: metres of the blind push along the "
+                        "gripper's local +z. Default: taken from the run config, "
+                        "else derived as standoff_dist*(1-1/reach_tail) = 0.064.")
+    p.add_argument("--forward-steps", type=int, default=None,
+                   help="pregrasp only: sub-steps to spread the push over "
+                        "(default from the run config, else 4)")
     p.add_argument("--max-steps", type=int, default=30, help="max policy steps")
     p.add_argument("--hold-steps", type=int, default=3,
                    help="stable_grasp: policy-steps to hold the gripper shut after "
@@ -519,6 +630,11 @@ def main():
 
     cfg = get_cfg()
     cfg_from_file(filename=args.cfg_file, dict=cfg, merge_to_cn_dict=True)
+    if args.split is not None:
+        # Same key build_sim_cfg sets, so a scene index printed by the evaluator
+        # names the same scene here.
+        cfg.BENCHMARK.SPLIT = args.split
+        print(f"Benchmark split: {args.split} (scene indices are split-relative)")
     if args.freeze_partial_pointcloud:
         cfg.POLICY.FREEZE_PARTIAL_POINTCLOUD = True
     if args.freeze_at_step is not None:
@@ -534,6 +650,7 @@ def main():
 
     env = GraspBenchmarkWrapper(gym.make(cfg.ENV.ID, cfg=cfg))
     point_listener = PointListener(cfg, seed=0)
+    target, fwd_dist, fwd_steps = resolve_endgame(run_dir, args)
     model = load_policy(run_dir, args.device)
 
     panda_base_inv_tf = pybullet.invertTransform(
@@ -569,7 +686,9 @@ def main():
                        pin_table=pin_table,
                        hold_steps=args.hold_steps,
                        dwell_steps=args.dwell_steps,
-                       show_pred_grasp=(args.show_pred_grasp and draw))
+                       show_pred_grasp=(args.show_pred_grasp and draw),
+                       target=target, forward_dist=fwd_dist,
+                       forward_steps=fwd_steps)
 
     # Headless benchmark: roll out many scenes, report success / grasp / dist.
     if args.benchmark:

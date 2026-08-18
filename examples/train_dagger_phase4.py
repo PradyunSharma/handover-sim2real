@@ -447,7 +447,8 @@ LOG_FIELDS = [
     # -- (1) eval
     "success_rate", "grasp_rate", "near_rate", "close_rate",
     "close_success_rate", "chance_rate", "missed_rate", "miss_given_chance",
-    "box_chance_rate", "box_taken_rate", "box_missed_rate", "miss_given_box",
+    "box_chance_rate", "box_taken_rate", "box_success_rate",
+    "box_missed_rate", "miss_given_box",
     "mean_box_steps", "mean_box_frac",
     # DAGGER.target: pregrasp only. `box_after_rate` is that mode's conversion
     # measure: of the episodes where the policy committed, how many had the
@@ -519,7 +520,8 @@ def eval_columns(m: dict | None) -> dict:
     out = {k: _r(m.get(k)) for k in (
         "success_rate", "grasp_rate", "near_rate", "close_rate",
         "close_success_rate", "chance_rate", "missed_rate", "miss_given_chance",
-        "box_chance_rate", "box_taken_rate", "box_missed_rate", "miss_given_box",
+        "box_chance_rate", "box_taken_rate", "box_success_rate",
+        "box_missed_rate", "miss_given_box",
         "mean_box_steps", "mean_box_frac",
         "mean_reach_pos_err", "mean_reach_rot_err", "box_after_rate",
         "eval_min_pos", "eval_min_rot",
@@ -860,6 +862,10 @@ def main() -> None:
         close_pos_thresh=collect_params.close_pos_thresh,
         close_rot_thresh=collect_params.close_rot_thresh,
         box_check=bool(ev.get("box_check", True)),
+        # Second-tier opportunity confirmation. Off by default and NOT recommended
+        # in the training loop — it roughly doubles eval time on the critical
+        # path. Score it afterwards with eval_run_scenes.py --box-probe instead.
+        box_probe=bool(ev.get("box_probe", False)),
         box=box_params,
         # Taken from the COLLECTION params, not re-read from the EVAL block: a
         # policy trained to stop at the pre-grasp and evaluated as if it stopped

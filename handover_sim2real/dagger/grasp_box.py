@@ -46,8 +46,8 @@ cast cannot leave the object colliding with the table (group 1) either.
 
 The reported number is the FRACTION of the grid that hits the object, i.e. how
 much of the CONTACT PAD has material behind it — a proxy for how much the
-fingers would actually close on. A single ray clipping a corner is not an
-opportunity in any useful sense, so callers threshold it (`min_frac`).
+fingers would actually close on. Callers threshold it, but only barely: see
+BoxParams for why the gate is one ray rather than the half-pad it used to be.
 
 THE BOX IS THE PAD, NOT THE FINGER. An earlier version spanned the whole
 53.7 mm finger blade, which diluted the signal roughly 2x with geometry that can
@@ -58,12 +58,13 @@ close rather than gripped. See BoxParams for the measured pad extent.
 THE HUMAN HAND IS INVISIBLE TO THESE RAYS. MANO carries the same style of
 one-bit collision filter as the object (`COLLISION_FILTER_MANO = 2**22`) and the
 patch below widens ONLY the YCB object's mask, so rays pass straight through the
-hand and it can never block one. This makes the metric a pure object test:
-`box_chance_rate` can be true in a configuration where actually closing would
-collide with the human, which is a leading failure mode here. Treat it as an
-UPPER BOUND on real opportunity. Verified by firing a ray at every body's AABB
-centre: plane/table/panda are ray-visible (their groups include bit 0), YCB and
-MANO are not.
+hand and it can never block one. This makes the cast a pure object test: it can
+be true in a configuration where actually closing would collide with the human,
+which is a leading failure mode here. So on its own it is an UPPER BOUND on real
+opportunity — which is precisely why `EvalParams.box_probe` exists to settle it
+with a real close, and why the threshold here can afford to be permissive.
+Verified by firing a ray at every body's AABB centre: plane/table/panda are
+ray-visible (their groups include bit 0), YCB and MANO are not.
 
 Those ray-visible bodies can block, by first-hit semantics — the table in
 particular, if the jaws ever pass near it. Measured at a pinned grasp pose the
@@ -91,29 +92,45 @@ import pybullet
 class BoxParams:
     """Jaw cuboid + the rule for calling one step an opportunity.
 
-    The defaults describe the Panda finger pads and are not meant to be tuned
-    per-run; `min_frac` and `open_thresh` are the two knobs that define the
-    metric, and changing either changes what `box_chance_rate` means across runs.
+    The cuboid defaults describe the Panda finger pads and are not meant to be
+    tuned per-run. `min_rays` / `min_frac` / `open_thresh` are the knobs that
+    define the metric, and changing any of them changes what `opportunity_rate`
+    means across runs.
     """
 
     # ---- what counts as an opportunity ----
-    # Fraction of the ray grid that must hit the object — i.e. how much of the
-    # CONTACT PAD has material behind it. 0.50 = 25 of 49 rays, half the pad,
-    # a patch of roughly 12 x 12 mm on each face.
     #
-    # This is a STRICT reading of "opportunity": the object must be squarely
-    # presented across the pad, not merely clipping it. Measured over a 20-scene
-    # eval of run 7's best checkpoint, that keeps 13 of the 14 episodes that
-    # actually secured the object (92.9%); the one it drops peaked at 0.265, a
-    # grasp that worked on a corner of the pad. On the failure side it halves the
-    # false denominator: 33% of failures clear 0.50 against 67% at 0.20.
+    # THE GATE IS NOW DELIBERATELY PERMISSIVE, because it is no longer the whole
+    # test. With `EvalParams.box_probe` on, this ray cast is only the cheap first
+    # tier: anything that clears it is then settled by actually closing the
+    # gripper and scoring the result (dagger/grasp_probe.py). Precision comes
+    # from that second tier, so the only job left here is to not MISS anything,
+    # and the cheapest way to not miss anything is to ask for a single ray.
     #
-    # The trade is deliberate — `box_chance_rate` now means "had a clean chance"
-    # and slightly UNDER-counts, where a lower threshold over-counted marginal
-    # ones. For reference the full picture on ideal pinned poses: at-grasp
-    # coverage is mean 0.949 / p10 0.798 / min 0.592, and at the 6.4 cm standoff
-    # it is exactly 0.000 in every scene.
-    min_frac: float = 0.50
+    # WHY THE OLD 0.50 HAD TO GO. Measured on run 16's best checkpoint over the
+    # 130-scene test split, `min_frac 0.50` reported a chance in 80 episodes
+    # while 90 secured the object — a chance rate BELOW the success rate, which
+    # is impossible if the metric means what its name says. Recounting the 18
+    # secured-but-no-chance episodes off `box_frac_max` settled why: not one of
+    # them is 0.0. Their peak occupancies run 0.02, 0.06, 0.08, 0.14, 0.14, 0.18,
+    # 0.18, 0.24, 0.29, 0.35, 0.39, 0.39, 0.41, 0.43, 0.43, 0.45, 0.47, 0.49 —
+    # a smooth spread with six of them pressed right up against the old gate.
+    # The rays SEE the object in every successful episode; 0.50 simply refused to
+    # call a thin or small object a chance. Recall against secured episodes runs
+    # 80.0% at 0.50, 86.7% at 0.40, 96.7% at 0.10, 98.9% at 0.06, and only
+    # reaches 100% at one ray.
+    #
+    # Rays, not fraction, is the primary knob: a fraction threshold silently
+    # changes meaning if `grid_x`/`grid_z` ever change, whereas "at least one ray
+    # found object material between the pads" is the same predicate at any grid
+    # resolution.
+    min_rays: int = 1
+    # Secondary, and inert at its default. Kept so an old run can be reproduced
+    # exactly (`min_frac: 0.5` was the setting for runs 1-20) and so a stricter
+    # reading stays one config key away. For reference on ideal pinned poses:
+    # at-grasp coverage is mean 0.949 / p10 0.798 / min 0.592, and at the 6.4 cm
+    # standoff it is exactly 0.000 in every scene.
+    min_frac: float = 0.0
     # Gripper must still be OPEN for the step to be an opportunity — a step taken
     # mid-close is not a chance the policy is declining, and counting it would
     # inflate the denominator with states the policy has already committed from.
@@ -157,6 +174,7 @@ def build_box_params(ev: dict) -> BoxParams:
     bx = (ev or {}).get("box") or {}
     d = BoxParams()
     return BoxParams(
+        min_rays=int(bx.get("min_rays", d.min_rays)),
         min_frac=float(bx.get("min_frac", d.min_frac)),
         open_thresh=float(bx.get("open_thresh", d.open_thresh)),
         half_x=float(bx.get("half_x", d.half_x)),
@@ -331,13 +349,22 @@ def object_in_jaws_frac(env, box: BoxParams, hand_pose=None, gap=None) -> float:
 
 
 def grasp_opportunity(env, box: BoxParams) -> tuple[bool, float]:
-    """(is this step an opportunity, jaw occupancy fraction).
+    """(does this step clear the geometric gate, jaw occupancy fraction).
 
-    An opportunity requires BOTH that the jaws are still open and that enough of
-    the object sits between them. The fraction is returned regardless so callers
-    can log a continuous diagnostic and recalibrate `min_frac` after the fact
-    without re-running the eval.
+    The gate requires that the jaws are still open AND that at least `min_rays`
+    of them found object material (plus the mostly-inert `min_frac` floor). At
+    the default of one ray this is close to "is any part of the object between
+    the open pads at all", which is what makes it usable as the first tier of the
+    hierarchy — see BoxParams. The caller decides whether that is the final
+    verdict or a gate in front of `grasp_probe.probe_grasp_here`.
+
+    The fraction is returned regardless of the verdict so callers can log a
+    continuous diagnostic and recalibrate the threshold after the fact without
+    re-running the eval — a step clears fraction threshold t exactly when the
+    logged `box_frac_max` for the episode is >= t.
     """
-    frac = object_in_jaws_frac(env, box)
+    _, _, mask, frac = jaw_ray_hits(env, box)
     is_open = gripper_open_frac(env) >= box.open_thresh
-    return bool(is_open and frac >= box.min_frac), frac
+    ok = (is_open and int(mask.sum()) >= int(box.min_rays)
+          and frac >= box.min_frac)
+    return bool(ok), frac
