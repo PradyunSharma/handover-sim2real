@@ -270,6 +270,78 @@ python examples/rollout_bc_policy_p5.py --run-dir output/dagger_runs/dagger5_run
 input from it, so the script refuses to run without one. `--max-steps` must match
 `DAGGER.max_steps` (50).
 
+### 6c. Chained regrasping — retry from where the failure happened
+
+`retry_at_k` in `eval_log.csv` is an OR over four **independent** episodes, each
+from its own `env.reset()`. Nothing carries over from the failed attempt, so the
+retry never pays for it. `eval_chained_retry_p5.py` runs the sequence instead:
+roll grasp 0, and on failure rewind to 30 % of that trajectory, switch the
+conditioning to grasp 1, and keep rolling from there.
+
+```bash
+python examples/eval_chained_retry_p5.py --run-dir output/dagger_runs/dagger5_run1 --policy-dir output/dagger_runs/dagger5_run1/last --rewind-frac 0.30
+```
+
+The rewind is `env.reset()` plus a replay of the first *r* recorded joint
+targets. That was chosen over `pybullet.saveState`/`restoreState` because the
+env's Python state — `mano._frame`, `ycb._frame`, `ycb._released`,
+`_release_step_counter_*`, `_elapsed_steps`, `_dropped` — is not in the bullet
+snapshot, and `ycb.release()` additionally swaps the object from a kinematic to a
+dynamic body. Replaying drives all of it through the normal code path, so there
+is no list of counters to keep in sync as handover-sim changes.
+
+Three columns decide whether the headline means anything, in this order:
+
+* **`chained_retry_at_1`** is a control, not a result. Attempt 0 *is* the slot-0
+  episode, so it must reproduce `succ_g0` from the same checkpoint up to rollout
+  noise. If it does not, nothing else here is comparable with anything.
+* **`replay_err_max`** is the assumption the module rests on, in metres of EE
+  divergence at the branch point. It should be ~0.
+* **`retryable_frac`** bounds the claim. The rewind resets the simulator, which
+  rewinds the **human** too — the hand is a DexYCB playback keyed on a frame
+  index — and after a `HUMAN_CONTACT` or `DROP` failure there is no world left to
+  retry in at all. This is the share of retried failures a non-resetting retreat
+  controller could have handled; the complement is the part of the metric that
+  exists only because the simulator can be rewound.
+
+So `chained_retry_at_k` is still an upper bound, just a much tighter one than
+`retry_at_k`: the robot pays for its failed approach, the human does not.
+
+`--rewind-mode first` branches every retry off attempt 0 instead of off the
+attempt that just failed; `--budget fresh` gives the resumed segment a full
+`max_steps` of its own instead of sharing one horizon with the prefix (both stay
+inside the benchmark's own 13 s / 86-policy-step limit). `<out>.h5` holds every
+attempt as a normal `episode_%05d` group with `prefix_len` marking the seam
+between the replayed and the newly chosen steps.
+
+**Watching it happen.** `--render` opens a PyBullet window:
+
+```bash
+python examples/eval_chained_retry_p5.py --run-dir output/dagger_runs/dagger5_run1 --policy-dir output/dagger_runs/dagger5_run1/last --scenes 10 --render
+```
+
+It pauses after each scene rather than closing the window, and the keys go to the
+**PyBullet window** (it needs focus): **N** next, **P** previous, **R** re-run
+this scene, **A** run the rest without pausing, **Q** stop (whatever was rolled
+is still written). While stepping, N *browses* — it walks on into the usable pool
+past whatever `--scenes` listed, so `--scenes 10` means "start at 10" and N goes
+to 11, 12, … skipping anything the pin table does not hold and wrapping at the
+end. Headless runs never extend: there `--scenes` is the workload, and quietly
+rolling extra scenes would change what the reported rates are rates *of*.
+
+The scene's four grasps are gripper wireframes colour-coded by slot — g0 green,
+g1 blue, g2 orange, g3 magenta — with the commanded one drawn bright and thick
+and the others dim. Each attempt's EE path is drawn in its slot colour and left
+up for the whole scene, so a chained retry looks like what it is: a trunk that
+forks. The replayed prefix retraces in grey and the branch point gets a white
+cross-hair. `--show-cloud` adds the point cloud the policy is actually seeing
+(orange object, blue hand), `--pace` / `--replay-pace` / `--pause-s` control the
+timing, and `--no-path` / `--no-grasp-markers` strip it back.
+
+Use a handful of scenes. `--render` changes the offscreen renderer, which changes
+the point cloud, which can flip a borderline close — so take the numbers from a
+headless run and use the window to understand them, not to produce them.
+
 ## What changed against Phase-4 run 16
 
 Run 1 is a **combination run**, not a controlled test — conditioning, the aux
@@ -434,9 +506,16 @@ breaks.
 
 ## Deferred
 
-**True chained retry**, where attempt 2 starts from where attempt 1 stopped rather
-than from home, with any object or hand disturbance persisting. That is the honest
-deployment metric; `retry_at_k` as computed here is its ceiling.
+**A retreat controller** — the last step of true chained retry. §6c closes most
+of the gap `retry_at_k` left: attempt 2 now resumes from a state the policy drove
+itself into rather than from home. What it still does not charge for is the
+**human**, because rewinding by reset-and-replay rewinds the DexYCB playback too.
+The version that charges for both drives the arm backwards along its own recorded
+joint path *without* resetting, so the hand keeps moving and any object
+disturbance persists. It needs three things this repo does not have: gripper
+reopening, a collision-safe reverse servo, and an answer for the failures that
+already ended the episode (`HUMAN_CONTACT`, `DROP`) and leave no world to retry
+in — `retryable_frac` measures how often that last case bites.
 
 **A held-out grasp split** — train on slots 0–2, evaluate on slot 3 — which would
 answer whether the conditioning generalises to a grasp never demonstrated for that

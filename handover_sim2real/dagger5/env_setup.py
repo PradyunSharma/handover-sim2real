@@ -173,7 +173,13 @@ def build_sim_cfg(sim: dict):
     cfg_from_file(filename=sim["cfg_file"], dict=cfg, merge_to_cn_dict=True)
 
     cfg.BENCHMARK.SPLIT = str(sim.get("split", "train"))
-    cfg.SIM.RENDER = False
+    # Headless by default — collection and training must never open a window, and
+    # no saved run config sets this key, so every existing run is unaffected.
+    # `render: true` is opt-in from a viewer (eval_chained_retry_p5.py --render)
+    # and has to be decided HERE: the GUI-vs-DIRECT bullet connection is made
+    # inside gym.make(), so setting cfg.SIM.RENDER after build_sim_context is too
+    # late to have any effect.
+    cfg.SIM.RENDER = bool(sim.get("render", False))
     if bool(sim.get("egl", False)):
         cfg.SIM.BULLET.USE_EGL = True
 
