@@ -16,10 +16,10 @@
 # log cannot be interpreted without it. It is also expensive to regenerate — it
 # is the output of the K=8 collection, not of a planner sweep — and the .h5 it
 # was derived from lives on /scratch and is never committed. A few hundred KB.
-!grasp_cand_table_*_p5.json
+!grasp_cand_table_*_regrasp.json
 !bc_dataset/
-!bc_dataset/*_p5.json
-!bc_dataset/*_p5_excluded.json
+!bc_dataset/*_regrasp.json
+!bc_dataset/*_regrasp_excluded.json
 
 # Track lightweight per-run metadata under rl_runs/ (training logs, plots, and
 # configs) so runs can be committed/pushed for record-keeping. The parent dirs

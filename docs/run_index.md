@@ -75,6 +75,206 @@ extended one} × {DART 0.2, DART 0.5}`, with runs 4 and 8 as the controls. **The
 independent single-variable tests of the off-pose finding, sharing run 10 as
 control.
 
+### Rolling out any of these runs
+
+Set the environment once per shell, from the repo root:
+
+```bash
+export OMG_PLANNER_DIR=$PWD/OMG-Planner GADDPG_DIR=$PWD/GA-DDPG
+export PYTHONPATH="$PWD:$PWD/handover-sim:$PWD/handover-sim/mano_pybullet"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$PWD/OMG-Planner/orocos_kinematics_dynamics/orocos_kdl/release/lib"
+
+R=output/dagger_runs
+RO="python examples/rollout_bc_policy.py --max-steps 50 --show-goal-grasp \
+    --grasp-pin-table output/grasp_pin_table_train_omg.json"
+```
+
+Then one line per run — the **only** thing that changes is `--cfg-file`, which
+must match the camera rig the run trained on, and `--scene`:
+
+```bash
+# --- wrist only -----------------------------------------------------------
+$RO --run-dir $R/dagger4_run3/best  --cfg-file examples/pretrain.yaml --scene 0
+$RO --run-dir $R/dagger4_run4/best  --cfg-file examples/pretrain.yaml --scene 0
+$RO --run-dir $R/dagger4_run6/best  --cfg-file examples/pretrain.yaml --scene 0
+$RO --run-dir $R/dagger4_run7/best  --cfg-file examples/pretrain.yaml --scene 0
+$RO --run-dir $R/dagger4_run8/best  --cfg-file examples/pretrain.yaml --scene 0
+$RO --run-dir $R/dagger4_run9/best  --cfg-file examples/pretrain.yaml --scene 0
+$RO --run-dir $R/dagger4_run10/best --cfg-file examples/pretrain.yaml --scene 0
+$RO --run-dir $R/dagger4_run11/best --cfg-file examples/pretrain.yaml --scene 0
+$RO --run-dir $R/dagger4_run12/best --cfg-file examples/pretrain.yaml --scene 0
+$RO --run-dir $R/dagger4_run13/best --cfg-file examples/pretrain.yaml --scene 0
+$RO --run-dir $R/dagger4_run14/best --cfg-file examples/pretrain.yaml --scene 0
+$RO --run-dir $R/dagger4_run18/best --cfg-file examples/pretrain.yaml --scene 0
+
+# --- wrist + left + right -------------------------------------------------
+$RO --run-dir $R/dagger4_run5/best  --cfg-file examples/pretrain_multicam_wlr.yaml --scene 0
+$RO --run-dir $R/dagger4_run15/best --cfg-file examples/pretrain_multicam_wlr.yaml --scene 0
+$RO --run-dir $R/dagger4_run16/best --cfg-file examples/pretrain_multicam_wlr.yaml --scene 0
+$RO --run-dir $R/dagger4_run17/best --cfg-file examples/pretrain_multicam_wlr.yaml --scene 0
+$RO --run-dir $R/dagger4_run20/best --cfg-file examples/pretrain_multicam_wlr.yaml --scene 0
+
+# --- right only (no wrist) ------------------------------------------------
+$RO --run-dir $R/dagger4_run19/best --cfg-file examples/pretrain_right.yaml --scene 0
+
+# --- wrist + right, PRE-GRASP endgame (see below) -------------------------
+$RO --run-dir $R/dagger4_run21/best --cfg-file examples/pretrain_multicam_wr.yaml --scene 0
+
+# --- runs 1-2 only: the OLDER pin table ----------------------------------
+python examples/rollout_bc_policy.py --max-steps 50 --show-goal-grasp \
+    --grasp-pin-table output/grasp_pin_table_train.json \
+    --run-dir $R/dagger4_run1/best --cfg-file examples/pretrain.yaml --scene 0
+python examples/rollout_bc_policy.py --max-steps 50 --show-goal-grasp \
+    --grasp-pin-table output/grasp_pin_table_train.json \
+    --run-dir $R/dagger4_run2/best --cfg-file examples/pretrain.yaml --scene 0
+```
+
+In the PyBullet window: **N** = next scene, **R** = re-roll the same one,
+**Q** = quit. Pass `--scenes 30,86,32` to walk a specific list with **N**.
+
+Four things about that template are load-bearing:
+
+**`--cfg-file` must match the run's camera rig.** It sets `CAMERAS`, which
+determines what the point cloud contains. A mismatch is not a mild degradation —
+the policy gets an input distribution it never saw, and a healthy run looks
+broken. The grouping above is `SIM.cfg_file` read straight out of each
+`<run>/config.yaml`.
+
+**`--max-steps 50`** because the script defaults to 30 while every Phase-4 run
+evaluated at `EVAL.max_steps: 50`. At 30 a policy that commits late is cut off
+and reads as a `TIMEOUT` that the run itself never had.
+
+**The pin table is the overlay's ground truth, not the policy's.** It only
+affects the green `--show-goal-grasp` gripper — but with the wrong one that
+gripper is drawn at a grasp the run was never aiming at, so a correct rollout
+looks like a miss. Runs 1–2 predate the `_omg` pin rule and need
+`grasp_pin_table_train.json`; runs 3–21 use `grasp_pin_table_train_omg.json`.
+
+**`--split` and the pin table move together.** All the commands above are on the
+train split, which is where these runs were collected and evaluated. To roll out
+a *test*-split scene, add `--split test` **and** switch to
+`output/grasp_pin_table_test_omg.json` in the same edit — scene indices are
+numbered within a split, so scene 30 of test is not scene 30 of train.
+
+**Run 21 needs the open-loop endgame, and gets it automatically.** With
+`DAGGER.target: pregrasp`, channel 6 of the action means "commit the blind push",
+not "close the fingers"; closing in place would shut the jaws 6.4 cm short of the
+object on every episode. `--target` defaults to `auto`, which reads
+`DAGGER.target` out of `<run>/config.yaml`, so nothing extra is needed — but
+check the startup line says `Endgame: PRE-GRASP` before trusting the result.
+Force it with `--target pregrasp` if the checkpoint has been copied away from its
+run directory. See `docs/thesis_phase4_dagger.md` §7.1.
+
+**Most weights are not on the workstation.** Only runs **1, 2, 7, 12, 13, 15, 16**
+have a local `best/checkpoints/`; everything else has logs only and needs the
+snapshot pulled from the cluster first:
+
+```bash
+rsync -avz delftblue:/scratch/pradyunsharma/handover-sim2real/output/dagger_runs/dagger4_runNN/best/ \
+    output/dagger_runs/dagger4_runNN/best/
+```
+
+### Scoring any of these runs on the **test** split
+
+**None of the numbers in the table above are generalisation numbers.** Every
+Phase-4 run sets `SIM.split: train`, and every run except run 1 sets
+`EVAL.holdout: false`, which puts the eval scenes back into the collection pool
+— so the `best iter` / `final` columns are performance on scenes the policy was
+trained on. Measured on run 16 that gap is eleven points: **0.80 logged, 0.692 on
+test**. `examples/eval_run_scenes.py` produces the honest figure.
+
+Same environment block as above, then:
+
+```bash
+R=output/dagger_runs
+EV="python examples/eval_run_scenes.py --split test --box-probe \
+    --grasp-pin-table output/grasp_pin_table_test_omg.json --exclude-scenes none"
+```
+
+**Unlike the rollout commands, there is no `--cfg-file` here.** This script
+rebuilds the simulator from `<run>/config.yaml` through the same
+`build_phase4_context` the training loop uses, so the camera rig, the thresholds,
+`EVAL.max_steps` and the success criterion all come from the run itself and
+cannot drift from what it was scored with in-loop. Only the *split* is
+overridden. That also means `--run-dir` takes the **run root** here, not
+`<run>/best` — the script resolves the checkpoint itself (`--from last` for the
+final policy instead of the best one).
+
+```bash
+$EV --run-dir $R/dagger4_run1  --out-prefix $R/dagger4_run1/scene_eval_test
+$EV --run-dir $R/dagger4_run2  --out-prefix $R/dagger4_run2/scene_eval_test
+$EV --run-dir $R/dagger4_run3  --out-prefix $R/dagger4_run3/scene_eval_test
+$EV --run-dir $R/dagger4_run4  --out-prefix $R/dagger4_run4/scene_eval_test
+$EV --run-dir $R/dagger4_run5  --out-prefix $R/dagger4_run5/scene_eval_test
+$EV --run-dir $R/dagger4_run6  --out-prefix $R/dagger4_run6/scene_eval_test
+$EV --run-dir $R/dagger4_run7  --out-prefix $R/dagger4_run7/scene_eval_test
+$EV --run-dir $R/dagger4_run8  --out-prefix $R/dagger4_run8/scene_eval_test
+$EV --run-dir $R/dagger4_run9  --out-prefix $R/dagger4_run9/scene_eval_test
+$EV --run-dir $R/dagger4_run10 --out-prefix $R/dagger4_run10/scene_eval_test
+$EV --run-dir $R/dagger4_run11 --out-prefix $R/dagger4_run11/scene_eval_test
+$EV --run-dir $R/dagger4_run12 --out-prefix $R/dagger4_run12/scene_eval_test
+$EV --run-dir $R/dagger4_run13 --out-prefix $R/dagger4_run13/scene_eval_test
+$EV --run-dir $R/dagger4_run14 --out-prefix $R/dagger4_run14/scene_eval_test
+$EV --run-dir $R/dagger4_run15 --out-prefix $R/dagger4_run15/scene_eval_test
+$EV --run-dir $R/dagger4_run16 --out-prefix $R/dagger4_run16/scene_eval_test
+$EV --run-dir $R/dagger4_run17 --out-prefix $R/dagger4_run17/scene_eval_test
+$EV --run-dir $R/dagger4_run18 --out-prefix $R/dagger4_run18/scene_eval_test
+$EV --run-dir $R/dagger4_run19 --out-prefix $R/dagger4_run19/scene_eval_test
+$EV --run-dir $R/dagger4_run20 --out-prefix $R/dagger4_run20/scene_eval_test
+
+# --- run 21 is DIFFERENT: pre-grasp endgame, see below --------------------
+python examples/eval_run_scenes.py --split test \
+    --grasp-pin-table output/grasp_pin_table_test_omg.json --exclude-scenes none \
+    --min-frac 0.5 \
+    --run-dir $R/dagger4_run21 --out-prefix $R/dagger4_run21/scene_eval_test
+```
+
+Roughly 10–13 min per run over the 130 usable test scenes. Outputs are
+`<prefix>.csv` (one row per scene), `.json` (the aggregate plus the gate settings
+that produced it) and `.png`.
+
+**Run 21 drops `--box-probe` and pins `--min-frac 0.5`, for two different
+reasons.** With `DAGGER.target: pregrasp` the episode ends 6.4 cm short of the
+object, so the jaws are never around it while the policy is still deciding and
+`opportunity` is near zero *by construction* — the probe refines steps that clear
+the geometric gate and almost none do, and the counterfactual it asks ("would
+closing here secure it?") is not even in that policy's action space, whose
+commit is a blind push. Separately, `eval_run_scenes.py` always overrides
+`EVAL.box.min_frac` from the CLI, whose default is now the permissive one-ray
+gate; `box_after_rate` — the one usable opportunity-style number in pre-grasp
+mode — is computed with those same box params, so `--min-frac 0.5` is what keeps
+the test figure comparable to the 0.50 → 0.65 trajectory in run 21's own
+`dagger_log.csv`. The report grows a pre-grasp block for this run:
+
+```
+  reach after push    pos 0.0564 m   rot 0.9012 rad   (where the blind 0.064 m push LANDED, vs the grasp)
+  object in jaws after   52.2%   of the commits, how many put the object between the open pads
+```
+
+and the `!!` invariant warning will fire legitimately, because successes exceed
+the near-zero opportunity count.
+
+**Runs 1–2: the pose columns are against the wrong pin.** Those two runs were
+collected with the `furthest_from_hand` grasp rule
+(`grasp_pin_table_train.json`), and no non-`_omg` table exists for the test
+split. So `near_rate`, `chance_rate`, `pos_err` and `min_pos` will be measured
+against a grasp they were never taught to aim at. `success_rate`, `grasp_rate`,
+`close_rate` and the whole opportunity block are pin-free and unaffected — and
+both runs failed outright anyway (0.13 and 0.21), so this is a footnote rather
+than a blocker.
+
+**Add `--min-frac 0.5` to the grasp-mode runs too if you want
+`dagger_log.csv`-comparable box columns.** The default one-ray gate plus
+`--box-probe` is the *better* opportunity measure — it is the only setting under
+which `success ⊆ opportunity` actually holds — but it is not the definition runs
+1–20 logged. Use the default for a correct opportunity figure, `--min-frac 0.5
+--min-rays 1` without `--box-probe` to reproduce the training curve's meaning.
+Both are recorded in the output JSON, so the two cannot be confused later.
+
+The same weights caveat applies: only runs **1, 2, 7, 12, 13, 15, 16, 21** have a
+local snapshot, and the rest need the rsync above first. Full documentation of
+the report and its metrics is in `docs/thesis_phase4_dagger.md` §6.
+
 ### The noise floor, finally measured — and it invalidates the 2×2
 
 All six of runs 4, 6, 7, 8, 9, 10 train iteration 0 from an **identical**
@@ -182,8 +382,8 @@ joint state was breaking.
 
 ## Phase 5 — grasp conditioning and regrasping (`output/dagger_runs/`)
 
-Runbook and design notes: [`README_PHASE5.md`](../README_PHASE5.md). Code is a
-full fork (`handover_sim2real/dagger5/`, `bc5/`, `examples/*_p5.py`), so nothing
+Runbook and design notes: [`README_REGRASP.md`](../README_REGRASP.md). Code is a
+full fork (`handover_sim2real/regrasp/`, `bc5/`, `examples/*_p5.py`), so nothing
 above changes.
 
 | run | config | camera | iters | m | grasps/scene | init | model flags | best iter | final | Δ from predecessor |
@@ -353,7 +553,7 @@ Configs without a numbered run file were shared across several runs.
 | `bc_phase4_reachw.yaml` | run 14 `TRAIN.train_cfg` — `DATA.reach_tail_weight: 2.5` |
 | `bc_phase4_all.yaml` | runs 15, 16 `TRAIN.train_cfg` — pm + aux + reach-tail weighting |
 | `bc_phase4_all_prevact.yaml` | run 17 `TRAIN.train_cfg` — same, `MODEL.use_prev_act: true` |
-| `dagger_phase5_run1.yaml` | p5_run1 (`examples/train_dagger_phase5.py`) |
+| `dagger_phase5_run1.yaml` | p5_run1 (`examples/train_regrasp.py`) |
 | `dagger_phase5_smoke.yaml` | Phase-5 shakedown — 2 iters, m=8, 3 eval scenes |
 | `bc_phase5_cond.yaml` | p5_run1 `TRAIN.train_cfg` — `MODEL.grasp_cond`, aux head off, head `[512,256]` |
 

@@ -43,7 +43,7 @@
       "Bash(bash -n examples/slurm/collect_pregrasp_demos.sbatch)",
       "Bash(~/anaconda3/envs/pch2r_dev/bin/python examples/check_pregrasp_demos.py /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/c790be60-5e96-4232-9970-349c38e20b3d/scratchpad/pregrasp_smoke.h5 --cfg /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/c790be60-5e96-4232-9970-349c38e20b3d/scratchpad/cfg_local.yaml)",
       "Bash(echo \"exit=$?\")",
-      "Bash(sed -i 's/Phase4Context/Phase5Context/g; s/build_phase4_context/build_phase5_context/g' handover_sim2real/dagger5/*.py examples/train_dagger_phase5.py examples/eval_dagger_run_p5.py examples/rollout_bc_policy_p5.py && grep -rn \"Phase4Context\\\\|build_phase4_context\" handover_sim2real/dagger5/ examples/*_p5.py examples/train_dagger_phase5.py; echo \"renamed\"; grep -rn \"phase4\\\\|Phase4\" handover_sim2real/dagger5/__init__.py)",
+      "Bash(sed -i 's/Phase4Context/Phase5Context/g; s/build_phase4_context/build_phase5_context/g' handover_sim2real/regrasp/*.py examples/train_dagger_phase5.py examples/eval_dagger_run_p5.py examples/rollout_bc_policy_p5.py && grep -rn \"Phase4Context\\\\|build_phase4_context\" handover_sim2real/regrasp/ examples/*_p5.py examples/train_dagger_phase5.py; echo \"renamed\"; grep -rn \"phase4\\\\|Phase4\" handover_sim2real/regrasp/__init__.py)",
       "Bash(git ls-files *)",
       "Bash(git check-ignore *)",
       "Bash(grep -n \"sbatch\\\\|\\\\\\\\\\\\\\\\$\" README_PHASE5.md)",
@@ -61,11 +61,14 @@
       "Bash(awk -F, 'NR>1 && $2==1 && $14==0 {print $18}' scene_eval_test_probe.csv)",
       "Bash(awk '{a[NR]=$1; s+=$1} END {print \"n =\", NR; print \"min =\", a[1]; print \"p25 =\", a[int\\(NR*0.25\\)+1]; print \"median =\", a[int\\(NR*0.5\\)+1]; print \"p75 =\", a[int\\(NR*0.75\\)+1]; print \"max =\", a[NR]; print \"mean =\", s/NR}')",
       "Bash(awk -F, 'NR>1 && $2==1 && $14==0 {f=$18; if\\(f==0\\) b=\"exactly 0.00\"; else if\\(f<0.10\\) b=\"0.00-0.10\"; else if\\(f<0.25\\) b=\"0.10-0.25\"; else if\\(f<0.40\\) b=\"0.25-0.40\"; else if\\(f<0.50\\) b=\"0.40-0.50 \\(just under\\)\"; else b=\">=0.50 \\(?!\\)\"; c[b]++} END {for\\(k in c\\) printf \"%-24s %3d\\\\n\", k, c[k]}' scene_eval_test_probe.csv)",
-      "Bash(~/anaconda3/envs/pch2r_dev/bin/python -m py_compile examples/rollout_bc_policy.py)"
+      "Bash(~/anaconda3/envs/pch2r_dev/bin/python -m py_compile examples/rollout_bc_policy.py)",
+      "Bash(grep -viE \"warning|futurewarn|payload = |^ *$\")",
+      "Bash(bash /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/faa38ba3-e255-48f1-9964-915b0926f8c6/scratchpad/rename_to_regrasp.sh)",
+      "Bash(bash /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/faa38ba3-e255-48f1-9964-915b0926f8c6/scratchpad/rename_to_regrasp.sh --apply)"
     ],
     "additionalDirectories": [
       "/home/pradyun/h2r/handover-sim2real/examples/configs",
-      "/home/pradyun/h2r/handover-sim2real/handover_sim2real/dagger5"
+      "/home/pradyun/h2r/handover-sim2real/handover_sim2real/regrasp"
     ]
   }
 }
