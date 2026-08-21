@@ -61,21 +61,20 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-# Import grasp_select DIRECTLY, not as handover_sim2real.regrasp.grasp_select.
-# The module itself needs only numpy, but `from pkg.mod import ...` executes the
-# package __init__ first, and regrasp/__init__.py pulls gym, pybullet and the
-# handover envs — so a stage-3 prune that touches nothing but HDF5 and numpy
-# would otherwise demand the full simulator PYTHONPATH. Putting the package
-# directory on sys.path bypasses __init__ entirely and keeps this script (and
-# analyze_direction_spread.py) runnable on a login node with a bare env.
+# regrasp/__init__.py resolves its re-exports lazily (PEP 562), so importing
+# a submodule no longer drags in gym/pybullet/handover or asserts on
+# GADDPG_DIR. This script therefore imports normally. It used to insert the
+# package DIRECTORY on sys.path to bypass __init__ -- a path built from
+# string literals, invisible to every import-graph check, which is exactly
+# how it silently broke during the dagger5 -> regrasp rename.
+
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
-sys.path.insert(0, str(_REPO / "handover_sim2real" / "regrasp"))
 
 import h5py
 import numpy as np
 
-from grasp_select import grasp_distance_matrix, select_diverse_grasps
+from handover_sim2real.regrasp.grasp_select import grasp_distance_matrix, select_diverse_grasps
 
 
 def parse_args() -> argparse.Namespace:

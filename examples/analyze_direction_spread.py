@@ -48,17 +48,20 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# Direct module import, not through the package — see select_regrasp_demos.py
-# for why (regrasp/__init__.py pulls gym/pybullet/handover; this script needs
-# neither, and should run on a login node with a bare env).
+# regrasp/__init__.py resolves its re-exports lazily (PEP 562), so importing
+# a submodule no longer drags in gym/pybullet/handover or asserts on
+# GADDPG_DIR. This script therefore imports normally. It used to insert the
+# package DIRECTORY on sys.path to bypass __init__ -- a path built from
+# string literals, invisible to every import-graph check, which is exactly
+# how it silently broke during the dagger5 -> regrasp rename.
+
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
-sys.path.insert(0, str(_REPO / "handover_sim2real" / "regrasp"))
 
 import h5py
 import numpy as np
 
-from grasp_select import pairwise_mean_distance
+from handover_sim2real.regrasp.grasp_select import pairwise_mean_distance
 
 
 def parse_args() -> argparse.Namespace:
