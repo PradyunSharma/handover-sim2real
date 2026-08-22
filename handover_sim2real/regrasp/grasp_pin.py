@@ -82,6 +82,19 @@ class GraspPinTable:
             return 0
         return min(len(v) for v in self.entries.values())
 
+    @property
+    def max_grasps(self) -> int:
+        """The LARGEST slot count over scenes — the right width for a metric array.
+
+        `num_grasps` is a MIN and is the wrong accessor for a Regrasp table, which
+        deliberately mixes 1-grasp and 2-grasp scenes (a scene that can only reach
+        one direction still contributes a demonstration). A min of 1 there would
+        make every consumer that iterates `range(num_grasps)` silently drop the
+        paired second demonstration — which is the entire point of the pairing.
+        Iterate with `num_grasps_for(scene)`; size arrays with this.
+        """
+        return max((len(v) for v in self.entries.values()), default=0)
+
     def num_grasps_for(self, scene_idx: int) -> int:
         return len(self.entries.get(int(scene_idx), ()))
 
@@ -98,6 +111,20 @@ class GraspPinTable:
         if not grasps or not (0 <= int(grasp_idx) < len(grasps)):
             return None
         return np.asarray(grasps[int(grasp_idx)]["ee_pose_world"], dtype=np.float64)
+
+    def bin_of(self, scene_idx: int, grasp_idx: int = 0):
+        """The approach-direction bin index a slot was ASSIGNED, or None.
+
+        Regrasp tables carry it per grasp (`assign_direction_pairs.py` writes it);
+        a Phase-4/5 table has no such key and returns None, which the collector
+        records as -1. This is the ASSIGNED bin — compare it against the episode's
+        `bin_realized` to see where a failed pin sent the demonstration instead.
+        """
+        grasps = self.entries.get(int(scene_idx))
+        if not grasps or not (0 <= int(grasp_idx) < len(grasps)):
+            return None
+        b = grasps[int(grasp_idx)].get("bin")
+        return None if b is None else int(b)
 
     def describe(self) -> str:
         m = self.meta

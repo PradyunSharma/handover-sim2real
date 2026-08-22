@@ -145,10 +145,21 @@ from collect_bc_dataset import (  # noqa: E402
     dynamic_replan_horizon,
     ACTION_DIM,
     NUM_PTS,
-    PC_CHANNELS,
+    PC_CHANNELS as _BASE_PC_CHANNELS,   # 5; shadowed below, see PC_CHANNELS
     ROBOT_STATE_DIM,
 )
 from rollout_bc_policy import action_to_target_joint  # noqa: E402
+
+from handover_sim2real.regrasp import anchor as _rg_anchor        # noqa: E402
+from handover_sim2real.regrasp import channels as _rg_channels   # noqa: E402
+from handover_sim2real.regrasp import directions as _rg_directions  # noqa: E402
+
+# WHAT WE WRITE IS WIDER THAN WHAT `collect_bc_dataset` DEFINES. That module's
+# PC_CHANNELS is 5 (xyz|ycb|hand) and it is imported by Phase-1..4 code that must
+# keep seeing 5, so it is shadowed here rather than changed: a Regrasp shard
+# stores 8 (…|nx|ny|nz) and the model eats 7 (…|d.n|d.r). Writing the imported 5
+# into the file attr would be a lie that BCDataset's width check then rejects.
+PC_CHANNELS = _rg_channels.STORED_CHANNELS   # 8
 
 # Outcome scoring, imported from the Phase-3 worker rather than reimplemented —
 # the evaluator imports the same two, so a collection outcome and an eval outcome
@@ -709,10 +720,10 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     obs = env.reset(idx=scene_idx)
     sim.point_listener.reset()
     runner.reset()
-    # Cleared until the pin lands. A grasp-conditioned BCRunner raises rather
-    # than acting on a stale goal from the previous episode, which is the failure
-    # this line exists to make impossible.
-    runner.set_goal(None)
+    # Cleared until the pin lands. A direction-conditioned BCRunner raises rather
+    # than acting on a stale command from the previous episode, which is the
+    # failure this line exists to make impossible.
+    runner.set_direction(None)
 
     prev_act6d = np.zeros(6, dtype=np.float32)
     point_clouds, robot_states, expert_actions = [], [], []
@@ -752,6 +763,20 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     goal_idx_prev = None   # OMG's grasp SELECTION index, to detect real switches
     pinned = False
     n_omg_fail = n_goal_switch = n_expert_steps = n_close_labels = 0
+    n_pin_fail = 0
+    n_normal_fallback = n_no_centroid = 0
+    d_world = None         # the command, derived from what OMG flies to
+    # ANCHOR FRAME, computed once at reset. Under the active sim config
+    # (YCB_MANO_START_FRAME: last, MANO_SIMULATION_MODE:
+    # disable_control_and_move_by_reset) the MANO frame index is clamped forever,
+    # so the hand is STATIC and this is a per-episode constant. It is recorded
+    # rather than recomputed at training time because it is what `bin_realized`
+    # is measured in, and because storing the wrist alongside it means the frame
+    # DEFINITION can be changed later as a relabelling pass instead of a
+    # collection campaign.
+    anchor_R = anchor_mode = wrist = mano_side = None
+    bin_assigned = (pin_table.bin_of(int(scene_idx), int(grasp_idx))
+                    if pin_table is not None else None)
     n_reach_steps = 0
     # Settle countdown (CollectParams.commit_settle_steps). None until the close
     # tolerance is first met; 0 or less means "commit on this step".
@@ -853,7 +878,40 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
 
     for step in range(params.max_steps):
         # ----- state exactly as the policy / dataset sees it -----
-        pc = _point_cloud(obs, sim.point_listener, sim.panda_base_inv_tf)
+        # `pc5` is what the runner gets — it appends its own two conditioning
+        # channels from the direction it was handed, exactly as BCDataset does at
+        # training time. `pc8` is what the FILE gets: the same points plus their
+        # estimated normals, which are the d-INDEPENDENT half of the conditioning
+        # and therefore the half that can be stored. Baking d.n and d.r into the
+        # file instead would make the training-time noise augmentation impossible.
+        pc5 = _point_cloud(obs, sim.point_listener, sim.panda_base_inv_tf)
+        pc8, _pcinfo = _rg_channels.pack_stored_cloud(pc5)
+        if step == 0:
+            # ANCHOR FRAME, once, from the step-0 cloud. Reusing `pc5` rather
+            # than re-reading matters: `_point_cloud` resamples the listener's
+            # accumulated points on every call, so a second read at the same sim
+            # step would silently change the cloud that gets recorded.
+            #
+            # Under the active config (YCB_MANO_START_FRAME: last,
+            # MANO_SIMULATION_MODE: disable_control_and_move_by_reset) the hand is
+            # STATIC for the whole episode, so one read is the whole truth.
+            # `wrist_world` is stored anyway, so the frame DEFINITION can be
+            # changed later as a relabelling pass rather than a re-collection.
+            wrist = _rg_anchor.wrist_world(env)
+            mano_side = _rg_anchor.handedness(env)
+            _c_ee = _rg_channels.object_centroid(pc5, fallback_to_all=False)
+            if _c_ee is not None:
+                _c_w = _rg_anchor.centroid_to_world(
+                    _c_ee, obs, sim.panda_base_inv_tf,
+                    sim.cfg.ENV.PANDA_BASE_POSITION,
+                    sim.cfg.ENV.PANDA_BASE_ORIENTATION)
+                anchor_R, _ameta = _rg_anchor.anchor_rotation(
+                    _c_w, wrist, np.asarray(sim.cfg.ENV.PANDA_BASE_POSITION),
+                    _rg_anchor.AnchorState())
+                anchor_mode = _ameta["mode"]
+        n_normal_fallback += int(_pcinfo.get("n_fallback", 0))
+        n_no_centroid += int(bool(_pcinfo.get("no_centroid", False)))
+        pc = pc8
         rs = _robot_state(obs, prev_act6d)
 
         expert_target_jp = None
@@ -920,16 +978,24 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                 # pose read back afterwards becomes the learner's conditioning
                 # for the rest of the episode.
                 if step == 0 and pin_table is not None:
-                    if not pin_table.apply(env, scene_idx, grasp_idx):
-                        # Phase 4 carried on with OMG's own selection here. Phase
-                        # 5 cannot: `grasp_idx` names the target, the learner is
-                        # conditioned on it, and an episode that quietly flew
-                        # somewhere else would be mislabelled in the aggregate.
-                        return None, {"scene_idx": scene_idx,
-                                      "grasp_idx": int(grasp_idx),
-                                      "skipped": True, "reason": "PIN_FAIL",
-                                      "steps": 0, "n_omg_fail": n_omg_fail}
-                    pinned = True
+                    # PIN FAILURE IS RECOVERABLE NOW, and that is a direct
+                    # consequence of conditioning on a direction. Phase 5 had to
+                    # abandon the episode here: `grasp_idx` NAMED the target, the
+                    # learner was conditioned on that exact pose, and an episode
+                    # that quietly flew elsewhere would be mislabelled. Under
+                    # Regrasp the command is DERIVED from whatever the expert
+                    # actually flies to, so a failed pin just means the episode
+                    # demonstrates a different direction than intended — which is
+                    # still a correct demonstration, provided it is re-binned.
+                    # `bin_assigned` vs `bin_realized` records the difference.
+                    #
+                    # The ~1% irreducible pin-failure rate (the goal set is
+                    # re-drawn with np.random.choice for the 97 subsample-capped
+                    # scenes, so a recorded pose can simply be absent) therefore
+                    # stops costing episodes.
+                    pinned = bool(pin_table.apply(env, scene_idx, grasp_idx))
+                    if not pinned:
+                        n_pin_fail += 1
                     # Pruning renumbers the goal set (the pinned grasp becomes
                     # index 0), so re-baseline the switch counter or the
                     # renumbering itself reads as a switch on the next step.
@@ -944,7 +1010,15 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                     # Condition the learner on what the expert is actually flying
                     # to, not on what the table says it should be — they agree to
                     # within match_tol, and this one is true by construction.
-                    runner.set_goal(grasp_pose)
+                    # CONDITION ON WHAT THE EXPERT IS ACTUALLY FLYING TO, not on
+                    # what the table says it should be. With a successful pin the
+                    # two agree to within match_tol and this is simply the more
+                    # honest of two equal answers; with a FAILED pin it is the
+                    # only correct one, and it is what makes the failure
+                    # recoverable rather than fatal.
+                    if grasp_pose is not None:
+                        d_world = _rg_directions.approach_direction(grasp_pose)
+                        runner.set_direction(d_world)
 
                 # ----- COMMIT THE REACH once the EE reaches the standoff -----
                 # Beyond this point replanning is actively harmful: the standoff
@@ -1063,7 +1137,12 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # (ACT's history buffer / chunk queue) that keeps its bookkeeping
         # advancing exactly as it would in deployment. For the single-frame
         # policy it is simply one forward pass.
-        policy_action = runner.act(pc, rs)   # [7], ch6 in {0,1}
+        # `pc5`, NOT `pc`: the runner appends its own two conditioning channels
+        # from the direction it was set, which is what makes the online cloud
+        # bit-identical to the one BCDataset builds from `pc8` + the same d.
+        # Handing it the stored 8-channel array instead would reach `predict`
+        # with the wrong width and fail on the first conv.
+        policy_action = runner.act(pc5, rs)   # [7], ch6 in {0,1}
 
         # ----- DART Sigma estimate: (pi_theta(x) - pi*(x))(...)^T at this state.
         # Accumulated in BOTH modes so a jolt run still reports what the noise
@@ -1345,12 +1424,34 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         "robot_states": np.asarray(robot_states, dtype=np.float32),
         "expert_actions": np.asarray(expert_actions, dtype=np.float32),
         "scene_idx": int(scene_idx),
-        # Phase 5. The slot the sampler asked for, and the pose the episode
-        # actually flew to — the training set's conditioning target, carried on
-        # the episode so no table lookup can ever disagree with it.
+        # The slot the sampler asked for, and the pose the episode ACTUALLY flew
+        # to. Carried on the episode so no table lookup can ever disagree with it.
         "grasp_idx": int(grasp_idx),
         "grasp_pose_world": (np.eye(4, dtype=np.float32) if grasp_pose is None
                              else np.asarray(grasp_pose, dtype=np.float32)),
+        # REGRASP. `d_world` is THE conditioning: one unit vector per episode,
+        # derived from the pose the expert flew to rather than from the table, so
+        # a pin that missed is still correctly labelled. BCDataset rotates it into
+        # the current EE frame every step; storing it per step would be T x 3
+        # floats saying the same thing.
+        "d_world": (np.zeros(3, dtype=np.float32) if d_world is None
+                    else np.asarray(d_world, dtype=np.float32)),
+        # ASSIGNED vs REALIZED. They differ exactly when the pin failed and the
+        # episode flew to OMG's own pick instead. Recording both is what turns
+        # the ~1% irreducible pin-failure rate from lost episodes into re-binned
+        # ones, and lets an analysis exclude them if it wants to.
+        "bin_assigned": int(bin_assigned) if bin_assigned is not None else -1,
+        "bin_realized": (-1 if d_world is None
+                         else int(_rg_directions.bin_of(
+                             _rg_directions.from_world(d_world, anchor_R)
+                             if anchor_R is not None else d_world))),
+        "anchor_R": (np.eye(3, dtype=np.float32) if anchor_R is None
+                     else np.asarray(anchor_R, dtype=np.float32)),
+        "anchor_mode": str(anchor_mode or "unset"),
+        "wrist_world": (np.full(3, np.nan, dtype=np.float32) if wrist is None
+                        else np.asarray(wrist, dtype=np.float32)),
+        "mano_side": str(mano_side or "unknown"),
+        "pin_ok": int(bool(pinned)),
     }
     stats = {
         "scene_idx": int(scene_idx),
@@ -1450,7 +1551,14 @@ class DaggerHDF5Writer:
         self._f.attrs["action_dim"] = ACTION_DIM
         self._f.attrs["action_format"] = "delta_pos(3)+delta_euler(3)+gripper_cmd(1)"
         self._f.attrs["dagger"] = True
+        # Left at 5 deliberately: archived Phase-5 shards carry it and
+        # changing the number would make them unreadable by anything that
+        # checks. `schema` is the field that names Regrasp.
         self._f.attrs["dagger_phase"] = 5
+        self._f.attrs["schema"] = "regrasp-v1"
+        self._f.attrs["pc_format"] = (
+            "xyz(3)+ycb(1)+hand(1)+normal(3) in EE frame; the two\n"
+            "conditioning channels d.n and d.r are built at load time")
         for key, val in (attrs or {}).items():
             self._f.attrs[key] = val
 
@@ -1467,6 +1575,14 @@ class DaggerHDF5Writer:
         grp.attrs["grasp_idx"] = episode.get("grasp_idx", 0)
         if "grasp_pose_world" in episode:
             grp.attrs["grasp_pose_world"] = episode["grasp_pose_world"]
+        # REGRASP schema. `d_world` is the one BCDataset requires; the rest are
+        # provenance, and `wrist_world` in particular is what lets the anchor
+        # frame be re-derived under a different definition as a relabelling pass
+        # rather than a re-collection.
+        for _k in ("d_world", "bin_assigned", "bin_realized", "anchor_R",
+                   "anchor_mode", "wrist_world", "mano_side", "pin_ok"):
+            if _k in episode:
+                grp.attrs[_k] = episode[_k]
         for name in ("point_clouds", "robot_states", "expert_actions"):
             grp.create_dataset(name, data=episode[name], compression="gzip")
         self._n += 1

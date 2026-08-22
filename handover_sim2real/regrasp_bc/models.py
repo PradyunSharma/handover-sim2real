@@ -140,43 +140,17 @@ class RobotEncoder(nn.Module):
         return self.net(rs)
 
 
-# ── goal-grasp encoder (Phase 5) ─────────────────────────────────────────────
-
-class GraspEncoder(nn.Module):
-    """Plain MLP: goal grasp in the CURRENT EE frame [B, 9] -> [B, grasp_feat_dim].
-
-    Structurally a second RobotEncoder, and injected at the same place — the
-    fused feature vector, following `rl/actor.py`'s `clock_dim`, whose docstring
-    gives the reason: "Injecting at the fused level (rather than into the
-    robot-state vector, as GA-DDPG does) keeps the two encoders shape-identical
-    to the BC policy, so warm-starting from a trained BC checkpoint is a clean
-    1:1 load." The same holds here — a Phase-4 checkpoint's pc_encoder and
-    robot_encoder still load 1:1 into a Phase-5 model.
-
-    Input is rot6d(6) + translation(3), not the aux head's quaternion(4)+trans(3).
-    For a regression *target* the quaternion is fine; for an *input* its double
-    cover (q and -q are the same rotation) makes the mapping the MLP has to learn
-    discontinuous for no benefit. rot6d — the first two columns of R, Zhou et al.
-    2019 — is continuous and needs no normalization.
-    """
-
-    def __init__(self,
-                 in_dim: int = 9,
-                 hidden_dim: int = 128,
-                 feature_dim: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, feature_dim),
-            nn.ReLU(inplace=True),
-        )
-        self.in_dim = in_dim
-        self.feature_dim = feature_dim
-
-    def forward(self, goal: torch.Tensor) -> torch.Tensor:
-        return self.net(goal)
-
+# The Phase-5 GraspEncoder lived here: an MLP taking the goal grasp in the EE
+# frame and concatenating its embedding into the fused vector. Regrasp deletes it.
+# The conditioning is now a DIRECTION injected PER-POINT into the cloud
+# (regrasp/channels.py), so the points on the commanded approach side are marked
+# in the input rather than described by a vector beside it. That makes
+# `pc_channels` 7 instead of 5 and returns `fused_dim` to 2 * feature_dim.
+#
+# If dir_track comes back flat, the first thing to try is putting a small global
+# d-branch back here alongside the per-point channels — the SA layers max-pool,
+# and two scalars among ten input features can be washed out. The difference
+# between that run and this one is the measurement of how much pooling destroys.
 
 # ── policy head ──────────────────────────────────────────────────────────────
 
@@ -236,10 +210,6 @@ class BCPolicy(nn.Module):
                  aux_head: bool = False,
                  aux_dim: int = 7,
                  aux_hidden=(256, 256),
-                 grasp_cond: bool = False,
-                 grasp_cond_dim: int = 9,
-                 grasp_hidden: int = 128,
-                 grasp_feat_dim: int = 128,
                  normalizer=None):
         super().__init__()
         # The stored robot_state always has `robot_state_dim` channels, laid out
@@ -301,13 +271,9 @@ class BCPolicy(nn.Module):
         # Changes policy_head's in_dim, so a Phase-4 checkpoint cannot strict-load
         # into a conditioned model — same situation as drop_joint_state and the
         # aux head, and the run's config.yaml is again the only record.
-        self.grasp_cond = bool(grasp_cond)
-        self.grasp_cond_dim = int(grasp_cond_dim) if self.grasp_cond else 0
-        self.grasp_encoder = (GraspEncoder(in_dim=self.grasp_cond_dim,
-                                           hidden_dim=grasp_hidden,
-                                           feature_dim=grasp_feat_dim)
-                              if self.grasp_cond else None)
-        fused_dim = 2 * feature_dim + (grasp_feat_dim if self.grasp_cond else 0)
+        # No conditioning branch: the direction rides in the cloud's channels 5
+        # and 6, so the fused vector is just perception + proprioception.
+        fused_dim = 2 * feature_dim
 
         self.policy_head = PolicyHead(
             in_dim=fused_dim,
@@ -339,21 +305,19 @@ class BCPolicy(nn.Module):
         # situation drop_joint_state already has, and the run's config.yaml is
         # again the only record.
         #
-        # Phase-5 note: with grasp_cond on, this head's target IS its own input
-        # (both are the goal grasp in the current EE frame), so it degenerates to
-        # an identity map and teaches nothing. Phase-5 configs set
-        # MODEL.aux_head: false / LOSS.aux_weight: 0.0. The two flags therefore
-        # move together against run 16 and cannot be separated — a confound worth
-        # stating rather than hiding.
+        # REGRASP: THIS HEAD IS LEGITIMATE AGAIN. Under Phase-5 grasp
+        # conditioning its target (the goal grasp in the EE frame) WAS its own
+        # input, so it degenerated to an identity map, taught nothing, and the
+        # configs had to force it off — which made "conditioning on" and "aux head
+        # off" a confound that could not be separated. The policy is no longer
+        # told the goal pose, only a direction, so predicting the pose is a real
+        # auxiliary task once more. Still off by default in bc_regrasp.yaml (one
+        # variable at a time), but the constraint that REQUIRED it off is gone.
         self.aux_dim = int(aux_dim) if aux_head else 0
         self.aux_head = (PolicyHead(in_dim=fused_dim,
                                     hidden=tuple(aux_hidden),
                                     action_dim=self.aux_dim)
                          if self.aux_dim else None)
-        if self.aux_head is not None and self.grasp_cond:
-            print("[model] WARNING aux_head is on together with grasp_cond: the "
-                  "head's target is its own input, so the auxiliary loss is an "
-                  "identity map and carries no signal.")
         self.feature_dim = feature_dim
         self.action_dim  = action_dim
         # Normalizer is *not* a submodule — it's a plain Python object that
@@ -420,44 +384,36 @@ class BCPolicy(nn.Module):
         return rs[..., lo:hi]
 
     # ----- forward (training) ----------------------------------------------
-    def _features(self, pc: torch.Tensor, rs: torch.Tensor,
-                  goal: torch.Tensor | None = None) -> torch.Tensor:
-        """Concatenated [scene ‖ robot (‖ goal)] features — one PointNet++ pass."""
-        scene = self.pc_encoder(pc)
-        robot = self.robot_encoder(self._select_robot_state(rs))
-        parts = [scene, robot]
-        if self.grasp_encoder is not None:
-            if goal is None:
-                raise ValueError(
-                    "this policy was built with MODEL.grasp_cond: true, so every "
-                    "forward/predict needs the goal grasp in the current EE frame "
-                    "[B, %d]. Passing None would silently condition on nothing."
-                    % self.grasp_cond_dim)
-            parts.append(self.grasp_encoder(goal[..., :self.grasp_cond_dim]))
-        return torch.cat(parts, dim=-1)
+    def _features(self, pc: torch.Tensor, rs: torch.Tensor) -> torch.Tensor:
+        """Concatenated [scene ‖ robot] features — one PointNet++ pass.
 
-    def forward(self, pc: torch.Tensor, rs: torch.Tensor,
-                goal: torch.Tensor | None = None) -> torch.Tensor:
-        """Raw action [B, 7]. Return type is UNCHANGED by the aux head, so every
-        existing caller (predict, PolicyRunner, the evaluator, the rollouts) is
-        untouched whether the head is present or not.
-
-        `goal` is required iff the model was built with grasp_cond, and is the
-        goal grasp expressed in the CURRENT EE frame — rot6d(6) + trans(3), which
-        is what `regrasp_bc/dataset.goal_cond_from_state` produces. It changes every step
-        even though the world-frame grasp does not, because the EE moves.
+        THE CONDITIONING IS ALREADY IN `pc`. Channels 5 and 6 are `d . n_i` and
+        `d . normalize(p_i - c)`, appended per point by
+        `regrasp.channels.append_direction_channels`, so there is no third branch
+        and no argument that can be forgotten. That is the main ergonomic win of
+        moving the conditioning into the cloud: a caller cannot silently condition
+        on nothing, because the tensor it already has to pass carries it.
         """
-        return self.policy_head(self._features(pc, rs, goal))
+        return torch.cat([self.pc_encoder(pc),
+                          self.robot_encoder(self._select_robot_state(rs))], dim=-1)
 
-    def forward_aux(self, pc: torch.Tensor, rs: torch.Tensor,
-                    goal: torch.Tensor | None = None):
+    def forward(self, pc: torch.Tensor, rs: torch.Tensor) -> torch.Tensor:
+        """Raw action [B, 7] from a [B, N, 7] cloud.
+
+        Return type is UNCHANGED by the aux head, so every caller (predict,
+        PolicyRunner, the evaluator, the rollouts) is untouched whether the head
+        is present or not.
+        """
+        return self.policy_head(self._features(pc, rs))
+
+    def forward_aux(self, pc: torch.Tensor, rs: torch.Tensor):
         """(action [B, 7], goal [B, 7] or None) from ONE encoder pass.
 
         The goal's quaternion block is L2-normalized here rather than in the loss,
         so whatever reads the head gets a unit quaternion — GA-DDPG normalizes in
         the same place (core/networks.py `extra_pred`).
         """
-        feat = self._features(pc, rs, goal)
+        feat = self._features(pc, rs)
         action = self.policy_head(feat)
         if self.aux_head is None:
             return action, None
@@ -469,8 +425,7 @@ class BCPolicy(nn.Module):
 
     # ----- inference helper -------------------------------------------------
     @torch.no_grad()
-    def predict(self, pc: torch.Tensor, rs: torch.Tensor,
-                goal: torch.Tensor | None = None) -> torch.Tensor:
+    def predict(self, pc: torch.Tensor, rs: torch.Tensor) -> torch.Tensor:
         """Run inference and return a deployable action.
 
         If a Normalizer is attached:
@@ -478,14 +433,14 @@ class BCPolicy(nn.Module):
           2. action channels 0..5 are denormalized after.
         Gripper logit (channel 6) is passed through sigmoid and thresholded.
 
-        `goal` is NOT normalized — it is already an EE-relative displacement in
-        metres and radians-free (rot6d), i.e. the same kind of quantity the action
-        channels are, and centred near zero by construction. Normalizing it would
-        also make it depend on statistics the real robot cannot reproduce.
+        THE CLOUD IS NEVER NORMALIZED, and that now covers the conditioning too:
+        channels 5 and 6 are dot products of unit vectors, so they already live in
+        [-1, 1] with no dataset statistics involved — which is exactly the
+        property the real robot needs, since it cannot reproduce those statistics.
         """
         self.eval()
         rs_in = self.normalizer.normalize_state(rs) if self.normalizer is not None else rs
-        raw   = self.forward(pc, rs_in, goal)
+        raw   = self.forward(pc, rs_in)
         if self.normalizer is not None:
             raw = self.normalizer.denormalize_action(raw)
         cont    = raw[..., :6]

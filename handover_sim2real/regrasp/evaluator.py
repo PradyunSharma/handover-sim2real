@@ -383,14 +383,21 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
     opportunities they are. `box_taken_rate` is the conversion of the latter.
     """
     pregrasp = str(params.target) == "pregrasp"
-    # Phase 5: every scene is scored under EVERY pinned grasp, so the eval set is
-    # `num_grasps` x larger than `scenes` and each episode carries the slot it was
-    # conditioned on. That is what makes the per-slot rates, retry@k and
-    # cond_track all fall out of one pass.
-    num_grasps = int(getattr(pin_table, "num_grasps", 1) or 1)
+    # Every scene is scored under EVERY direction it can supply, and each episode
+    # carries the slot it was conditioned on — that is what makes the per-bin
+    # rates, retry@k and dir_track all fall out of one pass.
+    #
+    # `max_grasps`, NOT `num_grasps`: the latter is a MIN over scenes and reads 1
+    # on a Regrasp table (which mixes 1- and 2-direction scenes), which would
+    # score only the first direction of every scene and quietly halve the eval.
+    # The per-scene count drives the actual iteration.
+    num_grasps = int(getattr(pin_table, "max_grasps", 0) or
+                     getattr(pin_table, "num_grasps", 1) or 1)
     rows = []
     for i, scene in enumerate(scenes):
-        for gi in range(num_grasps):
+        n_here = (pin_table.num_grasps_for(int(scene))
+                  if pin_table is not None else num_grasps)
+        for gi in range(max(int(n_here), 1)):
             # proximity needs a grasp pose; stable_grasp only wants one if a pin
             # table makes it free (it is a diagnostic there, not the score).
             grasp_pose = None

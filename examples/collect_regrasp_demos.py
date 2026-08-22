@@ -60,6 +60,9 @@ import handover_sim2real # registers HandoverSim2RealTrainEnv-v1
 
 from handover.benchmark_wrapper import HandoverBenchmarkWrapper, EpisodeStatus
 from handover_sim2real.config import get_cfg
+from handover_sim2real.regrasp import anchor as _rg_anchor
+from handover_sim2real.regrasp import channels as _rg_channels
+from handover_sim2real.regrasp import directions as _rg_directions
 from handover_sim2real.policy import PointListener
 from handover_sim2real.utils import add_sys_path_from_env
 
@@ -73,7 +76,10 @@ from experiments.config import cfg_from_file
 ROBOT_STATE_DIM = 32   # joint_pos(9) + joint_vel(9) + EE(7) + gripper(1) + prev_act(6)
 ACTION_DIM      = 7    # Δpos(3) + Δeuler(3) + gripper_cmd(1)
 NUM_PTS         = 1024
-PC_CHANNELS     = 5    # xyz + ycb_flag + hand_flag
+# 8 on disk (xyz|ycb|hand|nx|ny|nz), 7 into the model (…|d.n|d.r). The two
+# conditioning channels depend on the COMMAND, which is perturbed at training
+# time, so only the d-independent half — the normals — can be stored.
+PC_CHANNELS     = 8
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -220,9 +226,15 @@ def collect_episode(env, point_listener, cfg, scene_idx,
     if expert_plan is None:
         return None
 
+    pin_ok = True
     if pin_table is not None:
-        if not pin_table.apply(env, scene_idx, grasp_idx):
-            return None
+        # A FAILED PIN NO LONGER LOSES THE EPISODE. Phase 5 returned None here
+        # because `grasp_idx` NAMED the conditioning target; under Regrasp the
+        # command is derived from whatever the planner actually flies to, so the
+        # episode is still a correct demonstration — of a different direction.
+        # `bin_assigned` vs `bin_realized` records that. This recovers the ~1%
+        # irreducible failures caused by the goal set being re-drawn.
+        pin_ok = bool(pin_table.apply(env, scene_idx, grasp_idx))
         expert_plan, _ = env.run_omg_planner(cfg.RL_MAX_STEP, scene_idx,
                                              reset_scene=False)
         if expert_plan is None:
@@ -242,8 +254,28 @@ def collect_episode(env, point_listener, cfg, scene_idx,
     done = False
     info = {}
 
+    # The anchor frame, once, from the step-0 cloud — see regrasp/anchor.py. The
+    # hand is static under this config, so one read is the whole episode.
+    anchor_R = anchor_mode = None
+    wrist = _rg_anchor.wrist_world(env)
+    mano_side = _rg_anchor.handedness(env)
+    d_world = _rg_directions.approach_direction(grasp_pose)
+    _ba = pin_table.bin_of(scene_idx, grasp_idx) if pin_table is not None else None
+    _bin_assigned = None if _ba is None else int(_ba)
+
     for step in range(stop_step):
-        pc    = _point_cloud(obs, point_listener, panda_base_inv_tf)
+        pc5   = _point_cloud(obs, point_listener, panda_base_inv_tf)
+        pc, _ = _rg_channels.pack_stored_cloud(pc5)
+        if step == 0:
+            c_ee = _rg_channels.object_centroid(pc5, fallback_to_all=False)
+            if c_ee is not None:
+                c_w = _rg_anchor.centroid_to_world(
+                    c_ee, obs, panda_base_inv_tf,
+                    cfg.ENV.PANDA_BASE_POSITION, cfg.ENV.PANDA_BASE_ORIENTATION)
+                anchor_R, _am = _rg_anchor.anchor_rotation(
+                    c_w, wrist, np.asarray(cfg.ENV.PANDA_BASE_POSITION),
+                    _rg_anchor.AnchorState())
+                anchor_mode = _am["mode"]
         rs    = _robot_state(obs, prev_act6d)
         delta = env.convert_target_joint_position_to_action(expert_plan[step])  # [6]
         act   = np.concatenate([delta, [1.0]]).astype(np.float32)  # gripper open
@@ -266,7 +298,8 @@ def collect_episode(env, point_listener, cfg, scene_idx,
 
     # Append gripper-close transition at the pre-grasp pose
     if not done:
-        pc = _point_cloud(obs, point_listener, panda_base_inv_tf)
+        pc, _ = _rg_channels.pack_stored_cloud(
+            _point_cloud(obs, point_listener, panda_base_inv_tf))
         rs = _robot_state(obs, prev_act6d)
         close_act = np.concatenate(
             [np.zeros(6, dtype=np.float32), [0.0]]
@@ -283,6 +316,21 @@ def collect_episode(env, point_listener, cfg, scene_idx,
         "scene_idx":      scene_idx,
         "grasp_idx":      int(grasp_idx),
         "grasp_pose_world": grasp_pose,                                # [4, 4]
+        # ---- Regrasp conditioning + provenance ----
+        "d_world":        np.asarray(d_world, dtype=np.float32),
+        # `x or -1` would map bin 0 (+x, the MOST common bin) to -1, because 0
+        # is falsy. Explicit None check, always.
+        "bin_assigned":   _bin_assigned if _bin_assigned is not None else -1,
+        "bin_realized":   (-1 if anchor_R is None else
+                           int(_rg_directions.bin_of(
+                               _rg_directions.from_world(d_world, anchor_R)))),
+        "anchor_R":       (np.eye(3, dtype=np.float32) if anchor_R is None
+                           else np.asarray(anchor_R, dtype=np.float32)),
+        "anchor_mode":    str(anchor_mode or "unset"),
+        "wrist_world":    (np.full(3, np.nan, dtype=np.float32) if wrist is None
+                           else np.asarray(wrist, dtype=np.float32)),
+        "mano_side":      str(mano_side or "unknown"),
+        "pin_ok":         int(pin_ok),
     }
 
 
@@ -407,7 +455,9 @@ def main():
         f.attrs["action_dim"]      = ACTION_DIM
         f.attrs["action_format"]   = "delta_pos(3)+delta_euler(3)+gripper_cmd(1)"
         f.attrs["robot_state_fmt"] = "joint_pos(9)+joint_vel(9)+ee_xyz(3)+ee_wxyz(4)+gripper_norm(1)+prev_act(6)"
-        f.attrs["pc_format"]       = "xyz(3)+ycb_flag(1)+hand_flag(1) in EE frame"
+        f.attrs["pc_format"]       = ("xyz(3)+ycb(1)+hand(1)+normal(3) in EE "
+                                      "frame; d.n and d.r are built at load")
+        f.attrs["schema"]          = "regrasp-v1"
         f.attrs["freeze_partial_pointcloud"]  = cfg.POLICY.FREEZE_PARTIAL_POINTCLOUD
         f.attrs["freeze_at_step"]             = cfg.POLICY.FREEZE_PARTIAL_POINTCLOUD_AT_STEP
         # PROVENANCE — which grasp set these labels aim at. Without it a dataset
@@ -461,6 +511,13 @@ def main():
             # table at training time.
             grp.attrs["grasp_idx"]        = episode["grasp_idx"]
             grp.attrs["grasp_pose_world"] = episode["grasp_pose_world"]
+            # Regrasp: `d_world` is the one BCDataset requires; the rest are
+            # provenance. `wrist_world` in particular lets the anchor frame be
+            # re-derived under a different definition as a relabelling pass.
+            for _k in ("d_world", "bin_assigned", "bin_realized", "anchor_R",
+                       "anchor_mode", "wrist_world", "mano_side", "pin_ok"):
+                if _k in episode:
+                    grp.attrs[_k] = episode[_k]
             grp.create_dataset("point_clouds",   data=episode["point_clouds"],   compression="gzip")
             grp.create_dataset("robot_states",   data=episode["robot_states"],   compression="gzip")
             grp.create_dataset("expert_actions", data=episode["expert_actions"], compression="gzip")

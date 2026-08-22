@@ -73,7 +73,9 @@
       "Bash(/home/pradyun/anaconda3/envs/pch2r_dev/bin/python -c ' *)",
       "Bash(env -u PYTHONPATH -u GADDPG_DIR -u OMG_PLANNER_DIR /home/pradyun/anaconda3/envs/pch2r_dev/bin/python examples/analyze_direction_feasibility.py)",
       "Bash(env -u PYTHONPATH -u GADDPG_DIR -u OMG_PLANNER_DIR /home/pradyun/anaconda3/envs/pch2r_dev/bin/python examples/analyze_direction_feasibility.py --out output/direction_feasibility_train.json)",
-      "Bash(bash -n examples/slurm/build_direction_table.sbatch)"
+      "Bash(bash -n examples/slurm/build_direction_table.sbatch)",
+      "Bash(env -u PYTHONPATH -u GADDPG_DIR -u OMG_PLANNER_DIR /home/pradyun/anaconda3/envs/pch2r_dev/bin/python examples/assign_direction_pairs.py --table output/direction_table_train.json --out output/regrasp_pins_train)",
+      "Bash(/home/pradyun/anaconda3/envs/pch2r_dev/bin/python -m py_compile examples/train_regrasp.py)"
     ],
     "additionalDirectories": [
       "/home/pradyun/h2r/handover-sim2real/examples/configs",

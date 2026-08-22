@@ -35,7 +35,8 @@ import torch
 import yaml
 
 from handover_sim2real.regrasp_bc import ACTPolicy, BCPolicy, Normalizer, TemporalEnsembler
-from handover_sim2real.regrasp_bc.dataset import goal_cond_from_state
+from handover_sim2real.regrasp.channels import build_model_cloud
+from handover_sim2real.regrasp_bc.dataset import direction_in_ee_frame
 
 
 # ── which policy is this run? ────────────────────────────────────────────────
@@ -77,12 +78,9 @@ def build_policy(run_cfg: dict, normalizer: Normalizer | None):
             aux_dim=int(m.get("aux_dim", 7)),
             aux_hidden=tuple(m.get("aux_hidden", (256, 256))),
             # Phase 5. Same lockstep requirement as the aux head, and with more
-            # teeth: grasp_cond changes policy_head's in_dim, so a mismatch is a
-            # shape error at load rather than a silent behavioural difference.
-            grasp_cond=bool(m.get("grasp_cond", False)),
-            grasp_cond_dim=int(m.get("grasp_cond_dim", 9)),
-            grasp_hidden=int(m.get("grasp_hidden", 128)),
-            grasp_feat_dim=int(m.get("grasp_feat_dim", 128)),
+            # teeth: pc_channels changes the first conv's in_dim, so a mismatch
+            # is a shape error at load rather than a silent behavioural
+            # difference. That is the ONLY tensor whose shape depends on it.
             normalizer=normalizer,
         )
     return ACTPolicy(
@@ -115,12 +113,16 @@ def build_policy(run_cfg: dict, normalizer: Normalizer | None):
 class PolicyRunner:
     """One action per step, whatever the policy underneath.
 
-    Phase-5 note: the goal grasp is set ONCE per episode via `set_goal`, not
-    passed to every `act`. The runner recomputes the EE-frame conditioning from
-    the `rs` it is handed anyway, which keeps `act(pc, rs)` — and therefore every
-    call site in the collector, the evaluator, the rollout scripts and the
-    real-robot runner — unchanged in arity. A goal threaded through four call
-    sites is four chances to pass None and condition on nothing.
+    REGRASP note: the commanded approach direction is set ONCE per attempt via
+    `set_direction`, not passed to every `act`. The runner rotates it into the
+    current EE frame and appends the two per-point channels itself, which keeps
+    `act(pc, rs)` — and therefore every call site in the collector, the
+    evaluator, the retry machine and the rollout scripts — unchanged in arity.
+
+    `act` takes the BARE [N, 5] cloud, exactly what `_point_cloud` returns, and
+    produces the [N, 7] the model eats. Normals are recomputed here rather than
+    threaded in; `regrasp/normals.py` documents why that is bit-identical to what
+    the collector stored, and what would break the equality.
     """
 
     kind = "?"
@@ -128,10 +130,17 @@ class PolicyRunner:
     def reset(self) -> None:
         raise NotImplementedError
 
-    def set_goal(self, grasp_pose_world) -> None:
-        """The 4x4 world pose this episode is being asked to reach, or None."""
-        self.goal_grasp = (None if grasp_pose_world is None
-                           else np.asarray(grasp_pose_world, dtype=np.float64))
+    def set_direction(self, d_world) -> None:
+        """The commanded approach direction in WORLD, or None.
+
+        Set once per attempt, not per step: the direction is constant while the
+        EE moves, and `act` re-expresses it in the current EE frame every call.
+        Kept OFF the `act` signature for the same reason the goal pose was —
+        threading it through four call sites is four chances to pass None and
+        condition on nothing.
+        """
+        self.d_world = (None if d_world is None
+                        else np.asarray(d_world, dtype=np.float64))
 
     def act(self, pc: np.ndarray, rs: np.ndarray) -> np.ndarray:
         raise NotImplementedError
@@ -148,31 +157,33 @@ class BCRunner(PolicyRunner):
     def __init__(self, model: BCPolicy, device: str):
         self.model = model
         self.device = device
-        self.goal_grasp = None
+        self.d_world = None
 
     def reset(self) -> None:
         pass
 
     @torch.no_grad()
     def act(self, pc: np.ndarray, rs: np.ndarray) -> np.ndarray:
-        pc_t = torch.from_numpy(pc).float().unsqueeze(0).to(self.device)
-        rs_t = torch.from_numpy(rs).float().unsqueeze(0).to(self.device)
-        cond_t = None
-        if getattr(self.model, "grasp_cond", False):
-            if self.goal_grasp is None:
+        pc = np.asarray(pc)
+        if pc.shape[-1] == 5:
+            if self.d_world is None:
                 raise RuntimeError(
-                    "grasp-conditioned policy asked to act with no goal set — "
-                    "call runner.set_goal(grasp_pose_world) at episode start.")
-            # From the RAW rs, exactly as BCDataset does at training time; the
+                    "asked to act with no direction set — call "
+                    "runner.set_direction(d_world) at the start of the attempt. "
+                    "Conditioning on nothing is not a safe default: the two "
+                    "channels would read 0 everywhere, which the policy cannot "
+                    "tell from 'approach from nowhere'.")
+            # RAW rs, exactly as BCDataset does at training time; the
             # normalization of rs happens inside predict(), after this.
-            cond = goal_cond_from_state(rs, self.goal_grasp)
-            cond_t = torch.from_numpy(cond).float().unsqueeze(0).to(self.device)
+            d_ee = direction_in_ee_frame(rs, self.d_world)
+            pc, self.last_cloud_info = build_model_cloud(pc, d_ee)
+        pc_t = torch.from_numpy(np.asarray(pc, dtype=np.float32)).unsqueeze(0).to(self.device)
+        rs_t = torch.from_numpy(rs).float().unsqueeze(0).to(self.device)
         # BCPolicy.predict denormalizes ch0..5 and hard-thresholds ch6 to {0,1}.
-        return self.model.predict(pc_t, rs_t, cond_t)[0].cpu().numpy().astype(np.float32)
+        return self.model.predict(pc_t, rs_t)[0].cpu().numpy().astype(np.float32)
 
     def describe(self) -> str:
-        return ("bc (single frame, grasp-conditioned)"
-                if getattr(self.model, "grasp_cond", False) else "bc (single frame)")
+        return "bc (single frame, direction-conditioned)"
 
 
 class ACTRunner(PolicyRunner):
@@ -188,11 +199,25 @@ class ACTRunner(PolicyRunner):
         self.k = int(chunk_len)
         self.mode = exec_cfg.get("mode", "ensemble")
         self.ensemble_m = float(exec_cfg.get("ensemble_m", 0.01))
-        # ACT is not grasp-conditioned in Phase 5 — models_act.py is untouched —
-        # but the attribute has to exist so set_goal() is a no-op rather than an
-        # AttributeError when the loop is pointed at an ACT learner.
-        self.goal_grasp = None
+        self.d_world = None
         self.reset()
+
+    def set_direction(self, d_world) -> None:
+        """REFUSES a direction rather than ignoring one.
+
+        Under Phase 5 this was a harmless no-op: the conditioning was a separate
+        tensor ACT simply never received. It is not harmless now — the command
+        rides in the cloud's channels, and `dataset_seq`/`models_act` will happily
+        consume a 7-channel cloud while nothing ever sets `d`. That would train
+        and roll out on conditioning channels that are whatever the collector
+        happened to write, with no error anywhere.
+        """
+        if d_world is not None:
+            raise NotImplementedError(
+                "ACT is not direction-conditioned: models_act.py has no path for "
+                "the per-point command, so an ACT run would consume the channels "
+                "without ever setting them. Use the single-frame BC policy, or "
+                "add the conditioning to the ACT encoder first.")
 
     def reset(self) -> None:
         self.pc_buf: list[np.ndarray] = []

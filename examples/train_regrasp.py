@@ -165,24 +165,32 @@ def sample_scenes(pool: list[int], m: int, mode: str, rng, cursor: int) -> tuple
 
 
 def sample_pairs(pool: list[int], m: int, num_grasps: int, mode: str, rng,
-                 cursor: int) -> tuple[list[tuple[int, int]], int]:
-    """m (scene, grasp) pairs for one iteration. Returns (pairs, new cursor).
+                 cursor: int, pin_table=None) -> tuple[list[tuple[int, int]], int]:
+    """~m (scene, direction) pairs for one iteration. Returns (pairs, cursor).
 
-    Phase 5 draws `m // num_grasps` scenes and rolls out EVERY grasp of each,
-    rather than drawing m independent pairs. The reason is what the conditioning
-    has to learn: two rollouts that differ only in the commanded grasp — same
-    scene, same start state, same point cloud — are the only data that can teach
-    the network the goal input matters, and drawing them together puts them in
-    the same iteration and the same batches. Independent (scene, grasp) draws
-    would spread that contrast across the whole run.
+    Draws scenes and rolls out EVERY direction of each, rather than drawing m
+    independent pairs. The reason is what the conditioning has to learn: two
+    rollouts that differ only in the commanded direction — same scene, same start
+    state, same point cloud — are the only data that can teach the network the
+    command matters, and drawing them together puts them in the same iteration
+    and the same batches. Independent draws would spread that contrast across
+    the whole run.
 
-    The cost is scene coverage per iteration: at m=200 and 4 grasps that is 50
-    distinct scenes, against Phase-4 run 16's 100 at m=100.
+    PER-SCENE COUNTS, NOT A UNIFORM ONE. A Regrasp table mixes scenes that can
+    supply two separated directions with scenes that can only supply one (471 and
+    146 respectively on s0/train). Expanding `range(num_grasps)` uniformly would
+    either invent a slot 1 that does not exist, or — with `num_grasps` read from
+    `GraspPinTable.num_grasps`, which is a MIN — collapse to slot 0 everywhere
+    and silently discard every paired second demonstration. So the expansion asks
+    the table per scene, and `m` becomes a target rather than an exact count.
     """
     num_grasps = max(int(num_grasps), 1)
     n_scenes = max(int(m) // num_grasps, 1)
     scenes, cursor = sample_scenes(pool, n_scenes, mode, rng, cursor)
-    return [(int(s), g) for s in scenes for g in range(num_grasps)], cursor
+    if pin_table is None:
+        return [(int(s), g) for s in scenes for g in range(num_grasps)], cursor
+    return [(int(s), g) for s in scenes
+            for g in range(max(pin_table.num_grasps_for(int(s)), 1))], cursor
 
 
 # ── per-iteration training (a fresh fit on the whole aggregate) ──────────────
@@ -254,23 +262,26 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
         if bool(cfg["MODEL"].get("aux_head", False)) and \
                 float(cfg.get("LOSS", {}).get("aux_weight", 0.0)) > 0.0:
             goal_table = cfg["DATA"].get("grasp_pin_table") or "auto"
-        # Phase-5 conditioning. No table needed: every Phase-5 episode carries
-        # `grasp_pose_world`, so the dataset reads its own conditioning target
-        # and a rebuilt pin table cannot retarget an existing collection. The
-        # table stays available as the fallback for older files.
-        grasp_cond = bool(cfg["MODEL"].get("grasp_cond", False))
+        # REGRASP conditioning. No table needed: every episode carries its own
+        # `d_world` attr, so the dataset reads its own command and a rebuilt pin
+        # table cannot retarget an existing collection.
+        direction_cond = bool(cfg["MODEL"].get("direction_cond", True))
+        # Perturb the command by this much, TRAIN ONLY. Weighting or perturbing
+        # val would change what val_loss means across epochs.
+        d_noise = float(cfg["DATA"].get("d_noise_deg", 0.0))
         # Reach-tail oversampling (run 14). TRAIN ONLY — weighting val would
         # change what val_loss means and break comparability across runs. Under
         # conditioning it matters more, not less: the four grasps of a scene look
         # alike during the free approach and only diverge in the reach, so the
         # reach tail is where most of the conditioning signal lives.
         train_ds = BCDataset(cfg["DATA"]["train_h5"], normalizer=normalizer,
-                             goal_table=goal_table, grasp_cond=grasp_cond,
+                             goal_table=goal_table,
+                             direction_cond=direction_cond, d_noise_deg=d_noise,
                              reach_tail_weight=float(cfg["DATA"].get(
                                  "reach_tail_weight", 1.0)),
                              reach_tail=int(cfg["DATA"].get("reach_tail", 5)))
         val_ds = (BCDataset(val_h5, normalizer=normalizer, goal_table=goal_table,
-                            grasp_cond=grasp_cond)
+                            direction_cond=direction_cond, d_noise_deg=0.0)
                   if val_h5 and os.path.exists(val_h5) else None)
     else:
         T = int(cfg["MODEL"]["history_len"])
@@ -819,18 +830,28 @@ def main() -> None:
     # labels and the regression can only predict their mean — a policy that is
     # worse than a Phase-4 one and gives no hint why. Cheap to check, expensive
     # to discover 15 hours in.
-    grasp_cond = bool(train_cfg.get("MODEL", {}).get("grasp_cond", False))
-    if num_grasps > 1 and not grasp_cond:
+    model_cfg = train_cfg.get("MODEL", {})
+    # A RENAMED KEY MUST NOT FAIL OPEN. `.get("grasp_cond", False)` on a config
+    # that no longer has the key returns False, the guard never fires, and the
+    # check that exists specifically to stop an unconditioned fit on multi-modal
+    # data becomes a no-op. So: reject the dead key outright.
+    if "grasp_cond" in model_cfg:
         raise SystemExit(
-            f"[cfg] SIM.grasp_pin_table pins {num_grasps} grasps per scene but "
-            f"{trn['train_cfg']} has MODEL.grasp_cond: false. The dataset would "
-            f"hold {num_grasps} contradictory labels per state and the fit would "
-            f"regress their mean. Set MODEL.grasp_cond: true, or use a "
-            f"single-grasp pin table.")
-    if grasp_cond and num_grasps <= 1:
-        print(f"[cfg] WARNING MODEL.grasp_cond is on but the pin table offers one "
-              f"grasp per scene — the conditioning is constant per scene and "
-              f"carries no information the policy could not memorize.")
+            f"[cfg] {trn['train_cfg']} sets MODEL.grasp_cond, which Regrasp "
+            f"removed — the conditioning is now per-point in the cloud, not an "
+            f"MLP branch. Use MODEL.direction_cond and DATA.pc_channels: 7.")
+    direction_cond = bool(model_cfg.get("direction_cond", True))
+    if num_grasps > 1 and not direction_cond:
+        raise SystemExit(
+            f"[cfg] the pin table gives {num_grasps} directions per scene but "
+            f"{trn['train_cfg']} has MODEL.direction_cond: false. The dataset "
+            f"would hold {num_grasps} contradictory labels per state and the fit "
+            f"could only regress their mean.")
+    if int(train_cfg.get("DATA", {}).get("pc_channels", 0)) != 7:
+        raise SystemExit(
+            f"[cfg] direction conditioning needs DATA.pc_channels: 7 "
+            f"(xyz|ycb|hand|d.n|d.r); {trn['train_cfg']} says "
+            f"{train_cfg.get('DATA', {}).get('pc_channels')}.")
 
     collect_params = CollectParams(
         max_steps=int(dag.get("max_steps", 30)),
@@ -1084,11 +1105,15 @@ def main() -> None:
         rng = np.random.RandomState(seed * 10_000 + i)
         pairs, state["cursor"] = sample_pairs(
             pool, int(dag["episodes_per_iter"]), num_grasps,
-            str(dag.get("scene_sampling", "random")), rng, int(state.get("cursor", 0)))
+            str(dag.get("scene_sampling", "random")), rng,
+            int(state.get("cursor", 0)), pin_table=pin_table)
 
+        n_scenes_drawn = len({s for s, _ in pairs})
+        n_paired = sum(1 for s in {s for s, _ in pairs}
+                       if sum(1 for ss, _ in pairs if ss == s) > 1)
         print(f"\n{'='*78}\n[iter {i:02d}/{num_iters}]  beta={beta:.3f}  "
-              f"m={len(pairs)} episodes = {len(pairs)//max(num_grasps,1)} scenes x "
-              f"{num_grasps} grasps  policy={cur_run_dir}\n{'='*78}")
+              f"m={len(pairs)} episodes over {n_scenes_drawn} scenes "
+              f"({n_paired} paired)  policy={cur_run_dir}\n{'='*78}")
 
         # --- D_i: roll out the CURRENT policy, label every visited state ---
         t_collect = time.time()

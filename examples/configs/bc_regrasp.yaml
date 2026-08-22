@@ -1,96 +1,72 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase-5 learner config: the grasp-CONDITIONED single-frame BC policy.
+# Regrasp learner config: the APPROACH-DIRECTION-conditioned single-frame policy.
 #
-# = examples/configs/bc_phase4_all.yaml (runs 15/16) with four changes, three of
-# which are forced by the fourth.
+# = the Phase-5 config with the conditioning moved out of an MLP branch and into
+# the point cloud itself.
 #
-#   1. MODEL.grasp_cond: true          THE change. The goal grasp, expressed in
-#                                      the current EE frame, becomes an INPUT.
-#   2. MODEL.aux_head: false           Forced. With (1) the aux head's target IS
-#      LOSS.aux_weight: 0.0            its own input; it would learn an identity
-#                                      map and carry no signal.
-#   3. MODEL.policy_hidden [512, 256]  The fused vector grows 512 -> 640, and the
-#                                      first head layer is where conditioning and
-#                                      perception have to mix.
-#   4. MODEL.pc_pretrained: (empty)    PointNet++ from scratch, as run 21 does —
-#                                      the CVPR2023 encoder was trained on a
-#                                      different rig, and it was ALSO trained with
-#                                      an aux goal head we are now removing.
+#   1. DATA.pc_channels 5 -> 7        THE change. Two per-point channels carry
+#      MODEL.direction_cond: true     the command: d.n_i ("is this surface facing
+#                                     the incoming gripper?") and
+#                                     d.normalize(p_i - c) ("is this point on the
+#                                     side I am approaching from?"). Points on the
+#                                     commanded side are MARKED IN THE INPUT
+#                                     rather than described by a vector beside it.
+#   2. GraspEncoder deleted           No global branch, deliberately. If dir_track
+#      policy_hidden back to [256,256] comes back flat, adding a small d-MLP is
+#                                     run 2, and the gap between the runs measures
+#                                     how much the SA-layer max-pooling destroys.
+#   3. DATA.d_noise_deg: 12.0         Perturb the command once per EPISODE, train
+#                                     only. Teaches interpolation between bins and
+#                                     robustness to the fact that a test-time bin
+#                                     CENTRE never matches a demo's realised
+#                                     direction — the demo's d is wherever OMG
+#                                     actually flew, somewhere inside the bin.
 #
-# WHY THE CONDITIONING IS NOT OPTIONAL. Phase 5 pins four grasps per scene, so
-# the same (point cloud, robot state) carries four different expert labels. An
-# unconditioned regression can only predict their mean, which is a valid action
-# for none of the four — strictly worse than a Phase-4 policy. Conditioning is
-# what makes the mapping single-valued again. train_regrasp.py refuses to
-# start if the pin table has several grasps and this flag is off.
+# WHY A DIRECTION AND NOT A POSE. A pose needs a grasp proposer at deployment
+# (`sim2real/my_policy_runner.py` has none), it is per-object so coverage does not
+# transfer, and it bakes k into the data. A direction is object-agnostic, so the
+# k bins need covering ACROSS the dataset rather than per object, and because the
+# network reads a continuous unit vector rather than a one-hot, k is a pure
+# test-time knob up to about 20 (past that the bins are closer than 40 degrees and
+# stop being independent retry hypotheses).
 #
-# 2 AND 1 MOVE TOGETHER and cannot be separated: the confound is real and is
-# stated rather than hidden. If you want the aux head back, it has to predict
-# something the policy is NOT already given.
+# AND IT RETIRES PHASE 5's HARDEST BUG FOR FREE. `grasp_select.FLIP` is pi about
+# the gripper's own +z, which leaves column 2 of R untouched — so d = -R[:,2] is
+# IDENTICAL for a grasp and its wrist-flip twin (measured at 0.000e+00 over 2000
+# random poses). The flip ambiguity that forced the whole flip-quotient metric
+# cannot arise when the command is a direction.
 #
-# THE CONDITIONING VECTOR is rot6d(6) + translation(3), built by
-# regrasp_bc.dataset.goal_cond_from_state from the RAW robot state and the episode's
-# `grasp_pose_world` attr. rot6d, not the aux head's quaternion: as a regression
-# target the quaternion double cover (q == -q) is absorbed by the geodesic loss,
-# but as a network INPUT it makes the function the encoder must learn
-# discontinuous. It is recomputed every step — the world grasp is fixed, the EE
-# moves — so it is the residual pose the policy still has to null out.
+# MEASURED FEASIBILITY, and it constrains what this config can be asked to do.
+# Over 623 scenes and 28339 goal-set grasps on s0/train:
+#     +x free end 490 scenes   +z top-down 415   +y 366   -y 325
+#     -x over the fingers 12 (0.19% of grasps)   -z from beneath 0
+# so FOUR of the six bins are live, and -x/-z are directions the policy will
+# EXTRAPOLATE into if the feasibility mask ever admits them. 491/623 scenes supply
+# a separated PAIR; the other 126 give one demo and cannot break the confound.
 #
-# NOT NORMALIZED. It is already an EE-relative displacement in metres, centred
-# near zero by construction, and normalizing it would make it depend on dataset
-# statistics the real robot cannot reproduce.
+# THE CONFOUND IS THE REASON FOR PAIRS, and it is a property of the DATASET that
+# no architecture reaches: at one demonstration per scene, d is a deterministic
+# function of the observation across the whole dataset, so the network can drive
+# the loss to its floor by learning scene -> action and ignoring the channels
+# entirely. Two demos of one scene under different d map the SAME observation to
+# two DIFFERENT actions. Watch `cond_delta` in the val log: non-zero at init
+# (random weights respond to their inputs), and DECAYING toward zero is the
+# signature of the network learning to ignore the command.
 #
-# SIZED AT 128, a fifth of the 640-D fused vector: enough not to be drowned by
-# 512 dims of perception, not so much that the head can solve the task by
-# servoing to the goal and ignoring the cloud. That shortcut does exist — it
-# would fly straight through the human's hand, which is precisely what OMG's
-# labels do not do, so the loss pushes back. Watch `f_human_contact` anyway.
-#
-# CAPACITY IS NOT SCALED WITH THE DATA, deliberately. The aggregate grows ~2.2x
-# against run 16, not 4x (D_dagger_frac reaches 0.90, so the base set is a tenth
-# of it), the new axis of variation is a 9-D pose rather than new perceptual
-# complexity, and 87% of the parameters sit in a PointNet++ whose job has not
-# changed. Phase-3 runs 41 (deeper) and 42 (smaller) bracket run 28 on both sides
-# and neither moved the number beyond the +-0.115 noise floor. Total here is
-# 2.04 M against run 16's 1.96 M — the head widening and the grasp encoder very
-# nearly cancel the aux head that was removed.
-#
-# REACH-TAIL OVERSAMPLING: WINDOW WIDENED 5 -> 10, AND THE REASON IS MEASURED.
-#
-# The obvious expectation — four grasps share a free approach and diverge only in
-# the reach, so the reach-tail weighting already sits on the conditioning signal —
-# is WRONG, and `analyze_direction_spread.py` on train_p5.h5 says so. Mean
-# pairwise |dpos| difference between the four expert action sequences, by step
-# from the END of the episode:
-#
-#     step  0     1      2      3      4      5      6      7      8      9
-#     diff  0.000 0.0021 0.0030 0.0078 0.0292 0.1185 0.1083 0.0990 0.0912 0.0857
-#
-# The signal PEAKS 5-9 steps out and collapses to ~0 over the last four. Step 0 is
-# exactly zero by construction (CLOSE_LABEL is the zero vector). The collapse is
-# the committed reach doing its job: past `reach_commit_dist` the tail is frozen
-# and followed by index, so every demo emits the same small shrinking residual
-# toward its own target — four different destinations, four nearly identical
-# deltas. The split happens where the trajectories separate toward four standoffs
-# ~8 cm apart, which is one step before the commit.
-#
-# So at reach_tail: 5 the 2.5x weight lands on the LEAST informative steps. Draw
-# shares over ~21-step episodes: the flat band (0-4) took 44% of draws while the
-# peak band (5-9) took 17.5%. Widening the window to 10 puts both inside it — the
-# peak band roughly doubles to ~35%, and the endgame keeps its own ~35%, which is
-# what the flag was originally for (the reach is 23.8% of the data but only 11.1%
-# of the SmoothL1 pose gradient, because the expert's labels shrink into it).
-#
-# THE COST is the free approach, which drops from ~56% of draws to ~31%. That is
-# where obstacle avoidance is learned, so if `f_human_contact` rises against run
-# 16 this is the first thing to put back.
+# CAPACITY GOES DOWN, not up. The fused vector returns to 2*feature_dim = 512
+# because there is no conditioning branch to concatenate, so policy_hidden goes
+# back to [256, 256]. The only shape that grows is the first PointNet++ conv,
+# [64, 8, 1, 1] -> [64, 10, 1, 1] — the single tensor that depends on
+# pc_channels, and the reason a 5-channel checkpoint cannot strict-load here.
 # ─────────────────────────────────────────────────────────────────────────────
 
 DATA:
   # Overwritten by train_regrasp.py with the aggregate file list.
   train_h5: output/bc_dataset/train_p5.h5
   val_h5: null
-  pc_channels: 5              # xyz + ycb_flag + hand_flag  (2-class, wrist+right)
+  pc_channels: 7              # xyz + ycb + hand + d.n + d.r  (the last two
+                              # are the conditioning, appended per point)
+  d_noise_deg: 12.0           # TRAIN ONLY; val is forced to 0.0
   robot_state_dim: 32
   action_dim: 7
   reach_tail_weight: 2.5
@@ -99,18 +75,15 @@ DATA:
 MODEL:
   feature_dim: 256
   robot_hidden: 128
-  policy_hidden: [512, 256]
+  policy_hidden: [256, 256]
   pointnet_scale: 1
   pointnet_radius: 0.02
   pointnet_nclusters: 32
   use_prev_act: false
   drop_joint_state: true      # the single largest effect measured in this project
   joint_state_dim: 18
-  # ---- Phase 5 ----
-  grasp_cond: true
-  grasp_cond_dim: 9           # rot6d(6) + trans(3)
-  grasp_hidden: 128
-  grasp_feat_dim: 128
+  # ---- Regrasp ----
+  direction_cond: true        # the command is per-point in the cloud, not an MLP
   # ---- off, and why: see the header ----
   aux_head: false
   aux_dim: 7
@@ -130,7 +103,9 @@ LOSS:
   gripper_weight: 1.0
   pose_loss: pm
   pm_weight: 7.0
-  aux_weight: 0.0             # must be 0 while grasp_cond is on
+  aux_weight: 0.0             # off by ONE-VARIABLE-AT-A-TIME, not by
+                              # necessity: the aux head is legitimate
+                              # again now the policy is not told the pose
 
 TRAIN:
   batch_size: 64

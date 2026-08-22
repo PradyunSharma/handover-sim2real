@@ -1,0 +1,211 @@
+"""
+Audit a Regrasp collection against the schema the trainer requires.
+
+Run this on the PILOT before collecting at scale. Every check here is one that
+would otherwise surface hours later — inside a DataLoader worker, in a shape
+error with no episode named, or as a policy quietly trained on a wrong label.
+
+    python examples/audit_regrasp_demos.py --demos output/bc_dataset/train_regrasp.h5
+
+WHAT IT CHECKS, and why each one earns its place:
+
+  widths        every cloud is [T, N, 8]. A 5-channel shard mixed into an
+                aggregate kills `collate` in a worker with nothing naming the
+                offending file (this is the run-19 crash).
+  d_world       present, unit, finite on EVERY episode. A zeroed direction is not
+                a missing label, it is a wrong one: the two conditioning channels
+                would read 0 everywhere, which the policy cannot distinguish from
+                "approach from nowhere".
+  normals       unit and finite. `regularize_pc_point_count` oversamples WITH
+                replacement when a class is short, and duplicated points give a
+                rank-deficient covariance whose eigenvector is arbitrary. The
+                estimator falls back for those, and this counts how often.
+  bins          `bin_assigned` vs `bin_realized`. They differ exactly when the pin
+                failed and the episode flew to OMG's own pick instead — which
+                Regrasp keeps rather than discards, but which must be VISIBLE.
+  pairing       how many scenes carry two demonstrations at DIFFERENT directions.
+                This is the number the whole design rests on: a scene with one
+                demo, or two at the same direction, lets the network learn
+                scene -> action and ignore the conditioning entirely.
+  separation    the angle between a scene's two commands, and the per-step action
+                difference between its two demonstrations. A pair that is 180 deg
+                apart but produces identical trajectories teaches nothing.
+  anchor        `anchor_mode` should be "wrist" on ~every episode under the
+                active config, where the hand is static. A run of "base" means the
+                degeneracy threshold is miscalibrated, not that the fallback
+                worked.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import h5py
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from handover_sim2real.regrasp import channels as CH        # noqa: E402
+from handover_sim2real.regrasp import directions as D       # noqa: E402
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--demos", required=True)
+    p.add_argument("--noise-floor", type=float, default=0.005,
+                   help="metres of per-step |dpos| difference below which two "
+                        "demonstrations are saying the same thing")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    fails, warns = [], []
+
+    with h5py.File(args.demos, "r") as f:
+        keys = sorted(k for k in f if k.startswith("episode"))
+        if not keys:
+            raise SystemExit(f"{args.demos} has no episodes")
+        fattrs = dict(f.attrs)
+        print("=" * 74)
+        print(f"Regrasp demo audit   {args.demos}")
+        print(f"  episodes {len(keys)}   schema="
+              f"{fattrs.get('schema', b'?')!r}   pc_channels="
+              f"{fattrs.get('pc_channels', '?')}")
+        print("=" * 74)
+
+        widths, steps = Counter(), 0
+        by_scene = defaultdict(list)
+        n_nofinite_d = n_nonunit_d = n_missing_d = 0
+        n_norm_bad = 0
+        modes, sides, pin_ok = Counter(), Counter(), Counter()
+        rebinned = 0
+
+        for k in keys:
+            g = f[k]
+            pc = g["point_clouds"]
+            widths[int(pc.shape[-1])] += 1
+            steps += int(pc.shape[0])
+
+            a = dict(g.attrs)
+            d = a.get("d_world")
+            if d is None:
+                n_missing_d += 1
+                continue
+            d = np.asarray(d, dtype=np.float64)
+            if not np.all(np.isfinite(d)):
+                n_nofinite_d += 1
+            elif abs(np.linalg.norm(d) - 1.0) > 1e-3:
+                n_nonunit_d += 1
+
+            # normals: sample the first and last step rather than every one
+            if pc.shape[-1] >= 8:
+                for t in (0, int(pc.shape[0]) - 1):
+                    n = np.asarray(pc[t][:, 5:8], dtype=np.float64)
+                    ln = np.linalg.norm(n, axis=1)
+                    if not np.all(np.isfinite(n)) or np.any(np.abs(ln - 1.0) > 1e-2):
+                        n_norm_bad += 1
+                        break
+
+            modes[str(a.get("anchor_mode", "?"))] += 1
+            sides[str(a.get("mano_side", "?"))] += 1
+            pin_ok[int(a.get("pin_ok", -1))] += 1
+            ba, br = int(a.get("bin_assigned", -1)), int(a.get("bin_realized", -1))
+            if ba >= 0 and br >= 0 and ba != br:
+                rebinned += 1
+            by_scene[int(a["scene_idx"])].append(
+                {"key": k, "d": d, "bin": br, "assigned": ba,
+                 "act": np.asarray(g["expert_actions"][:, :3], dtype=np.float64)})
+
+        # ---- widths -------------------------------------------------------
+        print(f"\n  cloud widths      : {dict(widths)}   steps {steps}")
+        if set(widths) != {CH.STORED_CHANNELS}:
+            fails.append(f"cloud width is {dict(widths)}, expected "
+                         f"{{{CH.STORED_CHANNELS}: n}} — the trainer will refuse "
+                         f"this, and a MIX would die inside collate")
+
+        # ---- the command --------------------------------------------------
+        print(f"  d_world           : missing {n_missing_d}, non-finite "
+              f"{n_nofinite_d}, non-unit {n_nonunit_d}")
+        if n_missing_d or n_nofinite_d or n_nonunit_d:
+            fails.append("d_world is missing/invalid on some episodes — a zeroed "
+                         "direction is a WRONG label, not a missing one")
+
+        print(f"  normals           : {n_norm_bad} episode(s) with non-unit or "
+              f"non-finite normals")
+        if n_norm_bad:
+            fails.append(f"{n_norm_bad} episodes have bad normals")
+
+        print(f"  anchor_mode       : {dict(modes)}")
+        if modes.get("base", 0) > 0.02 * max(len(keys), 1):
+            warns.append(f"{modes['base']} episodes fell back to the base "
+                         f"direction; under a static hand that points at a "
+                         f"miscalibrated degeneracy threshold, not a working "
+                         f"fallback")
+        print(f"  mano_side         : {dict(sides)}")
+        print(f"  pin ok / failed   : {pin_ok.get(1, 0)} / {pin_ok.get(0, 0)}"
+              f"   re-binned {rebinned}")
+        if rebinned:
+            print(f"    ({rebinned} episodes flew to a different bin than assigned "
+                  f"— kept and relabelled, which is the point of deriving the "
+                  f"command from the realised pose)")
+
+        # ---- pairing: the number the design rests on ----------------------
+        n_pair = n_single = n_same_bin = 0
+        seps, divs = [], []
+        for sc, eps in by_scene.items():
+            if len(eps) < 2:
+                n_single += 1
+                continue
+            n_pair += 1
+            a, b = eps[0], eps[1]
+            sep = float(D.angle_between(a["d"], b["d"]))
+            seps.append(sep)
+            if a["bin"] == b["bin"]:
+                n_same_bin += 1
+            n = min(len(a["act"]), len(b["act"]))
+            if n:
+                # aligned from the END: it is the reach that has to line up
+                diff = np.abs(a["act"][-n:] - b["act"][-n:]).sum(axis=1)
+                divs.append(float(np.mean(diff > args.noise_floor)))
+
+        print(f"\n  scenes            : {len(by_scene)}   paired {n_pair}, "
+              f"single {n_single}")
+        if n_same_bin:
+            fails.append(f"{n_same_bin} paired scene(s) have BOTH demos in the "
+                         f"same bin — they cannot break the confound")
+        if seps:
+            s = np.asarray(seps)
+            print(f"  pair separation   : median {np.median(s):.0f} deg   "
+                  f"min {s.min():.0f}   antipodal {100*(s>179).mean():.0f}%")
+        if divs:
+            dv = np.asarray(divs)
+            print(f"  informative steps : median {np.median(dv):.3f}   "
+                  f"mean {dv.mean():.3f}   (per-step |dpos| difference between "
+                  f"the two demos > {args.noise_floor} m)")
+            print(f"  scenes under 10%  : {int((dv < 0.10).sum())}/{len(dv)}  "
+                  f"(their two demos are nearly the same trajectory)")
+            if np.median(dv) < 0.05:
+                fails.append(
+                    "the two demonstrations of a scene are nearly IDENTICAL "
+                    "trajectories. The commands differ but the behaviour does "
+                    "not, so there is nothing for the conditioning to learn and "
+                    "no architecture fixes it — this is a DATA result.")
+
+    print("\n" + "=" * 74)
+    for w in warns:
+        print(f"  WARN  {w}")
+    for e in fails:
+        print(f"  FAIL  {e}")
+    if not fails:
+        print("  PASS — the schema is what the trainer expects.")
+    print("=" * 74)
+    raise SystemExit(1 if fails else 0)
+
+
+if __name__ == "__main__":
+    main()

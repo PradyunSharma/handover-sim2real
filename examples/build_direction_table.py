@@ -161,7 +161,9 @@ def main() -> None:
             table[str(idx)] = None
             print(f"  [{idx:4d}] no object points — cannot anchor")
             continue
-        c_world = _centroid_to_world(obs, c_ee, sim)
+        c_world = A.centroid_to_world(
+            c_ee, obs, sim.panda_base_inv_tf,
+            cfg.ENV.PANDA_BASE_POSITION, cfg.ENV.PANDA_BASE_ORIENTATION)
 
         R, meta = A.anchor_rotation(c_world, wrist, base, A.AnchorState())
         modes[meta["mode"]] += 1
@@ -253,23 +255,6 @@ def main() -> None:
     print(f"\nwrote {out}  ({time.time() - t0:.0f}s)")
     print("Next: examples/assign_direction_pairs.py — pure combinatorics over this "
           "file, no simulator.")
-
-
-def _centroid_to_world(obs, c_ee, sim) -> np.ndarray:
-    """EE-frame centroid -> world, via the panda base.
-
-    `_point_cloud` returns the cloud in the `panda_hand` link frame, reached from
-    the panda BASE frame; `se3_transform_pc` was applied with the base-relative EE
-    pose. So going back out is EE -> base -> world, which is exactly the round
-    trip `rollout_regrasp_policy.draw_pointcloud` does.
-    """
-    from scipy.spatial.transform import Rotation as Rot
-    from collect_bc_dataset import _ee_pose_mat
-    ee_mat = _ee_pose_mat(obs["panda_body"], obs["panda_link_ind_hand"],
-                          sim.panda_base_inv_tf)
-    p_base = ee_mat[:3, :3] @ np.asarray(c_ee, dtype=np.float64) + ee_mat[:3, 3]
-    R_base = Rot.from_quat(np.asarray(sim.cfg.ENV.PANDA_BASE_ORIENTATION)).as_matrix()
-    return R_base @ p_base + np.asarray(sim.cfg.ENV.PANDA_BASE_POSITION)
 
 
 if __name__ == "__main__":

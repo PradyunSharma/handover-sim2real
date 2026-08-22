@@ -43,9 +43,21 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+# Pure numpy, no simulator: regrasp/__init__.py resolves its re-exports lazily,
+# so importing these in a DataLoader worker costs nothing beyond scipy.
+from handover_sim2real.regrasp import channels as _rg_channels
+from handover_sim2real.regrasp import directions as _rg_directions
 
-GOAL_DIM = 8   # [quat_wxyz(4) ‖ trans(3) ‖ valid(1)]
-COND_DIM = 9   # [rot6d(6) ‖ trans(3)] — the CONDITIONING vector (Phase 5)
+
+GOAL_DIM = 8   # [quat_wxyz(4) ‖ trans(3) ‖ valid(1)] — the AUX HEAD's target.
+               # Legitimate again under Regrasp: the policy is no longer given the
+               # goal pose, so predicting it is a real auxiliary task rather than
+               # an identity map. Off by default; see bc_regrasp.yaml.
+
+# What the FILE holds and what the MODEL eats are deliberately different widths.
+# `d` is perturbed at training time, so a d-dependent channel cannot be baked in.
+STORED_PC_CHANNELS = _rg_channels.STORED_CHANNELS   # 8: xyz ycb hand nx ny nz
+MODEL_PC_CHANNELS = _rg_channels.MODEL_CHANNELS     # 7: xyz ycb hand d.n d.r
 
 
 def load_goal_table(path) -> dict[tuple[int, int], np.ndarray]:
@@ -110,31 +122,22 @@ def goal_target_from_state(rs_raw: np.ndarray, grasp_world: np.ndarray) -> np.nd
     return np.concatenate([mat2quat(rel[:3, :3]), rel[:3, 3], [1.0]]).astype(np.float32)
 
 
-def goal_cond_from_state(rs_raw: np.ndarray, grasp_world: np.ndarray) -> np.ndarray:
-    """[rot6d(6) ‖ trans(3)] — the goal grasp IN THE CURRENT EE FRAME, as the
-    Phase-5 policy's conditioning INPUT.
+def direction_in_ee_frame(rs_raw: np.ndarray, d_world: np.ndarray) -> np.ndarray:
+    """The commanded approach direction, rotated into the CURRENT EE frame.
 
-    Same geometry as `goal_target_from_state`; the rotation is carried as the
-    first two columns of R (Zhou et al. 2019) instead of a quaternion. The reason
-    is the direction of use: as a regression target the quaternion's double cover
-    (q and -q name the same rotation) is handled by the geodesic/PM loss, but as a
-    network INPUT it makes the function the encoder must learn discontinuous —
-    two inputs that are maximally far apart in R^4 must map to the same action.
-    rot6d has no such seam and needs no normalization.
+    `d_world` is constant for an episode — the pinned grasp does not move — but
+    the EE does, so this is recomputed every step, exactly as the Phase-5
+    conditioning was. TRANSLATION IS IRRELEVANT: `d` is a direction, so only the
+    EE's rotation enters. `rs_raw[21:25]` is the EE quaternion in wxyz.
 
-    Recomputed every step, because the EE moves even though the world-frame grasp
-    does not. That is the point: the conditioning is the residual pose the policy
-    still has to null out.
+    Deriving `d_ee` here rather than storing it per step is what lets the
+    perturbation below be applied once per episode: the stored quantity is the
+    command, and the frame change is a pure function of the state.
     """
     from transforms3d.quaternions import quat2mat
 
-    ee = np.eye(4, dtype=np.float64)
-    ee[:3, 3] = np.asarray(rs_raw[18:21], dtype=np.float64)
-    ee[:3, :3] = quat2mat(np.asarray(rs_raw[21:25], dtype=np.float64))
-
-    rel = _se3_inverse(ee) @ np.asarray(grasp_world, dtype=np.float64)
-    rot6d = rel[:3, :2].T.reshape(-1)          # columns 0 and 1 of R, flattened
-    return np.concatenate([rot6d, rel[:3, 3]]).astype(np.float32)
+    R_ee = quat2mat(np.asarray(rs_raw[21:25], dtype=np.float64))
+    return _rg_directions.normalize(R_ee.T @ np.asarray(d_world, dtype=np.float64))
 
 
 def _as_path_list(paths) -> list[str]:
@@ -283,7 +286,8 @@ class BCDataset(Dataset):
 
     def __init__(self, hdf5_paths, normalizer: Normalizer | None = None,
                  goal_table=None, reach_tail_weight: float = 1.0,
-                 reach_tail: int = 5, grasp_cond: bool = False):
+                 reach_tail: int = 5, direction_cond: bool = True,
+                 d_noise_deg: float = 0.0):
         self.hdf5_paths = _as_path_list(hdf5_paths)
         self.normalizer = normalizer
         # Oversampling weight for the last `reach_tail` steps of every episode —
@@ -329,7 +333,18 @@ class BCDataset(Dataset):
         # it), and only falls back to a pin-table lookup for older files. That is
         # deliberate: a dataset that carries its own target cannot be silently
         # retargeted by rebuilding the table it was collected against.
-        self.grasp_cond = bool(grasp_cond)
+        # REGRASP. The conditioning is no longer a pose handed to an MLP; it is a
+        # DIRECTION injected per-point into the cloud (regrasp/channels.py). What
+        # the dataset must resolve per episode is therefore `d_world`, a single
+        # unit vector, and `__getitem__` rotates it into the current EE frame and
+        # appends the two dot-product channels.
+        self.direction_cond = bool(direction_cond)
+        # Perturb `d` by this many degrees, once per EPISODE (not per step), to
+        # teach interpolation between bins and robustness to the fact that a
+        # test-time bin centre never exactly matches a demonstration's realised
+        # direction. MUST be 0 on the val set or val loss stops being comparable
+        # across epochs — train_regrasp builds both from one config block.
+        self.d_noise_deg = float(d_noise_deg)
         self.goal_table = goal_table
         self._goal_tables: list[dict[tuple[int, int], np.ndarray]] | None = None
         if goal_table is not None:
@@ -361,8 +376,13 @@ class BCDataset(Dataset):
         # episode -> the 4x4 world grasp pose it aimed at. Resolved once, so
         # __getitem__ only does the EE-frame transform.
         grasp_of: dict[tuple[int, str], np.ndarray] = {}
-        want_grasp = grasp_cond or (goal_table is not None)
+        # episode -> the commanded approach direction in WORLD, constant per
+        # episode. Resolved once here so __getitem__ only rotates it.
+        dir_of: dict[tuple[int, str], np.ndarray] = {}
+        want_grasp = goal_table is not None
         n_from_attr = n_from_table = n_unresolved = 0
+        n_dir = n_dir_missing = 0
+        widths: set[int] = set()
         # Per-item sampling weight, aligned with `index`. Built here because
         # step-from-end needs the episode length, which is only known while the
         # index is being walked.
@@ -374,6 +394,15 @@ class BCDataset(Dataset):
                     raise RuntimeError(f"No episodes found in {path}")
                 for k in ep_keys:
                     T = int(f[k].attrs["num_steps"])
+                    widths.add(int(f[k]["point_clouds"].shape[-1]))
+                    if self.direction_cond:
+                        dw = f[k].attrs.get("d_world")
+                        if dw is None:
+                            n_dir_missing += 1
+                        else:
+                            dir_of[(fi, k)] = _rg_directions.normalize(
+                                np.asarray(dw, dtype=np.float64))
+                            n_dir += 1
                     if want_grasp:
                         sc = f[k].attrs.get("scene_idx")
                         if sc is None:
@@ -402,6 +431,40 @@ class BCDataset(Dataset):
         self._index = index
         self._scene_of = scene_of
         self._grasp_of = grasp_of
+        self._dir_of = dir_of
+
+        # CHANNEL WIDTH. Nothing in this repo compared the h5's width against the
+        # model's before, and the failure mode is nasty: mixing a pre-Regrasp
+        # 5-channel shard with an 8-channel one kills the DataLoader inside
+        # `collate`, in a worker, with nothing naming the offending episode —
+        # exactly the run-19 crash `select_regrasp_demos.py`'s docstring
+        # describes. Fatal and specific, here, at construction.
+        if len(widths) > 1:
+            raise RuntimeError(
+                f"point-cloud width differs across the aggregate: {sorted(widths)}. "
+                f"A pre-Regrasp shard has been mixed with a Regrasp one; the "
+                f"DataLoader would die inside collate with no episode named. "
+                f"Files: {[str(p) for p in self.hdf5_paths]}")
+        self.stored_pc_channels = widths.pop() if widths else 0
+        if self.direction_cond and self.stored_pc_channels != STORED_PC_CHANNELS:
+            raise RuntimeError(
+                f"direction conditioning needs {STORED_PC_CHANNELS}-channel clouds "
+                f"(xyz|ycb|hand|normal) but the data has "
+                f"{self.stored_pc_channels}. Set DATA.pc_channels to "
+                f"{MODEL_PC_CHANNELS} in the MODEL and re-collect with "
+                f"examples/collect_regrasp_demos.py, which writes the normals.")
+        if self.direction_cond:
+            print(f"[direction] d_world resolved for {n_dir} episodes"
+                  + (f", MISSING on {n_dir_missing}" if n_dir_missing else "")
+                  + f"; clouds {self.stored_pc_channels}ch -> model "
+                    f"{MODEL_PC_CHANNELS}ch"
+                  + (f", d noise {self.d_noise_deg} deg" if self.d_noise_deg else ""))
+            if n_dir_missing:
+                raise RuntimeError(
+                    f"{n_dir_missing} episode(s) have no `d_world` attr. A zeroed "
+                    f"direction is not a missing label, it is a wrong one — the "
+                    f"two conditioning channels would read 0 everywhere, which the "
+                    f"policy cannot tell from 'approach from nowhere'. Re-collect.")
         # None when uniform, so callers can branch on "is this dataset weighted"
         # without comparing floats.
         self.sample_weights = weights if self.reach_tail_weight != 1.0 else None
@@ -454,37 +517,47 @@ class BCDataset(Dataset):
         f = self._ensure_open(fi)
         grp = f[ep_key]
 
-        pc  = torch.from_numpy(grp["point_clouds"][t]).float()       # [1024, 5]
+        pc_raw = grp["point_clouds"][t]                              # [1024, 8]
         rs_raw = grp["robot_states"][t]                              # [32], RAW
         rs  = torch.from_numpy(rs_raw).float()
         act = torch.from_numpy(grp["expert_actions"][t]).float()     # [7]
 
-        # Built from the RAW state, before normalization touches the ee_pose.
-        # Fixed 5-tuple arity whenever either the aux target or the conditioning
-        # is wanted; the unused one is zeros. See __init__ for why.
-        if self._goal_tables is None and not self.grasp_cond:
-            if self.normalizer is not None:
-                rs  = self.normalizer.normalize_state(rs)
-                act = self.normalizer.normalize_action(act)
-            return pc, rs, act
-
-        grasp = self._grasp_of.get((fi, ep_key))
-        if grasp is None:
-            goal = torch.zeros(GOAL_DIM, dtype=torch.float32)          # valid=0
-            cond = torch.zeros(COND_DIM, dtype=torch.float32)
+        if self.direction_cond:
+            d_world = self._dir_of[(fi, ep_key)]
+            if self.d_noise_deg:
+                # SEEDED ON THE EPISODE, not the step. The augmentation means
+                # "the commanded direction is N degrees off", which is a property
+                # of the command; a per-step draw would instead mean "the command
+                # jitters within the episode", which is a different and much less
+                # plausible corruption. Deriving the seed from the key rather than
+                # drawing from global state also keeps a DataLoader worker's
+                # output reproducible.
+                seed = (hash((fi, ep_key)) ^ 0x9E3779B9) & 0x7FFFFFFF
+                d_world = _rg_channels.perturb_direction(
+                    d_world, self.d_noise_deg, np.random.default_rng(seed))
+            d_ee = direction_in_ee_frame(rs_raw, d_world)
+            # [N,8] -> [N,7]: the stored normals are used as-is, so this matches
+            # what BCRunner.act computes at inference bit-for-bit.
+            pc = torch.from_numpy(
+                _rg_channels.append_direction_channels(pc_raw, d_ee)).float()
         else:
+            pc = torch.from_numpy(np.asarray(pc_raw)).float()
+
+        # The aux target is built from the RAW state, before normalization touches
+        # the ee_pose. It is a plain 4-tuple now: with the conditioning living in
+        # the cloud there is no second vector to keep the arity fixed for.
+        goal = None
+        if self._goal_tables is not None:
+            grasp = self._grasp_of.get((fi, ep_key))
             goal = (torch.from_numpy(goal_target_from_state(rs_raw, grasp))
-                    if self._goal_tables is not None
-                    else torch.zeros(GOAL_DIM, dtype=torch.float32))
-            cond = (torch.from_numpy(goal_cond_from_state(rs_raw, grasp))
-                    if self.grasp_cond
-                    else torch.zeros(COND_DIM, dtype=torch.float32))
+                    if grasp is not None
+                    else torch.zeros(GOAL_DIM, dtype=torch.float32))   # valid=0
 
         if self.normalizer is not None:
             rs  = self.normalizer.normalize_state(rs)
             act = self.normalizer.normalize_action(act)
 
-        return pc, rs, act, goal, cond
+        return (pc, rs, act) if goal is None else (pc, rs, act, goal)
 
     # ----- convenience ------------------------------------------------------
     @property

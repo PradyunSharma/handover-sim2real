@@ -153,11 +153,19 @@ def build_regrasp_context(cfg4: dict, *, seed: int = 0,
     # each of those scenes is now scored under every grasp. Keeping the pools
     # scene-shaped means the resume logic, the exclusion list and
     # eval_regrasp_run.py's reproduction of the in-loop pool are all unchanged.
-    num_grasps = pin_table.num_grasps if pin_table is not None else 1
+    # MAX, not min: a Regrasp table mixes 1- and 2-grasp scenes, and
+    # `num_grasps` (a min) would read 1 and make every `range(num_grasps)`
+    # loop drop the paired second demonstration. This value sizes metric
+    # arrays; ITERATION must use pin_table.num_grasps_for(scene).
+    num_grasps = pin_table.max_grasps if pin_table is not None else 1
     if verbose:
-        print(f"[regrasp] {num_grasps} pinned grasp(s) per scene -> "
-              f"{len(pool) * num_grasps} collectable (scene, grasp) pairs, "
-              f"{len(eval_scenes) * num_grasps} eval episodes per scored iteration")
+        n_pool_pairs = (len(pin_table.pairs(pool)) if pin_table is not None
+                        else len(pool))
+        n_eval_pairs = (len(pin_table.pairs(eval_scenes)) if pin_table is not None
+                        else len(eval_scenes))
+        print(f"[regrasp] up to {num_grasps} direction(s) per scene -> "
+              f"{n_pool_pairs} collectable (scene, direction) pairs, "
+              f"{n_eval_pairs} eval episodes per scored iteration")
 
     return RegraspContext(
         sim=sim, sim_cfg=sim_cfg, pin_table=pin_table,

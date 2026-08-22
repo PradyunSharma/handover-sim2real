@@ -63,7 +63,9 @@ from handover_sim2real.policy import PointListener
 from handover_sim2real.eval_wrapper import GraspBenchmarkWrapper
 from handover_sim2real.utils import add_sys_path_from_env
 # Module scope, not inside load_policy: rollout() below needs it every step.
-from handover_sim2real.regrasp_bc.dataset import goal_cond_from_state
+from handover_sim2real.regrasp_bc.dataset import direction_in_ee_frame
+from handover_sim2real.regrasp.channels import build_model_cloud
+from handover_sim2real.regrasp import directions as _dirs
 
 add_sys_path_from_env("GADDPG_DIR")
 from core.utils import unpack_action, tf_quat, unpack_pose, se3_transform_pc  # noqa: E402
@@ -173,8 +175,6 @@ def load_policy(run_dir: Path, device: str):
         # Phase 5's goal-grasp conditioning. Unlike the aux head this changes
         # policy_head's in_dim, so getting it wrong is a shape error at load
         # rather than a silent behavioural difference.
-        grasp_cond         = bool(m.get("grasp_cond", False)),
-        grasp_cond_dim     = int(m.get("grasp_cond_dim", 9)),
         grasp_hidden       = int(m.get("grasp_hidden", 128)),
         grasp_feat_dim     = int(m.get("grasp_feat_dim", 128)),
         normalizer         = normalizer,
@@ -267,18 +267,19 @@ def rollout(env, model, point_listener, scene_idx, device,
             grasp_idx=0):
     obs = env.reset(idx=scene_idx)
 
-    # Phase 5: which of the scene's pinned grasps this roll is commanded to
-    # reach. It is BOTH the policy's conditioning and what the green overlay
-    # draws, so watching slot 0 and slot 3 on the same scene is the eyeball
-    # version of the cond_track diagnostic. Requires the pin table — without one
-    # there is no such thing as "grasp 3" and a conditioned policy has nothing to
-    # be conditioned on.
+    # REGRASP: which DIRECTION this roll is commanded to approach from. It is
+    # both the policy's conditioning and what the overlay draws, so watching two
+    # different slots of one scene is the eyeball version of `dir_track`. The
+    # command is derived from the pinned grasp exactly as the collector derives
+    # it — d = -R[:,2] — so the overlay and the policy cannot disagree.
     cond_goal = None if pin_table is None else pin_table.pose(scene_idx, grasp_idx)
-    if getattr(model, "grasp_cond", False) and cond_goal is None:
+    d_world = None if cond_goal is None else _dirs.approach_direction(cond_goal)
+    if d_world is None:
         raise SystemExit(
-            f"this checkpoint is grasp-conditioned (MODEL.grasp_cond: true) but "
-            f"no pinned pose is available for scene {scene_idx} slot {grasp_idx}. "
-            f"Pass --grasp-pin-table (the run's SIM.grasp_pin_table).")
+            f"no pinned grasp for scene {scene_idx} slot {grasp_idx}, so there is "
+            f"no direction to command. Pass --grasp-pin-table (the run's "
+            f"SIM.grasp_pin_table). Conditioning on nothing is not a safe "
+            f"default: the two channels would read 0 everywhere.")
 
     # Optionally overlay the grasp the policy is supposed to be aiming at. Drawn
     # once (the object is static) and left up for the whole roll so you can watch
@@ -345,16 +346,13 @@ def rollout(env, model, point_listener, scene_idx, device,
         pc = _point_cloud(obs, point_listener, panda_base_inv_tf)   # [N,5] EE frame
         rs = _robot_state(obs, prev_act6d)                          # [32]
 
-        pc_t = torch.from_numpy(pc).float().unsqueeze(0).to(device)
-        rs_t = torch.from_numpy(rs).float().unsqueeze(0).to(device)
         # Recomputed every step from the RAW rs, exactly as BCDataset does at
-        # training time — the world grasp is fixed but the EE moves, so the
-        # EE-frame residual the policy is conditioned on changes.
-        cond_t = None
-        if getattr(model, "grasp_cond", False):
-            cond_t = torch.from_numpy(
-                goal_cond_from_state(rs, cond_goal)).float().unsqueeze(0).to(device)
-        action = model.predict(pc_t, rs_t, cond_t)[0].cpu().numpy()  # [7] real units
+        # training time — the world direction is fixed but the EE moves, so the
+        # EE-frame command the channels encode changes.
+        pc7, _cinfo = build_model_cloud(pc, direction_in_ee_frame(rs, d_world))
+        pc_t = torch.from_numpy(pc7).float().unsqueeze(0).to(device)
+        rs_t = torch.from_numpy(rs).float().unsqueeze(0).to(device)
+        action = model.predict(pc_t, rs_t)[0].cpu().numpy()          # [7] real units
         prev_act6d = action[:6].astype(np.float32)                  # for next step's robot_state
 
         # ----- run-13 auxiliary head: where does the policy THINK the grasp is --

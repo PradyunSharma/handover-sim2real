@@ -1,8 +1,9 @@
 from .dataset import (BCDataset, Normalizer, compute_normalization_stats,
-                      COND_DIM, GOAL_DIM, goal_cond_from_state,
-                      goal_target_from_state, load_goal_table)
+                      GOAL_DIM, MODEL_PC_CHANNELS, STORED_PC_CHANNELS,
+                      direction_in_ee_frame, goal_target_from_state,
+                      load_goal_table)
 from .models  import (BCPolicy, PointCloudEncoder, RobotEncoder, PolicyHead,
-                      GraspEncoder, load_pretrained_pc_encoder)
+                      load_pretrained_pc_encoder)
 from .losses  import bc_loss, bc_metrics
 from .trainer import BCTrainer
 

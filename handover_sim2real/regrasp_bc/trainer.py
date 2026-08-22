@@ -165,27 +165,22 @@ class BCTrainer:
 
     # ----- one epoch --------------------------------------------------------
     def _step_batch(self, batch, train: bool) -> tuple[Dict[str, torch.Tensor], Dict[str, float], int]:
-        # 3-tuple when neither the aux target nor the Phase-5 conditioning is
-        # wanted; otherwise a fixed 5-tuple (pc, rs, act, goal8, cond9) with zeros
-        # in whichever is off — see BCDataset.__getitem__. Branching on the
-        # model's own flags rather than on tuple length keeps a zeroed slot from
-        # being mistaken for a present one.
+        # (pc, rs, act) normally, (pc, rs, act, goal8) when the aux head is on.
+        # There is no conditioning slot any more: under Regrasp the command rides
+        # in the cloud's channels 5 and 6, so a batch that reaches here cannot be
+        # missing it — which is why the "conditioned model, unconditioned batch"
+        # guard that used to live here is gone rather than relaxed.
         moved = [t.to(self.device, non_blocking=True) for t in batch]
         pc, rs, act = moved[0], moved[1], moved[2]
         goal = moved[3] if len(moved) > 3 else None
-        cond = moved[4] if len(moved) > 4 else None
         want_aux = self.aux_weight > 0.0 and goal is not None \
             and getattr(self.model, "aux_head", None) is not None
-        if getattr(self.model, "grasp_cond", False) and cond is None:
-            raise RuntimeError(
-                "the model is grasp-conditioned but the batch carries no "
-                "conditioning vector — build BCDataset with grasp_cond=True")
         autocast = torch.cuda.amp.autocast if (self.use_amp and self.device != "cpu") else _noop_ctx
         with autocast():
             if want_aux:
-                out, goal_pred = self.model.forward_aux(pc, rs, cond)
+                out, goal_pred = self.model.forward_aux(pc, rs)
             else:
-                out, goal_pred = self.model(pc, rs, cond), None
+                out, goal_pred = self.model(pc, rs), None
             losses = bc_loss(out, act, gripper_weight=self.gripper_weight,
                              pose_loss=self.pose_loss, pm_weight=self.pm_weight,
                              action_mean=self.a_mean_t, action_std=self.a_std_t)
@@ -228,12 +223,66 @@ class BCTrainer:
         self.model.eval()
         acc = _MetricAccum()
         bar = tqdm(self.val_loader, desc=f"epoch {epoch:03d}  val ", leave=False)
+        first = None
         for batch in bar:
+            if first is None:
+                first = batch
             losses, metrics, B = self._step_batch(batch, train=False)
             row = {k: v.item() for k, v in losses.items()}
             row.update(metrics)
             acc.update(row, B)
-        return acc.average()
+        out = acc.average()
+        if first is not None:
+            d = self.conditioning_sensitivity(first)
+            if d is not None:
+                out["cond_delta"] = d
+        return out
+
+    @torch.no_grad()
+    def conditioning_sensitivity(self, batch) -> float | None:
+        """How much the predicted action moves when the COMMAND is randomised.
+
+        The premise of Regrasp is that the two per-point channels are read. This
+        answers that at EPOCH 2 rather than after a twenty-iteration DAgger run,
+        for the cost of one extra forward pass on one val batch: predict on the
+        batch, then predict again with channels 5 and 6 recomputed against a
+        random unit direction, and report the mean L2 between the two actions.
+
+        HOW TO READ IT. On an UNTRAINED model it must be non-zero — random weights
+        do respond to their inputs — and a zero there means the channels are not
+        reaching the network at all, which no amount of training will fix. During
+        training it should hold up or rise; DECAYING TOWARD ZERO is the signature
+        of the network learning to ignore the conditioning, which is precisely the
+        dataset-level confound two-demos-per-scene exists to prevent, and it is
+        the earliest possible warning that the collection did not achieve it.
+
+        WHY A PERMUTATION AND NOT A FRESH RANDOM DIRECTION. Recomputing the
+        channels for a new `d` would need the per-point NORMALS, and the model
+        cloud deliberately does not carry them — it carries `d . n`, from which
+        `n` cannot be recovered. So instead the conditioning channels are taken
+        from a DIFFERENT sample in the batch: a real command, correctly scaled and
+        in-distribution, just for the wrong scene. That is exactly the
+        `d_shuffle_delta` probe, and it needs no geometry.
+
+        Returns None for a model whose clouds carry no conditioning channels, and
+        for a batch of one (a permutation of one sample is the identity).
+        """
+        pc = batch[0]
+        if pc.ndim != 3 or pc.shape[-1] < 7 or pc.shape[0] < 2:
+            return None
+        pc = pc.to(self.device, non_blocking=True)
+        rs = batch[1].to(self.device, non_blocking=True)
+
+        # A derangement, so no sample keeps its own conditioning: a plain randperm
+        # leaves ~1/B of the batch unchanged and biases the mean toward zero.
+        B = pc.shape[0]
+        perm = (torch.arange(B, device=pc.device) + 1) % B
+        alt = pc.clone()
+        alt[..., 5:7] = pc[perm][..., 5:7]
+
+        base = self.model(pc, rs)
+        other = self.model(alt, rs)
+        return float(torch.linalg.vector_norm(other - base, dim=-1).mean().item())
 
     # ----- checkpointing ----------------------------------------------------
     def save_checkpoint(self, name: str, epoch: int) -> None:

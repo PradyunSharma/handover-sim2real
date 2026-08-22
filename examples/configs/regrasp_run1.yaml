@@ -100,13 +100,13 @@ SIM:
   # FOUR grasps per scene, in farthest-point-sampling order under the
   # flip-invariant control-point metric. Slot 0 is OMG's own pick, so `succ_g0`
   # is the column comparable with a Phase-4 run.
-  grasp_pin_table: output/bc_dataset/train_p5.json
+  grasp_pin_table: output/regrasp_pins_train.json
   grasp_pin_match_tol: 0.02
 
   # Scenes that could not supply 4 separated grasps whose demonstrations all
   # succeeded. Written by select_regrasp_demos.py; subtracted from BOTH the
   # collection pool and the eval set.
-  exclude_scenes: output/bc_dataset/train_p5_excluded.json
+  exclude_scenes: output/regrasp_pins_train_excluded.json
 
 DAGGER:
   num_iters: 25
@@ -158,8 +158,8 @@ TRAIN:
   train_cfg: examples/configs/bc_regrasp.yaml
   # Empty => PointNet++ initialised randomly (iteration 0 only).
   pc_pretrained:
-  base_train_h5: output/bc_dataset/train_p5.h5
-  val_h5: output/bc_dataset/val_p5.h5
+  base_train_h5: output/bc_dataset/train_regrasp.h5
+  val_h5: output/bc_dataset/val_regrasp.h5
   base_run: null
   base_epochs: 100
   iter_epochs: 12

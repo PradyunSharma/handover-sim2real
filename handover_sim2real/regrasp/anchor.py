@@ -46,9 +46,17 @@ unchanged.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
+
+# Only `centroid_to_world` needs it, and only at call time -- the frame maths
+# above stays importable with nothing but numpy.
+_EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
+if str(_EXAMPLES) not in sys.path:
+    sys.path.insert(0, str(_EXAMPLES))
 
 from handover_sim2real.regrasp.directions import normalize
 
@@ -197,15 +205,23 @@ def handedness(env) -> str | None:
     return "left" if str(name).endswith("_left") else "right"
 
 
-def object_centroid_world(pc_ee_xyz, ee_pose_world):
-    """Object centroid in WORLD, from the EE-frame cloud and the EE pose.
+def centroid_to_world(c_ee, obs, panda_base_inv_tf, base_pos, base_quat):
+    """An EE-frame point -> WORLD, via the panda base.
 
-    Only the anchor needs a world-frame centroid (to compare against a world-frame
-    wrist). The per-point channels use the EE-frame centroid directly and never
-    go through here -- see `channels.object_centroid`.
+    ONLY THE ANCHOR NEEDS THIS. The per-point channels are dot products, so they
+    work entirely in the EE frame and never convert anything; the anchor is the
+    one place that has to compare the centroid against a world-frame wrist.
+
+    The chain mirrors `_point_cloud`'s in reverse. `_ee_pose_mat` gives the EE in
+    the panda BASE frame (that is the pose `se3_transform_pc` was applied with),
+    so it is EE -> base -> world — the same round trip
+    `rollout_regrasp_policy.draw_pointcloud` performs to overlay a cloud.
     """
-    T = np.asarray(ee_pose_world, dtype=np.float64)
-    p = np.asarray(pc_ee_xyz, dtype=np.float64)
-    if p.size == 0:
-        return None
-    return T[:3, :3] @ p.mean(axis=0) + T[:3, 3]
+    from scipy.spatial.transform import Rotation as Rot
+    from collect_bc_dataset import _ee_pose_mat
+
+    ee_mat = _ee_pose_mat(obs["panda_body"], obs["panda_link_ind_hand"],
+                          panda_base_inv_tf)
+    p_base = ee_mat[:3, :3] @ np.asarray(c_ee, dtype=np.float64) + ee_mat[:3, 3]
+    R_base = Rot.from_quat(np.asarray(base_quat, dtype=np.float64)).as_matrix()
+    return R_base @ p_base + np.asarray(base_pos, dtype=np.float64)
