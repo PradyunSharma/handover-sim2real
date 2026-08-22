@@ -1,0 +1,3 @@
+scene_idx,n_attempts,solved,solved_at,a0_success,a0_reason,a0_steps,a0_branch,a0_min_pos,a0_replay_err,a1_success,a1_reason,a1_steps,a1_branch,a1_min_pos,a1_replay_err,a2_success,a2_reason,a2_steps,a2_branch,a2_min_pos,a2_replay_err,a3_success,a3_reason,a3_steps,a3_branch,a3_min_pos,a3_replay_err
+192,4,0,-1,0,DROP,11,0,0.0764,0.0,0,DROP,10,3,0.1058,0.0,0,DROP,28,3,0.0854,0.0,0,TIMEOUT,50,8,0.1162,0.0
+193,1,1,0,1,GRASP_OK,23,0,0.0158,0.0,,,,,,,,,,,,,,,,,,

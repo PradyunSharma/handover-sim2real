@@ -120,6 +120,13 @@ SCENE_FIELDS = [
     "status", "reason",
 ]
 
+# Appended only for DAGGER.target: pregrasp runs, where the episode ends at the
+# standoff and the endgame is an open-loop push. These are the columns that
+# describe that push, and they are NaN/0 by construction in grasp mode — so they
+# are added per-run rather than always, to keep a grasp-mode CSV free of dead
+# columns.
+PREGRASP_FIELDS = ["reach_pos_err", "reach_rot_err", "box_after", "box_after_frac"]
+
 # Outcome categories, ordered best -> worst so the strip plot reads top to bottom.
 # `_status_name` can OR two failures into "DROP|HUMAN_CONTACT", so anything not
 # in this list is appended at the end rather than dropped.
@@ -215,18 +222,20 @@ def apply_split_override(cfg4: dict, split: str, pin: str | None,
         sim["exclude_scenes"] = (None if exclude.lower() == "none" else exclude)
 
 
-def write_scene_csv(path: Path, rows: list[dict]) -> None:
+def write_scene_csv(path: Path, rows: list[dict], pregrasp: bool = False) -> None:
+    fields = SCENE_FIELDS + (PREGRASP_FIELDS if pregrasp else [])
     tmp = path.with_suffix(".csv.tmp")
     with tmp.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=SCENE_FIELDS, extrasaction="ignore")
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, "") for k in SCENE_FIELDS})
+            w.writerow({k: r.get(k, "") for k in fields})
     tmp.replace(path)
 
 
 def summarise(m: dict, rows: list[dict], scenes: list[int], which: str,
-              run_root: Path, ckpt_dir: Path, ckpt: str) -> dict:
+              run_root: Path, ckpt_dir: Path, ckpt: str,
+              pregrasp: bool = False) -> dict:
     """Aggregate block, printed and saved as JSON."""
     n_close = sum(r["closed"] for r in rows)
     n_box = sum(r["opportunity"] for r in rows)
@@ -270,6 +279,15 @@ def summarise(m: dict, rows: list[dict], scenes: list[int], which: str,
         # box_probe only: gate passes, and the fraction a real close confirmed.
         "n_probes": m.get("n_probes", 0),
         "probe_pass_rate": m.get("probe_pass_rate", float("nan")),
+        # ---- pre-grasp mode only (DAGGER.target: pregrasp) ----
+        # The endgame is an open-loop push here, so the questions change: where
+        # did the blind push actually LAND relative to the grasp, and did it put
+        # the object between the still-open pads. `box_after_rate` is the only
+        # usable opportunity-style number in this mode — see print_summary.
+        **({"mean_reach_pos_err": m.get("mean_reach_pos_err", float("nan")),
+            "mean_reach_rot_err": m.get("mean_reach_rot_err", float("nan")),
+            "box_after_rate": m.get("box_after_rate", float("nan"))}
+           if pregrasp else {}),
         "eval_min_pos": m["eval_min_pos"], "eval_min_rot": m["eval_min_rot"],
         "mean_pos_err": m["mean_pos_err"], "mean_rot_err": m["mean_rot_err"],
         "mean_close_step": m["mean_close_step"], "mean_dist": m["mean_dist"],
@@ -295,6 +313,20 @@ def print_summary(s: dict, params) -> None:
         "of those closes, how many held")
     row("grasp_rate", s["grasp_rate"], "fingers on the object after the hold")
     print("-" * 78)
+    # ---- PRE-GRASP MODE: a different endgame asks different questions -------
+    # The episode ends at the standoff and an open-loop push finishes the job,
+    # so `opportunity` below is near zero BY CONSTRUCTION — the jaws are never
+    # around the object while the policy is still deciding — and every
+    # conditional on it rests on a denominator of one or two episodes. These
+    # three are the numbers that mean something here.
+    if str(getattr(params, "target", "grasp")) == "pregrasp":
+        print(f"  reach after push    pos {s['mean_reach_pos_err']:.4f} m   "
+              f"rot {s['mean_reach_rot_err']:.4f} rad   "
+              f"(where the blind {params.forward_dist:.3f} m push LANDED, vs the grasp)")
+        row("object in jaws after", s["box_after_rate"],
+            "of the commits, how many put the object between the open pads")
+        print("-" * 78)
+
     # Spell out which definition produced the number, because the two differ by
     # a lot and a bare percentage does not say which one it is.
     if params.box_probe:
@@ -699,9 +731,11 @@ def main() -> None:
     prefix = Path(args.out_prefix) if args.out_prefix \
         else run_root / f"scene_eval_{pool_label}"
     prefix.parent.mkdir(parents=True, exist_ok=True)
-    write_scene_csv(prefix.with_suffix(".csv"), rows)
+    pregrasp = str(ctx.eval_params.target) == "pregrasp"
+    write_scene_csv(prefix.with_suffix(".csv"), rows, pregrasp=pregrasp)
 
-    s = summarise(m, rows, scenes, pool_label, run_root, ckpt_dir, ckpt)
+    s = summarise(m, rows, scenes, pool_label, run_root, ckpt_dir, ckpt,
+                  pregrasp=pregrasp)
     s["eval_s"] = round(dt, 1)
     # Saved so the JSON says which definition of "an opportunity" produced its
     # numbers. Without it a gated-and-probed result and a bare geometric one are

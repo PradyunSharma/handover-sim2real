@@ -1,41 +1,54 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# DelftBlue SLURM job — build the Phase-5 grasp CANDIDATE table, K maximally
-# separated grasps per scene (examples/build_direction_table.py). STEP 1
-# of four; select_pinned_grasps.py later prunes K down to the final N=4.
+# DelftBlue SLURM job — build the Regrasp DIRECTION table: per scene, the anchor
+# frame plus the best goal-set grasp realising each approach-direction bin
+# (examples/build_direction_table.py). STEP 1 of four; assign_direction_pairs.py
+# then picks two bins per scene OFFLINE, with no simulator.
 #
 #   Train split:
-#     sbatch --export=ALL,SPLIT=train,OUT=output/grasp_cand_table_train_p5.json \
+#     sbatch --export=ALL,SPLIT=train,OUT=output/direction_table_train.json \
 #         examples/slurm/build_direction_table.sbatch
 #   Val split (for the val demos used in within-run best.pt selection):
-#     sbatch --export=ALL,SPLIT=val,OUT=output/grasp_cand_table_val_p5.json \
+#     sbatch --export=ALL,SPLIT=val,OUT=output/direction_table_val.json \
 #         examples/slurm/build_direction_table.sbatch
-#   Smoke first (~20 scenes, ~2 min — proves the env before burning 24 h):
-#     sbatch --export=ALL,SPLIT=train,OUT=output/pin_smoke_p5.json,EXTRA="--num-scenes 20" \
+#   Smoke first (~20 scenes, ~2 min — proves the env before burning the full pass):
+#     sbatch --export=ALL,SPLIT=train,OUT=output/direction_smoke.json,EXTRA="--num-scenes 20" \
 #         examples/slurm/build_direction_table.sbatch
 #
-# K=8 AND NOT 4 ON PURPOSE. About a quarter of pinned demonstrations fail (the
-# plan clips the object on the lateral approach), so demanding four of four would
-# keep ~0.76^4 = 33% of scenes. Over-provision here, collect all K, and let stage
-# 3 choose the four that actually worked.
+# WHAT THIS RECORDS, and why it is not the old K-candidate table. Per scene: the
+# giver's wrist, the OBSERVED object centroid, the anchor frame, and — for each
+# of the k approach-direction bins — the goal-set grasp closest to that bin's
+# axis. Every goal-set member is binned (not an FPS subsample of 8), so the
+# per-bin counts are the real feasibility census.
 #
-# READ THE SUMMARY IT PRINTS. "fewer than 4 distinct" is the count of scenes that
-# cannot survive stage 3 no matter how collection goes, and it is the first
-# honest estimate of the Phase-5 scene budget.
-#   Watch:  tail -f slurm_logs/pintable_<jobid>.out
+# THE TABLE NOW DEPENDS ON THE RENDERER. This is the opposite of what the old
+# K-candidate builder needed, and the reason is the centroid: it comes from the
+# observed point CLOUD, so the camera set and the renderer change it. SIM_CFG
+# MUST match what the demonstrations will be collected with, or the anchor frame
+# a bin was assigned in differs from the frame the policy sees at run time.
+# Still no --egl (leaks ~85 MB/scene -> OOM over a full split), which matches
+# `egl: false` in the run config.
+#
+# READ THE PER-BIN SUMMARY IT PRINTS. It is the GO/NO-GO gate: a bin no scene can
+# reach is not a retry hypothesis, and finding that out here costs minutes rather
+# than a 20-hour collection. The offline preview
+# (`examples/analyze_direction_feasibility.py`, no simulator at all) already says
+# to expect -z at 0% and -x at ~2% on s0/train; this pass confirms it against the
+# FULL goal set rather than the FPS-selected 8.
+#   Watch:  tail -f slurm_logs/dirtable_<jobid>.out
 #
 # ONE TABLE PER SPLIT. Scene indices are split-relative, so a train table applied
-# to val pins the wrong grasps; loading a mismatched table is a hard error.
+# to val anchors the wrong scenes.
 #
 # SERIAL — one env, one OMG plan per scene (~720 train scenes at ~1-3 s each →
-# ~30-60 min). The JSON is rewritten every 25 scenes, so a timeout keeps most of
-# the work. No --egl (leaks ~85 MB/scene → OOM over a full split), and the table
-# does not depend on the renderer anyway.
+# ~30-60 min). The JSON is written once at the end; use EXTRA="--num-scenes N"
+# to smoke it first.
 #
-# REBUILD whenever SIM.valid_grasp_dict_path or hand_collision_filter changes —
-# those change which grasp candidates exist.
+# REBUILD whenever SIM.valid_grasp_dict_path, hand_collision_filter, the camera
+# set or the renderer changes — the first two change which grasps exist, the last
+# two change the centroid.
 # ─────────────────────────────────────────────────────────────────────────────
-#SBATCH --job-name=h2r-pintab5
+#SBATCH --job-name=h2r-dirtab
 # A GPU IS MANDATORY — not for a neural network, but for OMG itself. Importing
 # `omg.config` runs get_global_param() at module scope, which calls .cuda()
 # (config.py:222); and the planner's SDF collision cost (sdf_tools.py, cost.py)
@@ -54,13 +67,12 @@
 # CPU partition cannot run this job at all — OMG needs CUDA).
 #SBATCH --time=24:00:00
 #SBATCH --nodes=1
-#SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gpus-per-task=1
 #SBATCH --mem-per-cpu=4G              # 16G total
-#SBATCH --output=slurm_logs/pintable5_%j.out
-#SBATCH --error=slurm_logs/pintable5_%j.err
+#SBATCH --output=slurm_logs/dirtable_%j.out
+#SBATCH --error=slurm_logs/dirtable_%j.err
 
 set -euo pipefail
 mkdir -p slurm_logs
@@ -108,26 +120,30 @@ export OPENBLAS_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 
 # ── parameters (override via sbatch --export=ALL,...) ───────────────────────
-CFG="${CFG:-examples/configs/regrasp_run1.yaml}"  # its SIM block defines the grasp set
+#
+# NOTE the --cfg-file here is the SIMULATOR yaml, not a Regrasp run config. It
+# MUST match what the demonstrations will be collected with: the object centroid
+# recorded per scene comes from the observed point CLOUD, and the cloud is
+# renderer- and camera-dependent. A mismatch puts a silent offset between the
+# anchor frame a bin was assigned in and the frame the policy sees.
+SIM_CFG="${SIM_CFG:-examples/pretrain_multicam_wr.yaml}"
 SPLIT="${SPLIT:-train}"
-OUT="${OUT:-output/grasp_cand_table_${SPLIT}_p5.json}"
-K="${K:-8}"                           # candidates collected; 4 survive stage 3
-NFINAL="${NFINAL:-4}"                 # recorded in _meta; only affects reporting here
-SEP="${SEP:-0.02}"                    # minimum control-point separation, metres.
-                                      # Under the FLIP-INVARIANT metric, so a
-                                      # wrist-flip twin reads as distance 0 and can
-                                      # never be selected as a "distant" grasp.
+OUT="${OUT:-output/direction_table_${SPLIT}.json}"
+K="${K:-6}"                           # 6 = the octahedral bins
+MAXANG="${MAXANG:-45}"                # Voronoi half-angle at k=6, so each grasp
+                                      # falls in exactly one bin
+VGD="${VGD:-examples/valid_grasp_dict_005.pkl}"
 EXTRA="${EXTRA:-}"                    # e.g. EXTRA="--num-scenes 20"
 
 echo "host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
-echo "cfg=${CFG}  split=${SPLIT}  out=${OUT}  k=${K}  n_final=${NFINAL}  sep=${SEP}  extra=${EXTRA:-none}"
+echo "sim_cfg=${SIM_CFG}  split=${SPLIT}  out=${OUT}  k=${K}  max_angle=${MAXANG}  extra=${EXTRA:-none}"
 mkdir -p "$(dirname "${OUT}")"
 
 srun python examples/build_direction_table.py \
-    --cfg-file  "${CFG}" \
-    --split     "${SPLIT}" \
-    --out       "${OUT}" \
-    --k         "${K}" \
-    --n-final   "${NFINAL}" \
-    --sep-floor "${SEP}" \
+    --cfg-file         "${SIM_CFG}" \
+    --split            "${SPLIT}" \
+    --out              "${OUT}" \
+    --k                "${K}" \
+    --max-angle        "${MAXANG}" \
+    --valid-grasp-dict "${VGD}" \
     ${EXTRA}

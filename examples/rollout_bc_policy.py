@@ -191,9 +191,50 @@ def resolve_endgame(run_dir: Path, args):
     return target, float(dist), int(steps)
 
 
+def check_run_dir(run_dir: Path) -> None:
+    """Fail early and legibly when --run-dir is not a usable checkpoint dir.
+
+    Two mistakes account for essentially every occurrence, and the bare
+    FileNotFoundError on config.yaml distinguishes neither: pointing at the
+    Phase-4 RUN root instead of a snapshot inside it, or pointing at a run whose
+    weights were never copied down from the cluster (most Phase-4 runs keep only
+    logs locally — `output/dagger_runs/<run>/` is synced, `best/` is not).
+    """
+    need = ["config.yaml", "normalization.npz"]
+    missing = [f for f in need if not (run_dir / f).exists()]
+    ckpts = run_dir / "checkpoints"
+    if not (ckpts / "best.pt").exists() and not (ckpts / "last.pt").exists():
+        missing.append("checkpoints/best.pt")
+    if not missing:
+        return
+
+    hint = ""
+    if (run_dir / "dagger_log.csv").exists() or (run_dir / "iters").is_dir():
+        # It IS a run, just the wrong level of it.
+        hint = (f"\n  This looks like a Phase-4 RUN ROOT, not a checkpoint "
+                f"directory. Point --run-dir at a snapshot inside it:\n"
+                f"      --run-dir {run_dir}/best        (best-on-eval)\n"
+                f"      --run-dir {run_dir}/last        (final iteration)\n"
+                f"      --run-dir {run_dir}/iters/iter_NN\n"
+                f"  (examples/eval_run_scenes.py is the one that takes the run "
+                f"root and resolves best/ itself.)")
+    else:
+        root = run_dir.parent if run_dir.name in ("best", "last") else run_dir
+        hint = (f"\n  The snapshot is incomplete — most likely the weights were "
+                f"never copied down from the cluster, since a Phase-4 run syncs "
+                f"its logs without its checkpoints. Pull it with:\n"
+                f"      rsync -avz delftblue:/scratch/$USER/handover-sim2real/"
+                f"{root}/{run_dir.name if run_dir.name in ('best','last') else 'best'}/ \\\n"
+                f"          {run_dir}/\n"
+                f"  A complete snapshot has config.yaml, normalization.npz, "
+                f"source.txt, log.csv and checkpoints/best.pt.")
+    raise SystemExit(f"\n--run-dir {run_dir} is missing: {', '.join(missing)}{hint}\n")
+
+
 def load_policy(run_dir: Path, device: str):
     from handover_sim2real.bc import BCPolicy, Normalizer
 
+    check_run_dir(run_dir)
     with (run_dir / "config.yaml").open() as f:
         rcfg = yaml.safe_load(f)
 

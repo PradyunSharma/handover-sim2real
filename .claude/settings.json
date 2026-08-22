@@ -43,7 +43,7 @@
       "Bash(bash -n examples/slurm/collect_pregrasp_demos.sbatch)",
       "Bash(~/anaconda3/envs/pch2r_dev/bin/python examples/check_pregrasp_demos.py /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/c790be60-5e96-4232-9970-349c38e20b3d/scratchpad/pregrasp_smoke.h5 --cfg /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/c790be60-5e96-4232-9970-349c38e20b3d/scratchpad/cfg_local.yaml)",
       "Bash(echo \"exit=$?\")",
-      "Bash(sed -i 's/Phase4Context/Phase5Context/g; s/build_phase4_context/build_phase5_context/g' handover_sim2real/regrasp/*.py examples/train_dagger_phase5.py examples/eval_dagger_run_p5.py examples/rollout_bc_policy_p5.py && grep -rn \"Phase4Context\\\\|build_phase4_context\" handover_sim2real/regrasp/ examples/*_p5.py examples/train_dagger_phase5.py; echo \"renamed\"; grep -rn \"phase4\\\\|Phase4\" handover_sim2real/regrasp/__init__.py)",
+      "Bash(sed -i 's/Phase4Context/Phase5Context/g; s/build_phase4_context/build_phase5_context/g' handover_sim2real/dagger5/*.py examples/train_dagger_phase5.py examples/eval_dagger_run_p5.py examples/rollout_bc_policy_p5.py && grep -rn \"Phase4Context\\\\|build_phase4_context\" handover_sim2real/dagger5/ examples/*_p5.py examples/train_dagger_phase5.py; echo \"renamed\"; grep -rn \"phase4\\\\|Phase4\" handover_sim2real/dagger5/__init__.py)",
       "Bash(git ls-files *)",
       "Bash(git check-ignore *)",
       "Bash(grep -n \"sbatch\\\\|\\\\\\\\\\\\\\\\$\" README_PHASE5.md)",
@@ -64,11 +64,20 @@
       "Bash(~/anaconda3/envs/pch2r_dev/bin/python -m py_compile examples/rollout_bc_policy.py)",
       "Bash(grep -viE \"warning|futurewarn|payload = |^ *$\")",
       "Bash(bash /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/faa38ba3-e255-48f1-9964-915b0926f8c6/scratchpad/rename_to_regrasp.sh)",
-      "Bash(bash /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/faa38ba3-e255-48f1-9964-915b0926f8c6/scratchpad/rename_to_regrasp.sh --apply)"
+      "Bash(bash /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/faa38ba3-e255-48f1-9964-915b0926f8c6/scratchpad/rename_to_regrasp.sh --apply)",
+      "Bash(env -u PYTHONPATH -u GADDPG_DIR -u OMG_PLANNER_DIR /home/pradyun/anaconda3/envs/pch2r_dev/bin/python /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/faa38ba3-e255-48f1-9964-915b0926f8c6/scratchpad/test_directions.py)",
+      "Bash(env -u PYTHONPATH /home/pradyun/anaconda3/envs/pch2r_dev/bin/python -)",
+      "Bash(env -u PYTHONPATH -u GADDPG_DIR -u OMG_PLANNER_DIR /home/pradyun/anaconda3/envs/pch2r_dev/bin/python /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/faa38ba3-e255-48f1-9964-915b0926f8c6/scratchpad/test_anchor.py)",
+      "Bash(env -u PYTHONPATH -u GADDPG_DIR -u OMG_PLANNER_DIR /home/pradyun/anaconda3/envs/pch2r_dev/bin/python /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/faa38ba3-e255-48f1-9964-915b0926f8c6/scratchpad/test_channels.py)",
+      "Bash(env -u PYTHONPATH -u GADDPG_DIR -u OMG_PLANNER_DIR /home/pradyun/anaconda3/envs/pch2r_dev/bin/python -c ' *)",
+      "Bash(/home/pradyun/anaconda3/envs/pch2r_dev/bin/python -c ' *)",
+      "Bash(env -u PYTHONPATH -u GADDPG_DIR -u OMG_PLANNER_DIR /home/pradyun/anaconda3/envs/pch2r_dev/bin/python examples/analyze_direction_feasibility.py)",
+      "Bash(env -u PYTHONPATH -u GADDPG_DIR -u OMG_PLANNER_DIR /home/pradyun/anaconda3/envs/pch2r_dev/bin/python examples/analyze_direction_feasibility.py --out output/direction_feasibility_train.json)",
+      "Bash(bash -n examples/slurm/build_direction_table.sbatch)"
     ],
     "additionalDirectories": [
       "/home/pradyun/h2r/handover-sim2real/examples/configs",
-      "/home/pradyun/h2r/handover-sim2real/handover_sim2real/regrasp"
+      "/home/pradyun/h2r/handover-sim2real/handover_sim2real/dagger5"
     ]
   }
 }
