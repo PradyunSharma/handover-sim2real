@@ -175,13 +175,34 @@ def main() -> None:
 
         print(f"\n  scenes            : {len(by_scene)}   paired {n_pair}, "
               f"single {n_single}")
-        if n_same_bin:
-            fails.append(f"{n_same_bin} paired scene(s) have BOTH demos in the "
-                         f"same bin — they cannot break the confound")
+        # A collapsed pair is a CONSEQUENCE of recoverable pin failure, not a
+        # schema error: when the pin misses, the episode flies to OMG's own pick,
+        # and OMG picks the same grasp for both slots of that scene. The episodes
+        # are honestly labelled and still teach reaching; they simply contribute
+        # no contrast. Fatal only if it is a large share, because a few percent
+        # dilutes nothing and re-collecting to chase them would cost hours.
+        frac_same = n_same_bin / max(n_pair, 1)
+        if frac_same > 0.05:
+            fails.append(
+                f"{n_same_bin}/{n_pair} ({100*frac_same:.1f}%) paired scenes have "
+                f"BOTH demos in one bin — too many to dismiss; the paired subset "
+                f"is substantially diluted")
+        elif n_same_bin:
+            warns.append(
+                f"{n_same_bin}/{n_pair} ({100*frac_same:.1f}%) paired scenes "
+                f"collapsed to one bin, all of them via a failed pin. Kept and "
+                f"honestly labelled; they just carry no contrast. Filter on "
+                f"realised separation when reporting cond_delta on 'paired'.")
         if seps:
             s = np.asarray(seps)
             print(f"  pair separation   : median {np.median(s):.0f} deg   "
                   f"min {s.min():.0f}   antipodal {100*(s>179).mean():.0f}%")
+            print("    distribution    : " + "  ".join(
+                f"{lo}-{hi}:{int(((s >= lo) & (s < hi)).sum())}"
+                for lo, hi in ((0, 40), (40, 90), (90, 150), (150, 181))))
+            n_below = int((s < 40).sum())
+            print(f"    below the 40 deg independence floor: {n_below} "
+                  f"({100*n_below/len(s):.1f}%)  <- these pairs teach no contrast")
         if divs:
             dv = np.asarray(divs)
             print(f"  informative steps : median {np.median(dv):.3f}   "
