@@ -1,524 +1,492 @@
-# Phase 5 — grasp conditioning and regrasping
+# Regrasp — approach-direction conditioning
 
-Phase 4 pins one grasp per scene and trains a policy that never goes there.
-Across runs 4–16, `near_rate` — closed within 2 cm / 0.34 rad of the pinned grasp
-— sat at 0.00–0.08 while `success_rate` reached 0.80. The policy learned to come
-away with the object from wherever it happened to arrive, and
-[`docs/run_index.md`](docs/run_index.md) already named the cause: *the observation
-never says which orientation to arrive at.* Run 13's auxiliary head was the weak
-test of that hypothesis, and it did not move `near_rate` either.
+The policy is told **which side to come in from**, not which pose to reach. If the
+handover fails, it is told a different side and tries again.
 
-Phase 5 is the strong version. The goal grasp becomes an **input** to the policy,
-and each scene carries **four** well-separated pinned grasps instead of one, so a
-failed handover can be retried under a different grasp. That is regrasping — and
-it is only meaningful if the policy's behaviour actually changes when the
-commanded grasp changes, which is why `cond_track` is the column to read first.
+    conditioning   a unit vector d, injected PER-POINT into the cloud
+    command set    k = 6 octahedral bins in a gravity-aligned, hand-anchored frame
+    retry          on failure, command the surviving bin furthest from those tried
 
-Phase 4 is untouched: `handover_sim2real/regrasp/`, `handover_sim2real/regrasp_bc/` and
-`examples/*_p5.py` / `*_multi.py` are a full fork, so all 21 recorded Phase-4 runs
-stay byte-reproducible. Everything else (env setup, Phases 1–3, cluster sync):
-[`README_MY.md`](README_MY.md). Phase 4 itself: [`README_PHASE4.md`](README_PHASE4.md).
+Code lives in `handover_sim2real/regrasp/` and `handover_sim2real/regrasp_bc/`.
+Nothing outside those two packages is modified.
 
-## Setup
+---
 
-```bash
-module load miniconda3                                # cluster only
-source "$(conda info --base)/etc/profile.d/conda.sh"  # `conda activate` alone won't work
-conda activate pch2r_dev
-export GADDPG_DIR=$PWD/GA-DDPG OMG_PLANNER_DIR=$PWD/OMG-Planner
+## Why a direction and not a pose
+
+Commanding a **goal grasp pose** carries three costs, all of which get worse with
+scale:
+
+- **It needs a grasp proposer at deployment.** The real rig has no pin table.
+- **Coverage is per object.** "These grasps for *this* object" does not transfer,
+  so the 351-scene ceiling stays the bottleneck.
+- **`k` is baked into the data.** Changing the number of retry hypotheses means
+  relabelling and retraining.
+
+A direction is object-agnostic, so coverage is required **across the dataset**
+rather than per object; and because the network reads a continuous vector rather
+than a one-hot, `k` is a test-time knob.
+
+**It also makes the wrist-flip ambiguity impossible.** `augment_flip_grasp`
+appends twins rotated π about the gripper's own +z, which leaves column 2 of R
+untouched — so `d = −R[:,2]` is *identical* for a grasp and its twin, measured at
+`0.000e+00` over 2000 random poses. A pose-space metric ranks those twins as
+maximally separated and will happily select two commands that are one physical
+grasp; a direction cannot.
+
+---
+
+## The conditioning
+
+**Anchor frame** (recomputed per step), where `c` is the object point-cloud
+centroid and `p_wrist` the giver's wrist:
+
+```
+z = world up (gravity)
+x = normalize(horizontal(c - p_wrist))     # object side, away from the giver
+y = z × x
 ```
 
-Anything that touches the simulator needs a GPU **and** the full `PYTHONPATH`
-(`OMG-Planner/omg/config.py` calls `.cuda()` at import, PointNet++ has no CPU
-kernel, and `import handover` needs `handover-sim` on the path):
+Degenerate when the hand sits over the object: fall back to base→object, with
+**two thresholds** (engage below 4 cm, release above 8 cm) so the mode latches and
+cannot chatter mid-approach. Handedness is **not** mirrored — DexYCB is 542/540
+right/left in our collection, so the data covers both.
 
-```bash
-export PYTHONPATH=$PWD:$PWD/handover-sim:$PWD/handover-sim/mano_pybullet:$PYTHONPATH
+**The command** is `d = −R_grasp[:,2]` rotated into that frame — the negated
+gripper approach axis, pointing from the object outward toward where the gripper
+comes from. The sign is verified: advancing 10 cm along `+R[:,2]` shrinks a
+scene's candidate spread from 0.0851 m to 0.0340 m on **100 %** of 486 scenes.
+
+**Injection is per-point, and only per-point.** For each point `p_i` with
+estimated normal `n_i`:
+
+```
+d · n_i                     is this surface facing the incoming gripper?
+d · normalize(p_i - c)      is this point on the side I am approaching from?
 ```
 
-`select_pinned_grasps.py`, `analyze_grasp_separation.py` and the plotters are
-genuinely exempt — no GPU, no `PYTHONPATH`, no env vars at all. They import
-`grasp_select` by putting `handover_sim2real/regrasp/` on `sys.path` directly
-rather than as `handover_sim2real.regrasp.grasp_select`, because the latter runs
-the package `__init__` and drags in gym, pybullet and the handover envs for a
-script that only needs h5py and numpy. Run them on a login node.
+so the model input is **7 channels**: `xyz | ycb | hand | d·n | d·r`. There is no
+global `d` branch — `GraspEncoder` is deleted and `fused_dim` returns to
+`2 × feature_dim`.
 
-> **Paste these one line at a time.** `export A=$PWD/X` followed immediately by a
-> command on the next line will, if the newline is lost, produce
-> `A=$PWD/Xpython` — a *valid* assignment that bash accepts silently, leaving a
-> corrupted path that fails much later as `ModuleNotFoundError`. This has now
-> happened twice in this project; see the troubleshooting section.
+Three facts make this cheap to get right:
 
-## The two design decisions worth understanding first
+1. **Dot products are frame-invariant**, so everything happens in the EE frame
+   where the cloud already lives. The anchor never reaches the network — it only
+   decides *bin labels* and the retry bookkeeping.
+2. **`c` comes from the cloud itself**, identical at collection, training and
+   deployment, with no ground truth.
+3. **Normals must not ride through `PointListener`.** `se3_transform_pc` rotates
+   only rows `:3` and *copies* the rest, so a normal carried as an extra row
+   silently stays in the wrong frame. Estimating at the end, in the EE frame,
+   sidesteps it and leaves `policy.py` — shared with the rest of the repo —
+   untouched.
 
-**Conditioning is load-bearing, not a feature.** With four demonstrations per
-scene, the same `(point cloud, robot state)` carries four different expert
-labels. An unconditioned regression can only predict their mean — which is a
-valid action for none of the four, and strictly worse than a Phase-4 policy.
-Telling the policy which grasp it is being asked to reach is what makes the
-mapping single-valued again. `train_dagger_phase5.py` refuses to start if the pin
-table holds several grasps and `MODEL.grasp_cond` is off.
+Normals are kNN-PCA from the observed cloud (`scipy.spatial.cKDTree`; `open3d`
+exists only on the robot PC), sign-oriented outward from `c`.
 
-The corollary is that the network *ignoring* the conditioning is a regression
-risk, not a neutral outcome, and that is what `cond_track` exists to detect
-before you spend another run on it.
+---
 
-**Flip twins are the trap in "pick four grasps as far apart as possible".**
-`omg/planner.py`'s `augment_flip_grasp` appends, for every grasp, a duplicate
-rotated π about `panda_joint7` — π about the gripper's own approach axis, under
-which a parallel-jaw gripper is symmetric. The twin is *the same physical grasp*
-sitting at the maximum possible rotation distance, so a naive max-min selector
-picks twins first and returns four poses that are really two, with contradictory
-rotation labels for one target. `dagger5/grasp_select.py` quotients that out: the
-metric is the mean displacement of the gripper's six control points minimised
-over the two-element flip group, so a twin measures exactly 0 m and can never be
-chosen as a "distant" grasp.
+## MEASURED: k = 6 is really k = 4
+
+`analyze_direction_feasibility.py` runs the census **offline** — the DexYCB cache
+already holds extrinsics-transformed hand and object poses, and the MANO wrist is
+`joint7`'s origin in each subject/side URDF. Seconds, no GPU. Confirmed against
+the full goal set by the direction table:
+
+| bin | goal-set grasps | scenes reaching it |
+|---|---|---|
+| `+x` free end | 11358 | 490 (78.7 %) |
+| `+z` top-down | 8653 | 415 (66.6 %) |
+| `+y` lateral | 4314 | 366 (58.7 %) |
+| `−y` lateral | 3959 | 325 (52.2 %) |
+| **`−x` over the fingers** | **55** | **12 (1.9 %)** |
+| **`−z` from beneath** | **0** | **0 (0.0 %)** |
+
+Replicates on val (`−z` 0/29, `−x` 0/29). `−z` is geometrically impossible — the
+object is held above a table. `−x` at 0.19 % of all grasps is the hand-collision
+filtering working as designed.
+
+**Both bins are kept and masked at runtime**, so the code stays rig-agnostic and
+`−z` becomes real on a table-less setup with no change. But the retry ladder has
+**four** live rungs, `chained_retry_at_k` saturates at k = 4, and `succ_bin_−x` /
+`succ_bin_−z` are NaN rather than zero.
+
+`k` is a test-time knob **up to 20**: minimum separation falls 78.1° at k=6 to
+41.0° at k=20 and 39.4° at k=21, below the ~40° where bins stop being independent
+hypotheses. Note the Fibonacci lattice at k=6 gives only 78.1° against the
+octahedron's 90°, so `BINS` is strictly better there.
+
+---
+
+## Why two demonstrations per scene
+
+**This is a property of the dataset that no architecture reaches.** At one demo
+per scene, `d` is a deterministic function of the observation across the whole
+dataset, so the network can drive the loss to its floor by learning
+scene → action and ignoring the conditioning entirely. Two demos of one scene
+under different `d` map the **same observation to two different actions**, which
+is the only thing that forces the channels to be read.
+
+Pairs are selected by **realised** separation, not bin-axis separation — a grasp
+may sit up to 45° from its bin's axis, so two grasps in 90°-separated bins can
+realise 35° apart. Selecting on the axis overstated the contrast; on the realised
+directions the median went 90° → **116°** and the minimum 35° → **41°**.
+
+---
 
 ## Runbook
 
-Four stages, each consuming what the previous one wrote. The last stage's three
-outputs move together — swapping one without the others silently produces
-nonsense.
-
-### 1. Build the candidate table (K = 8 per scene)
+### Everything at once (DelftBlue)
 
 ```bash
-python examples/build_direction_table.py \
-    --cfg-file examples/configs/regrasp_run1.yaml \
-    --split train --k 8 --sep-floor 0.02 \
-    --out output/grasp_cand_table_train_p5.json
-
-# SLURM
-sbatch --export=ALL,SPLIT=train,OUT=output/grasp_cand_table_train_p5.json examples/slurm/build_direction_table.sbatch
+bash examples/slurm/regrasp_pipeline.sh
 ```
 
-Repeat with `--split val`. Slot 0 is seeded with `env.get_omg_goal_idx()`, so it
-is byte-identical to a Phase-4 `--mode omg` pin and `succ_g0` stays comparable
-with run 16; slots 1–7 are greedy farthest-point sampling under the
-flip-invariant metric.
+One command on a **login node**. It runs the offline assignment inline, then
+submits six SLURM jobs wired together with `--dependency=afterok`, and returns in
+about a second:
 
-**K = 8 and not 4 on purpose.** About a quarter of pinned demonstrations fail —
-the plan clips the object on the lateral approach — so demanding four of four
-would keep only ~0.76⁴ ≈ 33 % of scenes. Over-provisioning to eight and choosing
-the surviving four in stage 3 keeps roughly 90 %, for one extra collection pass.
+```
+A  collect train demos      GPU  ~4 h   ──┐
+B  collect val demos        GPU  ~20 m  ──┼──> D  smoke ──> E  train
+C  build test dir. table    GPU  ~2 h   ──┴────────────────────┴──> F  test eval
+```
 
-Read the summary it prints. "fewer than 4 distinct" counts scenes that cannot
-survive stage 3 whatever collection does, and is the first honest estimate of the
-Phase-5 scene budget. Starting point: of 720 s0/train scenes, 623 plan at all
-(`024_bowl` fails on all 40, `037_scissors` on 19 of 40) and 592 have a goal set
-of at least four.
+It cannot be one job: the chain is ~30 h and DelftBlue caps at 24. Splitting it
+also means A, B and C run in **parallel**, a failure costs only its own stage,
+and the smoke failing stops the chain by construction.
 
-### 2. Collect one demonstration per (scene, candidate)
+Two things it handles that are easy to get wrong by hand. It **detects a stale
+shard** — run 1's `.h5` sits at exactly the path run 2 wants, and its `d_world`
+is the grasp axis rather than the bin axis (a median 22° apart), so the pipeline
+fingerprints it, moves it to `*.run1-stale.h5`, and re-collects. And it
+**derives** `demo_ok_table` and the test pin table inside the jobs that need
+them, so no manual step sits between two multi-hour jobs.
+
+`--dry-run` prints the whole graph without submitting. `--force` resubmits
+everything. Re-running after a failure resubmits only what is missing.
+
+The stages below are the same work done by hand, and are what to read when a
+stage fails.
+
+
+### 1. Feasibility census (offline, seconds)
 
 ```bash
-python examples/collect_regrasp_demos.py \
-    --cfg-file examples/pretrain_multicam_wr.yaml \
-    --split train \
-    --valid-grasp-dict examples/valid_grasp_dict_005.pkl \
-    --grasp-pin-table output/grasp_cand_table_train_p5.json \
-    --output output/bc_dataset/train_p5_k8.h5
-
-# SLURM, chained on the table
-PIN=$(sbatch --parsable --export=ALL,SPLIT=train examples/slurm/build_direction_table.sbatch) && sbatch --dependency=afterok:$PIN --export=ALL,SPLIT=train,SIM_CFG=examples/pretrain_multicam_wr.yaml,OUT=output/bc_dataset/train_p5_k8.h5,PIN=output/grasp_cand_table_train_p5.json examples/slurm/collect_regrasp_demos.sbatch
+python examples/analyze_direction_feasibility.py --split train
 ```
 
-`--cfg-file` must equal `SIM.cfg_file` in the Phase-5 config. Budget K× Phase 4:
-~5000 episodes at K = 8, still serial.
+The go/no-go gate. A bin no scene can reach is not a retry hypothesis.
 
-Two differences from Phase 4's collector. Pinning is **mandatory** — an episode
-whose pin does not match is skipped rather than quietly falling back to OMG's own
-selection, because `grasp_idx` is supposed to name the target. And every episode
-group gains `grasp_idx` plus `grasp_pose_world`, the 4×4 the episode actually flew
-to, read back from the planner rather than copied from the table. Storing the pose
-means the dataset carries its own conditioning target and rebuilding a pin table
-can never retarget a collection made against the old one.
-
-### 3. Prune K → 4, keeping only the demonstrations that worked
+### 2. Direction table (one sim pass, ~20 min on a laptop GPU)
 
 ```bash
-python examples/select_regrasp_demos.py \
-    --demos output/bc_dataset/train_p5_k8.h5 \
-    --cand-table output/grasp_cand_table_train_p5.json \
-    --n-final 4 --sep-floor 0.02 \
-    --out output/bc_dataset/train_p5           # --dry-run for the attrition only
+python examples/build_direction_table.py --split train --out output/direction_table_train.json
 ```
 
-Writes three files, all of which the config points at:
+Per scene: wrist, **observed** centroid, anchor frame, and for each bin the
+goal-set grasp closest to its axis, with per-bin counts over the *full* goal set.
 
-| file | config key |
+The `--cfg-file` must match what the demos will be collected with — the centroid
+comes from the cloud, so the camera set and renderer change it.
+
+### 3. Demo assignment (offline, seconds)
+
+```bash
+python examples/assign_direction_demos.py --table output/direction_table_train.json \
+    --out output/regrasp_pins_train --mode per-bin --drop-bins='-z_beneath,-x_over_fingers'
+```
+
+Pure combinatorics, so `k`, the mode and the separation floor can all be
+re-decided without touching the cluster. Writes the pin table and the exclusion
+list.
+
+`--mode per-bin` (run 2 on, the default) gives each scene **one demonstration for
+every bin it can reach**, each the goal-set grasp *closest to that bin's axis* —
+which is the vector the policy is commanded with, so the demonstration is as
+close to the instruction as the goal set allows. On s0/train: 617 scenes,
+**1596 demos**, mean 2.59 per scene, split +x 490 / +y 366 / −y 325 / +z 415.
+
+`--mode pair` reproduces run 1: the single maximally-separated pair, 1088 demos.
+Both break the scene→action confound; per-bin breaks it harder and, more
+importantly, populates every bin's *evaluation* sample instead of only the two a
+scene happened to draw.
+
+### 4. Collect
+
+```bash
+python examples/collect_regrasp_demos.py --cfg-file examples/pretrain_multicam_wr.yaml --split train --grasp-pin-table output/regrasp_pins_train.json --output output/bc_dataset/train_regrasp.h5
+```
+
+~3.5 h for train at 1596 demos, ~5 min for val. Repeat with `--split val`.
+
+### 5. Audit, and write the usable-pair list
+
+```bash
+python examples/audit_regrasp_demos.py --demos output/bc_dataset/train_regrasp.h5 \
+    --write-ok output/regrasp_demos_train_ok.json
+```
+
+**The number to read is `informative steps`** — the fraction of steps where a
+scene's demos actually differ. Run 1's: **median 1.000, mean 0.921**. A flat
+profile there means the idea fails in the *data*, before any architecture
+question.
+
+`--write-ok` is not optional for run 2. It records the (scene, **bin**) pairs
+collection actually demonstrated — dropping any where OMG could not plan, or
+where the pin missed and the expert flew into a different sector. Point
+`SIM.demo_ok_table` at it and those pairs leave **both** the collection pool and
+the eval set.
+
+Why that matters more than it did in run 1: the command is now the bin axis, so a
+missed pin does not change what the policy is *told*, only what it is *shown* —
+leaving an episode captioned `+z` whose trajectory comes in from elsewhere. It
+cannot be re-binned either, because the scene already has a demonstration for the
+bin it actually flew to. Without the filter the policy trains on three directions
+and gets scored on four.
+
+### 6. Train
+
+```bash
+# base fit only — answers "is the conditioning read?" in ~1 h
+python examples/train_regrasp.py --cfg-file examples/configs/regrasp_run2.yaml --run-name regrasp_base --num-iters 0
+
+# the full DAgger loop
+python examples/train_regrasp.py --cfg-file examples/configs/regrasp_run2.yaml --run-name regrasp_run2
+```
+
+Resumable — re-run the same command. ~50 min/iteration on a laptop; ~13 h for the
+whole of `regrasp_run2.yaml` on a DelftBlue V100 with 20 collection workers:
+
+```bash
+sbatch --time=20:00:00 --export=ALL,RUN=regrasp_run2,\
+    SCRATCH_ROOT=/scratch/$USER/handover-sim2real examples/slurm/train_regrasp.sbatch
+```
+
+`regrasp_run2.yaml` is `regrasp_run1.yaml` with four changes and nothing else:
+20 iterations instead of 25, `base_epochs` 40 → 50, `EVAL.every` 0 → 1, and
+`EVAL.holdout` false → **true**. That last one means run 2's rates are genuinely
+held out and are therefore **not comparable with run 1's absolute numbers** —
+run 1 collected on its own eval scenes.
+
+### 7. Score
+
+Run 2 scores itself: `EVAL.every: 1` puts evaluation back inside the loop, where
+Phase 4 had it. It costs ~300 s an iteration (50 scenes × the 1.58 directions the
+average scene can supply ≈ 79 episodes), which is 1.7 h on a 13 h run — and it
+means `EVAL.ckpt: best` actually selects on `success_rate` rather than on val loss,
+because the metrics exist before the next iteration starts.
+
+To split it out instead, set `EVAL.every: 0` and run the scorer alongside:
+
+```bash
+python examples/eval_regrasp_run.py --run-dir output/dagger_runs/regrasp_run2 --iters all
+```
+
+Writes `<run>/eval_log.csv`. Safe to run WHILE training continues — it only reads
+what the trainer writes, and its own CSV is written atomically, so a concurrent
+plot never sees a partial file. Add `--watch` to poll for new iterations, or
+`--iters 0,5,10,15,19` for a subset if you want the trend sooner. The plotter
+handles either layout.
+
+### 8. Plot
+
+```bash
+python examples/plot_regrasp_run.py output/dagger_runs/regrasp_run2
+```
+
+Five figures, written into the run directory:
+
+| file | what it shows |
 |---|---|
-| `output/bc_dataset/train_p5.h5` | `TRAIN.base_train_h5` |
-| `output/bc_dataset/train_p5.json` | `SIM.grasp_pin_table` |
-| `output/bc_dataset/train_p5_excluded.json` | `SIM.exclude_scenes` |
+| `training_curve.png` | 4×3, **one row per commanded direction**: success stages, chance vs conversion, approach error. The main figure — see below for why it is per bin |
+| `curves_regrasp.png` | 2×3, **the one to read first**: is the policy using the command, `retry@k`, **ended in the commanded bin per bin**, per-bin success, per-bin tracking, arrived-from-the-commanded-side per bin |
+| `debug_dagger.png` | 3×4 loop machinery: per-bin collection progress, per-bin failure profile, the pooled outcome stack, pin consistency, \|D\| growth, refit loss |
+| `curves_diag.png` | 2×4 machinery health: label collapse, endgame, planner failures, β mixing, close timing, wall-clock split |
+| `media_curves.png` | the presentation cut — the same panels pooled over directions, trimmed to five that fit on a slide |
 
-This is the single place that decides what the training set contains. It applies
-`filter_demos.py`'s completion test verbatim in effect (an episode has a CLOSE
-label iff it ran to the end) plus the malformed-cloud check that killed run 19,
-then re-runs the max-min selection **over the survivors** rather than taking the
-first four by FPS rank — if slots 1 and 2 failed, a fresh pass over exactly the
-poses that worked gives the best four available. `slot0_is_omg` records per scene
-whether OMG's own pick survived, which is what makes a slot-0-only comparison
-against run 16 legitimate.
+A sixth, `test_set_evaluation.png`, comes from step 9 and is not written by this
+script.
 
-`filter_demos.py` does not need to run first, and its `--scenes-out` list is wrong
-for Phase 5 anyway: it drops a whole scene when any single slot fails.
+**Why the main figure is per bin.** A pooled `success_rate` averages four
+physically different commands, so a policy that solves `+x` and ignores `+z`
+plots identically to one that is mediocre at both — and telling those apart is
+the entire question. The rows are the four directions this dataset can reach,
+read from the log rather than assumed.
 
-Repeat for val. **Known pre-existing bug worth noting while rebuilding val:**
-`valid_grasp_dict_005.pkl` has exactly 720 keys and `run_omg_planner` passes the
-split-relative index straight through (`omg/planner.py:490`), so val tables have
-always been built with the train dict's entries 0–35. `utils.py:34` guards `SETUP`
-but not `SPLIT`. Phase 5 inherits this.
+`curves_regrasp.png` only appears once eval metrics exist — the figure is gated
+on `dir_track` being finite, so plotting a run with no scored iterations
+silently gives you four figures instead of five. A panel whose columns are
+missing entirely (an older log) says so in grey text rather than rendering an
+empty axis that reads as a genuine zero.
 
-### 4. Check the data before spending a trainer on it
+The plotter splices `eval_log.csv` into the trainer's own log automatically
+(`[plot] merged N rows`), reads only, and overwrites in place — so re-run it as
+scoring progresses. Add `--show` to open the figures instead of only saving them.
 
-```bash
-python examples/analyze_direction_spread.py --demos output/bc_dataset/train_p5.h5
-```
-
-Twenty minutes, no GPU, and it answers the question that decides whether the whole
-idea can work: for a given scene, how different are the four expert
-demonstrations? If they are nearly identical the conditioning input has nothing
-to predict from, and the failure is in the data rather than the network.
-
-Read the **profile**, not the headline. The four grasps share a free approach and
-are meant to diverge only into the reach, so a low overall informative fraction is
-the geometry, not a bug — it is exactly why `DATA.reach_tail_weight: 2.5` exists.
-A profile that is flat at ~0 all the way to the last step means the pin did not
-apply or the slots collapsed onto one grasp, and that is a bug to find here.
-
-### 5. Train
+Full-environment form, if you are not in an activated shell:
 
 ```bash
-# shakedown FIRST — see the checklist below
-sbatch --time=01:00:00 --export=ALL,RUN=dagger5_smoke,CFG=examples/configs/regrasp_smoke.yaml examples/slurm/train_regrasp.sbatch
-
-# run 1 — eval split off into its own job
-sbatch --time=20:00:00 --export=ALL,RUN=dagger5_run1,SCRATCH_ROOT=/scratch/$USER/handover-sim2real examples/slurm/train_regrasp.sbatch
-sbatch --export=ALL,RUN=dagger5_run1 examples/slurm/eval_regrasp_run.sbatch
+cd ~/h2r/handover-sim2real && GADDPG_DIR=$PWD/GA-DDPG OMG_PLANNER_DIR=$PWD/OMG-Planner PYTHONPATH="$PWD:$PWD/handover-sim:$PWD/handover-sim/mano_pybullet" python examples/plot_regrasp_run.py output/dagger_runs/regrasp_run2
 ```
 
-Re-run the identical command to resume. Run dir layout is Phase 4's exactly.
+### 9. Test-set evaluation (after training)
 
-The smoke run is not optional: Phase 5 changes the unit of work from a scene to a
-`(scene, grasp)` pair in six places, and this is what proves all six agree.
+```bash
+sbatch --export=ALL,RUN=regrasp_run2,CHAINED=1,"ITERS=0,5,10,15,20" examples/slurm/eval_regrasp_testset.sbatch
+```
 
-| smoke check | expected |
+Writes `<run>/test_eval_log.csv` and `<run>/test_set_evaluation.png` — the
+`training_curve.png` layout (one row per commanded direction) plus a
+conditioning row: *ended in the commanded bin* per bin, *arrived from the
+commanded side* per bin, and `retry@k` with the chained curve overlaid.
+
+**This is the held-out number.** The in-loop curves run with
+`EVAL.holdout: false` on the train split, so they are train-set rates by design
+— a clean read of "is the policy getting better at what it is being taught",
+and nothing more. This script scores the s0 **test** split, which the run has
+never seen in any form.
+
+**Two evaluations, and they answer different questions.** *Independent* (always)
+rolls every (scene, bin) pair fresh from home; its `retry@k` is an OR over
+independent attempts and therefore a **ceiling** — it assumes a failed attempt
+costs nothing. *Chained* (`--chained`) runs the retry ladder for real: attempt 1
+fails, the arm rewinds to 30 % of the trajectory it just flew, and attempt 2 is
+commanded from there. The gap between the two curves is what the reset-based
+version was giving away. Costs ~1.6× the independent sweep.
+
+s0/test is 144 scenes, ~124 of which plan, so ~320 episodes an iteration: ~21 min
+independent, ~35 min chained. `ITERS` is the first thing to set — five points
+spread across the run show the trend for a tenth of the cost, and the CSV is
+incremental so the rest can be filled in later. `--plot-only` re-renders from the
+CSV with no simulator, which runs on a laptop.
+
+Prerequisite — the test split needs its own tables, which is a GPU sim pass:
+
+```bash
+sbatch --export=ALL,SPLIT=test,OUT=output/direction_table_test.json examples/slurm/build_direction_table.sbatch
+python examples/assign_direction_demos.py --table output/direction_table_test.json --out output/regrasp_pins_test --mode per-bin --drop-bins='-z_beneath,-x_over_fingers'
+```
+
+There is deliberately no `demo_ok_table` on test: nothing is collected there, so
+the pin table itself is the feasibility statement.
+
+### 10. Chained retry (single scenes, with rendering)
+
+```bash
+python examples/eval_regrasp_retry.py --run-dir output/dagger_runs/regrasp_run2 --scenes 10,12,40 --render
+```
+
+On failure, rewind to 30 % of the failed trajectory and command the next
+direction from the ladder. `--render` draws the bin rays styled by state
+(commanded bright, spent dim, available faint) and each attempt's path.
+
+---
+
+## Reading the results
+
+| metric | means |
 |---|---|
-| `grasp_mismatch` | `0` — a (scene, slot) never re-aimed between iterations |
-| `goal_switch` | `0` — and never moved within an episode |
-| `grasp_idx` values in `data/dagger_iter_01.h5` | four distinct |
-| `cond_goal_spread` | `> 0` — the commanded grasps really are separated |
-| `cond_track` | any number; a blank means the diagnostic is not wired up |
+| **`dir_err`** | angle between the command and the achieved approach axis. The headline. |
+| `dir_track` | `1 − dir_err/90°`. 1 follows, 0 ignores. |
+| `bin_hit_rate` | arrived from the commanded side within 30°. Replaces `near_rate`. |
+| `bin_diag_rate` | confusion-matrix diagonal. Collapsing to `1/k` = the policy goes the same way whatever it is told. |
+| `cond_sep` | spread of what it DID over spread of what it was TOLD. |
+| `chained_retry_at_k` | the regrasping headline. Saturates at k=4 here. |
+| `cond_delta` | in the *training* log: does the action change when the command is shuffled. Non-zero at init; **decaying toward zero is the failure signature**. |
 
-### 6. Read the results
+**`near_rate` is dead.** It measured distance to a pinned pose the policy is no
+longer given, and reads ~0. That is not a regression.
 
-```bash
-python examples/plot_regrasp_run.py output/dagger_runs/dagger5_run1
-```
+---
 
-Three figures now: `curves.png` and `curves_diag.png` as in Phase 4, plus
-**`curves_p5.png`**, which is the one this phase is about.
+## Gotchas
 
-`cond_track` first. It is the mean pairwise spread of the four final EE poses
-divided by the spread of the four commanded grasps, under the same flip-invariant
-metric the selection used. Near 1 means the policy separates the four conditions
-as much as their targets are separated; near 0 means it does the same thing
-whatever it is told — the multi-modal averaging failure, which makes regrasping
-inert however good `success_rate` looks.
+**`GraspPinTable.num_grasps` is a MIN and reads 1** on a Regrasp table, which
+mixes 1- and 2-direction scenes. Use `max_grasps` to size arrays and
+`num_grasps_for(scene)` to iterate. Getting this wrong silently discards every
+paired second demonstration — the mechanism the whole design rests on.
 
-Read it against `near_rate`, because the pair localises the problem. **Both low**
-means the conditioning is being ignored, and the fix is FiLM over the fused
-feature rather than concatenation. **`cond_track` high with `near_rate` low**
-means the policy separates the conditions but tracks none of them, which is a
-reach-endgame problem and points at merging in run 21's open-loop pre-grasp
-commit. Either way it is readable from the first run, which is the point.
+**Shard completeness.** `DaggerHDF5Writer` writes `complete=False` at open and
+`True` only on a clean close; the resume path requires it. Without that flag a
+resume reuses a partial shard as if it were whole. Shards predating the flag have
+no attr and are treated as complete.
 
-`retry_at_k` is the regrasping headline — success with k attempts at different
-grasps, in FPS order — and it is free, derived from the same episodes with no
-extra rollouts. It assumes each retry restarts from home, which is true of this
-evaluation and *not* of a real deployment where attempt 2 begins wherever attempt
-1 stopped, so read it as a ceiling.
+**`attempted` is world vectors, never bin indices.** The anchor rotates with the
+human, so a bin index names a different physical direction before and after.
+Invisible under `YCB_MANO_START_FRAME: last` (static hand); appears on hardware.
 
-`succ_g0..3` / `near_g0..3` are the per-slot rates; slot 0 is OMG's own pick, so
-`succ_g0` is the number comparable with a Phase-4 run and the spread across slots
-says how much harder the deliberately-separated grasps are.
+**8 channels on disk, 7 into the model.** `d` is perturbed at training time, so
+`d`-dependent channels cannot be baked into the file — the normals are stored and
+the dot products are built at load.
 
-And the standing caveat from `docs/run_index.md`: the Phase-4 noise floor on 100
-eval scenes is **±0.115** (six identical base fits spanning 0.32–0.62). Any
-`success_rate` difference against run 16 smaller than ~0.15 is unreadable. Prefer
-`near_rate` and `cond_track`, which sit near zero today and have room to move.
+**`EVAL.holdout`** decides whether the eval scenes are also collected on.
+`regrasp_run1.yaml` inherited `false` from Phase 5, so every rate that run
+produced is a train-set rate and optimistic. `regrasp_run2.yaml` sets it `true`,
+which is why the two runs' absolute numbers are not comparable.
 
-### 6b. Roll out a checkpoint
+---
 
-```bash
-# watch one scene under two different commanded grasps — the eyeball cond_track
-python examples/rollout_regrasp_policy.py --run-dir output/dagger_runs/dagger5_run1/best \
-    --cfg-file examples/pretrain_multicam_wr.yaml --max-steps 50 \
-    --scenes-from-run output/dagger_runs/dagger5_run1 \
-    --grasp-pin-table output/bc_dataset/train_p5.json --show-goal-grasp --grasp-idx 0
-#   ... then --grasp-idx 3
+## Run 1
 
-# headless conditional table over every scene x every slot
-python examples/rollout_regrasp_policy.py --run-dir output/dagger_runs/dagger5_run1/best \
-    --cfg-file examples/pretrain_multicam_wr.yaml --max-steps 50 \
-    --scenes-from-run output/dagger_runs/dagger5_run1 \
-    --grasp-pin-table output/bc_dataset/train_p5.json \
-    --benchmark --all-grasps --no-render --egl
-```
+19 of 25 DAgger iterations (stopped by choice), 1087 base episodes / 20386 steps.
+`m ≈ 354` for iterations 1–5 and `≈ 176` for 6–19 — a deliberate budget
+correction, which is why `D_steps` changes slope at iteration 6.
 
-`--grasp-pin-table` is no longer overlay-only: a conditioned checkpoint gets its
-input from it, so the script refuses to run without one. `--max-steps` must match
-`DAGGER.max_steps` (50).
+Base fit: `val_total` best **0.1851 at epoch 16**, degrading to 0.239 by 99 with a
+4.9× train/val gap — hence `base_epochs: 40`. `cond_delta` **rose 0.73 → 1.38** on
+held-out val, so the conditioning is read and generalises.
 
-### 6c. Chained regrasping — retry from where the failure happened
+`DATA.reach_tail` went 10 → **5** on measurement: the divergence profile is flat
+(0.083 over the last ten steps vs 0.093 over 10–15, a ratio of **0.89×**). A wider
+window only pays when the demonstrations share a free approach and diverge into
+the reach; two directions come in from opposite sides from step 0, so weighting
+the endgame was starving the free approach where obstacle avoidance is learned.
 
-`retry_at_k` in `eval_log.csv` is an OR over four **independent** episodes, each
-from its own `env.reset()`. Nothing carries over from the failed attempt, so the
-retry never pays for it. `eval_chained_retry_p5.py` runs the sequence instead:
-roll grasp 0, and on failure rewind to 30 % of that trajectory, switch the
-conditioning to grasp 1, and keep rolling from there.
+**Headline: `success_rate` 0.210 (first 5) → 0.203 (last 5)**, a change of −0.008
+and well inside the ±0.115 noise floor. The readable finding is the pair
+`bin_diag_rate ≈ 0.50` against a chance of 0.25 while `bin_hit_rate` sits **at**
+chance: the policy orients as told and then approaches from wherever it likes.
 
-```bash
-python examples/eval_regrasp_retry.py --run-dir output/dagger_runs/dagger5_run1 --policy-dir output/dagger_runs/dagger5_run1/last --rewind-frac 0.30
-```
+---
 
-The rewind is `env.reset()` plus a replay of the first *r* recorded joint
-targets. That was chosen over `pybullet.saveState`/`restoreState` because the
-env's Python state — `mano._frame`, `ycb._frame`, `ycb._released`,
-`_release_step_counter_*`, `_elapsed_steps`, `_dropped` — is not in the bullet
-snapshot, and `ycb.release()` additionally swaps the object from a kinematic to a
-dynamic body. Replaying drives all of it through the normal code path, so there
-is no list of counters to keep in sync as handover-sim changes.
+## Run 2 (configured, not yet run)
 
-Three columns decide whether the headline means anything, in this order:
+`examples/configs/regrasp_run2.yaml`. Same architecture, same conditioning, same
+data — run 1's ambiguity was about the RUN, not the method, and run 2 removes the
+four reasons it could not be read:
 
-* **`chained_retry_at_1`** is a control, not a result. Attempt 0 *is* the slot-0
-  episode, so it must reproduce `succ_g0` from the same checkpoint up to rollout
-  noise. If it does not, nothing else here is comparable with anything.
-* **`replay_err_max`** is the assumption the module rests on, in metres of EE
-  divergence at the branch point. It should be ~0.
-* **`retryable_frac`** bounds the claim. The rewind resets the simulator, which
-  rewinds the **human** too — the hand is a DexYCB playback keyed on a frame
-  index — and after a `HUMAN_CONTACT` or `DROP` failure there is no world left to
-  retry in at all. This is the share of retried failures a non-resetting retreat
-  controller could have handled; the complement is the part of the metric that
-  exists only because the simulator can be rewound.
-
-So `chained_retry_at_k` is still an upper bound, just a much tighter one than
-`retry_at_k`: the robot pays for its failed approach, the human does not.
-
-`--rewind-mode first` branches every retry off attempt 0 instead of off the
-attempt that just failed; `--budget fresh` gives the resumed segment a full
-`max_steps` of its own instead of sharing one horizon with the prefix (both stay
-inside the benchmark's own 13 s / 86-policy-step limit). `<out>.h5` holds every
-attempt as a normal `episode_%05d` group with `prefix_len` marking the seam
-between the replayed and the newly chosen steps.
-
-**Watching it happen.** `--render` opens a PyBullet window:
-
-```bash
-python examples/eval_regrasp_retry.py --run-dir output/dagger_runs/dagger5_run1 --policy-dir output/dagger_runs/dagger5_run1/last --scenes 10 --render
-```
-
-It pauses after each scene rather than closing the window, and the keys go to the
-**PyBullet window** (it needs focus): **N** next, **P** previous, **R** re-run
-this scene, **A** run the rest without pausing, **Q** stop (whatever was rolled
-is still written). While stepping, N *browses* — it walks on into the usable pool
-past whatever `--scenes` listed, so `--scenes 10` means "start at 10" and N goes
-to 11, 12, … skipping anything the pin table does not hold and wrapping at the
-end. Headless runs never extend: there `--scenes` is the workload, and quietly
-rolling extra scenes would change what the reported rates are rates *of*.
-
-The scene's four grasps are gripper wireframes colour-coded by slot — g0 green,
-g1 blue, g2 orange, g3 magenta — with the commanded one drawn bright and thick
-and the others dim. Each attempt's EE path is drawn in its slot colour and left
-up for the whole scene, so a chained retry looks like what it is: a trunk that
-forks. The replayed prefix retraces in grey and the branch point gets a white
-cross-hair. `--show-cloud` adds the point cloud the policy is actually seeing
-(orange object, blue hand), `--pace` / `--replay-pace` / `--pause-s` control the
-timing, and `--no-path` / `--no-grasp-markers` strip it back.
-
-Use a handful of scenes. `--render` changes the offscreen renderer, which changes
-the point cloud, which can flip a borderline close — so take the numbers from a
-headless run and use the window to understand them, not to produce them.
-
-## What changed against Phase-4 run 16
-
-Run 1 is a **combination run**, not a controlled test — conditioning, the aux
-head, the cameras, the encoder init and the epoch budget all move at once.
-
-| | run 16 | Phase 5 run 1 | why |
+| | run 1 | run 2 | why |
 |---|---|---|---|
-| `SIM.cfg_file` | `pretrain_multicam_wlr` | `pretrain_multicam_wr` | wrist + right, matching what `sim2real/` can produce |
-| `SIM.grasp_pin_table` | 1 grasp/scene | **4** | the phase |
-| `DAGGER.episodes_per_iter` | 100 | **200** | 50 scenes × 4 slots |
-| `MODEL.grasp_cond` | — | **true** | goal grasp as input, rot6d(6)+trans(3) in the EE frame |
-| `MODEL.aux_head` | true | **false** | forced by the above |
-| `MODEL.policy_hidden` | `[256,256]` | `[512,256]` | fused vector 512 → 640 |
-| `TRAIN.pc_pretrained` | CVPR2023 | **empty** | PointNet++ from scratch |
-| `TRAIN.iter_epochs` | 25 | **12** | holds wall clock at 2.2× the data |
-| `TRAIN.train_from_scratch` | true | **false** | warm start each iteration |
-| `TRAIN.init_ckpt` | (inert) | **`best`** | borrow the previous iteration's best |
-| `EVAL.every` / `num_scenes` | 1 / 100 | **0 / 50** | scorer as its own job; ×4 slots = 200 episodes |
+| `m` | 354 → 176 mid-run | uniform | `num_grasps` is a MIN and read 1 on a mixed table; fixed with `max_grasps`, so \|D\| no longer changes slope at iteration 6 |
+| eval | pooled over 4 directions | **per bin** | "solves +x, ignores +z" and "mediocre at both" gave the same number |
+| `EVAL.holdout` | `false` | **`true`** | run 1 collected on its own eval scenes; its rates are train-set rates |
+| iterations | stopped at 19/25 | 20, planned | flat from iteration 6 on, and the marginal iteration is ~40 min of refit against a change inside the noise floor |
 
-**The aux head and the conditioning move together and cannot be separated.** Once
-the grasp is an input in the EE frame, the aux head's target *is* its own input
-and it learns an identity map. The confound is real; it is stated rather than
-hidden.
+`base_epochs` also goes 40 → 50 (margin, not need — the measured val minimum is
+epoch 16) and `EVAL.every` 0 → 1, which puts scoring back inside the loop and
+makes `EVAL.ckpt: best` select on `success_rate` rather than on val loss.
 
-### Sampling: 50 scenes × 4, not 200 independent draws
+**Run 2's absolute rates will be lower than run 1's and that is not a
+regression** — `holdout: true` is a different measurement. Compare trends and
+per-bin spread, not levels.
 
-`sample_pairs` draws `m // num_grasps` scenes and rolls out every grasp of each.
-Two rollouts that differ *only* in the commanded grasp — same scene, same start
-state, same cloud — are the only data that can teach the network the goal input
-matters, and drawing them together puts them in the same iteration and the same
-batches. The cost is scene coverage: 50 distinct scenes per iteration against run
-16's 100.
+The pre-registered branch: if `dir_track` stays near its floor with
+`bin_diag_rate` at 0.25 across all four rows, the per-point channels are being
+washed out by the SA-layer max-pooling, and run 3 adds a small global-`d` branch.
+The gap between runs 2 and 3 is then the measurement of how much the pooling
+destroys.
 
-### Epochs come down, not up
-
-The aggregate reaches ~220k steps by iteration 25, 2.2× run 16's 99.5k — not 4×,
-because `D_dagger_frac` reaches 0.90 and the base set is only a tenth of the
-total. Run 16 spent 25 epochs per refit for ~34.4 M sample-passes and ~11.9 h of
-`train_s`; 12 epochs here spends ~39 M, so the wall clock lands near run 16's
-despite the extra data. Warm-starting is what makes 12 enough.
-
-`base_epochs` stays at 100: iteration 0 sees 4× the data *and* a randomly
-initialised PointNet++, so 100 is if anything the floor. Budget ~78 min against
-run 16's ~19.
-
-### Capacity is deliberately not scaled with the data
-
-2.04 M parameters against run 16's 1.96 M — the head widening and the grasp
-encoder very nearly cancel the aux head that was removed. The new axis of
-variation is a 9-D pose, not new perceptual complexity: same 18 objects, same
-cameras, in fact *fewer* scenes, and 87 % of the parameters sit in a PointNet++
-whose job has not changed. Phase-3 runs 41 (deeper) and 42 (smaller) bracket run
-28 on both sides and neither moved the number beyond the ±0.115 floor. A capacity
-bump is a clean single-variable run 2 if the train loss plateaus high — not
-something to confound run 1 with.
-
-## Architecture
-
-```
-point_cloud [B,1024,5] ─► PointNet++      ─► scene [B,256] ┐
-robot_state [B,32]     ─► RobotEncoder    ─► robot [B,256] ├─► [B,640] ─► PolicyHead ─► [B,7]
-goal grasp  [B,9]      ─► GraspEncoder    ─► grasp [B,128] ┘
-```
-
-Injected at the **fused** level, following `rl/actor.py`'s `clock_dim`, whose
-docstring gives the reason: it keeps the two existing encoders shape-identical, so
-a Phase-4 checkpoint's `pc_encoder` and `robot_encoder` still load 1:1.
-
-The conditioning vector is `rot6d(6) + translation(3)` — the goal grasp in the
-**current EE frame**, recomputed every step because the world grasp is fixed but
-the EE moves, so it is the residual pose the policy still has to null out. It is
-frame-consistent with the point cloud, and it is the same quantity run 13's aux
-head was asked to predict. rot6d rather than the aux head's quaternion because
-the direction of use differs: as a regression target the double cover (q ≡ −q) is
-absorbed by the geodesic loss, but as a network **input** it makes the function
-the encoder must learn discontinuous.
-
-Not normalized — it is already an EE-relative displacement in metres, centred near
-zero by construction, and normalizing it would make it depend on statistics the
-real robot cannot reproduce.
-
-Sized at 128, about a fifth of the fused vector: enough not to be drowned by 512
-dims of perception, not so much that the head can solve the task by servoing to
-the goal and ignoring the cloud. That shortcut does exist — it would fly straight
-through the human's hand, which is precisely what OMG's labels do not do, so the
-loss pushes back. Watch `f_human_contact` anyway.
-
-## Sim2real consequence
-
-`sim2real/my_policy_runner.py` has no grasp source, and the real rig has no pin
-table and no OMG goal set. `bc/models.py`'s own block diagram notes that the
-original design had an *AnyGrasp/Grasp-MLP* branch which was removed; Phase 5
-reintroduces that dependency. It is arguably the right dependency — regrasping on
-hardware needs a grasp proposer regardless — but a Phase-5 checkpoint cannot be
-deployed without one. `goal_target_from_state`'s `valid` channel is kept so the
-branch stays maskable.
-
-## Troubleshooting
-
-### `ModuleNotFoundError: No module named 'omg'` from inside `gym.make()`
-
-This is a **path** problem wearing a dependency's clothes, and the message is
-misleading in a specific way: `sys.path` is not missing `$OMG_PLANNER_DIR`. It has
-it. `add_sys_path_from_env` ([`utils.py:10`](handover_sim2real/utils.py#L10))
-asserts only that the *variable exists* and then appends its value verbatim — it
-never checks that the directory contains an `omg/` package. So a variable pointing
-anywhere at all passes the assert and fails at `import omg` a moment later.
-
-The tell is in the same job log: `handover_sim2real/policy.py` and
-`dagger5/env_setup.py` both do `add_sys_path_from_env("GADDPG_DIR")` followed by a
-*real* import from GA-DDPG, and those succeed. Same process, same node, same
-`$PWD`-derived default — so if GA-DDPG resolves and OMG-Planner does not, the two
-variables are not equally trustworthy. Two causes:
-
-**The value was inherited.** Every sbatch writes
-`export OMG_PLANNER_DIR="${OMG_PLANNER_DIR:-$PWD/OMG-Planner}"`, and `:-` fires
-only when the variable is *unset*. With `--export=ALL`, whatever was in the
-submitting shell wins and rides onto the compute node — so an
-`export OMG_PLANNER_DIR=$PWD/OMG-Planner` run from a directory other than the repo
-root, once, in that login session, poisons every job submitted afterwards. This
-also explains a failure that will not reproduce on the login node: re-exporting
-"the sbatch environment" by hand from the repo root exercises the *default*
-branch, not the inherited one.
-
-**The submodule is not populated.** `OMG-Planner` is a git submodule
-(`git submodule status`). `git pull` moves the recorded gitlink but does not fetch
-its contents, so after a clone without `--recursive` the directory exists and is
-empty — again a valid path with no `omg/` in it, and again no assert error.
-
-One command on the affected node tells you which:
-
-```bash
-srun --partition=gpu-v100 --account=education-me-msc-ro --qos=normal --time=00:02:00 --nodes=1 --ntasks=1 --cpus-per-task=1 --gpus-per-task=1 bash -c 'echo "$OMG_PLANNER_DIR"; ls "$OMG_PLANNER_DIR" | head'
-```
-
-An unexpected path is cause 1 (`unset OMG_PLANNER_DIR` before submitting). The
-right path with an empty listing is cause 2 (`git submodule update --init
---recursive OMG-Planner`).
-
-Both are now caught before they can waste a job, in three places:
-
-`handover_sim2real/utils.py` — `add_sys_path_from_env` asserts `os.path.isdir`
-as well as presence, so a set-but-invalid variable fails immediately and by name
-instead of surfacing later as a missing module. This cannot change the behaviour
-of anything that works today: a run that imports successfully necessarily has a
-real directory there, so the assert is a no-op for it.
-
-**All 11 sbatch scripts** (Phase 1–5) validate both variables before `srun`. An
-inherited value whose package directory is missing is *discarded with a warning*
-and the `$PWD` default used instead — a paste accident should not kill a job that
-waited in the queue — while a `$PWD` default that is itself empty hard-fails with
-the `git submodule update` command. Both resolved paths are echoed into every job
-log.
-
-`dagger5/env_setup.py` adds `OMG_PLANNER_DIR` to `sys.path` at **import** rather
-than leaving it to `train_env.py`'s lazy load under the gym registry, and
-`assert_omg_importable()` runs immediately after — it checks for the `omg`
-package specifically, which `isdir` alone cannot do (an unpopulated submodule is
-a perfectly good directory). `preflight()` logs both resolved trees on every run,
-so the GA-DDPG-works/OMG-doesn't signature is on the record even when nothing
-breaks.
+---
 
 ## Deferred
 
-**A retreat controller** — the last step of true chained retry. §6c closes most
-of the gap `retry_at_k` left: attempt 2 now resumes from a state the policy drove
-itself into rather than from home. What it still does not charge for is the
-**human**, because rewinding by reset-and-replay rewinds the DexYCB playback too.
-The version that charges for both drives the arm backwards along its own recorded
-joint path *without* resetting, so the hand keeps moving and any object
-disturbance persists. It needs three things this repo does not have: gripper
-reopening, a collision-safe reverse servo, and an answer for the failures that
-already ended the episode (`HUMAN_CONTACT`, `DROP`) and leave no world to retry
-in — `retryable_frac` measures how often that last case bites.
+**A retreat controller.** The chained rewind resets the simulator, which rewinds
+the human's DexYCB playback too — so `chained_retry_at_k` is still an upper
+bound, just a much tighter one than the reset-based `retry_at_k`. The honest
+version drives the arm back along its own joint path without resetting.
 
-**A held-out grasp split** — train on slots 0–2, evaluate on slot 3 — which would
-answer whether the conditioning generalises to a grasp never demonstrated for that
-scene. `EVAL.holdout` currently holds out scenes, not grasps.
-
-Neither is in run 1.
+**A held-out BIN split** — train on three bins, evaluate on the fourth. This is
+the only real test of whether the conditioning *interpolates*, and therefore of
+the claim that makes `k` a test-time knob worth anything.

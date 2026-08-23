@@ -1,57 +1,44 @@
 """
-Plot a Phase-5 DAgger run from its dagger_log.csv.
+Plot a Regrasp DAgger run from its dagger_log.csv.
 
-    python examples/plot_regrasp_run.py output/dagger_runs/dagger5_run1
-    python examples/plot_regrasp_run.py output/dagger_runs/dagger5_run1 --show
+    python examples/plot_regrasp_run.py output/dagger_runs/regrasp_run1
+    python examples/plot_regrasp_run.py output/dagger_runs/regrasp_run1 --show
 
 Safe to run WHILE the loop is going — it only reads the CSV, which is appended
-and flushed once per iteration.
+and flushed once per iteration. If the run scored its iterations in a separate
+job (`EVAL.every: 0`), <run>/eval_log.csv is spliced in by iteration, so the
+figures look the same either way.
 
-Reads <run>/dagger_log.csv (one row per DAgger iteration, written by
-train_regrasp.py) and renders three figures.
+Five figures, and the split between them is by QUESTION, not by convenience.
 
-MAIN (<run>/curves.png) — 2x4 grid, "did it learn":
-  • success    — success / grasp / near / close rate on the held-out eval scenes.
-                 The four are nested (close >= near, close >= grasp >= success),
-                 so the VERTICAL GAPS are the diagnosis: close-near is closing in
-                 the wrong place, near-grasp is closing right but not gripping,
-                 grasp-success is gripping and then losing it.
-  • opportunity— did the policy GET a chance and did it TAKE it: the fraction of
-                 episodes that ever reached a graspable pose, the fraction that
-                 commanded a close, success CONDITIONED on having closed, and the
-                 episodes that reached a graspable pose and came away with
-                 nothing. A flat success rate with a rising chance rate means the
-                 reach is solved and the trigger is not.
-  • approach   — EE->grasp error: the CLOSEST reached over the episode (solid;
-                 defined even when the policy never closes) and the error AT the
-                 close (dashed), position on the left axis and rotation on the
-                 right. Phase-3 experience is that ROTATION binds first.
-                 With an auxiliary goal-grasp head (run 13 on) a third, DOTTED
-                 pair is added: how far the network's PREDICTION of the grasp is
-                 from the pinned pose. Read it against the solid curves — an
-                 accurate prediction alongside a gripper that still arrives far
-                 away means the information is in the features and the action
-                 head is not using it; both large means the observation cannot
-                 support the target at all. The two say different things and
-                 point at different fixes.
-  • outcomes   — eval outcome breakdown as a stacked area (fractions summing to 1):
-                 which failure mode is being traded for which as success moves.
-  • learner    — how far the LEARNER's own rollouts got during collection:
-                 fraction reaching the standoff / the grasp, and closing on their
-                 own. This is DAgger's state distribution shifting, and it moves
-                 BEFORE eval success does.
-  • consistency— scenes revisited in a later iteration, and how many aimed at a
-                 DIFFERENT grasp than the first time. Must stay 0: a nonzero bar
-                 means D holds contradictory labels for one scene.
-  • dataset    — |D| in steps (left) and the on-policy share (right). Success
-                 plotted against this is what separates "DAgger helps" from
-                 "more data helps".
-  • fit        — train/val loss of each refit (log axis) + gripper accuracy.
-                 Under FTL each point is a fresh fit on a bigger, more diverse D;
-                 a RISING train loss means the aggregate is becoming
-                 self-inconsistent, which is the failure DAgger cannot average away.
+TRAINING CURVE (<run>/training_curve.png) — 4x3, "did it learn, and for which
+direction". One ROW per commanded bin, three columns:
 
-DIAGNOSTIC (<run>/curves_diag.png) — 2x3 grid, "is the machinery healthy":
+  • success stages   close -> near -> grasp -> success. Nested (close >= near,
+                     close >= grasp >= success), so the VERTICAL GAPS are the
+                     diagnosis: close-near is closing in the wrong place,
+                     near-grasp is closing right but not gripping, grasp-success
+                     is gripping and then losing it.
+  • chance vs        did the policy GET a chance and did it TAKE it. Leads with
+    conversion       the geometric test (object material really between the open
+                     jaws) rather than agreement with the pinned pose. A flat
+                     success rate with a rising chance rate means the reach is
+                     solved and the trigger is not.
+  • approach error   EE -> grasp: the CLOSEST reached over the episode (solid;
+                     defined even when the policy never closes) and the error AT
+                     the close (dashed), position on the left axis and rotation
+                     on the right. Phase-3 experience is that ROTATION binds
+                     first.
+
+WHY PER BIN, AND WHY THIS IS THE MAIN FIGURE. A pooled `success_rate` averages
+four physically different commands. A policy that solves `+x` and ignores `+z`
+plots identically to one that is mediocre at both, and only the first is
+evidence the conditioning is being read — which is the entire question this
+phase exists to answer. The rows are the four directions the dataset can
+actually reach (`-x` is demonstrable by 12 of 623 scenes and `-z` by none), and
+which four is read from the log rather than assumed.
+
+DIAGNOSTIC (<run>/curves_diag.png) — 2x4, "is the machinery healthy":
   • labels     — mean approach-label displacement vs ee_step, and the count of
                  degenerate (~zero) labels. A collapse towards 0 is the standoff
                  stall returning; it is invisible in step counts.
@@ -71,38 +58,65 @@ DIAGNOSTIC (<run>/curves_diag.png) — 2x3 grid, "is the machinery healthy":
                  of the hand rather than displacing the gripper.
   • closing    — when each side decides to close: the learner's mean close step
                  during collection vs at eval, against the horizon.
-  • beta/mix   — the beta schedule and the fraction of executed steps that were
-                 the expert's. Without these the collection curves are not
-                 comparable across iterations.
   • cost       — wall-clock split by phase, so the expensive part is visible.
 
-REGRASP (<run>/curves_regrasp.png) — 1x3, "is the conditioning doing anything":
-  • cond_track — THE panel, and the one to read first. The mean pairwise spread
-                 of the four final EE poses over the spread of the four commanded
-                 grasps, under the flip-invariant control-point metric. 1.0 means
-                 the policy separates the four conditions as much as their targets
-                 are separated; 0.0 means it does the same thing whatever it is
-                 told, which is the multi-modal averaging failure Phase 5 is built
-                 to avoid and which makes regrasping inert however good
-                 `success_rate` looks. `near_rate` is drawn with it because the
-                 pair localises the problem: both low = the conditioning is being
-                 ignored, and the fix is FiLM rather than concatenation; cond_track
-                 high with near_rate low = the policy separates the conditions but
-                 tracks none of them, which is a reach-endgame problem.
-  • retry@k    — success with k attempts at different grasps, in FPS order. The
-                 regrasping headline, derived from the same episodes at no extra
-                 cost. It assumes each retry restarts from home, which is true of
-                 this evaluation and NOT of a real deployment, where attempt 2
-                 begins wherever attempt 1 stopped. Read it as a ceiling.
-  • per-slot   — success (solid) and near (dotted) for each pinned grasp. Slot 0
-                 is OMG's own pick, so `succ_g0` is the curve comparable with a
-                 Phase-4 run; the spread across slots is how much harder the
-                 deliberately-separated grasps are.
+DEBUG DAGGER (<run>/debug_dagger.png) — 3x4, "is the LOOP working":
+  • row 1      — collection, per commanded direction: how far the learner's own
+                 rollouts got. This is DAgger's state distribution shifting, and
+                 it moves BEFORE eval success does — and it can move for one
+                 direction and not another, which pooling hides.
+  • row 2      — per direction, of the episodes that came away with NOTHING,
+                 what went wrong. Conditioned on failure, so the categories
+                 stack to 1.0 and the PROFILE is readable independently of how
+                 often that bin fails at all. Two bins failing at 0.8 for
+                 different reasons are indistinguishable in `f_*` and obvious
+                 here.
+  • row 3      — the pooled outcome stack, the pin-consistency check
+                 (`grasp_mismatch` must stay 0 — a nonzero bar means D holds
+                 contradictory labels for one scene), |D| growth with the
+                 on-policy share, and the refit's train/val loss. Under FTL each
+                 refit point is a fresh fit on a bigger, more diverse D, so a
+                 RISING train loss means the aggregate is becoming
+                 self-inconsistent, which is the failure DAgger cannot average
+                 away.
 
-Drawn only when the log has the columns, so a Phase-4 log renders two figures and
-a Phase-5 log renders three.
+CONDITIONING (<run>/curves_regrasp.png) — 2x3, "is the conditioning doing
+anything". Read this one first.
+  • is it USING the command — the pooled headline. `dir_track`
+                 (1 - mean dir_err / 90 deg) is 1 when the gripper ends on the
+                 axis it was told to come in on and 0 when it ignores the
+                 command; `bin_diag_rate` is the discrete version and
+                 `bin_hit_rate` asks about the SIDE the gripper arrived from
+                 rather than its orientation. Chance for both is 1/4 with four
+                 live bins, drawn as the dotted line — a rate sitting ON it means
+                 the policy orients freely and the conditioning is inert.
+  • retry@k    — success with k attempts at different directions. The regrasping
+                 headline, derived from the same episodes at no extra cost. It
+                 assumes each retry restarts from home, which is true of this
+                 evaluation and NOT of a real deployment, where attempt 2 begins
+                 wherever attempt 1 stopped. Read it as a ceiling; the chained
+                 version is in eval_regrasp_testset.py.
+  • ended in the COMMANDED bin, PER BIN — the literal question, and the panel the
+                 phase turns on: told `+z`, what fraction of episodes ended with
+                 the gripper's approach axis in `+z`? Per bin rather than pooled
+                 because a pooled 0.50 is equally consistent with "follows all
+                 four commands half the time" and "nails +x and ignores the
+                 rest", and only the second is a reason to change anything.
+  • per-bin success — one curve per commanded direction. The spread is how much
+                 the direction matters: curves on top of each other mean
+                 retrying is four draws from one distribution.
+  • per-bin tracking — `dir_track` per direction, the continuous companion to the
+                 panel above it.
+  • arrived from the COMMANDED side, PER BIN — orientation and side fail
+                 independently: a gripper can point the right way on the wrong
+                 side of the object. Run 1 measured exactly that pooled
+                 (bin_diag ~0.50, bin_hit at chance); per bin is where it becomes
+                 actionable.
 
-Saves them all (and shows them with --show).
+MEDIA (<run>/media_curves.png) — the presentation cut. The same data and the
+same panel functions, POOLED over directions and trimmed to five panels that fit
+on a slide. Nothing in it is new; the per-bin split, the pin check, |D| growth
+and the refit loss are all dropped as internal questions.
 
 TARGET AWARENESS (run 21 on). `DAGGER.target` is read from <run>/config.yaml,
 because under `pregrasp` several columns keep their NAMES and change their
@@ -110,25 +124,16 @@ MEANING — the episode ends 6.4 cm short of the grasp, so `eval_min_pos`,
 `mean_pos_err` and `chance_rate` are measured against the PRE-GRASP. A pre-grasp
 min-pos-err of 0.005 is not twenty times better than run 16's 0.10; it is a
 different quantity, and plotting the two under one label invites exactly the
-wrong comparison. Every affected panel is relabelled, and three things are added:
-
-  • `mean_reach_pos_err` on the approach panel (diamonds) — where the BLIND push
-    ended up relative to the GRASP. THIS is the line comparable to a grasp-mode
-    run's min pos err, because it is the only one measured against the pose the
-    gripper actually has to end up on.
-  • `box_after_rate` on the opportunity panel — of the episodes that committed,
-    how many had the object between the open jaws after the push. In this mode
-    `box_chance_rate` reads ~0 by construction (the policy stops 6.4 cm short, so
-    the jaws are never occupied while it is still deciding) and `box_taken_rate`
-    is NaN with it; neither is a regression.
-  • `settle_steps` on the endgame panel — how much convergence servo the episodes
-    actually got, against `commit_settle_steps` x the episodes that committed.
+wrong comparison. Every affected panel is relabelled, and the pooled panels gain
+`mean_reach_pos_err` (diamonds) — where the BLIND push ended up relative to the
+GRASP, and the only line comparable to a grasp-mode run's min pos err.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -137,6 +142,13 @@ import yaml
 matplotlib.use("Agg")  # headless-safe; overridden by --show below
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
+
+# `directions` is pure numpy — no torch, no sim, no h5py — so importing it costs
+# this script nothing and keeps the bin names and the LIVE_BINS default in ONE
+# place. Duplicating them here as string literals is exactly the kind of copy
+# that survives a bin-set change and silently mislabels every figure afterwards.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from handover_sim2real.regrasp import directions as _D          # noqa: E402
 
 
 def _load(log_path: Path, eval_log: Path | None = None):
@@ -252,6 +264,317 @@ def _fix_x(fig, it):
         a.xaxis.set_major_locator(MaxNLocator(integer=True))
 
 
+# ── PER-BIN PANELS ───────────────────────────────────────────────────────────
+#
+# Every eval panel is drawn once per commanded direction, and the SAME function
+# draws the pooled version on the media figure. That is deliberate: a per-bin
+# panel that differs from its aggregate in some detail of what it plots is a
+# figure that cannot be read against itself, and the only reliable way to keep
+# them identical is for there to be one implementation.
+#
+# `sfx` selects the column family: "" is the pooled eval set, "_b3" is the
+# episodes commanded to approach from `-y`. Columns that exist only pooled (the
+# auxiliary head, the pinned-pose reference pair, the pre-grasp push) draw only
+# when `sfx` is empty, so a per-bin panel is a strict subset rather than a panel
+# with mysterious gaps.
+
+
+# Columns that were called something else before the per-bin family existed.
+# `succ_bin_{b}` IS `success_rate_b{b}` — the same reduction over the same rows —
+# so accepting it keeps run 1's figures readable instead of rendering four empty
+# rows for the only run that predates the schema.
+_LEGACY = {f"success_rate_b{b}": f"succ_bin_{b}" for b in range(len(_D.BINS))}
+_LEGACY["n_b0"] = "n_bin_0"
+
+# One colour per BIN INDEX, so `+y` is the same green on every panel of every
+# figure. Indexed by bin, not by position in `bins`, because a run that never
+# commands `-y` must not silently shift `+z` onto `-y`'s colour.
+_BIN_COLOURS_BY_BIN = ("tab:blue", "tab:brown", "tab:green", "tab:orange",
+                       "tab:red", "tab:purple")
+
+
+class _Ctx:
+    """What every panel needs: the columns, the x axis, and which pose the run
+    was steering to."""
+
+    def __init__(self, num, it, args, target):
+        self.num, self.it, self.args = num, it, args
+        self.target = target
+        self.pregrasp = target == "pregrasp"
+        self.TGT = "pre-grasp" if self.pregrasp else "grasp"
+
+    def get(self, key):
+        """A column, falling back to its pre-rename name if the new one is empty."""
+        ys = self.num(key)
+        if not _finite(ys) and key in _LEGACY:
+            ys = self.num(_LEGACY[key])
+        return ys
+
+
+def _note_empty(a, msg="not recorded in this run's log"):
+    """Say WHY a panel is blank.
+
+    An empty axis reads as "the measurement is zero", which is a claim about the
+    policy. These panels are blank because the columns did not exist when the run
+    was logged, which is a claim about the CSV — a distinction worth one line of
+    grey text.
+    """
+    if not a.get_lines() and not a.collections:
+        a.text(0.5, 0.5, msg, transform=a.transAxes, ha="center", va="center",
+               fontsize=8, color="0.55", style="italic")
+        return True
+    return False
+
+
+def _bins_to_plot(num, k=4):
+    """Which directions this run actually commanded, in bin order.
+
+    Ranked by episode count and cut at `k`, because the octahedral set has six
+    bins and this dataset can reach four — four blank rows would be four rows of
+    nothing. Sorted back into bin order afterwards so the rows read
+    +x, +y, -y, +z rather than by popularity. Falls back to `LIVE_BINS` for a log
+    with no per-bin counts at all.
+    """
+    tot = {}
+    for b in range(len(_D.BINS)):
+        # `n_b{b}` is the new column; `n_bin_{b}` is what run 1 wrote. Either
+        # answers "did this bin get episodes", so accept both rather than
+        # rendering an empty figure for a log that predates the rename.
+        ns = [v for v in num(f"n_b{b}") if v == v]
+        if not any(ns):
+            ns = [v for v in num(f"n_bin_{b}") if v == v]
+        if sum(ns) > 0:
+            tot[b] = sum(ns)
+    if not tot:
+        return list(_D.LIVE_BINS)
+    return sorted(sorted(tot, key=lambda b: -tot[b])[:k])
+
+
+def _bin_title(b: str | int) -> str:
+    return f"{_D.BIN_SHORT[b]} ({_D.BIN_NAMES[b].split('_', 1)[1].replace('_', ' ')})"
+
+
+def _panel_nested(a, c: _Ctx, sfx="", title=None):
+    """close -> near -> grasp -> success, which are NESTED. The vertical GAPS are
+    the diagnosis: close-near is closing in the wrong place, near-grasp is closing
+    right but not gripping, grasp-success is gripping and then losing it."""
+    for key, label, style in (("close_rate", "close", ":"),
+                              ("near_rate", "near (pose ok)", "-."),
+                              ("grasp_rate", "grasp", "--"),
+                              ("success_rate", "success", "-")):
+        ys = c.get(key + sfx)
+        if _finite(ys):
+            _plot(a, c.it, ys, style, marker="o", ms=3, label=label,
+                  lw=2 if key == "success_rate" else 1.2)
+    a.set_ylim(-0.02, 1.02)
+    _note_empty(a)
+    _grid(a, title or "success stages", ylabel="fraction of episodes")
+    _legend(a, loc="upper left")
+
+
+def _panel_opportunity(a, c: _Ctx, sfx="", title=None, lean=False):
+    """Did it get a chance, and did it take it.
+
+    LEADS WITH THE GEOMETRIC TEST (box_*, regrasp/grasp_box.py): object material
+    actually between the open jaws, which counts an off-pose grasp as the
+    opportunity it is. The pinned-pose pair (chance_rate / miss_given_chance) is
+    a faint reference only — it gates on agreement with the pin and reads
+    0.03-0.05 in runs succeeding 60-70% of the time, so it measures pin
+    agreement, not opportunity.
+    """
+    for key, label, style, col, lw in (
+            ("box_chance_rate", "object in jaws", "-", "tab:blue", 1.4),
+            ("box_taken_rate", "closed | in jaws", "-", "tab:green", 2.0),
+            ("miss_given_box", "no grasp | in jaws", "-", "tab:red", 1.4),
+            ("close_success_rate", "success | closed", "--", "tab:olive", 1.2),
+            ("mean_box_frac", "mean jaw occupancy", ":", "tab:gray", 1.0)):
+        # LEAN keeps only the three that carry the story. `success | closed` is a
+        # fourth conditioning on the same episodes and crowds the panel, and
+        # `mean jaw occupancy` tracks `object in jaws` so closely in these runs
+        # that it reads as a duplicate line.
+        if lean and key in ("close_success_rate", "mean_box_frac"):
+            continue
+        ys = c.get(key + sfx)
+        if _finite(ys):
+            _plot(a, c.it, ys, style, marker="o", ms=3, color=col, label=label, lw=lw)
+    if not sfx and not lean:
+        # Pre-grasp mode: the jaws cannot contain the object while the policy is
+        # still deciding — it stops 6.4 cm short — so box_chance_rate above reads
+        # ~0 BY CONSTRUCTION and box_taken_rate is NaN with it. `box_after_rate`
+        # is this mode's conversion measure.
+        ys = c.get("box_after_rate")
+        if _finite(ys):
+            _plot(a, c.it, ys, "-D", ms=4, color="tab:purple", lw=2.0,
+                  label="in jaws AFTER push | committed")
+        for key, label, col in (
+                ("chance_rate", f"at pinned {c.TGT} (ref)", "tab:blue"),
+                ("miss_given_chance", "missed | pinned (ref)", "tab:red")):
+            ys = c.get(key)
+            if _finite(ys):
+                _plot(a, c.it, ys, ":", marker="", color=col, label=label,
+                      lw=1.0, alpha=0.4)
+    a.set_ylim(-0.02, 1.02)
+    _note_empty(a)
+    _grid(a, title or "opportunity vs conversion", ylabel="fraction")
+    _legend(a, loc="upper left")
+
+
+def _panel_approach(a, c: _Ctx, sfx="", title=None):
+    """EE -> target: the CLOSEST reached over the episode (solid; defined even
+    when the policy never closes) and the error AT the close (dashed), position
+    on the left axis and rotation on the right. Phase-3 experience is that
+    ROTATION binds first."""
+    args, TGT = c.args, c.TGT
+    mp, mr = c.get("eval_min_pos" + sfx), c.get("eval_min_rot" + sfx)
+    pe, re_ = c.get("mean_pos_err" + sfx), c.get("mean_rot_err" + sfx)
+    if _finite(mp):
+        _plot(a, c.it, mp, "-o", ms=3, color="tab:blue",
+              label=f"min pos err to {TGT} (m)")
+    if _finite(pe):
+        _plot(a, c.it, pe, "--o", ms=3, color="tab:cyan", alpha=0.8,
+              label=(f"pos err to {TGT} at commit (m)" if c.pregrasp
+                     else "pos err at close (m)"))
+    if not sfx:
+        # Pre-grasp mode: where the BLIND push ended up relative to the GRASP.
+        # THIS, not `mp`, is the line comparable to a grasp-mode run's min pos
+        # err — the only one measured against the pose the gripper has to end on.
+        rp = c.get("mean_reach_pos_err")
+        if _finite(rp):
+            _plot(a, c.it, rp, "-D", ms=3, color="tab:purple",
+                  label="pos err to GRASP after blind push (m)")
+        # Auxiliary goal-grasp head: how far the network's BELIEF about the grasp
+        # is from the pinned pose, on the same axes as the gripper's own error on
+        # purpose. An accurate prediction alongside a gripper that still arrives
+        # far away means the information is in the features and the action head
+        # is not using it; both large means the observation cannot support the
+        # target at all.
+        ap = c.get("aux_pos_mm")
+        if _finite(ap):
+            _plot(a, c.it, (np.asarray(ap, dtype=float) / 1000.0).tolist(), ":^",
+                  ms=3, color="tab:green", alpha=0.9,
+                  label="aux: predicted grasp pos err (m)")
+    a.axhline(args.pos_thresh, color="tab:blue", ls=":", lw=1,
+              label=f"close thresh {args.pos_thresh} m")
+    a.set_ylim(bottom=0)
+    a.set_ylabel("position error (m)", fontsize=8, color="tab:blue")
+    a.tick_params(axis="y", labelcolor="tab:blue")
+    a2 = a.twinx()
+    if _finite(mr):
+        _plot(a2, c.it, mr, "-s", ms=3, color="tab:red",
+              label=f"min rot err to {TGT} (rad)")
+    if _finite(re_):
+        _plot(a2, c.it, re_, "--s", ms=3, color="tab:orange", alpha=0.8,
+              label=(f"rot err to {TGT} at commit (rad)" if c.pregrasp
+                     else "rot err at close (rad)"))
+    if not sfx:
+        rr = c.get("mean_reach_rot_err")
+        if _finite(rr):
+            _plot(a2, c.it, rr, "-D", ms=3, color="tab:brown", alpha=0.9,
+                  label="rot err to GRASP after blind push (rad)")
+        ar = c.get("aux_rot_deg")
+        if _finite(ar):
+            _plot(a2, c.it, np.radians(np.asarray(ar, dtype=float)).tolist(), ":^",
+                  ms=3, color="tab:olive", alpha=0.9,
+                  label="aux: predicted grasp rot err (rad)")
+    a2.axhline(args.rot_thresh, color="tab:red", ls=":", lw=1,
+               label=f"close thresh {args.rot_thresh} rad")
+    a2.set_ylim(bottom=0)
+    a2.set_ylabel("rotation error (rad)", fontsize=8, color="tab:red")
+    a2.tick_params(axis="y", labelcolor="tab:red", labelsize=7)
+    if not any(_finite(y) for y in (mp, mr, pe, re_)):
+        # The two dotted threshold lines are always drawn, so the generic
+        # empty-axis test cannot fire here — ask the data directly.
+        a.text(0.5, 0.5, "not recorded in this run's log", transform=a.transAxes,
+               ha="center", va="center", fontsize=8, color="0.55", style="italic")
+    _grid(a, title or f"EE -> {c.TGT}: closest (solid) vs at the close (dashed)")
+    h1, l1 = a.get_legend_handles_labels()
+    h2, l2 = a2.get_legend_handles_labels()
+    if h1 or h2:
+        # LOWER left, not upper right. Both axes are forced to start at 0 while
+        # the errors live near the top of their range (~0.1 m on a 0-0.11 axis),
+        # so the bottom-left corner is the only reliably empty one — upper right
+        # sat on top of the curves in every run so far.
+        a.legend(h1 + h2, l1 + l2, fontsize=6, loc="lower left", ncol=2,
+                 framealpha=0.85)
+
+
+# The eval outcome taxonomy, drawn two ways. `f_*` are fractions of the eval set
+# and stack to 1.0; `ff_*` drop the success and are fractions of the FAILURES, so
+# they stack to 1.0 over "of the episodes that came away with nothing, what went
+# wrong". The second is the one that separates two bins failing at the same rate
+# for different reasons, which is exactly what a per-bin figure is for.
+_OUTCOMES = (("f_grasp_ok", "secured", "tab:green"),
+             ("f_grasp_miss", "closed, not secured", "tab:olive"),
+             ("f_no_release", "no release", "tab:orange"),
+             ("f_drop", "drop", "tab:red"),
+             ("f_human_contact", "human contact", "tab:purple"),
+             ("f_timeout", "never closed", "tab:gray"))
+_FAILURES = (("ff_grasp_miss", "closed, not secured", "tab:olive"),
+             ("ff_no_release", "no release", "tab:orange"),
+             ("ff_drop", "drop", "tab:red"),
+             ("ff_human_contact", "human contact", "tab:purple"),
+             ("ff_timeout", "never closed / timed out", "tab:gray"))
+
+
+def _panel_outcomes(a, c: _Ctx, sfx="", title=None, failures_only=False,
+                    legend=True):
+    series = _FAILURES if failures_only else _OUTCOMES
+    if _stack(a, c.it, [c.get(k + sfx) for k, _, _ in series],
+              [lb for _, lb, _ in series], [col for _, _, col in series]):
+        a.set_ylim(0, 1)
+    _note_empty(a)
+    _grid(a, title or ("failure profile (of the episodes that failed)"
+                       if failures_only else "eval outcomes"),
+          ylabel="fraction")
+    # A stacked area has no empty corner, so four identical legends across a row
+    # cover four panels' worth of data to say the same thing once. Callers drawing
+    # a row pass legend=False on all but the first.
+    if legend:
+        _legend(a, loc="lower left", ncol=2)
+
+
+def _panel_collection(a, c: _Ctx, b=None, title=None, lean=False, legend=True):
+    """How far the LEARNER's own rollouts got during collection. This is DAgger's
+    state distribution shifting, and it moves BEFORE eval success does.
+
+    `b` selects a bin's `c_*_b{b}` counters; None is the pooled pair. The
+    per-bin counters are raw counts against `c_episodes_b{b}`, and the collector
+    writes -1 (not 0) for a bin it collected nothing for, so a reused shard —
+    which reports no breakdown at all — reads as a gap rather than as a
+    collapse.
+    """
+    if b is None:
+        eps = c.get("episodes")
+        keys = (("reached_standoff", "reached standoff"),
+                ("reached_grasp", "reached pre-grasp (COMMIT fired)"
+                 if c.pregrasp else "reached grasp (CLOSE fired)"),
+                ("policy_closed",
+                 "committed on its own" if c.pregrasp else "closed on its own"))
+    else:
+        eps = c.get(f"c_episodes_b{b}")
+        keys = ((f"c_reached_standoff_b{b}", "reached standoff"),
+                (f"c_reached_grasp_b{b}", "reached pre-grasp (COMMIT fired)"
+                 if c.pregrasp else "reached grasp (CLOSE fired)"),
+                (f"c_policy_closed_b{b}", "closed on its own"),
+                (f"c_success_b{b}", "secured (beta mixture)"))
+    if lean:
+        # `closed on its own` is a collection-side counter that needs beta to
+        # interpret, and the presentation figure no longer shows beta.
+        keys = keys[:2]
+    for key, label in keys:
+        ys = c.get(key)
+        frac = [(y / e if (e and e > 0 and y == y and y >= 0) else float("nan"))
+                for y, e in zip(ys, eps)]
+        if _finite(frac):
+            _plot(a, c.it, frac, "-o", ms=3, label=label)
+    a.set_ylim(-0.02, 1.02)
+    _note_empty(a)
+    _grid(a, title or "collection: how far the LEARNER got",
+          ylabel="fraction of episodes")
+    if legend:
+        _legend(a, loc="upper left")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -288,236 +611,45 @@ def main() -> None:
             target = str(((yaml.safe_load(f) or {}).get("DAGGER", {}) or {})
                          .get("target", "grasp"))
     pregrasp = target == "pregrasp"
-    TGT = "pre-grasp" if pregrasp else "grasp"
 
-    # ── MAIN ────────────────────────────────────────────────────────────────
-    fig, ax = plt.subplots(2, 4, figsize=(21, 8))
+    # Every panel reads its columns and its labels through this — including the
+    # "pre-grasp" / "grasp" relabelling, which is now `ctx.TGT`.
+    ctx = _Ctx(num, it, args, target)
+    bins = _bins_to_plot(num)
 
-    # success
-    a = ax[0][0]
-    for key, label, style in (("close_rate", "close", ":"),
-                              ("near_rate", "near (pose ok)", "-."),
-                              ("grasp_rate", "grasp", "--"),
-                              ("success_rate", "success", "-")):
-        ys = num(key)
-        if _finite(ys):
-            _plot(a, it, ys, style, marker="o", ms=3, label=label,
-                   lw=2 if key == "success_rate" else 1.2)
-    a.set_ylim(-0.02, 1.02)
-    _grid(a, "eval (held out): the nested rates", ylabel="fraction of eval scenes")
-    _legend(a, loc="upper left")
-
-    # opportunity vs conversion: did it get a chance, and did it take it.
+    # ── TRAINING CURVE (<run>/training_curve.png) — one ROW per direction ────
     #
-    # LEADS WITH THE GEOMETRIC TEST (box_*, dagger/grasp_box.py): object material
-    # actually between the open jaws, which counts an off-pose grasp as the
-    # opportunity it is. The pinned-pose pair (chance_rate / miss_given_chance)
-    # is kept as a faint reference only — it gates on agreement with the pin and
-    # reads 0.03-0.05 in runs succeeding 60-70% of the time, so it measures pin
-    # agreement, not opportunity. Runs before this metric existed show only the
-    # faint pair, which is why both are drawn rather than one replacing the other.
-    a = ax[0][1]
-    for key, label, style, col, lw in (
-            ("box_chance_rate", "object in jaws", "-", "tab:blue", 1.4),
-            ("box_taken_rate", "closed | in jaws", "-", "tab:green", 2.0),
-            ("miss_given_box", "no grasp | in jaws", "-", "tab:red", 1.4),
-            ("close_success_rate", "success | closed", "--", "tab:olive", 1.2),
-            ("mean_box_frac", "mean jaw occupancy", ":", "tab:gray", 1.0)):
-        ys = num(key)
-        if _finite(ys):
-            _plot(a, it, ys, style, marker="o", ms=3, color=col, label=label, lw=lw)
-    # Pre-grasp mode: the jaws cannot contain the object while the policy is
-    # still deciding — it stops 6.4 cm short — so box_chance_rate above reads ~0
-    # BY CONSTRUCTION and box_taken_rate is NaN with it. `box_after_rate` is this
-    # mode's conversion measure: of the episodes that committed, how many had the
-    # object between the open jaws once the blind push had run.
-    ys = num("box_after_rate")
-    if _finite(ys):
-        _plot(a, it, ys, "-D", ms=4, color="tab:purple", lw=2.0,
-              label="in jaws AFTER push | committed")
-    for key, label, col in (("chance_rate", f"at pinned {TGT} (ref)", "tab:blue"),
-                            ("miss_given_chance", "missed | pinned (ref)", "tab:red")):
-        ys = num(key)
-        if _finite(ys):
-            _plot(a, it, ys, ":", marker="", color=col, label=label,
-                  lw=1.0, alpha=0.4)
-    a.set_ylim(-0.02, 1.02)
-    _grid(a, "opportunity vs conversion (geometric)", ylabel="fraction")
-    _legend(a, loc="upper left")
-
-    # approach: CLOSEST the EE ever came, and where it was when it closed
-    a = ax[0][2]
-    mp, mr = num("eval_min_pos"), num("eval_min_rot")
-    pe, re_ = num("mean_pos_err"), num("mean_rot_err")
-    if _finite(mp):
-        _plot(a, it, mp, "-o", ms=3, color="tab:blue",
-              label=f"min pos err to {TGT} (m)")
-    if _finite(pe):
-        _plot(a, it, pe, "--o", ms=3, color="tab:cyan", alpha=0.8,
-               label=f"pos err to {TGT} at commit (m)"
-                     if pregrasp else "pos err at close (m)")
-    # Pre-grasp mode: where the BLIND push ended up relative to the GRASP. This,
-    # not `mp` above, is the quantity comparable to a grasp-mode run's min pos
-    # err — it is the only line on this panel measured against the pose the
-    # gripper actually has to end up on. The gap between it and `mp` is the
-    # push's own contribution, which should be small: the two differ only by
-    # forward_dist's mismatch with the true reach and by the orientation error
-    # projected over 6.4 cm.
-    rp, rr = num("mean_reach_pos_err"), num("mean_reach_rot_err")
-    if _finite(rp):
-        _plot(a, it, rp, "-D", ms=3, color="tab:purple",
-              label="pos err to GRASP after blind push (m)")
-    # Auxiliary goal-grasp head (run 13 on): how far the network's BELIEF about
-    # the grasp is from the pinned pose. Plotted on the same axes as the gripper's
-    # actual error on purpose — the comparison is the whole point. If the head
-    # predicts the pose accurately while the gripper still arrives far away, the
-    # information is present in the features and the action head is not using it;
-    # if both are large, the observation cannot support the target at all.
-    # Absent (all-NaN) on runs without the head, so nothing changes for those.
-    ap = num("aux_pos_mm")
-    if _finite(ap):
-        _plot(a, it, (np.asarray(ap, dtype=float) / 1000.0).tolist(), ":^", ms=3,
-              color="tab:green", alpha=0.9,
-              label="aux: predicted grasp pos err (m)")
-    a.axhline(args.pos_thresh, color="tab:blue", ls=":", lw=1,
-              label=f"close thresh {args.pos_thresh} m")
-    a.set_ylim(bottom=0)
-    a.set_ylabel("position error (m)", fontsize=8, color="tab:blue")
-    a.tick_params(axis="y", labelcolor="tab:blue")
-    a2 = a.twinx()
-    if _finite(mr):
-        _plot(a2, it, mr, "-s", ms=3, color="tab:red",
-              label=f"min rot err to {TGT} (rad)")
-    if _finite(re_):
-        _plot(a2, it, re_, "--s", ms=3, color="tab:orange", alpha=0.8,
-                label=f"rot err to {TGT} at commit (rad)"
-                      if pregrasp else "rot err at close (rad)")
-    if _finite(rr):
-        _plot(a2, it, rr, "-D", ms=3, color="tab:brown", alpha=0.9,
-              label="rot err to GRASP after blind push (rad)")
-    ar = num("aux_rot_deg")
-    if _finite(ar):
-        _plot(a2, it, np.radians(np.asarray(ar, dtype=float)).tolist(), ":^", ms=3,
-              color="tab:olive", alpha=0.9,
-              label="aux: predicted grasp rot err (rad)")
-    a2.axhline(args.rot_thresh, color="tab:red", ls=":", lw=1,
-               label=f"close thresh {args.rot_thresh} rad")
-    a2.set_ylim(bottom=0)
-    a2.set_ylabel("rotation error (rad)", fontsize=8, color="tab:red")
-    a2.tick_params(axis="y", labelcolor="tab:red", labelsize=7)
-    _grid(a, f"EE -> {TGT}: closest reached (solid) vs at the "
-             + ("commit (dashed), and -> grasp after the push (diamond)"
-                if pregrasp else "close (dashed)"))
-    h1, l1 = a.get_legend_handles_labels()
-    h2, l2 = a2.get_legend_handles_labels()
-    if h1 or h2:
-        a.legend(h1 + h2, l1 + l2, fontsize=6, loc="upper right")
-
-    # outcome breakdown
-    a = ax[0][3]
-    series = [("f_grasp_ok", "secured", "tab:green"),
-              ("f_grasp_miss", "closed, not secured", "tab:olive"),
-              ("f_no_release", "no release", "tab:orange"),
-              ("f_drop", "drop", "tab:red"),
-              ("f_human_contact", "human contact", "tab:purple"),
-              ("f_timeout", "never closed", "tab:gray")]
-    if _stack(a, it, [num(k) for k, _, _ in series],
-              [l for _, l, _ in series], [c for _, _, c in series]):
-        a.set_ylim(0, 1)
-    _grid(a, "eval outcomes (fraction of scenes)")
-    _legend(a, loc="lower left", ncol=2)
-
-    # learner progress during collection
-    a = ax[1][0]
-    eps = num("episodes")
-    for key, label in (("reached_standoff", "reached standoff"),
-                       ("reached_grasp", "reached pre-grasp (COMMIT fired)"
-                        if pregrasp else "reached grasp (CLOSE fired)"),
-                       ("policy_closed",
-                        "committed on its own" if pregrasp
-                        else "closed on its own")):
-        ys = num(key)
-        frac = [(y / e if (e and e > 0 and y == y and y >= 0) else float("nan"))
-                for y, e in zip(ys, eps)]
-        if _finite(frac):
-            _plot(a, it, frac, "-o", ms=3, label=label)
-    a.set_ylim(-0.02, 1.02)
-    _grid(a, "collection: how far the LEARNER got", ylabel="fraction of episodes")
-    _legend(a, loc="upper left")
-
-    # grasp consistency across iterations (verifies the pin actually held)
-    a = ax[1][1]
-    for key, label, col in (("revisits", "scenes revisited", "tab:blue"),
-                            ("grasp_mismatch", "grasp CHANGED", "tab:red")):
-        ys = num(key)
-        if _finite(ys):
-            _plot(a, it, ys, "-o", ms=3, color=col, label=label)
-    a.set_ylabel("episodes", fontsize=8)
-    a2 = a.twinx()
-    dr = num("max_grasp_drift")
-    if _finite(dr):
-        _plot(a2, it, dr, "--s", ms=3, color="tab:purple", label="max drift (m)")
-    a2.set_ylabel("max drift (m)", fontsize=8, color="tab:purple")
-    a2.tick_params(axis="y", labelcolor="tab:purple", labelsize=7)
-    _grid(a, "same grasp per scene? (should be 0 changed)")
-    h1, l1 = a.get_legend_handles_labels()
-    h2, l2 = a2.get_legend_handles_labels()
-    if h1 or h2:
-        a.legend(h1 + h2, l1 + l2, fontsize=7, loc="upper left")
-
-    # dataset growth
-    a = ax[1][2]
-    ds = num("D_steps")
-    if _finite(ds):
-        _plot(a, it, ds, "-o", ms=3, color="tab:blue", label="|D| (steps)")
-    a.set_ylabel("labelled steps in D", fontsize=8, color="tab:blue")
-    a.tick_params(axis="y", labelcolor="tab:blue")
-    a2 = a.twinx()
-    fr = num("D_dagger_frac")
-    if _finite(fr):
-        _plot(a2, it, fr, "-s", ms=3, color="tab:orange", label="on-policy share")
-    a2.set_ylabel("DAgger fraction of D", fontsize=8, color="tab:orange")
-    a2.set_ylim(0, 1)
-    a2.tick_params(axis="y", labelcolor="tab:orange", labelsize=7)
-    _grid(a, "the aggregate D the refit sees")
-    h1, l1 = a.get_legend_handles_labels()
-    h2, l2 = a2.get_legend_handles_labels()
-    if h1 or h2:
-        a.legend(h1 + h2, l1 + l2, fontsize=7, loc="upper left")
-
-    # fit health
-    a = ax[1][3]
-    for key, label, style in (("train_loss", "train", "-"),
-                              ("val_loss", "val", "--"),
-                              ("best_val_loss", "best val", ":")):
-        ys = num(key)
-        if _finite(ys):
-            _plot(a, it, ys, style, marker="o", ms=3, label=label)
-    a.set_yscale("log")
-    a.set_ylabel("loss (log)", fontsize=8)
-    a2 = a.twinx()
-    for key, label, style in (("train_grip_acc", "train grip acc", "-"),
-                              ("val_grip_acc", "val grip acc", "--")):
-        ys = num(key)
-        if _finite(ys):
-            _plot(a2, it, ys, style, marker="^", ms=3, color="tab:green", label=label,
-                    alpha=0.7 if key == "val_grip_acc" else 1.0)
-    a2.set_ylabel("gripper acc", fontsize=8, color="tab:green")
-    a2.set_ylim(0, 1.02)
-    a2.tick_params(axis="y", labelcolor="tab:green", labelsize=7)
-    _grid(a, "the refit on the growing aggregate")
-    h1, l1 = a.get_legend_handles_labels()
-    h2, l2 = a2.get_legend_handles_labels()
-    if h1 or h2:
-        a.legend(h1 + h2, l1 + l2, fontsize=7, loc="lower left")
+    # The pooled version of this figure is an average over four physically
+    # different commands, and that average is exactly what hides the phase's
+    # result: a policy that solves `+x` and ignores `+z` plots identically to one
+    # that is mediocre at both, and only the first is evidence the conditioning
+    # is doing anything. So the three eval panels are drawn once per bin, and
+    # every row shares its y limits with the others by construction (all four are
+    # fractions on [0, 1], and the approach row's axes are set from the data).
+    #
+    # The run-machinery panels that used to share this grid — the pin-consistency
+    # check, |D| growth, the refit loss, and the collection curves — moved to
+    # debug_dagger.png. None of them are results; all of them need the diagnostic
+    # figure's context to mean anything, and here they competed for attention
+    # with the four rows that ARE the result.
+    nrow = max(len(bins), 1)
+    fig, ax = plt.subplots(nrow, 3, figsize=(17, 3.7 * nrow), squeeze=False)
+    for r, b in enumerate(bins):
+        sfx = f"_b{b}"
+        name = _bin_title(b)
+        _panel_nested(ax[r][0], ctx, sfx, title=f"{name} — success stages")
+        _panel_opportunity(ax[r][1], ctx, sfx,
+                           title=f"{name} — chance vs conversion")
+        _panel_approach(ax[r][2], ctx, sfx,
+                        title=f"{name} — approach error to the {ctx.TGT}")
 
     _fix_x(fig, it)
-    fig.suptitle(f"Phase-5 DAgger — {run.name}"
+    fig.suptitle(f"Regrasp — {run.name}   [eval, by commanded direction]"
                  + (f"   [target: {target} — geometry is measured to the "
                     f"PRE-GRASP, not the grasp]" if pregrasp else ""),
                  fontsize=12)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-    main_out = run / "curves.png"
+    fig.tight_layout(rect=[0, 0, 1, 1 - 0.03 / nrow * 2])
+    main_out = run / "training_curve.png"
     fig.savefig(main_out, dpi=140)
     print(f"wrote {main_out}")
 
@@ -646,7 +778,8 @@ def main() -> None:
 
     # ---- collection outcomes (DAGGER.outcome_check; empty for runs 1-17) ----
     # Deliberately the same taxonomy and the same colours as the eval-outcome
-    # panel on curves.png, so the two stacks can be read against each other. The
+    # panel on debug_dagger.png, so the two stacks can be read against each
+    # other (`_OUTCOMES` is the shared definition of both). The
     # difference between them IS the beta mixture: this one is what the
     # expert/learner blend achieved on the collection scenes, that one is what the
     # policy achieves alone on the eval scenes.
@@ -691,37 +824,171 @@ def main() -> None:
     fig2.savefig(diag_out, dpi=140)
     print(f"wrote {diag_out}")
 
-    # ── REGRASP (<run>/curves_regrasp.png) — "is the conditioning doing anything" ──
-    # Its own figure rather than three more panels on curves.png, because these
-    # answer a different question and are blank for every Phase-4 run.
-    if _finite(num("cond_track")) or _finite(num("retry_at_2")):
-        fig3, ax3 = plt.subplots(1, 3, figsize=(16, 4.4))
+    # ── DEBUG DAGGER (<run>/debug_dagger.png) — the loop's own machinery ─────
+    #
+    # Everything here is a question about the RUN rather than about the policy:
+    # is the learner's state distribution moving, which way are the failures
+    # going, did the pin hold, is the aggregate growing, is the refit healthy.
+    # They shared a grid with the results until now and lost every time.
+    fig4, dx = plt.subplots(3, 4, figsize=(21, 12), squeeze=False)
 
-        # THE panel. cond_track is the mean pairwise spread of the four final EE
-        # poses over the spread of the four commanded grasps. 1.0 = the policy
-        # separates the conditions as much as the targets are separated; 0.0 = it
-        # does the same thing whatever it is told, which is the multi-modal
-        # averaging failure and makes regrasping inert however good success looks.
-        # near_rate rides along because the two together say which of the two
-        # failure modes is live: both low = the conditioning is ignored; cond_track
-        # high and near_rate low = the policy separates the conditions but tracks
-        # none of them, which is a reach-endgame problem, not a conditioning one.
-        a = ax3[0]
-        _plot(a, it, num("cond_track"), "-", marker="o", ms=3, lw=2.2,
-              color="tab:purple", label="cond_track (ee spread / goal spread)")
-        _plot(a, it, num("near_rate"), "-.", marker=".", ms=3, lw=1.2,
-              color="tab:red", label="near_rate")
-        a.axhline(0.3, color="0.6", ls=":", lw=1.0)
-        a.text(0.01, 0.31, "below this: switch to FiLM", fontsize=7,
-               color="0.4", transform=a.get_yaxis_transform())
+    # Row 1 — collection, per commanded direction. DAgger's state distribution
+    # shifting is the thing that moves BEFORE eval success does, and it can move
+    # for one direction and not another; pooled, that is invisible.
+    for j in range(4):
+        a = dx[0][j]
+        if j < len(bins):
+            b = bins[j]
+            _panel_collection(a, ctx, b=b, legend=(j == 0),
+                              title=f"{_D.BIN_SHORT[b]} — collection: how far "
+                                    f"the LEARNER got")
+        else:
+            a.axis("off")
+
+    # Row 2 — of the episodes that came away with NOTHING, what went wrong.
+    # Conditioned on failure, so the categories stack to 1.0 and the profile is
+    # readable independently of how often that bin fails at all: two bins can
+    # fail at 0.8 for completely different reasons, and `f_*` cannot tell them
+    # apart while `ff_*` can.
+    for j in range(4):
+        a = dx[1][j]
+        if j < len(bins):
+            b = bins[j]
+            _panel_outcomes(a, ctx, sfx=f"_b{b}", failures_only=True,
+                            legend=(j == 0),
+                            title=f"{_D.BIN_SHORT[b]} — why the failures failed")
+        else:
+            a.axis("off")
+
+    # Row 3 — the pooled outcome stack, then the three run-machinery panels that
+    # used to sit on the main grid.
+    _panel_outcomes(dx[2][0], ctx, title="eval outcomes (all bins, fraction of "
+                                         "the eval set)")
+
+    # Did a revisited scene still aim at the same grasp? The pin enforces it;
+    # this checks it actually held. `grasp_mismatch` must stay 0 — a nonzero bar
+    # means D holds contradictory labels for one scene.
+    a = dx[2][1]
+    for key, label, col in (("revisits", "scenes revisited", "tab:blue"),
+                            ("grasp_mismatch", "grasp CHANGED", "tab:red")):
+        ys = num(key)
+        if _finite(ys):
+            _plot(a, it, ys, "-o", ms=3, color=col, label=label)
+    a.set_ylabel("episodes", fontsize=8)
+    a2 = a.twinx()
+    dr = num("max_grasp_drift")
+    if _finite(dr):
+        _plot(a2, it, dr, "--s", ms=3, color="tab:purple", label="max drift (m)")
+    a2.set_ylabel("max drift (m)", fontsize=8, color="tab:purple")
+    a2.tick_params(axis="y", labelcolor="tab:purple", labelsize=7)
+    _grid(a, "same grasp per scene? (should be 0 changed)")
+    h1, l1 = a.get_legend_handles_labels()
+    h2, l2 = a2.get_legend_handles_labels()
+    if h1 or h2:
+        a.legend(h1 + h2, l1 + l2, fontsize=7, loc="upper left")
+
+    # |D| in steps and the on-policy share. Success plotted against this is what
+    # separates "DAgger helps" from "more data helps". NOTE the slope changes if
+    # `m` changed mid-run.
+    a = dx[2][2]
+    ds = num("D_steps")
+    if _finite(ds):
+        _plot(a, it, ds, "-o", ms=3, color="tab:blue", label="|D| (steps)")
+    a.set_ylabel("labelled steps in D", fontsize=8, color="tab:blue")
+    a.tick_params(axis="y", labelcolor="tab:blue")
+    a2 = a.twinx()
+    fr = num("D_dagger_frac")
+    if _finite(fr):
+        _plot(a2, it, fr, "-s", ms=3, color="tab:orange", label="on-policy share")
+    a2.set_ylabel("DAgger fraction of D", fontsize=8, color="tab:orange")
+    a2.set_ylim(0, 1)
+    a2.tick_params(axis="y", labelcolor="tab:orange", labelsize=7)
+    _grid(a, "the aggregate D the refit sees")
+    h1, l1 = a.get_legend_handles_labels()
+    h2, l2 = a2.get_legend_handles_labels()
+    if h1 or h2:
+        a.legend(h1 + h2, l1 + l2, fontsize=7, loc="upper left")
+
+    # Under FTL each point is a fresh fit on a bigger, more diverse D, so a
+    # RISING train loss means the aggregate is becoming self-inconsistent —
+    # the one failure DAgger cannot average away.
+    a = dx[2][3]
+    for key, label, style in (("train_loss", "train", "-"),
+                              ("val_loss", "val", "--"),
+                              ("best_val_loss", "best val", ":")):
+        ys = num(key)
+        if _finite(ys):
+            _plot(a, it, ys, style, marker="o", ms=3, label=label)
+    a.set_yscale("log")
+    a.set_ylabel("loss (log)", fontsize=8)
+    a2 = a.twinx()
+    for key, label, style in (("train_grip_acc", "train grip acc", "-"),
+                              ("val_grip_acc", "val grip acc", "--")):
+        ys = num(key)
+        if _finite(ys):
+            _plot(a2, it, ys, style, marker="^", ms=3, color="tab:green",
+                  label=label, alpha=0.7 if key == "val_grip_acc" else 1.0)
+    a2.set_ylabel("gripper acc", fontsize=8, color="tab:green")
+    a2.set_ylim(0, 1.02)
+    a2.tick_params(axis="y", labelcolor="tab:green", labelsize=7)
+    _grid(a, "the refit on the growing aggregate")
+    h1, l1 = a.get_legend_handles_labels()
+    h2, l2 = a2.get_legend_handles_labels()
+    if h1 or h2:
+        a.legend(h1 + h2, l1 + l2, fontsize=7, loc="lower left")
+
+    _fix_x(fig4, it)
+    fig4.suptitle(f"Regrasp DAgger machinery — {run.name}", fontsize=12)
+    fig4.tight_layout(rect=[0, 0, 1, 0.975])
+    debug_out = run / "debug_dagger.png"
+    fig4.savefig(debug_out, dpi=140)
+    print(f"wrote {debug_out}")
+
+    # ── REGRASP (<run>/curves_regrasp.png) — "is the conditioning doing anything" ──
+    # Its own figure rather than more panels on the training curve, because these
+    # answer a different question and are blank for every Phase-4 run.
+    if _finite(num("dir_track")) or _finite(num("retry_at_2")):
+        c_get = ctx.get       # legacy-aware column reader, as the panels use
+        _BIN_COLOURS = [_BIN_COLOURS_BY_BIN[b] for b in bins]
+        fig3, ax3 = plt.subplots(2, 3, figsize=(19, 9))
+
+        # THE panel, and the one to read first. `dir_track` is 1 - mean(dir_err)
+        # / 90 deg: 1 = the gripper ends on the axis it was told to come in on,
+        # 0 = it ignores the command. `bin_diag_rate` is the discrete version —
+        # how often the REALISED bin is the commanded one — and `bin_hit_rate`
+        # asks about the SIDE the gripper arrived from rather than its
+        # orientation. Chance for both is 1/4 on this dataset (four live bins),
+        # drawn as the dotted line, and a rate sitting ON it means the policy is
+        # orienting freely and the conditioning is inert.
+        a = ax3[0][0]
+        for key, label, style, col, lw in (
+                ("dir_track", "dir_track (1 - mean dir_err / 90 deg)", "-",
+                 "tab:purple", 2.2),
+                ("bin_diag_rate", "realised bin == commanded bin", "-",
+                 "tab:blue", 1.6),
+                ("bin_hit_rate", "arrived from the commanded side", "--",
+                 "tab:green", 1.4),
+                ("cond_sep", "cond_sep (what it DID / what it was TOLD)", "-.",
+                 "tab:orange", 1.4)):
+            ys = num(key)
+            if _finite(ys):
+                _plot(a, it, ys, style, marker="o", ms=3, color=col, label=label,
+                      lw=lw)
+        a.axhline(0.25, color="0.6", ls=":", lw=1.0)
+        # BELOW the line, not above: `bin_hit_rate` sits within a few points of
+        # chance in every run so far, so a label above 0.25 lands on the curve
+        # it is annotating.
+        a.text(0.01, 0.235, "chance (4 live bins)", fontsize=7, color="0.4",
+               va="top", transform=a.get_yaxis_transform())
         a.set_ylim(-0.02, 1.3)
-        _grid(a, "is the policy USING the commanded grasp?", ylabel="ratio / fraction")
+        _grid(a, "is the policy USING the commanded direction?",
+              ylabel="ratio / fraction")
         _legend(a, loc="upper left")
 
         # retry@k — the regrasping headline. Derived from the same episodes, so
         # it costs nothing; it assumes each retry restarts from home, which is
         # true of this evaluation and not of a real deployment. Read as a ceiling.
-        a = ax3[1]
+        a = ax3[0][1]
         for k, col in zip(range(1, 5), ("tab:blue", "tab:green", "tab:orange",
                                         "tab:red")):
             ys = num(f"retry_at_{k}")
@@ -732,30 +999,119 @@ def main() -> None:
         _grid(a, "regrasping: success with k tries", ylabel="fraction of eval scenes")
         _legend(a, loc="lower right")
 
-        # Per-slot rates. Slot 0 is OMG's own pick, so succ_g0 is the curve
-        # comparable with a Phase-4 run; the spread is how much harder the
-        # deliberately-separated grasps are.
-        a = ax3[2]
-        for g, col in zip(range(4), ("tab:blue", "tab:green", "tab:orange",
-                                     "tab:red")):
-            ys = num(f"succ_g{g}")
+        # ---- COMMANDED BIN vs REALISED BIN, one curve per commanded bin ----
+        # THE literal question: told to come in from `+z`, what fraction of
+        # episodes actually ENDED with the gripper's approach axis in `+z`?
+        # `bin_diag_rate_b{b}` is the b-th diagonal entry of the confusion matrix
+        # normalised by that bin's episode count, so each curve is a per-bin
+        # accuracy against a chance level of 1/4.
+        #
+        # Reading it per bin rather than pooled is the point. A pooled 0.50
+        # is consistent with two very different policies: one that follows all
+        # four commands half the time, and one that nails `+x` (which is 31% of
+        # the eval episodes and the easiest direction) while ignoring the rest.
+        # Only the second is a reason to change the architecture, and only this
+        # panel tells them apart.
+        a = ax3[0][2]
+        for b, col in zip(bins, _BIN_COLOURS):
+            ys = c_get(f"bin_diag_rate_b{b}")
             if _finite(ys):
-                _plot(a, it, ys, "-", marker="o", ms=3, lw=1.4, color=col,
-                      label=f"grasp {g}" + (" (OMG pick)" if g == 0 else ""))
-            ysn = num(f"near_g{g}")
-            if _finite(ysn):
-                _plot(a, it, ysn, ":", lw=1.0, color=col)
+                _plot(a, it, ys, "-", marker="o", ms=3, lw=1.8, color=col,
+                      label=_D.BIN_SHORT[b])
+        a.axhline(0.25, color="0.6", ls=":", lw=1.0)
+        a.text(0.01, 0.235, "chance (4 live bins)", fontsize=7, color="0.4",
+               va="top", transform=a.get_yaxis_transform())
         a.set_ylim(-0.02, 1.02)
-        _grid(a, "per-grasp success (solid) and near (dotted)",
-              ylabel="fraction of that slot's episodes")
+        _note_empty(a)
+        _grid(a, "ended in the COMMANDED bin (per bin)",
+              ylabel="fraction of that bin's episodes")
+        _legend(a, loc="upper left", ncol=2)
+
+        # ...and the same question about WHICH SIDE the gripper came from rather
+        # than which way it pointed. A gripper can be correctly oriented on the
+        # wrong side of the object and vice versa, so the two panels fail
+        # independently: orientation right / side wrong is what run 1 measured
+        # pooled (bin_diag ~0.50, bin_hit at chance), and per bin is where it
+        # becomes actionable.
+        a = ax3[1][2]
+        for b, col in zip(bins, _BIN_COLOURS):
+            ys = c_get(f"bin_hit_rate_b{b}")
+            if _finite(ys):
+                _plot(a, it, ys, "-", marker="o", ms=3, lw=1.8, color=col,
+                      label=_D.BIN_SHORT[b])
+        a.axhline(0.25, color="0.6", ls=":", lw=1.0)
+        a.set_ylim(-0.02, 1.02)
+        _note_empty(a)
+        _grid(a, "arrived from the COMMANDED side (per bin)",
+              ylabel="fraction of that bin's episodes")
+        _legend(a, loc="upper left", ncol=2)
+
+        # Per-BIN success, not per-slot. Slot k means "this scene's k-th chosen
+        # direction" and is not comparable across scenes; bin k is a fixed
+        # physical direction and is. The spread between these curves is how much
+        # the direction matters — if `+x` and `+z` separate, the retry ladder has
+        # something to work with; if they sit on top of each other, retrying is
+        # just four draws from one distribution.
+        a = ax3[1][0]
+        for b, col in zip(bins, _BIN_COLOURS):
+            ys = c_get(f"success_rate_b{b}")       # falls back to run 1's succ_bin_
+            if _finite(ys):
+                _plot(a, it, ys, "-", marker="o", ms=3, lw=1.6, color=col,
+                      label=_D.BIN_SHORT[b])
+        a.set_ylim(-0.02, 1.02)
+        _grid(a, "success per commanded direction",
+              ylabel="fraction of that bin's episodes")
+        _legend(a, loc="upper left", ncol=2)
+
+        # ...and whether it FOLLOWED each direction, which is the other half. A
+        # bin can succeed because the policy ignored it and did the easy thing;
+        # that shows up as a high success rate on the left with a dir_track here
+        # no better than the bins it is beating.
+        a = ax3[1][1]
+        for b, col in zip(bins, _BIN_COLOURS):
+            ys = c_get(f"dir_track_b{b}")
+            if _finite(ys):
+                _plot(a, it, ys, "-", marker="o", ms=3, lw=1.6, color=col,
+                      label=_D.BIN_SHORT[b])
+        a.set_ylim(-0.02, 1.02)
+        _note_empty(a)
+        _grid(a, "direction tracking per bin (1 - dir_err / 90 deg)",
+              ylabel="ratio")
         _legend(a, loc="upper left", ncol=2)
 
         _fix_x(fig3, it)
-        fig3.suptitle(f"Phase-5 grasp conditioning — {run.name}", fontsize=12)
-        fig3.tight_layout(rect=[0, 0, 1, 0.94])
+        fig3.suptitle(f"Regrasp conditioning — {run.name}", fontsize=12)
+        fig3.tight_layout(rect=[0, 0, 1, 0.96])
         regrasp_out = run / "curves_regrasp.png"
         fig3.savefig(regrasp_out, dpi=140)
         print(f"wrote {regrasp_out}")
+
+    # ── MEDIA (<run>/media_curves.png) — the presentation cut ────────────────
+    #
+    # The same data and the same panel functions, POOLED over directions and
+    # trimmed to the five that carry the story for an outside reader. Nothing
+    # here is new; what it buys is a figure that fits on a slide, which the 4x3
+    # per-bin grid above does not. Dropped on purpose: the per-bin split (an
+    # internal question), the pin-consistency check (a correctness check, not a
+    # result), |D| growth, and the refit loss.
+    fig5 = plt.figure(figsize=(16.5, 8))
+    gs = fig5.add_gridspec(2, 6)
+    mx = [[fig5.add_subplot(gs[0, 0:2]), fig5.add_subplot(gs[0, 2:4]),
+           fig5.add_subplot(gs[0, 4:6])],
+          [fig5.add_subplot(gs[1, 1:3]), fig5.add_subplot(gs[1, 3:5])]]
+    _panel_nested(mx[0][0], ctx, title="Eval: the nested success rates")
+    _panel_opportunity(mx[0][1], ctx, lean=True,
+                       title="Approach opportunity vs grasp conversion")
+    _panel_approach(mx[0][2], ctx, title=f"Approach error to the {ctx.TGT}")
+    _panel_outcomes(mx[1][0], ctx, title="Eval outcomes (fraction of episodes)")
+    _panel_collection(mx[1][1], ctx, lean=True, title="Data collection")
+
+    _fix_x(fig5, it)
+    fig5.suptitle(f"Regrasp — {run.name}", fontsize=12)
+    fig5.tight_layout(rect=[0, 0, 1, 0.96])
+    media_out = run / "media_curves.png"
+    fig5.savefig(media_out, dpi=140)
+    print(f"wrote {media_out}")
 
     if args.show:
         plt.show()

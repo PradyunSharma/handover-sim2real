@@ -6,22 +6,23 @@ will come from**. From a demonstration it is the negated gripper approach axis,
 `d_world = -R_grasp[:, 2]`, rotated into the anchor frame (`anchor.py`).
 
 THE SIGN IS MEASURED, NOT ASSUMED. Over the 486 scenes of
-`grasp_cand_table_train_p5.json` holding four or more candidates, advancing 10 cm
+the Phase-5 candidate table holding four or more candidates, advancing 10 cm
 along `+R[:, 2]` from the palm origin shrinks the spread of a scene's candidate
 set from 0.0851 m to 0.0340 m — on 100% of scenes. `+z` therefore points *into*
 the object, so `-R[:, 2]` is the outward direction this module talks about.
 
-`d` IS FLIP-INVARIANT FOR FREE, AND THAT RETIRES THE PHASE-5 DESIGN FLAW.
-`grasp_select.FLIP` is pi about the gripper's OWN +z, so it negates columns 0 and
-1 of R and leaves column 2 untouched: `d(T) == d(T @ FLIP)` exactly, measured at
-max 0.000e+00 over 2000 random poses. Phase 5's hardest bug was that
-`augment_flip_grasp` appends wrist-flip twins which are the same physical grasp
-sitting at SE(3) rotation distance pi, so a naive max-min selector picked four
-poses that were really two, and the dataset then held two contradictory rotation
-labels for one target (`grasp_pin.py` still carries the disambiguation code and
-the measured signature: episodes closing 3.1413 rad from their pin while p99 was
-0.0029). Under direction conditioning that entire class of bug CANNOT ARISE — the
-twins are the same command. This is the strongest single argument for the change.
+`d` IS FLIP-INVARIANT FOR FREE, WHICH MAKES A WHOLE CLASS OF BUG IMPOSSIBLE.
+`augment_flip_grasp` appends twins rotated pi about the gripper's OWN +z, which
+negates columns 0 and 1 of R and leaves column 2 untouched — so `d` is IDENTICAL
+for a grasp and its twin, measured at max 0.000e+00 over 2000 random poses.
+
+A pose-space metric does not have that property: the twins sit at SE(3) rotation
+distance pi, so a max-min selector ranks them as maximally separated and will
+select two commands that are one physical grasp, leaving the dataset holding two
+contradictory rotation labels for one target. `grasp_pin.py` still carries the
+rotation-disambiguation code that existed to catch it, and the measured
+signature (episodes closing 3.1413 rad from their pin while p99 was 0.0029).
+Under direction conditioning it cannot arise — the twins are the same command.
 
 WHY k = 6 OCTAHEDRAL. Exact optimal packing for six points on a sphere: 90 deg
 minimum separation, comfortably above the ~40 deg below which bins stop being
@@ -47,7 +48,7 @@ better and `fibonacci_directions` is for k != 6 only.
 
 MEASURED: THE `-z` BIN IS EMPTY ON THIS DATASET. Anchor `z` IS world up, so `d.z`
 is frame-independent and the +-z bins are computable from the Phase-5 candidate
-table with no wrist data at all. Over all 3810 candidates across 623 scenes:
+candidate table with no wrist data at all. Over 3810 candidates, 623 scenes:
 
     -z within 45 deg     0   ( 0.0%)      scenes with any:   0 / 623
     below-ish 45-70    154   ( 4.0%)
@@ -61,8 +62,8 @@ over the FPS-selected 8 of a median-49 goal set, and FPS *maximises* diversity, 
 a direction present anywhere would be over-represented in that subsample, not
 under; zero here is strong evidence of zero overall. `BIN_MINUS_Z` is kept anyway
 — on a different rig, or a table-less setup, it is real — but expect the
-feasibility mask to exclude it on every scene here, and the retry ladder to have
-five live hypotheses rather than six. Confirm against the FULL goal set when the
+feasibility mask to exclude it on every scene here. Confirmed against the FULL
+goal set: -z 0/623 scenes and -x 12/623, so FOUR live hypotheses, not six. Confirm against the FULL goal set when the
 direction table is built.
 
 Pure numpy. No sim imports, no torch, no h5py — so this runs on a login node, in
@@ -89,6 +90,19 @@ BIN_NAMES = ("+x_free_end", "-x_over_fingers", "+y_lateral", "-y_lateral",
              "+z_top_down", "-z_beneath")
 
 BIN_PLUS_X, BIN_MINUS_X, BIN_PLUS_Y, BIN_MINUS_Y, BIN_PLUS_Z, BIN_MINUS_Z = range(6)
+
+# THE FOUR BINS THIS DATASET CAN ACTUALLY REACH — a property of s0/train, NOT of
+# the system. `-x` is demonstrable by 12 of 623 scenes and `-z` by none (see the
+# header), so those two collect no episodes, score NaN, and would render as four
+# blank panels in any per-bin figure. Reporting and plotting default to this
+# tuple so a figure has one row per direction that exists; nothing in the retry
+# machine, the collector or the model reads it, and on a table-less rig the right
+# fix is to re-measure, not to edit this line.
+LIVE_BINS = (BIN_PLUS_X, BIN_PLUS_Y, BIN_MINUS_Y, BIN_PLUS_Z)
+
+# Short labels for figure titles and CSV headers — `BIN_NAMES` carries the
+# rationale in the name and is too long for a 3.5-inch axis.
+BIN_SHORT = ("+x", "-x", "+y", "-y", "+z", "-z")
 
 # The Voronoi half-angle for 90-deg-separated bins is 45 deg. `bin_hit_rate` uses
 # 30 to keep margin against boundary noise, so a "hit" is unambiguous rather than

@@ -380,31 +380,163 @@ joint state was breaking.
 
 ---
 
-## Phase 5 — grasp conditioning and regrasping (`output/dagger_runs/`)
+## Regrasp — approach-direction conditioning (`output/dagger_runs/`)
 
 Runbook and design notes: [`README_REGRASP.md`](../README_REGRASP.md). Code is a
-full fork (`handover_sim2real/regrasp/`, `bc5/`, `examples/*_p5.py`), so nothing
-above changes.
+full fork (`handover_sim2real/regrasp/`, `regrasp_bc/`, `examples/*regrasp*.py`),
+so nothing above changes.
 
-| run | config | camera | iters | m | grasps/scene | init | model flags | best iter | final | Δ from predecessor |
-|---|---|---|---|---|---|---|---|---|---|---|
-| **p5_run1** | `dagger_phase5_run1.yaml` | wrist+right | 25 | 200 | **4** | warm-start (best.pt), PointNet++ from scratch | nojoint, reach-tail ×2.5, pm (w=7), **grasp_cond**, **no aux head**, head [512,256] | not yet run | not yet run | = run 16, with the goal grasp as a policy INPUT and four pinned grasps per scene. Attacks the standing finding directly: over runs 4–16 `near_rate` never exceeded 0.08 while success reached 0.80, because nothing in the observation named the pose to arrive at. Run 13's aux head was the weak test of that (predict the grasp); this hands it over as an input. Four grasps per scene then make retry-under-a-different-grasp possible, which is the actual goal. **Conditioning is load-bearing, not decoration**: with four demos per scene the same observation carries four labels, so an unconditioned fit can only regress their mean and would be *worse* than run 16 — the trainer refuses to start on that combination. The aux head goes off with it and cannot be held fixed (its target becomes its own input), so this is a combination run: conditioning, aux head, cameras, encoder init and epoch budget all move at once. Selection uses a **flip-invariant** control-point metric — `augment_flip_grasp` appends π-about-approach-axis twins that are the same physical grasp at maximal rotation distance, and a naive max-min selector would pick four poses that are really two. K=8 candidates are collected and the best 4 that *planned successfully* are kept, because demanding 4-of-4 up front would keep only ~0.76⁴ ≈ 33% of scenes. |
+The policy is told **which side to come in from** — a unit vector `d` injected
+per-point into the cloud as `d·n_i` and `d·normalize(p_i−c)` — not which pose to
+reach. On failure it is commanded a different side. `pc_channels` 5 → 7,
+`GraspEncoder` deleted, no global conditioning branch.
 
-**Read `cond_track` before anything else.** It is the mean pairwise spread of the
-four final EE poses over the spread of the four commanded grasps. Near 0 means
-the policy does the same thing whatever it is told — the multi-modal averaging
-failure — and regrasping is inert however good `success_rate` looks; the fix is
-then FiLM rather than concatenation. `cond_track` high with `near_rate` still low
-means the policy separates the conditions but tracks none of them, which is a
-reach-endgame problem and points at merging in run 21's open-loop pre-grasp
-commit. `retry_at_k` is the regrasping headline and is derived from the same
-episodes at no extra cost, on the assumption that each retry restarts from home —
-read it as a ceiling.
+Columns are Phase 4's, so a Regrasp row can be read straight across against a
+Phase-4 one, plus three this phase needs: `config`, `dirs/scene` (how many
+directions a scene demonstrates) and `command` (what vector the policy is
+actually told). β params are `beta_start`→`beta_end` for the given
+`beta_schedule`.
 
-The ±0.115 noise floor below applies unchanged, which is another reason the
-headline for this phase is `near_rate` and `cond_track` rather than success.
+| run | config | camera | iters | m | dirs/scene | command | init | β | DART free | DART reach | DART variant | aux task | loss | model flags | best iter | final | notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **regrasp_run1** | `regrasp_run1.yaml` | wrist+right | **19 of 25** | 354 → 176 | 1–2 (max-separated pair) | grasp axis `−R[:,2]` | warm-start (**best**.pt), PointNet++ from scratch | constant 0.75 | 0.3 | 0.3 | replace | no | pm (w=7) | nojoint, reach-tail ×2.5 (window **5**), **direction_cond**, head [256,256] | 8 (`success 0.354`) | `success 0.139` | Stopped at 19 by choice. `m` was 354 for iterations 1–5 and 176 for 6–19 — a budget correction, so **`D_steps` changes slope at iteration 6**. Base set 1087 episodes / 20386 steps over 617 scenes (471 paired, 146 single). Eval/collection read `best.pt`, the warm start read `best.pt` too. |
+| **regrasp_run2** | `regrasp_run2.yaml` | wrist+right | 20 (planned) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | warm-start (**last**.pt), PointNet++ from scratch | **linear 1.0→0.75** | 0.3 | 0.3 | replace | **yes** (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 1 with the protocol fixed and two method changes. See below. |
+
+### Result: DAgger did not move success; the conditioning is read but not obeyed
+
+| metric | first 5 iters | last 5 iters | Δ | chance |
+|---|---|---|---|---|
+| `success_rate` | 0.210 | 0.203 | **−0.008** | — |
+| `dir_track` | 0.424 | 0.453 | +0.029 | — |
+| `bin_hit_rate` | 0.261 | 0.306 | +0.046 | **0.25** |
+| `bin_diag_rate` | 0.476 | 0.509 | +0.033 | **0.25** |
+| `cond_sep` | 0.677 | 0.632 | −0.045 | — |
+
+**Success is flat.** Every movement (range 0.114–0.354) sits inside the ±0.115
+noise floor, measured on 100 scenes where this eval has 50 scenes / 79 episodes —
+so the true floor here is wider still. There is no trend to read.
+
+**The two direction metrics disagree, and that is the finding.** `bin_diag_rate`
+≈ 0.50 against a chance level of 0.25: the approach *axis* matches the commanded
+bin about twice as often as random. `bin_hit_rate` ≈ 0.28, i.e. **at chance**: the
+side the gripper actually *arrives from* does not follow the command. The policy
+orients roughly as told and approaches from wherever it likes. A single
+"does it follow" number would have averaged these into something misleading;
+`dir_err` (orientation) and `sector_err` (which side) are separate for this reason.
+
+**Retry works, modestly and consistently.** `retry@2 − retry@1` is **+0.054 mean,
+positive in 17 of 20 iterations**. At iteration 0 the two were identical
+(0.400/0.400) — what an ignored command looks like — and the gap opening is the
+clearest evidence that the second attempt does something genuinely different from
+the first.
+
+**Do not compare `success 0.20` against run 16's 0.80.** Run 16 was "grasp it from
+wherever"; this is "grasp it from *there*", which is strictly harder, on a
+1087-episode base set. `near_rate` reads ~0 throughout and is **dead** under this
+methodology — it measures distance to a pose the policy is never given.
+
+### Measured before the run: k = 6 is really k = 4
+
+Over 623 planning scenes and 28339 goal-set grasps on s0/train, confirmed against
+the full goal set and replicated on val:
+
+| bin | scenes reaching it |
+|---|---|
+| `+x` free end | 490 (78.7 %) |
+| `+z` top-down | 415 (66.6 %) |
+| `+y` lateral | 366 (58.7 %) |
+| `−y` lateral | 325 (52.2 %) |
+| `−x` over the fingers | **12 (1.9 %)** |
+| `−z` from beneath | **0 (0.0 %)** |
+
+`−z` is geometrically impossible (object held above a table); `−x` at 0.19 % of
+all grasps is the hand-collision filtering working as designed. Both bins are kept
+and masked at runtime so the code stays rig-agnostic, but the retry ladder has
+**four** live rungs, `chained_retry_at_k` saturates at k=4, and `succ_bin_−x` /
+`succ_bin_−z` are NaN rather than zero. `k` is a test-time knob up to 20 (39.4° at
+k=21, below the ~40° where bins stop being independent hypotheses).
+
+### Caveats on every number above
+
+- **`EVAL.holdout: False`** — the 50 eval scenes are also collected on, so success
+  rates are optimistic.
+- **Stopped at 19 of 25**, and `m` changed at iteration 6.
+- `cond_delta` rose **0.73 → 1.38** on held-out val during the base fit, so the
+  channels demonstrably reach the network and generalise. `bin_hit` at chance says
+  they do not reach the *action* — which is precisely the pre-registered case for
+  adding a small global `d` branch as run 2, since the SA layers max-pool and two
+  scalars among ten input features are what pooling discards.
+
+### regrasp_run2 — configured, not yet run
+
+`examples/configs/regrasp_run2.yaml`, submitted with
+`examples/slurm/train_regrasp.sbatch` (`--time=24:00:00`, ~20–21 h budgeted).
+Two changes to the METHOD, four to the PROTOCOL, and nothing else.
+
+**Method.** *One demonstration per bin*, not a maximally-separated pair. Four
+contrasting commands on one observation break the scene→action confound harder
+than two, and — the reason that matters for the figures — they populate every
+bin's evaluation sample rather than only the two a scene happened to draw. The
+train direction table gives 617 scenes and **1596 (scene, bin) pairs**, mean 2.59
+per scene, split +x 490 / +y 366 / −y 325 / +z 415, against run 1's 1087 demos.
+
+*The command is the bin axis*, not the demonstrated grasp's own approach
+direction. This is a correctness fix: `retry.next_direction` has no grasp at
+deployment and commands `to_world(BINS[b], anchor_R)`, while run 1 trained and
+scored on `−R_grasp[:,2]`. The pinned grasp sits a **measured median 18.4° from
+its bin axis** (p90 38.5, max 45 = the bin half-width), so run 1 carried a
+train/deploy skew of the same order as the effect it was measuring — and
+`dir_err` could not see it, because it scored against the same shifted target.
+The demonstration is now the goal-set grasp *closest to that axis*, and the
+residual is recorded per episode as `demo_off_deg`.
+
+The consequence is that a failed pin is no longer recoverable. Run 1 re-derived
+the command from whatever the expert flew, so a miss simply relabelled the
+episode; now the command does not move, so a miss leaves an episode captioned
+`+z` whose trajectory approaches from elsewhere, and it cannot be re-binned
+because the scene already has a demonstration for the bin it flew to.
+`SIM.demo_ok_table` — written by `audit_regrasp_demos.py --write-ok` — drops
+those (scene, bin) pairs from **training and evaluation**, by pruning the pin
+table so every consumer sees the same set.
+
+**Protocol.**
+
+| | run 1 | run 2 | why |
+|---|---|---|---|
+| `m` | 354 → 176 mid-run | uniform (~259 from 100 scenes) | `num_grasps` is a MIN and read 1 on a mixed table; fixed with `max_grasps`, so \|D\| no longer changes slope at iteration 6 |
+| eval logging | pooled + `succ_bin_*` | **the full rate family per bin** (~180 columns) | pooled `success_rate` averages four physically different commands |
+| iterations | stopped at 19/25 | 20, planned | flat from iteration 6 on, and the marginal iteration is ~40 min of refit against a change inside the noise floor |
+| checkpoint | eval/collect `best`, warm start `last` | **`last` everywhere** | "the policy at iteration i" named two sets of weights |
+
+`EVAL.holdout` stays **false** in both, deliberately: the in-loop curves are a
+clean read of "is the policy getting better at what it is being taught", and the
+held-out number now comes from `examples/eval_regrasp_testset.py` on the s0
+**test** split instead. Also changed: `EVAL.every` 0 → 1 (scoring back inside the
+loop, Phase-4 style), `num_scenes` 50 → 100, `base_epochs` 40 → 50, `iter_epochs`
+12 → 15, β constant 0.75 → **linear 1.0→0.75**, and the **auxiliary head on**
+(`bc_regrasp_run2.yaml`, `aux_weight: 1.0`) — legitimate again now that the
+policy is told a direction rather than the pose the head predicts.
+
+**`last` is not a bookkeeping change.** Across all 26 refits of Phase-4 runs 16
+and 20 the best epoch was **never** the last epoch: the val minimum lands at
+epoch 1–9 of 25 and val loss then climbs (run 20 iteration 19: 0.3643 at epoch 3,
+0.4272 at epoch 24). `last.pt` is a visibly more overfit checkpoint, so run 2's
+absolute rates may sit below run 1's for that reason alone.
+
+**β = 1.0 makes iteration 1 a pure-expert round.** The learner is queried every
+step but never moves the arm, so D₁ adds 259 clean demonstrations on fresh scenes
+rather than on-policy states; the distribution shift starts at iteration 2, and
+iteration 1's collection curves are not comparable with later ones.
+
+**Figures.** `curves.png` → `training_curve.png` (4×3, one row per direction),
+plus `debug_dagger.png`, `media_curves.png`, a 2×3 `curves_regrasp.png` carrying
+*ended in the commanded bin* per bin, and — after the run —
+`test_set_evaluation.png` from the test-split script, which also reports the
+**chained** retry ladder beside the independent `retry@k`. See
+[`README_REGRASP.md`](../README_REGRASP.md) steps 8–9.
 
 ---
+
 
 ## Phase 3 — online RL, TD3+BC (`output/rl_runs/`)
 

@@ -85,6 +85,8 @@ from handover_sim2real.regrasp.collector import derived_standoff_pose  # noqa: E
 from handover_sim2real.regrasp.evaluator import (  # noqa: E402
     EvalParams, _ee_mat_from_state,
 )
+from handover_sim2real.regrasp import directions as _rg_dirs  # noqa: E402
+from handover_sim2real.regrasp import retry as _rg_retry  # noqa: E402
 from handover_sim2real.regrasp.grasp_box import grasp_opportunity  # noqa: E402
 from handover_sim2real.regrasp.pregrasp import open_loop_reach  # noqa: E402
 
@@ -175,6 +177,10 @@ class Attempt:
     reason: str = ""
     ee_final: object = None
     grasp_pose: object = None
+    d_world: object = None        # the command this attempt was given
+    bin_idx: int = -1             # which bin that direction is
+    dir_err: float = float("nan")  # angle to the achieved approach axis, degrees
+    stop_reason: str = ""         # SIGNAL_HUMAN when the ladder ran out
 
     @property
     def retryable(self) -> bool:
@@ -262,7 +268,12 @@ def _run_attempt(sim, runner, scene_idx: int, *, grasp_pose, target_pose,
 
     # ---- resume: the policy takes over, conditioned on the NEW grasp --------
     runner.reset()
-    runner.set_goal(grasp_pose)
+    # The command is the DIRECTION, derived from the grasp exactly as the
+    # collector derives it. `grasp_pose` stays around because the expert's CLOSE
+    # label and the geometric scores are still measured against it — it just is
+    # no longer what the policy is told.
+    runner.set_direction(None if grasp_pose is None
+                         else _rg_dirs.approach_direction(grasp_pose))
 
     rows = list(prefix_rows)
     # The inherited steps are re-scored against THIS attempt's grasp: the arm
@@ -387,24 +398,41 @@ def _run_attempt(sim, runner, scene_idx: int, *, grasp_pose, target_pose,
     return att
 
 
-def chained_retry_scene(sim, runner, scene_idx: int, grasp_poses, *,
-                        params: EvalParams, retry: RetryParams, viz=None) -> list:
+def chained_retry_scene(sim, runner, scene_idx: int, pose_of_bin, *,
+                        params: EvalParams, retry: RetryParams,
+                        anchor_R=None, feasible=None, viz=None) -> list:
     """Run the chain on one scene. Returns the attempts made, in order.
 
-    Stops at the first success, so a scene solved on grasp 0 costs exactly one
-    rollout — which is why the chain is CHEAPER than the four independent
-    episodes `evaluator.evaluate_policy` runs for the same scene.
+    THE SEQUENCE COMES FROM THE RETRY LADDER, NOT FROM A SLOT LIST. Phase 5 took
+    `grasp_poses[k]` for attempt k, which tied the number of attempts to the
+    number of pinned grasps and made `attempt == grasp_idx` by construction.
+    Under Regrasp the two are independent: the ladder can command up to
+    `retry.max_attempts` directions drawn from the k bins, while a scene supplies
+    at most two DEMONSTRATED ones. `retry.py` picks each next direction as the
+    surviving bin furthest from everything already attempted.
 
-    `viz` is an optional `chain_viz.ChainViz`; None keeps the loop headless and
-    costs nothing.
+    `pose_of_bin` maps bin index -> a 4x4 world grasp realising that direction.
+    A pose is still needed per attempt because OMG's CLOSE label and the
+    geometric scores are measured against one; it is simply no longer what the
+    policy is told. Bins with no pose are skipped — commanding a direction this
+    scene cannot realise would score the policy on an impossible instruction.
+
+    Stops at the first success, so a scene solved on the first direction costs
+    exactly one rollout.
     """
     pregrasp = str(params.target) == "pregrasp"
-    n = len(grasp_poses)
-    if retry.max_attempts:
-        n = min(n, int(retry.max_attempts))
+    anchor_R = np.eye(3) if anchor_R is None else np.asarray(anchor_R, dtype=np.float64)
+    # Only bins this scene can actually realise, intersected with any caller
+    # restriction (on s0/train that is {+x, +y, -y, +z}: -z is reachable by no
+    # scene and -x by twelve).
+    have = {int(b) for b, p in dict(pose_of_bin).items() if p is not None}
+    if feasible is not None:
+        have &= {int(b) for b in feasible}
+    rp = _rg_retry.RetryParams(max_attempts=int(retry.max_attempts or 4))
+    st = _rg_retry.RetryState()
 
     if viz is not None:
-        viz.begin_scene(int(scene_idx), grasp_poses)
+        viz.begin_scene(int(scene_idx), dict(pose_of_bin), anchor_R)
 
     attempts: list[Attempt] = []
     prefix_rows: list = []
@@ -412,8 +440,22 @@ def chained_retry_scene(sim, runner, scene_idx: int, grasp_poses, *,
     expect_ee = None
     branch_step = 0
 
-    for k in range(n):
-        grasp_pose = grasp_poses[k]
+    k = 0
+    while True:
+        d_world, bin_idx, info = _rg_retry.next_direction(
+            st, anchor_R, rp, feasible=have)
+        if d_world is None:
+            # The ladder is out of hypotheses. That is a RESULT — the robot
+            # should ask the person to re-present the object — not an error, so
+            # it is recorded on the last attempt rather than dropped.
+            if attempts:
+                attempts[-1].stop_reason = info["why"]
+            if retry.verbose:
+                print(f"    scene {scene_idx:4d}: {info['stop']} ({info['why']}) "
+                      f"after {st.attempts} attempt(s)")
+            break
+
+        grasp_pose = dict(pose_of_bin).get(bin_idx)
         target_pose = grasp_pose
         if pregrasp and grasp_pose is not None:
             target_pose = derived_standoff_pose(
@@ -426,8 +468,13 @@ def chained_retry_scene(sim, runner, scene_idx: int, grasp_poses, *,
             target_pose=target_pose, params=params,
             prefix_rows=prefix_rows, prefix_jp=prefix_jp, expect_ee=expect_ee,
             budget_steps=max(1, int(budget)), save_clouds=retry.save_clouds,
-            attempt=k, grasp_idx=k, branch_step=branch_step, n_attempts=n,
-            viz=viz)
+            attempt=k, grasp_idx=bin_idx, branch_step=branch_step,
+            n_attempts=rp.max_attempts, viz=viz)
+        att.d_world = np.asarray(d_world, dtype=np.float64)
+        att.bin_idx = int(bin_idx)
+        if att.ee_final is not None:
+            att.dir_err = float(_rg_dirs.angle_between(
+                d_world, _rg_dirs.approach_direction(np.asarray(att.ee_final))))
         attempts.append(att)
         if viz is not None:
             viz.end_attempt(att)
@@ -435,15 +482,18 @@ def chained_retry_scene(sim, runner, scene_idx: int, grasp_poses, *,
         if retry.verbose:
             seam = (f"  (branched at {att.branch_step}, replay_err "
                     f"{att.replay_err * 1000:.1f} mm)" if att.prefix_len else "")
-            print(f"    scene {scene_idx:4d} attempt {k} g{k}: "
+            print(f"    scene {scene_idx:4d} attempt {k} "
+                  f"{_rg_dirs.BIN_NAMES[bin_idx]:<16} "
                   f"{'OK ' if att.success else '-- '}{att.reason:<14} "
-                  f"steps={len(att.rows):2d} close@{att.close_step:3d} "
+                  f"steps={len(att.rows):2d} dir_err={att.dir_err:5.1f} "
                   f"min_pos={att.min_pos:.3f}{seam}")
 
-        if att.success or k + 1 >= n:
+        if att.success:
             break
+        st.mark(d_world, bin_idx, att.reason)
+        k += 1
 
-        # ---- pick the branch point for the next grasp ----
+        # ---- pick the branch point for the next direction ----
         src = attempts[0] if retry.rewind_mode == "first" else attempts[-1]
         exec_jp = src.executed_jp
         if not exec_jp:
@@ -464,7 +514,7 @@ def chained_retry_scene(sim, runner, scene_idx: int, grasp_poses, *,
     return attempts
 
 
-def chained_metrics(per_scene: dict, num_grasps: int) -> dict:
+def chained_metrics(per_scene: dict, max_attempts: int = 4) -> dict:
     """Aggregate the chains. `per_scene` maps scene_idx -> [Attempt].
 
     `chained_retry_at_k` is the headline and is the number to put beside
@@ -479,9 +529,13 @@ def chained_metrics(per_scene: dict, num_grasps: int) -> dict:
     if not per_scene:
         return {}
     n_scenes = len(per_scene)
-    out = {"n_scenes": n_scenes, "num_grasps": int(num_grasps)}
+    # `max_attempts`, NOT a slot count. Phase 5 tied the two together because
+    # attempt k WAS slot k; the ladder decouples them, so the metric arrays are
+    # sized by how many attempts are allowed, not by how many directions a scene
+    # happened to be pinned with.
+    out = {"n_scenes": n_scenes, "max_attempts": int(max_attempts)}
 
-    for k in range(1, num_grasps + 1):
+    for k in range(1, max_attempts + 1):
         hits = sum(1 for atts in per_scene.values()
                    if any(a.success for a in atts[:k]))
         out[f"chained_retry_at_{k}"] = hits / n_scenes
@@ -490,7 +544,7 @@ def chained_metrics(per_scene: dict, num_grasps: int) -> dict:
     # shrinks with k (a solved scene never makes attempt 2), so this is "given the
     # first k grasps failed, does grasp k work" — a conditional, not a per-slot
     # rate, and not comparable with `succ_g{k}` from the independent evaluation.
-    for k in range(num_grasps):
+    for k in range(max_attempts):
         reached = [atts[k] for atts in per_scene.values() if len(atts) > k]
         out[f"attempt_{k}_n"] = len(reached)
         out[f"attempt_{k}_succ"] = (sum(a.success for a in reached) / len(reached)
@@ -527,6 +581,28 @@ def chained_metrics(per_scene: dict, num_grasps: int) -> dict:
     out["retryable_frac"] = (
         float(np.mean([a.retryable for a in retried_after]))
         if retried_after else float("nan"))
+
+    # Direction tracking across the whole ladder: did the policy go where each
+    # successive command pointed, or does it do the same thing every attempt —
+    # which would make the retry inert however good the OR-over-attempts looks.
+    errs = [a.dir_err for atts in per_scene.values() for a in atts
+            if a.dir_err == a.dir_err]
+    out["dir_err"] = float(np.mean(errs)) if errs else float("nan")
+    out["dir_track"] = float(1.0 - np.mean(errs) / 90.0) if errs else float("nan")
+    by_bin = {}
+    for atts in per_scene.values():
+        for a in atts:
+            if a.bin_idx >= 0:
+                by_bin.setdefault(a.bin_idx, []).append(a.success)
+    for b, v in sorted(by_bin.items()):
+        out[f"chain_succ_bin_{b}"] = float(np.mean(v))
+        out[f"chain_n_bin_{b}"] = len(v)
+    # How often the ladder ran out rather than the policy simply failing. A high
+    # rate here means the feasibility mask is too tight, not that the policy is
+    # bad, and the two must not be read as the same thing.
+    n_sig = sum(1 for atts in per_scene.values()
+                if atts and atts[-1].stop_reason)
+    out["signal_human_rate"] = n_sig / n_scenes
 
     reasons = {}
     for atts in per_scene.values():

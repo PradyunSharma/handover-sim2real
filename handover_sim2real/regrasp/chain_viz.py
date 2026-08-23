@@ -50,11 +50,17 @@ if str(_EXAMPLES) not in sys.path:
 
 # One colour per grasp slot, chosen to stay distinguishable against the
 # handover-sim table and to survive the dim/bright split below.
+# ONE COLOUR PER BIN, and there must be at least as many as `directions.BINS`.
+# The Phase-5 tuple had exactly four and was indexed by SLOT; the ladder can make
+# up to six attempts across six bins, so a four-entry tuple was an IndexError
+# waiting for the fifth.
 SLOT_COLOURS = (
-    (0.10, 0.90, 0.20),   # 0  green   — OMG's own pick, the Phase-4-comparable slot
-    (0.20, 0.65, 1.00),   # 1  blue
-    (1.00, 0.60, 0.05),   # 2  orange
-    (0.95, 0.25, 0.85),   # 3  magenta
+    (0.10, 0.90, 0.20),   # 0  +x  green    free end
+    (0.95, 0.25, 0.85),   # 1  -x  magenta  over the giver's fingers
+    (0.20, 0.65, 1.00),   # 2  +y  blue     lateral
+    (0.10, 0.85, 0.90),   # 3  -y  cyan     lateral
+    (1.00, 0.60, 0.05),   # 4  +z  orange   top-down
+    (0.85, 0.85, 0.20),   # 5  -z  yellow   from beneath
 )
 GREY = (0.55, 0.55, 0.55)
 WHITE = (1.0, 1.0, 1.0)
@@ -90,8 +96,11 @@ class ChainViz:
         self._cloud_ids: list = []    # replaced every step
         self._text_ids: list = []
         self._prev_pt = None
+        self._attempted_bins = set()
         self._scene = None
-        self._grasp_poses = None
+        self._pose_of_bin = {}
+        self._anchor_R = None
+        self._centroid = None
 
     # ── low-level, all failure-tolerant ──────────────────────────────────────
 
@@ -139,7 +148,7 @@ class ChainViz:
 
     # ── scene / attempt lifecycle ────────────────────────────────────────────
 
-    def begin_scene(self, scene_idx: int, grasp_poses) -> None:
+    def begin_scene(self, scene_idx: int, pose_of_bin, anchor_R=None) -> None:
         if not self.enabled:
             return
         self._clear(self._path_ids)
@@ -147,7 +156,21 @@ class ChainViz:
         self._clear(self._cloud_ids)
         self._clear(self._text_ids)
         self._scene = int(scene_idx)
-        self._grasp_poses = list(grasp_poses)
+        self._attempted_bins = set()
+        if pose_of_bin is not None and not isinstance(pose_of_bin, dict):
+            raise TypeError(
+                "begin_scene now takes {bin_idx: pose}, not a list of poses. "
+                "The retry ladder commands BINS, and a scene's attempt index is "
+                "no longer its slot index — passing a list would silently "
+                "re-associate poses with the wrong directions.")
+        self._pose_of_bin = dict(pose_of_bin or {})
+        self._anchor_R = (np.eye(3) if anchor_R is None
+                          else np.asarray(anchor_R, dtype=np.float64))
+        self._centroid = None
+        for p in self._pose_of_bin.values():
+            if p is not None:
+                self._centroid = np.asarray(p, dtype=np.float64)[:3, 3]
+                break
         self._prev_pt = None
 
     def begin_attempt(self, attempt: int, grasp_idx: int, branch_step: int,
@@ -161,19 +184,36 @@ class ChainViz:
             return
         self._clear(self._grasp_ids)
         self._clear(self._text_ids)
-        if self.show_grasps and self._grasp_poses:
-            for i, pose in enumerate(self._grasp_poses):
-                if pose is None:
-                    continue
-                live = (i == grasp_idx)
-                self._gripper(pose, slot_colour(i) if live else _dim(slot_colour(i)),
-                              4.0 if live else 1.0, self._grasp_ids)
-            live_pose = self._grasp_poses[grasp_idx] \
-                if grasp_idx < len(self._grasp_poses) else None
+        if self.show_grasps and self._centroid is not None:
+            # RAYS FROM THE OBJECT ALONG EACH BIN AXIS, styled by state. This is
+            # a better picture of what the machine is doing than four gripper
+            # wireframes were: the commanded direction, the ones already spent,
+            # and the ones still available are the actual state of the ladder.
+            from handover_sim2real.regrasp import directions as _D
+            c = np.asarray(self._centroid, dtype=np.float64)
+            for b in range(len(_D.BINS)):
+                d_w = _D.to_world(_D.BINS[b], self._anchor_R)
+                reachable = self._pose_of_bin.get(b) is not None
+                live = (b == grasp_idx)
+                spent = b in self._attempted_bins
+                if live:
+                    col, w, ln = slot_colour(b), 5.0, 0.16
+                elif spent:
+                    col, w, ln = _dim(slot_colour(b), 0.5), 2.0, 0.10
+                elif reachable:
+                    col, w, ln = _dim(slot_colour(b), 0.25), 1.0, 0.07
+                else:
+                    continue          # this scene cannot realise it; do not draw
+                self._line(c, c + ln * d_w, col, w, self._grasp_ids)
+                if live or spent:
+                    self._text(_D.BIN_NAMES[b].split("_")[0],
+                               c + (ln + 0.02) * d_w, col, 1.2)
+            # the pose the expert is flying to, for the endgame
+            live_pose = self._pose_of_bin.get(grasp_idx)
             if live_pose is not None:
-                self._text(f"g{grasp_idx}",
-                           np.asarray(live_pose)[:3, 3] + np.array([0, 0, 0.045]),
-                           slot_colour(grasp_idx), 1.4)
+                self._gripper(live_pose, slot_colour(grasp_idx), 3.0,
+                              self._grasp_ids)
+            self._attempted_bins.add(int(grasp_idx))
 
         banner = (f"scene {self._scene}   attempt {attempt + 1}/{n_attempts}   "
                   f"-> grasp {grasp_idx}")

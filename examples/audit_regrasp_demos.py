@@ -39,6 +39,7 @@ WHAT IT CHECKS, and why each one earns its place:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -56,6 +57,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--demos", required=True)
+    p.add_argument("--write-ok", default=None,
+                   help="write the (scene, bin) pairs this shard actually "
+                        "demonstrated to JSON. Point SIM.demo_ok_table at it and "
+                        "every pair OMG could not plan, or that the pin missed, "
+                        "leaves BOTH the collection pool and the eval set. "
+                        "Without it a per-bin planner failure trains on three "
+                        "directions and scores four.")
     p.add_argument("--noise-floor", type=float, default=0.005,
                    help="metres of per-step |dpos| difference below which two "
                         "demonstrations are saying the same thing")
@@ -83,7 +91,10 @@ def main() -> None:
         n_nofinite_d = n_nonunit_d = n_missing_d = 0
         n_norm_bad = 0
         modes, sides, pin_ok = Counter(), Counter(), Counter()
+        ok_pairs: dict = defaultdict(set)
         rebinned = 0
+        cmd_off = []          # angle between d_world and its bin's AXIS
+        demo_off = []         # angle between d_world and what the expert flew
 
         for k in keys:
             g = f[k]
@@ -117,6 +128,28 @@ def main() -> None:
             ba, br = int(a.get("bin_assigned", -1)), int(a.get("bin_realized", -1))
             if ba >= 0 and br >= 0 and ba != br:
                 rebinned += 1
+            # USABLE means: the pair was demonstrated, and the demonstration is
+            # of the bin it is captioned with. A missed pin leaves an episode
+            # commanded `+z` whose trajectory approaches from elsewhere; under
+            # bin-axis conditioning that is not re-labellable (the scene already
+            # has a demonstration for the bin it actually flew to), so the pair
+            # is dropped rather than kept as a contradiction in D.
+            # WHICH RULE PRODUCED THIS SHARD. Run 1 set `d_world` from the
+            # grasp (`-R[:,2]`); run 2 sets it to the assigned BIN'S AXIS. The
+            # two differ by a median 18 deg, so the angle between `d_world` and
+            # the bin axis is 0 for a run-2 shard and ~18 for a run-1 one — an
+            # unambiguous fingerprint, and the only cheap way to notice that a
+            # stale shard is about to be trained on under the new command rule.
+            aR = a.get("anchor_R")
+            if ba >= 0 and aR is not None and np.all(np.isfinite(d)):
+                axis = D.to_world(D.BINS[ba], np.asarray(aR, dtype=np.float64))
+                cmd_off.append(float(D.angle_between(d, axis)))
+            dg = a.get("d_grasp_world")
+            if dg is not None and np.all(np.isfinite(d)) and \
+                    np.linalg.norm(np.asarray(dg)) > 0.5:
+                demo_off.append(float(D.angle_between(d, np.asarray(dg))))
+            if ba >= 0 and br == ba and int(a.get("pin_ok", 1)):
+                ok_pairs[int(a["scene_idx"])].add(ba)
             by_scene[int(a["scene_idx"])].append(
                 {"key": k, "d": d, "bin": br, "assigned": ba,
                  "act": np.asarray(g["expert_actions"][:, :3], dtype=np.float64)})
@@ -216,6 +249,50 @@ def main() -> None:
                     "trajectories. The commands differ but the behaviour does "
                     "not, so there is nothing for the conditioning to learn and "
                     "no architecture fixes it — this is a DATA result.")
+
+    # ---- the command rule, and the label noise it leaves ------------------
+    if cmd_off:
+        co = np.asarray(cmd_off)
+        print(f"\n  command vs bin axis: median {np.median(co):.2f} deg   "
+              f"max {co.max():.2f}")
+        if np.median(co) > 1.0:
+            fails.append(
+                f"`d_world` is NOT the bin axis (median {np.median(co):.1f} deg "
+                f"off it). This shard was collected under RUN 1's rule, where the "
+                f"command came from the grasp pose. Run 2 commands the bin axis "
+                f"at both training and deployment, so training on this would "
+                f"caption every episode with a vector no rollout will ever be "
+                f"given. RE-COLLECT with the per-bin pin table.")
+        else:
+            print("       -> run-2 rule: the command is the bin axis, as the "
+                  "retry machine issues it")
+    if demo_off:
+        do = np.asarray(demo_off)
+        print(f"  command vs demo    : median {np.median(do):.1f} deg   "
+              f"p90 {np.percentile(do, 90):.1f}   max {do.max():.1f}")
+        print("       -> the label noise the conditioning must tolerate: the "
+              "policy is told a sector and shown one grasp inside it")
+        if np.median(do) > 45.0:
+            warns.append(
+                f"the demonstration is a median {np.median(do):.0f} deg from the "
+                f"command — beyond the 45 deg bin half-width, so the grasps are "
+                f"not the closest-to-axis representatives the table should hold")
+
+    if args.write_ok:
+        out = Path(args.write_ok)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "_meta": {"stage": "audit_regrasp_demos --write-ok",
+                      "source": str(args.demos),
+                      "n_scenes": len(ok_pairs),
+                      "n_pairs": sum(len(v) for v in ok_pairs.values())},
+            "ok": {str(s_): sorted(int(b) for b in bs)
+                   for s_, bs in sorted(ok_pairs.items())},
+        }
+        out.write_text(json.dumps(payload, indent=1))
+        print(f"\n  wrote {out}  ({payload['_meta']['n_pairs']} usable "
+              f"(scene, bin) pairs over {payload['_meta']['n_scenes']} scenes)")
+        print("  -> SIM.demo_ok_table in the run config")
 
     print("\n" + "=" * 74)
     for w in warns:

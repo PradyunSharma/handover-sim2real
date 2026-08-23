@@ -978,21 +978,27 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                 # pose read back afterwards becomes the learner's conditioning
                 # for the rest of the episode.
                 if step == 0 and pin_table is not None:
-                    # PIN FAILURE IS RECOVERABLE NOW, and that is a direct
-                    # consequence of conditioning on a direction. Phase 5 had to
-                    # abandon the episode here: `grasp_idx` NAMED the target, the
-                    # learner was conditioned on that exact pose, and an episode
-                    # that quietly flew elsewhere would be mislabelled. Under
-                    # Regrasp the command is DERIVED from whatever the expert
-                    # actually flies to, so a failed pin just means the episode
-                    # demonstrates a different direction than intended — which is
-                    # still a correct demonstration, provided it is re-binned.
-                    # `bin_assigned` vs `bin_realized` records the difference.
+                    # PIN FAILURE IS DETECTABLE, AND UNDER RUN 2 IT IS FATAL TO
+                    # THE (scene, bin) PAIR. Phase 5 had to abandon the episode
+                    # because `grasp_idx` NAMED the target the learner was
+                    # conditioned on. Run 1 made it recoverable by deriving the
+                    # command from whatever the expert flew to, so a missed pin
+                    # simply re-labelled the episode under the direction actually
+                    # demonstrated.
                     #
-                    # The ~1% irreducible pin-failure rate (the goal set is
+                    # Run 2 gives that up deliberately. The command is now the BIN
+                    # AXIS (see below), so a failed pin does not change what the
+                    # policy is told — it changes what it is SHOWN, leaving an
+                    # episode captioned `+z` whose trajectory approaches from
+                    # somewhere else. Re-binning cannot fix that either, because
+                    # the scene already has a demonstration for the bin the
+                    # episode actually flew to. So `bin_realized` is still
+                    # recorded, and the base-collection audit drops every pair
+                    # where it disagrees with `bin_assigned` from BOTH training
+                    # and evaluation. The ~1% irreducible rate (the goal set is
                     # re-drawn with np.random.choice for the 97 subsample-capped
-                    # scenes, so a recorded pose can simply be absent) therefore
-                    # stops costing episodes.
+                    # scenes, so a recorded pose can simply be absent) is the
+                    # price of the command matching deployment.
                     pinned = bool(pin_table.apply(env, scene_idx, grasp_idx))
                     if not pinned:
                         n_pin_fail += 1
@@ -1007,17 +1013,39 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                     s_ = _standoff_for(grasp_pose)
                     if s_ is not None:
                         standoff_pose = s_
-                    # Condition the learner on what the expert is actually flying
-                    # to, not on what the table says it should be — they agree to
-                    # within match_tol, and this one is true by construction.
-                    # CONDITION ON WHAT THE EXPERT IS ACTUALLY FLYING TO, not on
-                    # what the table says it should be. With a successful pin the
-                    # two agree to within match_tol and this is simply the more
-                    # honest of two equal answers; with a FAILED pin it is the
-                    # only correct one, and it is what makes the failure
-                    # recoverable rather than fatal.
-                    if grasp_pose is not None:
+                    # ---- THE COMMAND IS THE BIN AXIS, NOT THE GRASP ----------
+                    # Run 1 conditioned on `-R_grasp[:,2]` — the approach axis of
+                    # the pose the expert actually flew to. That is a different
+                    # vector from the one the retry machine issues at deployment:
+                    # `retry.next_direction` has no grasp, so it commands
+                    # `to_world(BINS[b], anchor_R)`, the bin's own axis. Training
+                    # on one and deploying on the other is a train/test skew of a
+                    # MEASURED median 18.4 deg (p90 38.5, max 45 — the bin
+                    # half-width), which is the same order as the effect the
+                    # conditioning is supposed to have.
+                    #
+                    # So the command is the bin axis in both places, and the
+                    # DEMONSTRATION is chosen to match it: the direction table
+                    # stores, per bin, the goal-set grasp closest to that axis
+                    # (`angle_to_axis_deg`), and assign_direction_demos.py keeps
+                    # exactly that one. The residual 18 deg is now honest label
+                    # noise -- the policy is told a sector and shown a grasp
+                    # inside it -- rather than a silent shift between training
+                    # and deployment.
+                    #
+                    # A FAILED PIN no longer changes the command, because the
+                    # command never referred to the pose. It makes the
+                    # DEMONSTRATION wrong instead, which is why run 2 drops those
+                    # (scene, bin) pairs outright rather than re-binning them.
+                    if anchor_R is not None and bin_assigned is not None \
+                            and int(bin_assigned) >= 0:
+                        d_world = _rg_directions.to_world(
+                            _rg_directions.BINS[int(bin_assigned)], anchor_R)
+                    elif grasp_pose is not None:
+                        # No anchor or no bin (a Phase-5-shaped table): fall back
+                        # to run 1's rule so an old pin table still collects.
                         d_world = _rg_directions.approach_direction(grasp_pose)
+                    if d_world is not None:
                         runner.set_direction(d_world)
 
                 # ----- COMMIT THE REACH once the EE reaches the standoff -----
@@ -1429,22 +1457,41 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         "grasp_idx": int(grasp_idx),
         "grasp_pose_world": (np.eye(4, dtype=np.float32) if grasp_pose is None
                              else np.asarray(grasp_pose, dtype=np.float32)),
-        # REGRASP. `d_world` is THE conditioning: one unit vector per episode,
-        # derived from the pose the expert flew to rather than from the table, so
-        # a pin that missed is still correctly labelled. BCDataset rotates it into
+        # REGRASP. `d_world` is THE conditioning: one unit vector per episode —
+        # the assigned BIN'S AXIS in world coordinates, which is exactly what
+        # `retry.next_direction` issues at deployment. BCDataset rotates it into
         # the current EE frame every step; storing it per step would be T x 3
-        # floats saying the same thing.
+        # floats saying the same thing (the pin holds the target fixed, so it is
+        # provably constant however the hand moves).
         "d_world": (np.zeros(3, dtype=np.float32) if d_world is None
                     else np.asarray(d_world, dtype=np.float32)),
-        # ASSIGNED vs REALIZED. They differ exactly when the pin failed and the
-        # episode flew to OMG's own pick instead. Recording both is what turns
-        # the ~1% irreducible pin-failure rate from lost episodes into re-binned
-        # ones, and lets an analysis exclude them if it wants to.
+        # ...and what the expert ACTUALLY flew, which is a different vector. The
+        # demonstration is the goal-set grasp closest to the bin axis, so the two
+        # differ by a MEASURED median 18.4 deg (p90 38.5, max 45 = the bin
+        # half-width). That gap is the label noise the conditioning has to
+        # tolerate: the policy is told a sector and shown one grasp inside it.
+        # Recorded per episode so it can be measured on the collected data rather
+        # than assumed from the table, and so a run can filter on it.
+        "d_grasp_world": (np.zeros(3, dtype=np.float32) if grasp_pose is None
+                          else _rg_directions.approach_direction(
+                              grasp_pose).astype(np.float32)),
+        "demo_off_deg": (float("nan") if (grasp_pose is None or d_world is None)
+                         else float(_rg_directions.angle_between(
+                             d_world,
+                             _rg_directions.approach_direction(grasp_pose)))),
+        # ASSIGNED vs REALIZED. `bin_realized` is the bin the DEMONSTRATION lands
+        # in, so the two disagree exactly when the pin missed and the expert flew
+        # to a grasp in a different sector. Under run 2 that pair is dropped from
+        # training and evaluation (see the step-0 block): the command did not
+        # change, so the episode is a correct caption over the wrong trajectory,
+        # and re-binning is not available because the scene already has a
+        # demonstration for the bin it actually flew to.
         "bin_assigned": int(bin_assigned) if bin_assigned is not None else -1,
-        "bin_realized": (-1 if d_world is None
+        "bin_realized": (-1 if grasp_pose is None or anchor_R is None
                          else int(_rg_directions.bin_of(
-                             _rg_directions.from_world(d_world, anchor_R)
-                             if anchor_R is not None else d_world))),
+                             _rg_directions.from_world(
+                                 _rg_directions.approach_direction(grasp_pose),
+                                 anchor_R)))),
         "anchor_R": (np.eye(3, dtype=np.float32) if anchor_R is None
                      else np.asarray(anchor_R, dtype=np.float32)),
         "anchor_mode": str(anchor_mode or "unset"),
@@ -1456,6 +1503,14 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     stats = {
         "scene_idx": int(scene_idx),
         "grasp_idx": int(grasp_idx),
+        # The direction this episode was actually driven under, so the iteration
+        # aggregate can be split by it. REALIZED, not assigned: the conditioning
+        # the network is handed is derived from the pose the expert flew to, so
+        # on the ~1% of episodes where the pin missed, `bin_assigned` names a
+        # direction that was never demonstrated and bucketing by it would file
+        # the episode under a command nobody gave.
+        "bin_assigned": int(episode["bin_assigned"]),
+        "bin_realized": int(episode["bin_realized"]),
         "skipped": False,
         "steps": len(expert_actions),
         "reason": reason,
@@ -1556,6 +1611,11 @@ class DaggerHDF5Writer:
         # checks. `schema` is the field that names Regrasp.
         self._f.attrs["dagger_phase"] = 5
         self._f.attrs["schema"] = "regrasp-v1"
+        # COMPLETENESS, written at OPEN so an interrupted shard is DISTINGUISHABLE
+        # from a finished one. close() flips it to True. Without this the resume
+        # path cannot tell them apart and reuses a partial iteration as if it were
+        # whole — it silently trained on 82 of 354 episodes once already.
+        self._f.attrs["complete"] = False
         self._f.attrs["pc_format"] = (
             "xyz(3)+ycb(1)+hand(1)+normal(3) in EE frame; the two\n"
             "conditioning channels d.n and d.r are built at load time")
@@ -1579,7 +1639,8 @@ class DaggerHDF5Writer:
         # provenance, and `wrist_world` in particular is what lets the anchor
         # frame be re-derived under a different definition as a relabelling pass
         # rather than a re-collection.
-        for _k in ("d_world", "bin_assigned", "bin_realized", "anchor_R",
+        for _k in ("d_world", "d_grasp_world", "demo_off_deg",
+                   "bin_assigned", "bin_realized", "anchor_R",
                    "anchor_mode", "wrist_world", "mano_side", "pin_ok"):
             if _k in episode:
                 grp.attrs[_k] = episode[_k]
@@ -1593,6 +1654,10 @@ class DaggerHDF5Writer:
         for key, val in (extra or {}).items():
             self._f.attrs[key] = val
         self._f.attrs["num_episodes"] = self._n
+        # Only set on a CLEAN close, so an interrupted shard stays complete=False
+        # and the resume path re-collects it instead of silently training on a
+        # fraction of an iteration.
+        self._f.attrs["complete"] = True
         self._f.close()
 
     def __enter__(self):
@@ -1668,6 +1733,15 @@ def collect_iteration(sim, runner, pairs, out_path, *, rng,
            "n_tiny_labels": 0, "n_revisits": 0, "n_grasp_mismatch": 0,
            "max_grasp_drift": 0.0,
            "min_pos": [], "min_rot": [], "close_steps": [], "reasons": {},
+           # PER-BIN collection counters. "How far the learner got" pooled over
+           # four physically different commands is an average that hides the
+           # thing DAgger is supposed to show: the state distribution shifting,
+           # which can shift for `+x` and not for `+z`. Six entries always, even
+           # the two this dataset cannot reach, so the CSV header does not depend
+           # on what a run happened to draw.
+           "per_bin": {b: {"episodes": 0, "reached_standoff": 0,
+                           "reached_grasp": 0, "policy_closed": 0, "success": 0}
+                       for b in range(len(_rg_directions.BINS))},
            # params.target == "pregrasp" + outcome_check only: where the blind
            # push landed relative to the grasp. Empty otherwise, so `_mean`
            # yields NaN and the columns blank out rather than reading 0.
@@ -1769,6 +1843,13 @@ def collect_iteration(sim, runner, pairs, out_path, *, rng,
                 agg["pinned"] += st["pinned"]
                 agg["reached_standoff"] += st["reached_standoff"]
                 agg["reached_grasp"] += st["reached_grasp"]
+                pb = agg["per_bin"].get(int(st.get("bin_realized", -1)))
+                if pb is not None:
+                    pb["episodes"] += 1
+                    pb["reached_standoff"] += st["reached_standoff"]
+                    pb["reached_grasp"] += st["reached_grasp"]
+                    pb["policy_closed"] += st["policy_closed"]
+                    pb["success"] += int(st.get("success", 0))
                 agg["n_reach_steps"] += st["n_reach_steps"]
                 agg["n_settle_steps"] += st.get("n_settle_steps", 0)
                 agg["policy_closed"] += st["policy_closed"]

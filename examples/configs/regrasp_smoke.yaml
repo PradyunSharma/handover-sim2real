@@ -1,21 +1,36 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# PHASE-5 SHAKEDOWN. Not a result — it exists to prove the wiring before a 20 h
+# REGRASP SHAKEDOWN. Not a result — it exists to prove the wiring before a 20 h
 # job is queued behind it. ~30 min on a V100.
 #
-#   = regrasp_run1.yaml with num_iters 2, m=8 (2 scenes x 4 grasps),
-#     base_epochs 3, iter_epochs 2, eval on 3 scenes x 4 grasps, verbose.
+#   = regrasp_run2.yaml with num_iters 2, m=8 (4 scenes x their directions),
+#     base_epochs 3, iter_epochs 2, eval on 3 scenes, verbose.
 #
 # WHAT IT MUST SHOW, in this order:
-#   grasp_mismatch      0   — a (scene, slot) never re-aimed between iterations
-#   goal_switch         0   — and never moved within an episode
-#   four distinct grasp_idx values in data/dagger_iter_01.h5
-#   cond_goal_spread    > 0 — the four commanded grasps really are separated
-#   cond_track          any value — it is meaningless at 3 epochs, but a NaN
-#                             means the diagnostic itself is not wired up
+#   grasp_mismatch      0    — a (scene, direction) never re-aimed between iterations
+#   goal_switch         0    — and never moved within an episode
+#   TWO distinct bin_assigned values on at least one scene in
+#                              data/dagger_iter_01.h5 — a scene demonstrating one
+#                              direction twice is the confound the pairing exists
+#                              to break, and it would look identical in every
+#                              aggregate number
+#   dir_err             finite — not NaN. It is meaningless at 3 epochs; a NaN
+#                              means the metric itself is not wired up
+#   cond_delta          > 0  — the direction channels reach the network at all
+#   n_b0 .. n_b5        the six per-bin denominators. With 3 eval scenes MOST OF
+#                              THESE ARE 0, and the check is that their columns
+#                              come out BLANK rather than 0.0 — a zero there
+#                              would read as "this direction always fails".
 #
 #   sbatch --time=01:00:00 --export=ALL,RUN=regrasp_smoke,\
 #       CFG=examples/configs/regrasp_smoke.yaml \
 #       examples/slurm/train_regrasp.sbatch
+#
+# THE PATHS BELOW ARE THE REGRASP ONES. This file previously pointed at Phase 5's
+# `train_p5.json` / `train_p5.h5`, which is worse than a missing file: the pin
+# table loads, but it carries FPS-selected poses with no `bin` key, so
+# `pin_table.bin_of()` returns None for every entry, every `bin_idx` becomes -1,
+# and every per-bin column blanks out — a shakedown that passes while measuring
+# nothing.
 # ─────────────────────────────────────────────────────────────────────────────
 
 SIM:
@@ -28,9 +43,15 @@ SIM:
   hand_points_radius: 0.35
   use_standoff: true
   standoff_dist: 0.08
-  grasp_pin_table: output/bc_dataset/train_p5.json
+  grasp_pin_table: output/regrasp_pins_train.json
   grasp_pin_match_tol: 0.02
-  exclude_scenes: output/bc_dataset/train_p5_excluded.json
+  exclude_scenes: output/regrasp_pins_train_excluded.json
+  # The shakedown reads the SAME (scene, bin) filter the real run does. Without
+  # it the smoke would pass while the one path that can silently train on three
+  # directions and score four went untested — and train_regrasp.sbatch derives
+  # this file when it is missing, so the smoke is also what proves that
+  # derivation works before a 24 h job depends on it.
+  demo_ok_table: output/regrasp_demos_train_ok.json
 DAGGER:
   num_iters: 2
   episodes_per_iter: 8
@@ -69,8 +90,8 @@ DAGGER:
 TRAIN:
   train_cfg: examples/configs/bc_regrasp.yaml
   pc_pretrained: null
-  base_train_h5: output/bc_dataset/train_p5.h5
-  val_h5: output/bc_dataset/val_p5.h5
+  base_train_h5: output/bc_dataset/train_regrasp.h5
+  val_h5: output/bc_dataset/val_regrasp.h5
   base_run: null
   base_epochs: 3
   iter_epochs: 2

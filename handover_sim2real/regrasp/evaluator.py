@@ -75,6 +75,7 @@ from rollout_bc_policy import action_to_target_joint  # noqa: E402
 from handover_sim2real.rl.rollout_worker import (  # noqa: E402
     _status_name, grasp_held_after_hold,
 )
+from handover_sim2real.regrasp import directions as _rg_dirs  # noqa: E402
 from handover_sim2real.regrasp.grasp_box import (  # noqa: E402
     BoxParams, grasp_opportunity,
 )
@@ -169,7 +170,7 @@ def _resolve_grasp_pose(sim, scene_idx: int, pin_table, grasp_idx: int = 0):
 
 
 def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
-                  grasp_pose=None, target_pose=None) -> dict:
+                  grasp_pose=None, target_pose=None, d_world=None) -> dict:
     """`grasp_pose` is what the gripper must end up on; `target_pose` is what the
     POLICY is steering to. They are the same pose in grasp mode and 6.4 cm apart
     in pre-grasp mode, where the difference is covered by the blind push."""
@@ -189,7 +190,10 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
     # pre-grasp mode — the standoff is where the policy stops, not what it was
     # told to aim at. Evaluation makes no OMG calls under stable_grasp, so this
     # comes from the pin table for free.
-    runner.set_goal(grasp_pose)
+    # Condition on the DIRECTION derived from the grasp being scored, so a
+    # policy that follows the command and one that ignores it are told apart by
+    # the metrics rather than by which target each was shown.
+    runner.set_direction(d_world)
 
     prev_act6d = np.zeros(6, dtype=np.float32)
     status, done, info = 0, False, {}
@@ -417,10 +421,36 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
                 target_pose = derived_standoff_pose(
                     grasp_pose, params.standoff_dist, params.reach_tail)
 
+            # THE COMMAND IS THE BIN AXIS, matching the collector and matching
+            # what `retry.next_direction` issues at deployment. Run 1 used
+            # `-R_grasp[:,2]` here, which is a different vector: the pinned grasp
+            # sits a median 18.4 deg off its bin's axis, so eval was scoring the
+            # policy on a command no deployment would ever give it — and
+            # `dir_err`, which is the angle between the command and the achieved
+            # axis, was measuring against that same shifted target and so hid the
+            # discrepancy rather than showing it.
+            meta = (pin_table.scene_meta.get(int(scene), {})
+                    if pin_table is not None else {})
+            anchor_R = meta.get("anchor_R")
+            b = (pin_table.bin_of(int(scene), gi)
+                 if pin_table is not None else None)
+            if b is not None and anchor_R is not None and int(b) >= 0:
+                d_world = _rg_dirs.to_world(_rg_dirs.BINS[int(b)],
+                                            np.asarray(anchor_R))
+            else:
+                # No bin or no anchor (a Phase-5-shaped table): run 1's rule, so
+                # an old pin table still scores rather than scoring nothing.
+                d_world = (None if grasp_pose is None
+                           else _rg_dirs.approach_direction(grasp_pose))
             row = _eval_episode(sim, runner, int(scene), params=params,
-                                grasp_pose=grasp_pose, target_pose=target_pose)
+                                grasp_pose=grasp_pose, target_pose=target_pose,
+                                d_world=d_world)
             row["grasp_idx"] = gi
             row["grasp_pose"] = grasp_pose
+            row["d_world"] = d_world
+            row["anchor_R"] = np.asarray(anchor_R) if anchor_R is not None else None
+            row["centroid_world"] = meta.get("centroid_world")
+            row["bin_idx"] = -1 if b is None else int(b)
             rows.append(row)
             if params.verbose:
                 reach = (f"reach={row['reach_pos_err']:.3f}/{row['box_after']} "
@@ -435,18 +465,60 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
                       f"@{row['box_steps']}st({row['box_frac_max']:.2f}) "
                       f"{row['reason']}")
 
+    out = _rate_block(rows, params)
+    out["rows"] = rows
+    out.update(_regrasp_metrics(rows, num_grasps))
+    # ---- THE SAME BLOCK AGAIN, ONE BIN AT A TIME ---------------------------
+    # Pooled rates hide the thing the phase is about. `success_rate` is an
+    # average over four physically different commands, and a policy that solves
+    # `+x` and ignores `+z` reads identically to one that is mediocre at both.
+    # Every panel of the training figure is therefore drawn per bin, which needs
+    # the whole family per bin rather than just `succ_bin_*`.
+    #
+    # Suffix `_b{b}`, and EVERY bin gets keys — including the two that are empty
+    # on this dataset. A fixed schema means the CSV header does not change with
+    # what a run happened to command, so two runs stay diffable and a plotter can
+    # ask for a column without first asking whether it exists. Empty bins yield
+    # NaN, which `_r` writes as a blank cell and matplotlib renders as a gap.
+    for b in range(len(_rg_dirs.BINS)):
+        rs = [r for r in rows if int(r.get("bin_idx", -1)) == b]
+        for k, v in _rate_block(rs, params).items():
+            out[f"{k}_b{b}"] = v
+    return out
+
+
+def _rate_block(rows, params) -> dict:
+    """The rate / error / outcome reduction over ONE set of eval episodes.
+
+    Factored out so the identical arithmetic runs over the whole eval set and
+    over each direction bin's slice of it — the alternative, a second
+    hand-written per-bin reduction, is how a pooled number and its own breakdown
+    drift apart without either looking wrong.
+
+    An EMPTY slice returns the same keys with NaN (and `n: 0`), never zeros: a
+    bin nobody commanded has an undefined success rate, and a 0 there is a claim
+    about the policy rather than about what was measured.
+    """
     n = max(len(rows), 1)
 
     def _mean(key, where=lambda r: True):
         vals = [r[key] for r in rows if where(r) and np.isfinite(r[key])]
         return float(np.mean(vals)) if vals else float("nan")
 
+    def _rate(pred, denom=None):
+        if not rows:
+            return float("nan")
+        d = n if denom is None else denom
+        return (sum(pred(r) for r in rows) / d) if d else float("nan")
+
     # Outcome breakdown as FRACTIONS of the eval set, so the categories stack to
     # 1.0 and plot directly as an area chart of where episodes are being lost.
     # `reason` is exclusive by construction (one break per episode).
-    reasons = {}
+    reasons, reasons_fail = {}, {}
     for r in rows:
         reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
+        if not r["success"]:
+            reasons_fail[r["reason"]] = reasons_fail.get(r["reason"], 0) + 1
 
     n_closed = sum(r["closed"] for r in rows)
     n_chance = sum(r["had_chance"] for r in rows)
@@ -454,21 +526,21 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
 
     return {
         "n": len(rows),
-        "success_rate": sum(r["success"] for r in rows) / n,
-        "grasp_rate": sum(r["grasped"] for r in rows) / n,
-        "close_rate": n_closed / n,
-        "near_rate": sum(r["near"] for r in rows) / n,
+        "success_rate": _rate(lambda r: r["success"]),
+        "grasp_rate": _rate(lambda r: r["grasped"]),
+        "close_rate": _rate(lambda r: r["closed"]),
+        "near_rate": _rate(lambda r: r["near"]),
         # CONDITIONAL on having closed: "when it decides to grasp, is it right?"
         # Distinct from success_rate, which is over all episodes and so conflates
         # a bad grasp with never trying. NaN when nothing closed.
         "close_success_rate": (sum(r["success"] for r in rows) / n_closed
                                if n_closed else float("nan")),
         # Reached a graspable pose at some step...
-        "chance_rate": n_chance / n,
+        "chance_rate": _rate(lambda r: r["had_chance"]),
         # ...and still did not secure the object. `missed_rate` is over ALL
         # episodes; `miss_given_chance` is the conditional — the fraction of
         # real opportunities the policy threw away.
-        "missed_rate": sum(r["missed"] for r in rows) / n,
+        "missed_rate": _rate(lambda r: r["missed"]),
         "miss_given_chance": (sum(r["missed"] for r in rows) / n_chance
                               if n_chance else float("nan")),
         # ---- the GEOMETRIC opportunity, pin-independent (grasp_box.py) ----
@@ -480,7 +552,8 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
         # policy never got a chance", which is a claim about the policy rather
         # than about what was measured. NaN writes a BLANK cell (see `_r` in
         # train_dagger_phase4) and plots as a gap.
-        "box_chance_rate": (n_box / n) if params.box_check else float("nan"),
+        "box_chance_rate": (_rate(lambda r: r["box_chance"])
+                            if params.box_check else float("nan")),
         # THE headline: given that the object really was between the open jaws,
         # how often did the policy command the close there. Conditional on the
         # chance, so it separates "never got a chance" from "got one and did not
@@ -489,7 +562,7 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
         "box_taken_rate": (sum(r["box_taken"] for r in rows) / n_box
                            if (n_box and params.box_check) else float("nan")),
         # ...and, taken or not, how often that chance failed to become a grasp.
-        "box_missed_rate": (sum(r["box_missed"] for r in rows) / n
+        "box_missed_rate": (_rate(lambda r: r["box_missed"])
                             if params.box_check else float("nan")),
         "miss_given_box": (sum(r["box_missed"] for r in rows) / n_box
                            if (n_box and params.box_check) else float("nan")),
@@ -527,9 +600,14 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
         "mean_pos_err": _mean("pos_err"),
         "mean_rot_err": _mean("rot_err"),
         "mean_close_step": _mean("close_step", where=lambda r: r["close_step"] >= 0),
+        # Of the episodes that did NOT come away with the object, which way did
+        # they fail. Denominator is the failures, not the eval set, so the
+        # categories stack to 1.0 and a bin's failure PROFILE is readable
+        # independently of how often that bin fails at all — the two questions
+        # the pooled `f_*` fractions run together.
         "reasons": reasons,
-        "rows": rows,
-        **_regrasp_metrics(rows, num_grasps),
+        "reasons_fail": reasons_fail,
+        "n_fail": int(sum(1 for r in rows if not r["success"])),
     }
 
 
@@ -555,20 +633,30 @@ def _regrasp_metrics(rows, num_grasps: int) -> dict:
     told, which is the multi-modal averaging failure and would make regrasping
     inert no matter how good `success_rate` looked.
     """
-    from handover_sim2real.regrasp.grasp_select import pairwise_mean_distance
+    from handover_sim2real.regrasp import directions as _D
 
     if not rows:
         return {}
     out = {"num_grasps": int(num_grasps)}
 
-    by_slot = {g: [r for r in rows if r.get("grasp_idx", 0) == g]
-               for g in range(num_grasps)}
-    for g, rs in by_slot.items():
+    # ---- per-BIN rates, not per-slot ---------------------------------------
+    # Slot k means "this scene's k-th chosen direction" and is not comparable
+    # across scenes; bin k is a fixed physical direction and is. `succ_bin_*` is
+    # therefore the column to read, and the one that shows whether -x and -z are
+    # learnable at all (on this dataset they are not: 11 and 0 demonstrations).
+    for b in range(len(_D.BINS)):
+        rs = [r for r in rows if int(r.get("bin_idx", -1)) == b]
+        out[f"succ_bin_{b}"] = (sum(r["success"] for r in rs) / len(rs)
+                                if rs else float("nan"))
+        out[f"n_bin_{b}"] = len(rs)
+    # Kept for continuity with the Phase-5 column set, but slot-indexed and so
+    # only meaningful within a scene.
+    for g in range(num_grasps):
+        rs = [r for r in rows if r.get("grasp_idx", 0) == g]
         m = max(len(rs), 1)
         out[f"succ_g{g}"] = sum(r["success"] for r in rs) / m
-        out[f"near_g{g}"] = sum(r["near"] for r in rs) / m
 
-    # retry@k, and the per-scene tables the other two need.
+    # ---- retry@k -----------------------------------------------------------
     by_scene: dict[int, dict[int, dict]] = {}
     for r in rows:
         by_scene.setdefault(int(r["scene_idx"]), {})[int(r.get("grasp_idx", 0))] = r
@@ -578,28 +666,113 @@ def _regrasp_metrics(rows, num_grasps: int) -> dict:
                    if any(per[g]["success"] for g in range(k) if g in per))
         out[f"retry_at_{k}"] = hits / n_scenes
 
-    if num_grasps < 2:
-        out["cond_track"] = float("nan")
-        out["cond_ee_spread"] = float("nan")
-        out["cond_goal_spread"] = float("nan")
-        return out
+    # ---- DID IT GO WHERE IT WAS TOLD ---------------------------------------
+    # This replaces `near_rate`, which measured distance to a pinned POSE the
+    # policy was never given and now reads low for a reason that says nothing
+    # about the policy.
+    #
+    #   dir_err       angle between the commanded d and the approach axis the
+    #                 gripper actually ended on. THE headline.
+    #   sector_err    angle between d and the direction the gripper arrived FROM
+    #                 (centroid -> EE). Genuinely different: dir_err is about
+    #                 ORIENTATION, sector_err about WHICH SIDE. A gripper can be
+    #                 correctly oriented on the wrong side and vice versa.
+    #   bin_hit_rate  fraction with sector_err < 30 deg. The `near_rate` analogue.
+    #                 30 rather than the 45-deg Voronoi half-angle, for margin.
+    #   dir_track     1 - mean(dir_err)/90, so it reads like cond_track did:
+    #                 1 = follows the command, 0 = ignores it.
+    dir_all, conf_all = _dir_block(rows)
+    out.update(dir_all)
+    out["bin_confusion"] = conf_all.tolist()
+    # ...and the same four numbers restricted to each commanded bin. `dir_track`
+    # pooled over four directions is an average of four different questions: a
+    # policy that tracks `+x` perfectly and ignores `+z` reads the same as one
+    # that half-tracks both, and only the first is evidence the conditioning is
+    # being read at all.
+    for b in range(len(_D.BINS)):
+        rs = [r for r in rows if int(r.get("bin_idx", -1)) == b]
+        blk, _ = _dir_block(rs)
+        for k, v in blk.items():
+            out[f"{k}_b{b}"] = v
 
-    ratios, ee_spreads, goal_spreads = [], [], []
+    # ---- does the behaviour CHANGE with the command -------------------------
+    # cond_sep is the direction-space analogue of Phase-5's cond_track: the
+    # spread of what the policy DID over the spread of what it was TOLD. It needs
+    # only two conditions per scene, where cond_track wanted four.
+    ratios = []
     for per in by_scene.values():
-        ees = [per[g]["ee_final"] for g in sorted(per)
-               if per[g].get("ee_final") is not None]
-        goals = [per[g]["grasp_pose"] for g in sorted(per)
-                 if per[g].get("grasp_pose") is not None]
-        if len(ees) < 2 or len(goals) < 2:
+        cmds = [per[g].get("d_world") for g in sorted(per)]
+        achs = [per[g].get("ee_final") for g in sorted(per)]
+        ok = [(c, a) for c, a in zip(cmds, achs) if c is not None and a is not None]
+        if len(ok) < 2:
             continue
-        d_ee = pairwise_mean_distance(np.stack(ees))
-        d_goal = pairwise_mean_distance(np.stack(goals))
-        ee_spreads.append(d_ee)
-        goal_spreads.append(d_goal)
-        if d_goal > 1e-6:
-            ratios.append(d_ee / d_goal)
-    out["cond_track"] = float(np.mean(ratios)) if ratios else float("nan")
-    out["cond_ee_spread"] = float(np.mean(ee_spreads)) if ee_spreads else float("nan")
-    out["cond_goal_spread"] = (float(np.mean(goal_spreads)) if goal_spreads
-                               else float("nan"))
+        c0, c1 = ok[0][0], ok[1][0]
+        a0 = _D.approach_direction(np.asarray(ok[0][1]))
+        a1 = _D.approach_direction(np.asarray(ok[1][1]))
+        told = float(_D.angle_between(c0, c1))
+        did = float(_D.angle_between(a0, a1))
+        if told > 1e-3:
+            ratios.append(did / told)
+    out["cond_sep"] = float(np.mean(ratios)) if ratios else float("nan")
     return out
+
+
+def _dir_block(rows):
+    """Did the gripper go where it was told, over one set of eval episodes.
+
+    Returns `(metrics, confusion)`. Factored out for the same reason as
+    `_rate_block`: the per-bin breakdown and the pooled headline are the same
+    arithmetic, and writing it twice is how they come to disagree.
+
+        dir_err       angle between the commanded d and the approach axis the
+                      gripper actually ended on. THE headline.
+        sector_err    angle between d and the direction the gripper arrived FROM
+                      (centroid -> EE). Genuinely different: dir_err is about
+                      ORIENTATION, sector_err about WHICH SIDE. A gripper can be
+                      correctly oriented on the wrong side and vice versa.
+        bin_hit_rate  fraction with sector_err < 30 deg. The `near_rate` analogue.
+                      30 rather than the 45-deg Voronoi half-angle, for margin.
+        dir_track     1 - mean(dir_err)/90, so 1 = follows the command, 0 =
+                      ignores it.
+        bin_diag_rate how often the REALISED bin is the commanded one. Collapsing
+                      onto one column of the confusion matrix is the multi-modal
+                      averaging failure — the policy going the same way whatever
+                      it is told.
+    """
+    from handover_sim2real.regrasp import directions as _D
+
+    dir_errs, sector_errs = [], []
+    confusion = np.zeros((len(_D.BINS), len(_D.BINS)), dtype=np.int64)
+    for r in rows:
+        d_cmd = r.get("d_world")
+        if d_cmd is None:
+            continue
+        ee = r.get("ee_final")
+        if ee is None:
+            continue
+        achieved = _D.approach_direction(np.asarray(ee))
+        dir_errs.append(float(_D.angle_between(d_cmd, achieved)))
+        c = r.get("centroid_world")
+        if c is not None:
+            arrived = _D.normalize(np.asarray(ee)[:3, 3] - np.asarray(c))
+            if float(np.linalg.norm(arrived)) > 0.5:
+                sector_errs.append(float(_D.angle_between(d_cmd, arrived)))
+        R = r.get("anchor_R")
+        cb, rb = int(r.get("bin_idx", -1)), -1
+        if R is not None:
+            rb = _D.bin_of(_D.from_world(achieved, np.asarray(R)))
+        if cb >= 0 and rb >= 0:
+            confusion[cb, rb] += 1
+
+    de = np.asarray(dir_errs, dtype=np.float64)
+    se = np.asarray(sector_errs, dtype=np.float64)
+    tot = int(confusion.sum())
+    nan = float("nan")
+    return {
+        "dir_err": float(de.mean()) if de.size else nan,
+        "dir_err_median": float(np.median(de)) if de.size else nan,
+        "dir_track": float(1.0 - de.mean() / 90.0) if de.size else nan,
+        "sector_err": float(se.mean()) if se.size else nan,
+        "bin_hit_rate": float((se < _D.BIN_HIT_DEG).mean()) if se.size else nan,
+        "bin_diag_rate": float(np.trace(confusion) / tot) if tot else nan,
+    }, confusion

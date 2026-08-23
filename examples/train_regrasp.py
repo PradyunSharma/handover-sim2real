@@ -515,16 +515,29 @@ LOG_FIELDS = [
     # `succ_g*` / `near_g*` are the per-slot rates. Slot 0 is OMG's own pick, so
     # `succ_g0` is the column comparable with a Phase-4 run; the spread across
     # slots says how much harder the deliberately-separated grasps are.
-    "cond_track", "cond_ee_spread", "cond_goal_spread",
+    # Regrasp: direction metrics replace cond_track / near_g*. `dir_err` is the
+    # headline (angle between the command and the achieved approach axis);
+    # `bin_hit_rate` is the near_rate analogue; `bin_diag_rate` collapsing means
+    # the policy goes the same way whatever it is told.
+    "dir_err", "dir_err_median", "dir_track", "sector_err",
+    "bin_hit_rate", "bin_diag_rate", "cond_sep",
     "retry_at_1", "retry_at_2", "retry_at_3", "retry_at_4",
-    "succ_g0", "succ_g1", "succ_g2", "succ_g3",
-    "near_g0", "near_g1", "near_g2", "near_g3",
+    "succ_bin_0", "succ_bin_1", "succ_bin_2",
+    "succ_bin_3", "succ_bin_4", "succ_bin_5",
+    "n_bin_0", "n_bin_1", "n_bin_2", "n_bin_3", "n_bin_4", "n_bin_5",
+    "succ_g0", "succ_g1",
     # -- (2) eval outcome breakdown, fractions of the eval set
     "f_grasp_ok", "f_grasp_miss", "f_no_release", "f_drop", "f_timeout",
     "f_human_contact",
+    # ...and the same breakdown over the FAILURES only, which is the profile
+    # rather than the level. See EVAL_FAIL_REASONS.
+    "ff_grasp_miss", "ff_no_release", "ff_drop", "ff_timeout", "ff_human_contact",
     # -- (6)
     "is_best", "collect_s", "train_s", "eval_s", "wall_s",
 ]
+# NOTE: ~180 more columns are APPENDED to this list below, once the per-bin
+# helpers exist. They are appended rather than interleaved because the block
+# would otherwise bury the ~130 columns a human reads by eye.
 
 # collector `reason` -> column, and evaluator `reason` -> column. Anything not
 # listed is dropped from the CSV rather than silently mis-filed, so a new reason
@@ -543,6 +556,56 @@ COLLECT_OUTCOMES = {"GRASP_OK": "co_grasp_ok", "GRASP_MISS": "co_grasp_miss",
                     "NO_RELEASE": "co_no_release", "DROP": "co_drop",
                     "HUMAN_CONTACT": "co_human_contact",
                     "BENCH_TIMEOUT": "co_bench_timeout", "TIMEOUT": "co_timeout"}
+# The same taxonomy conditioned on FAILURE — denominator is the episodes that did
+# not come away with the object, not the eval set. `f_timeout` answers "how much
+# of the eval set timed out", which moves whenever success moves; `ff_timeout`
+# answers "of the ones that failed, how many timed out", which is the failure
+# PROFILE and is what tells `+z` apart from `+x` when both succeed 20% of the
+# time. GRASP_OK is absent by construction: it is the success.
+EVAL_FAIL_REASONS = {"GRASP_MISS": "ff_grasp_miss", "NO_RELEASE": "ff_no_release",
+                     "DROP": "ff_drop", "TIMEOUT": "ff_timeout",
+                     "HUMAN_CONTACT": "ff_human_contact"}
+
+# ── PER-BIN COLUMNS ──────────────────────────────────────────────────────────
+# The Regrasp figures draw every eval panel once per commanded direction, so the
+# whole rate family is logged per bin with a `_b{b}` suffix. `n_bins` is the
+# BIN SET's size (6), not the number this dataset can reach (4): a fixed header
+# keeps two runs diffable and lets a plotter ask for a column without first
+# asking whether the run happened to command that direction. The two dead bins
+# write blanks.
+N_BINS = 6
+BIN_EVAL_KEYS = (
+    "n",                                                    # episodes in the bin
+    "close_rate", "near_rate", "grasp_rate", "success_rate",         # nested
+    "box_chance_rate", "box_taken_rate", "miss_given_box",           # opportunity
+    "close_success_rate", "mean_box_frac",
+    "eval_min_pos", "eval_min_rot", "mean_pos_err", "mean_rot_err",  # approach
+    "dir_err", "dir_track", "sector_err", "bin_hit_rate", "bin_diag_rate",
+)
+BIN_COLLECT_KEYS = ("episodes", "reached_standoff", "reached_grasp",
+                    "policy_closed", "success")
+
+
+def bin_eval_fields() -> list[str]:
+    """Every per-bin eval column, in a fixed order. Shared with
+    eval_regrasp_run.py so the two CSVs stay spliceable column-for-column."""
+    out = []
+    for b in range(N_BINS):
+        out += [f"{k}_b{b}" for k in BIN_EVAL_KEYS]
+        out += [f"{c}_b{b}" for c in EVAL_REASONS.values()]
+        out += [f"{c}_b{b}" for c in EVAL_FAIL_REASONS.values()]
+    return out
+
+
+def bin_collect_fields() -> list[str]:
+    """Every per-bin COLLECTION column — the learner's own rollouts, split by the
+    direction they were driven under."""
+    return [f"c_{k}_b{b}" for b in range(N_BINS) for k in BIN_COLLECT_KEYS]
+
+
+# Deferred to here because the helpers above have to exist first (see the note
+# at the end of the LOG_FIELDS literal).
+LOG_FIELDS += bin_collect_fields() + bin_eval_fields()
 
 
 def reason_columns(reasons: dict, mapping: dict, denom: int | None = None) -> dict:
@@ -586,14 +649,41 @@ def eval_columns(m: dict | None) -> dict:
         "mean_reach_pos_err", "mean_reach_rot_err", "box_after_rate",
         "eval_min_pos", "eval_min_rot",
         "mean_dist", "mean_pos_err", "mean_rot_err", "mean_close_step",
-        # Phase 5 — blank rather than 0 for the slots a run does not have, so a
-        # 4-grasp and a 2-grasp run share one schema without the missing slots
-        # reading as genuine zeroes.
-        "cond_track", "cond_ee_spread", "cond_goal_spread",
+        # Regrasp — blank rather than 0 for bins a run never commanded, so an
+        # unvisited direction does not read as a genuine zero success rate.
+        "dir_err", "dir_err_median", "dir_track", "sector_err",
+        "bin_hit_rate", "bin_diag_rate", "cond_sep",
         "retry_at_1", "retry_at_2", "retry_at_3", "retry_at_4",
-        "succ_g0", "succ_g1", "succ_g2", "succ_g3",
-        "near_g0", "near_g1", "near_g2", "near_g3")}
+        "succ_bin_0", "succ_bin_1", "succ_bin_2",
+        "succ_bin_3", "succ_bin_4", "succ_bin_5",
+        "n_bin_0", "n_bin_1", "n_bin_2", "n_bin_3", "n_bin_4", "n_bin_5",
+        "succ_g0", "succ_g1")}
     out.update(reason_columns(m.get("reasons"), EVAL_REASONS, denom=m.get("n") or None))
+    out.update(reason_columns(m.get("reasons_fail"), EVAL_FAIL_REASONS,
+                              denom=m.get("n_fail") or None))
+    # ---- the same family, once per commanded direction ----------------------
+    # `n_b{b}` stays an integer count (it is the denominator every other column
+    # in the block is over, and reading it as a rate would be a mistake); the
+    # rest go through `_r`, so an unvisited bin blanks rather than reading 0.
+    for b in range(N_BINS):
+        out[f"n_b{b}"] = int(m.get(f"n_b{b}", 0) or 0)
+        for k in BIN_EVAL_KEYS[1:]:
+            out[f"{k}_b{b}"] = _r(m.get(f"{k}_b{b}"))
+        # A bin with no episodes gets BLANKS, not the zeros `reason_columns`
+        # returns when handed no denominator — a stacked area reading 0.0 across
+        # every category says "nothing failed", which is the opposite of "nothing
+        # was measured".
+        nb, nf = out[f"n_b{b}"], int(m.get(f"n_fail_b{b}", 0) or 0)
+        for c in EVAL_REASONS.values():
+            out[f"{c}_b{b}"] = ""
+        for c in EVAL_FAIL_REASONS.values():
+            out[f"{c}_b{b}"] = ""
+        if nb:
+            out.update({f"{c}_b{b}": v for c, v in reason_columns(
+                m.get(f"reasons_b{b}"), EVAL_REASONS, denom=nb).items()})
+        if nf:
+            out.update({f"{c}_b{b}": v for c, v in reason_columns(
+                m.get(f"reasons_fail_b{b}"), EVAL_FAIL_REASONS, denom=nf).items()})
     return out
 
 
@@ -638,6 +728,13 @@ def collect_columns(c: dict) -> dict:
             (c.get("success", 0) / c["episodes"]) if c.get("episodes") else None),
         **reason_columns(c.get("outcomes"), COLLECT_OUTCOMES,
                          denom=c.get("episodes") or None),
+        # ---- the same counters split by the direction driven ----------------
+        # Raw counts, not fractions: `c_episodes_b{b}` is the denominator, and
+        # the plotter divides. -1 for a bin with no episodes so a reused shard
+        # (which reports no per-bin breakdown at all) is distinguishable from a
+        # direction that genuinely collected nothing.
+        **{f"c_{k}_b{b}": int((c.get("per_bin", {}).get(b) or {}).get(k, -1))
+           for b in range(N_BINS) for k in BIN_COLLECT_KEYS},
     }
 
 
@@ -784,7 +881,12 @@ def main() -> None:
     # scene under all of them, so it multiplies both `episodes_per_iter`'s
     # interpretation and the eval cost. 1 makes the loop behave exactly as Phase
     # 4 did, which is what a Phase-4 pin table gives.
-    num_grasps = pin_table.num_grasps if pin_table is not None else 1
+    # MAX, not `num_grasps` (a MIN, which reads 1 on a Regrasp table because the
+    # table mixes 1- and 2-direction scenes). With 1 here, sample_pairs computes
+    # n_scenes = m // 1 = m and then expands each scene to its real direction
+    # count, so `episodes_per_iter: 200` silently produced 354 episodes — 1.77x
+    # the requested budget, and roughly double the wall clock.
+    num_grasps = pin_table.max_grasps if pin_table is not None else 1
 
     # Scenes whose EXPERT is broken — the planned trajectory collides with the
     # object while translating into the pre-grasp pose, so the demonstration
@@ -1057,8 +1159,14 @@ def main() -> None:
     # has to be scored too, or a DAgger iteration wins the comparison by default.
     if eval_every > 0 and eval_scenes and done_iters[0].get("eval") is None:
         runner, _ = load_policy_runner(base_dir, device, ckpt=eval_ckpt)
-        print(f"[iter 00] evaluating the base policy on {len(eval_scenes)} scenes x "
-              f"{num_grasps} grasps = {len(eval_scenes)*num_grasps} episodes ...")
+        # The real episode count, not scenes x max_grasps: a per-bin table gives
+        # each scene only the directions it can reach (mean 2.59, max 4), so the
+        # product OVERSTATES the sweep by ~55% and makes the first timing estimate
+        # of the run wrong in the direction that matters.
+        _n_eval_ep = (len(pin_table.pairs(eval_scenes)) if pin_table is not None
+                      else len(eval_scenes))
+        print(f"[iter 00] evaluating the base policy on {len(eval_scenes)} scenes "
+              f"= {_n_eval_ep} episodes (per-scene direction counts) ...")
         base_metrics = evaluate_policy(sim, runner, eval_scenes, params=eval_params,
                                        pin_table=pin_table)
         base_metrics.pop("rows")
@@ -1118,10 +1226,32 @@ def main() -> None:
         # --- D_i: roll out the CURRENT policy, label every visited state ---
         t_collect = time.time()
         h5_path = run_root / "data" / f"dagger_iter_{i:02d}.h5"
+        # REUSE ONLY A SHARD THAT FINISHED. This path exists so a run that died
+        # between collection and the refit does not re-collect an hour of work.
+        # But `exists()` alone cannot tell a finished shard from an interrupted
+        # one, and it silently reused an 82-of-354-episode iteration and would
+        # have recorded it as complete — the aggregate would then be permanently
+        # short by most of an iteration, with nothing in any log saying so.
+        #
+        # `complete` is written only by DaggerHDF5Writer.close(). Shards from
+        # before the flag existed have no attr; those are treated as complete,
+        # because they were produced by a loop that could not record an unfinished
+        # one, and re-collecting them would discard good data.
+        reuse = False
         if h5_path.exists():
             with h5py.File(h5_path, "r") as f:
                 n_ep = int(f.attrs.get("num_episodes", 0))
-            print(f"  [collect] reusing existing {h5_path.name} ({n_ep} episodes)")
+                done = f.attrs.get("complete", None)
+            legacy = done is None
+            reuse = bool(done) or legacy
+            if not reuse:
+                print(f"  [collect] {h5_path.name} is INCOMPLETE ({n_ep} episodes, "
+                      f"complete=False) — the run was interrupted mid-collection. "
+                      f"Discarding and re-collecting.")
+                h5_path.unlink()
+        if reuse:
+            print(f"  [collect] reusing existing {h5_path.name} ({n_ep} episodes"
+                  + ("; legacy shard with no `complete` flag)" if legacy else ")"))
             cstats = {"episodes": n_ep, "steps": -1, "skipped": -1,
                       "reached_standoff": -1, "n_reach_steps": -1,
                       "reached_grasp": -1, "n_omg_fail": -1, "n_goal_switch": -1,

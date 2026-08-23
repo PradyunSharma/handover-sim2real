@@ -7,7 +7,7 @@ fixes the grasps every phase must aim at; this module applies one of them.
 
 **Phase 5 stores a LIST per scene, not a single entry.** Each scene carries N
 (default 4) physically distinct grasps, chosen by
-`grasp_select.select_diverse_grasps`, and the unit of work everywhere downstream
+`assign_direction_demos.py`, and the unit of work everywhere downstream
 is a `(scene_idx, grasp_idx)` pair rather than a scene. Slot 0 is always OMG's own
 pick, so it is byte-identical to a Phase-4 `--mode omg` table and Phase-5 slot-0
 numbers stay comparable with run 16.
@@ -76,7 +76,9 @@ class GraspPinTable:
     @property
     def num_grasps(self) -> int:
         """Slots per scene. Every scene in a built Phase-5 table has the same
-        count — `select_regrasp_demos.py` drops scenes that cannot supply N — so
+        count — but a Regrasp table deliberately MIXES 1- and 2-direction
+        scenes, so this reads 1 and is the WRONG accessor; use `max_grasps` to
+        size arrays and `num_grasps_for` to iterate. Kept only because a
         this is well defined, but `num_grasps_for` is the safe accessor."""
         if not self.entries:
             return 0
@@ -115,7 +117,7 @@ class GraspPinTable:
     def bin_of(self, scene_idx: int, grasp_idx: int = 0):
         """The approach-direction bin index a slot was ASSIGNED, or None.
 
-        Regrasp tables carry it per grasp (`assign_direction_pairs.py` writes it);
+        Regrasp tables carry it per grasp (`assign_direction_demos.py` writes it);
         a Phase-4/5 table has no such key and returns None, which the collector
         records as -1. This is the ASSIGNED bin — compare it against the episode's
         `bin_realized` to see where a failed pin sent the demonstration instead.
@@ -125,6 +127,54 @@ class GraspPinTable:
             return None
         b = grasps[int(grasp_idx)].get("bin")
         return None if b is None else int(b)
+
+    def keep_only(self, ok, *, verbose: bool = True) -> dict:
+        """Prune to the (scene, BIN) pairs listed in `ok`, renumbering the slots.
+
+        `ok` is {scene_idx: [bin, ...]} — what base collection actually managed to
+        demonstrate. A (scene, bin) that OMG could not plan for, or that the pin
+        missed so the expert flew into a different sector, has no usable
+        demonstration; run 2 drops it from TRAINING and from EVALUATION rather
+        than keeping it as an episode whose caption and trajectory disagree.
+
+        PRUNING THE TABLE IS THE FILTER. Every consumer — `sample_pairs`, the
+        evaluator's per-scene loop, `bin_of`, `max_grasps` — reads its slot count
+        from here, so removing an entry removes it everywhere at once and there is
+        no second place to keep in sync. The alternative, an exclusion set
+        consulted at each call site, is four opportunities to forget one.
+
+        SLOTS ARE RENUMBERED, BINS ARE NOT. `grasp_idx` is a position within the
+        scene and is meaningless across scenes; the BIN is the stable name and
+        rides along on each entry, so `bin_of` keeps answering correctly after the
+        prune. A scene left with nothing is removed entirely and shows up in the
+        returned `dropped_scenes`.
+        """
+        want = {int(s): {int(b) for b in bs} for s, bs in dict(ok).items()}
+        kept_entries, kept_meta = {}, {}
+        n_before = sum(len(v) for v in self.entries.values())
+        dropped_scenes = []
+        for s, grasps in self.entries.items():
+            allow = want.get(int(s))
+            keep = [g for g in grasps
+                    if allow is not None and g.get("bin") is not None
+                    and int(g["bin"]) in allow]
+            if keep:
+                kept_entries[s] = keep
+                if s in self.scene_meta:
+                    kept_meta[s] = self.scene_meta[s]
+            else:
+                dropped_scenes.append(int(s))
+        n_after = sum(len(v) for v in kept_entries.values())
+        self.entries, self.scene_meta = kept_entries, kept_meta
+        rep = {"demos_before": n_before, "demos_after": n_after,
+               "demos_dropped": n_before - n_after,
+               "scenes_before": len(dropped_scenes) + len(kept_entries),
+               "scenes_after": len(kept_entries),
+               "dropped_scenes": sorted(dropped_scenes)}
+        if verbose:
+            print(f"  [pin] demo filter: {n_after}/{n_before} (scene, bin) pairs "
+                  f"kept, {len(dropped_scenes)} scenes emptied")
+        return rep
 
     def describe(self) -> str:
         m = self.meta
@@ -192,7 +242,7 @@ class GraspPinTable:
         # (= pi) from their pinned grasp while p99 was 0.0029 rad. Disambiguate
         # among the position candidates by ROTATION.
         #
-        # Phase-5 note: `grasp_select` treats a flip twin as the SAME grasp (it is
+        # Regrasp note: a flip twin IS the same grasp (the gripper is
         # — the gripper is symmetric), so two slots can never be twins of each
         # other and this disambiguation can never pick a different slot's pose.
         near = np.flatnonzero(d <= self.match_tol)

@@ -1,0 +1,324 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRASP RUN 2 — one demonstration per BIN, commanded by the BIN AXIS.
+#
+# Run 1 asked "does approach-direction conditioning move anything" and could not
+# answer, for four reasons that were about the RUN rather than the method. Run 2
+# removes all four and changes two things about the method itself. Both sets are
+# listed below; nothing else moves.
+#
+# ── WHAT RUN 1 COULD NOT ANSWER ──────────────────────────────────────────────
+#
+#   1. `m` CHANGED MID-RUN. `GraspPinTable.num_grasps` is a MIN over scenes and
+#      read 1 on a mixed table, so iterations 0-5 collected ~354 episodes and
+#      6-18 collected ~176. |D| changes slope at iteration 6 and every "did it
+#      improve" question is confounded by it. Fixed in code (`max_grasps`).
+#   2. EVAL WAS POOLED over four directions, so "solves +x, ignores +z" and
+#      "mediocre at both" produced the same number. The evaluator now emits the
+#      whole rate family PER BIN and the figures draw one row per direction.
+#   3. IT STOPPED AT 19 OF 25 by choice.
+#   4. THREE DIFFERENT CHECKPOINTS were in play — collection and eval read
+#      `best.pt`, the warm start read `last.pt`. "The policy at iteration i" named
+#      two sets of weights. Everything now reads `last`.
+#
+# ── WHAT CHANGES ABOUT THE METHOD ────────────────────────────────────────────
+#
+#   A. ONE DEMONSTRATION PER BIN, not a maximally-separated pair.
+#
+#      Run 1 gave each scene two demonstrations, chosen to be as far apart as
+#      possible, because two contrasting commands on one observation are what
+#      break the scene->action confound. Four contrasting commands break it
+#      strictly harder — and they also populate EVERY bin's evaluation sample
+#      instead of only the two a scene happened to draw, which is what makes the
+#      per-bin panels readable. Measured on the train direction table:
+#
+#          feasible bins per scene   1:127  2:163  3:165  4:162   (6 scenes: 0)
+#          scenes kept               617        demos 1596 (2.59 per scene)
+#          per bin   +x 490   +y 366   -y 325   +z 415
+#
+#      against run 1's 1087 demos. `episodes_per_iter: 400` therefore draws 100
+#      scenes (400 // max_grasps=4) and yields ~259 episodes, not 400.
+#
+#   B. THE COMMAND IS THE BIN AXIS, not the demonstrated grasp's own direction.
+#
+#      This one is a correctness fix disguised as a design choice. At deployment
+#      `retry.next_direction` has no grasp to read, so it commands
+#      `to_world(BINS[b], anchor_R)` — the bin's axis. Run 1 trained and evaluated
+#      on `-R_grasp[:,2]` instead, and the pinned grasp sits a MEASURED median
+#      18.4 deg from its bin axis (p90 38.5, max 45 = the bin half-width). That is
+#      a train/deploy skew of the same order as the effect being measured, and
+#      `dir_err` could not see it because it scored against the shifted target
+#      too.
+#
+#      So the command is the bin axis everywhere, and the DEMONSTRATION is chosen
+#      to match: the direction table stores, per bin, the goal-set grasp closest
+#      to that axis, and `assign_direction_demos.py --mode per-bin` keeps exactly
+#      that one. The residual ~18 deg is now honest label noise — the policy is
+#      told a sector and shown one grasp inside it — recorded per episode as
+#      `demo_off_deg` so it can be measured rather than assumed.
+#
+#      CONSEQUENCE: a failed pin is no longer recoverable. Run 1 re-derived the
+#      command from whatever the expert flew, so a miss just relabelled the
+#      episode. Now the command does not move, so a miss leaves an episode
+#      captioned `+z` whose trajectory approaches from elsewhere — and it cannot
+#      be re-binned, because the scene already has a demonstration for the bin it
+#      actually flew to. `demo_ok_table` drops those (scene, bin) pairs from
+#      TRAINING AND EVALUATION, which is the only way the policy is not trained on
+#      three directions and scored on four.
+#
+# ── THE FULL DIFF AGAINST RUN 1 ──────────────────────────────────────────────
+#
+#   SIM.grasp_pin_table     pair mode -> per-bin mode (rebuild required)
+#   SIM.demo_ok_table       new         drop (scene, bin) pairs OMG could not do
+#   DAGGER.num_iters        25 -> 20
+#   DAGGER.episodes_per_iter 200 -> 400 = 100 scenes x up to 4 bins (~259 eps)
+#   DAGGER.beta_schedule    constant 0.75 -> linear 1.0 -> 0.75
+#   TRAIN.train_cfg         bc_regrasp -> bc_regrasp_run2   (AUX HEAD ON)
+#   TRAIN.base_epochs       40 -> 50
+#   TRAIN.iter_epochs       12 -> 15
+#   TRAIN.init_ckpt         best -> last
+#   EVAL.every              0 -> 1      scored INSIDE the loop, Phase-4 style
+#   EVAL.num_scenes         50 -> 100
+#   EVAL.ckpt               best -> last
+#
+# Unchanged and deliberately so: the wrist+right cameras, `max_steps: 50`, the
+# standoff, the close thresholds, DART on BOTH bands at run 16's magnitudes,
+# `reach_tail: 5`, `holdout: false`, and a randomly-initialised PointNet++ at
+# iteration 0.
+#
+# ── LAST, NOT BEST, EVERYWHERE ───────────────────────────────────────────────
+#
+# `EVAL.ckpt` is not only about evaluation: train_regrasp.py reads it once and
+# hands it to the collection workers too, so it picks the policy that gathers the
+# next iteration's data AND the policy that gets scored. Setting it to `last`
+# together with `TRAIN.init_ckpt: last` means one set of weights per iteration.
+#
+# This is a real change of behaviour, not bookkeeping. Measured across all 26
+# refits of Phase-4 runs 16 and 20, THE BEST EPOCH WAS NEVER THE LAST EPOCH: the
+# val minimum lands at epoch 1-9 of 25 and val loss then climbs (run 20 iteration
+# 19: 0.3643 at epoch 3, 0.4272 at epoch 24). So `last.pt` is a visibly more
+# overfit checkpoint than `best.pt`, and run 2's absolute rates may sit below
+# run 1's for that reason alone. What it buys is that the number being plotted
+# describes the weights that collected the data and seeded the next fit.
+#
+# ── beta 1.0 -> 0.75, AND WHAT ITERATION 1 THEREFORE IS ──────────────────────
+#
+# beta is the probability of executing the EXPERT's action. At beta = 1.0
+# iteration 1 is pure expert: the learner is queried every step (its close
+# decision is still recorded) but never moves the arm, so D_1 adds expert
+# trajectories on 100 fresh scenes rather than on-policy states. That is a data
+# augmentation round, not a DAgger round, and the distribution shift starts at
+# iteration 2. Deliberate — it is the gentlest possible hand-over and it makes
+# the first refit see 259 more clean demonstrations — but it means `retry@k` and
+# the collection curves at iteration 1 are not comparable with later ones.
+#
+# ── BUDGET (20 iterations, ~259 episodes, eval IN the loop) ──────────────────
+#
+#   base fit   ~65 min   50 epochs on ~56k steps, random PointNet++ init
+#   collect    ~4 min/iter with 20 workers
+#   refit      15 epochs on a |D| growing to ~238k; ~13 h in total
+#   eval       ~16 min/iter (259 episodes)             ~5.5 h
+#   => ~20-21 h. REQUEST --time=24:00:00, not 20. Resumable, so a timeout costs
+#      only the queue wait; if the queue is the problem, `EVAL.every: 2` saves
+#      2.75 h and halves the number of points on every curve.
+#
+# The refit and eval figures are extrapolated from run 1's laptop timings, so
+# treat them as an upper bound on a V100.
+#
+# ── WHAT WOULD FALSIFY THIS ──────────────────────────────────────────────────
+#
+# `bin_diag_rate_b*` at 0.25 across ALL FOUR rows of curves_regrasp.png means the
+# per-point channels are washed out by the SA-layer max-pooling, and the
+# pre-registered response is run 3 with a small global-`d` branch — the gap
+# between the runs is then the measurement of how much the pooling destroys.
+# High `dir_track_b*` with low `success_rate_b*` in the SAME row means the policy
+# follows that command into directions that do not afford a grasp, which points
+# at the feasibility mask rather than at the conditioning.
+#
+# ── BUILD THE DATA FIRST ─────────────────────────────────────────────────────
+#
+#   python examples/assign_direction_demos.py \
+#       --table output/direction_table_train.json \
+#       --out output/regrasp_pins_train --mode per-bin \
+#       --drop-bins='-z_beneath,-x_over_fingers'
+#   sbatch ... examples/slurm/collect_regrasp_demos.sbatch     # 1596 demos
+#   python examples/audit_regrasp_demos.py \
+#       --demos output/bc_dataset/train_regrasp.h5 \
+#       --write-ok output/regrasp_demos_train_ok.json
+#
+# All four paths below move together; swapping one without the others silently
+# produces nonsense. See README_REGRASP.md for the full runbook.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SIM:
+  cfg_file: examples/pretrain_multicam_wr.yaml   # wrist + right
+
+  split: train
+  egl: false
+
+  # The paper's offline hand-collision-filtered grasp dict. Must be on
+  # cfg.omg_config BEFORE the env is built. Keeps ~623/720 scenes planning,
+  # against ~351 for the runtime 0.08 m filter — which is why that stays off.
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08
+  hand_points_radius: 0.35
+
+  use_standoff: true
+  standoff_dist: 0.08
+
+  # PER-BIN: one grasp for every direction the scene can reach, each the goal-set
+  # grasp CLOSEST TO THAT BIN'S AXIS — which is the vector the policy is
+  # commanded with, so the demonstration is as close as the goal set allows to
+  # the instruction. Built by assign_direction_demos.py --mode per-bin.
+  #
+  # Scenes carry 1 to 4 grasps, so `GraspPinTable.num_grasps` (a MIN) reads 1 and
+  # is the WRONG accessor; `max_grasps` (4) sizes arrays and `num_grasps_for`
+  # iterates. `episodes_per_iter` is divided by max_grasps to get the scene count.
+  grasp_pin_table: output/regrasp_pins_train.json
+  grasp_pin_match_tol: 0.02
+
+  # Scenes with no feasible bin at all (6 of 623). Subtracted from BOTH pools.
+  exclude_scenes: output/regrasp_pins_train_excluded.json
+
+  # The (scene, BIN) pairs base collection actually demonstrated. Written by
+  # audit_regrasp_demos.py --write-ok. `exclude_scenes` is scene-granular and
+  # cannot say "this scene is fine for +x and +z but OMG could not plan -y"; this
+  # can, and without it a per-bin planner failure trains on three directions and
+  # scores four. Applied by pruning the pin table, so the collection pool, the
+  # eval loop and `bin_of` cannot disagree about which pairs exist.
+  demo_ok_table: output/regrasp_demos_train_ok.json
+
+DAGGER:
+  # 20, planned — not 25 abandoned at 19. Run 1 was flat in `success_rate` from
+  # iteration 6 on and the marginal iteration is ~40 min of refit against a
+  # change inside the +-0.115 noise floor.
+  num_iters: 20
+  # A TARGET, not an exact count. `sample_pairs` draws m // max_grasps = 100
+  # scenes and rolls out EVERY bin each can reach, so the iteration lands near
+  # 259 (the mean is 2.59 bins per scene). Drawing a scene's directions TOGETHER
+  # is the point: rollouts differing only in the command are the only data that
+  # can teach the network the command matters, and independent draws would spread
+  # that contrast across the whole run.
+  episodes_per_iter: 400
+  max_steps: 50
+  scene_sampling: random
+  seed: 0
+
+  # 1.0 -> 0.75 linearly over the 20 iterations. Iteration 1 is therefore PURE
+  # EXPERT (see the header): a data-augmentation round, with the distribution
+  # shift starting at iteration 2. Run 1 and Phase-4 run 16 both held 0.75
+  # constant, so the late iterations here match them and the early ones are
+  # gentler.
+  beta_schedule: linear
+  beta_start: 1.0
+  beta_end: 0.75
+  beta_mid: 0.5          # unused by `linear`; kept so a switch to `piecewise`
+  beta_knee: 0.66        # needs no other edit
+  beta_p: 0.7
+
+  close_pos_thresh: 0.02
+  close_rot_thresh: 0.34
+  stop_on_close_label: true
+  stop_on_policy_close: false
+
+  ee_step: 0.04
+  # 5, not 10: the divergence profile between a scene's demonstrations was
+  # measured FLAT (0.89x) over the tail, so a longer commit buys no extra
+  # contrast and starves the free approach where obstacle avoidance is learned.
+  reach_tail: 5
+  min_free: 1
+  max_horizon: 40
+  first_horizon: null
+
+  reach_commit_dist: 0.05
+  reach_skip_eps: 0.01
+  expert_after_commit: true
+
+  # DART ON BOTH BANDS, at Phase-4 run 16's magnitudes verbatim. `dart_ratio`
+  # covers the FREE approach (with dart_max_dist: 10.0 the distance gate never
+  # bites, so it fires anywhere before the commit) and `dart_reach_ratio` the
+  # committed REACH TAIL, where the jolt is smaller (0.012 m) and clearance-tested
+  # because the gripper is already inside the object's neighbourhood. Not
+  # re-tuned: these were derived for this reach geometry and DART is not the
+  # variable under test.
+  dart_ratio: 0.3
+  dart_max_dist: 10.0
+  dart_pos_mag: 0.04
+  dart_rot_mag: 0.3
+  dart_reach_ratio: 0.3
+  dart_reach_pos_mag: 0.01202
+  dart_reach_rot_mag: 0.3
+  dart_reach_max_tries: 5
+  dart_reach_clearance: 0.01
+  dart_reach_path_steps: 4
+
+  # Collection outcomes on the evaluator's taxonomy, so `c_success_rate` is
+  # comparable with `success_rate` (mixture-driven, not policy-only) and the
+  # per-bin collection counters have a `success` column meaning the same thing.
+  outcome_check: true
+
+TRAIN:
+  # AUX HEAD ON — the one architecture change against run 1. See that file's
+  # header: under direction conditioning the head no longer predicts its own
+  # input, so `aux_pos_mm` separates "the features have it and the action head
+  # ignores it" from "the observation cannot support it".
+  train_cfg: examples/configs/bc_regrasp_run2.yaml
+  # Empty => PointNet++ initialised RANDOMLY. Iteration 0 only; every later
+  # iteration warm-starts the WHOLE network from the previous last.pt and never
+  # reads this.
+  pc_pretrained:
+  base_train_h5: output/bc_dataset/train_regrasp.h5
+  val_h5: output/bc_dataset/val_regrasp.h5
+  base_run: null
+  # 50. The measured val minimum on run 1's base fit was epoch 16 (val_total
+  # 0.1851, degrading to 0.239 by 99 with a 4.9x train/val gap), so 40 already
+  # cleared it; 50 is margin against a differently-seeded init bottoming later,
+  # and iteration 0 now has ~1.47x the data. Harmless either way — the epoch that
+  # matters is whichever `last.pt` ends on.
+  base_epochs: 50
+  iter_epochs: 15
+  # Warm start the WHOLE network (not just the encoder) from the previous
+  # iteration's LAST checkpoint — the same weights that collected the data and
+  # were scored. `train_from_scratch: true` would discard it and refit from the
+  # pretrained encoder every round, which is Phase-4 run 16's behaviour.
+  train_from_scratch: false
+  init_ckpt: last
+  num_workers: 2
+  device: cuda
+
+EVAL:
+  # IN THE LOOP. ~16 min an iteration at 100 scenes x 2.59 directions; that is
+  # 5.5 h on a ~20 h run, and it is what makes `ckpt`/`select_on` able to select
+  # at all — with the split job the metrics arrived after the next iteration had
+  # already started. Set to 2 if the queue makes the shorter job worth it.
+  every: 1
+  # 100 scenes -> ~259 episodes, ~65 per live bin. NOT randomly drawn: an
+  # np.linspace over the usable scene ids, so the SAME 100 scenes are scored
+  # every iteration and consecutive points are a paired comparison rather than
+  # two independent samples. That is what makes a trend readable at n=65/bin,
+  # where a single point's binomial standard error is ~0.05.
+  num_scenes: 100
+  # FALSE, as in run 1: the eval scenes are also collected on, so these are
+  # TRAIN-SET rates and optimistic. Kept false deliberately — the curves are a
+  # clean read of "is it learning what it is taught", and the held-out number
+  # comes from examples/eval_regrasp_testset.py on the s0 TEST split afterwards.
+  holdout: false
+  max_steps: 50
+  # LAST. Also picks the policy that collects the next iteration (train_regrasp
+  # hands this same string to the workers), so one set of weights per iteration.
+  ckpt: last
+  success_mode: stable_grasp
+  hold_steps: 3
+  select_on: success_rate
+  verbose: false
+
+  box_check: true
+  box:
+    min_frac: 0.50
+    open_thresh: 0.8
+    half_x: 0.0088
+    z_lo: 0.0946
+    z_hi: 0.1122
+    inset: 0.002
+    grid_x: 7
+    grid_z: 7

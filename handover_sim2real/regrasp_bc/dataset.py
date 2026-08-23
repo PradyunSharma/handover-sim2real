@@ -437,7 +437,7 @@ class BCDataset(Dataset):
         # model's before, and the failure mode is nasty: mixing a pre-Regrasp
         # 5-channel shard with an 8-channel one kills the DataLoader inside
         # `collate`, in a worker, with nothing naming the offending episode —
-        # exactly the run-19 crash `select_regrasp_demos.py`'s docstring
+        # exactly the run-19 crash the Phase-5 filtering notes
         # describes. Fatal and specific, here, at construction.
         if len(widths) > 1:
             raise RuntimeError(

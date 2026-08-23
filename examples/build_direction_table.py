@@ -253,7 +253,7 @@ def main() -> None:
     live = int((scenes_with > 0).sum())
     print(f"\n  live bins: {live}/{len(bins)}   retry ladder has {live} rungs")
     print(f"\nwrote {out}  ({time.time() - t0:.0f}s)")
-    print("Next: examples/assign_direction_pairs.py — pure combinatorics over this "
+    print("Next: examples/assign_direction_demos.py — pure combinatorics over this "
           "file, no simulator.")
 
 

@@ -1,0 +1,95 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN 2's learner config = bc_regrasp.yaml (run 1) with the AUXILIARY HEAD ON.
+#
+# THAT IS THE ONLY CHANGE. Everything else — the 7 channels, the per-point
+# injection, `d_noise_deg: 12`, `reach_tail: 5`, the [256, 256] head, no global
+# `d` branch — is run 1's value, because run 2 is a re-run of the same
+# architecture under a fixed experimental protocol, not a new architecture.
+#
+# WHY THE AUX HEAD IS BACK
+#
+# Phase 5 had to switch it off: the policy was CONDITIONED on the goal grasp
+# pose, so a head predicting that pose was predicting its own input, and its
+# gradient said nothing about whether the features contained anything. Under
+# direction conditioning the input is a unit vector and the target is a 4x4 pose,
+# so the task is real again — bc_regrasp.yaml's own comment says exactly this and
+# then leaves the weight at 0, which is the kind of stale justification the next
+# run inherits without checking.
+#
+# What it buys: `aux_pos_mm` / `aux_rot_deg` separate two failures the action
+# curves cannot. A head that predicts the grasp accurately while the gripper
+# still arrives far away means the information IS in the features and the action
+# head is not using it — an architecture problem. Both large means the
+# observation cannot support the target at all — a sensing problem. Those want
+# opposite fixes, and run 1 had no way to tell them apart.
+#
+# `aux_weight: 1.0` is the paper's unit weight and Phase-4 run 13's setting; it
+# is not tuned here, deliberately, because a tuned auxiliary weight would make
+# the run-1/run-2 comparison two changes instead of one.
+#
+# COST: one extra MLP head ([256, 256] -> 7) and one extra loss term. The target
+# comes from the pin table via the h5's `grasp_pin_table` attr — train_regrasp.py
+# turns `goal_table` on automatically when aux_head is true AND aux_weight > 0,
+# so nothing else in the config has to move.
+#
+# The rest of this file is bc_regrasp.yaml verbatim; its header explains every
+# other choice.
+# ─────────────────────────────────────────────────────────────────────────────
+
+DATA:
+  # Overwritten by train_regrasp.py with the aggregate file list.
+  train_h5: output/bc_dataset/train_p5.h5
+  val_h5: null
+  pc_channels: 7              # xyz + ycb + hand + d.n + d.r  (the last two
+                              # are the conditioning, appended per point)
+  d_noise_deg: 12.0           # TRAIN ONLY; val is forced to 0.0
+  robot_state_dim: 32
+  action_dim: 7
+  reach_tail_weight: 2.5
+  reach_tail: 5            # back to run 16's value — MEASURED, see below
+
+MODEL:
+  feature_dim: 256
+  robot_hidden: 128
+  policy_hidden: [256, 256]
+  pointnet_scale: 1
+  pointnet_radius: 0.02
+  pointnet_nclusters: 32
+  use_prev_act: false
+  drop_joint_state: true      # the single largest effect measured in this project
+  joint_state_dim: 18
+  # ---- Regrasp ----
+  direction_cond: true        # the command is per-point in the cloud, not an MLP
+  # ---- off, and why: see the header ----
+  aux_head: true            # RUN 2: on — see the header
+  aux_dim: 7
+  aux_hidden: [256, 256]
+  # Empty => random PointNet++ init. Only iteration 0 is affected; later
+  # iterations warm-start from the previous checkpoint and never read this.
+  pc_pretrained:
+  freeze_pc: false
+
+OPTIM:
+  kind: adamw
+  lr: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+
+LOSS:
+  gripper_weight: 1.0
+  pose_loss: pm
+  pm_weight: 7.0
+  aux_weight: 1.0             # RUN 2: the paper's unit weight, and Phase-4
+                              # run 13's. Untuned on purpose — a tuned weight
+                              # would make run 1 -> run 2 two changes.
+
+TRAIN:
+  batch_size: 64
+  num_epochs: 100             # overridden per fit by DAGGER's base/iter epochs
+  num_workers: 4
+  device: cuda
+  mixed_precision: false
+  val_every: 1
+  save_every: 5
+  grad_clip: 1.0
+  seed: 0

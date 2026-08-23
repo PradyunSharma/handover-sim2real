@@ -1,62 +1,33 @@
 """
-Phase-5: grasp-CONDITIONED DAgger with several pinned grasps per scene.
+Regrasp: approach-direction conditioning and retry.
 
-A fork of `handover_sim2real/dagger/` (Phase 4), so all 21 recorded Phase-4 runs
-stay byte-reproducible while this diverges. The loop is unchanged — still
-Algorithm 3.1 of Ross et al. (2011) — and so is every observation: the difference
-is what a unit of work IS.
+The policy is told **which side to come in from** — a unit vector `d` injected
+PER-POINT into the cloud as `d.n_i` and `d.normalize(p_i - c)` — rather than which
+pose to reach. On failure it is commanded a different side and tries again.
 
-**The unit of work is a `(scene_idx, grasp_idx)` pair, not a scene.** Each scene
-carries N (default 4) physically distinct pinned grasps chosen by
-`grasp_select.select_diverse_grasps`, the policy is told which one it is being
-asked to reach, and a failed handover can be retried under a different one. That
-last part is the point: regrasping.
+    directions   the k=6 octahedral bin set, angles, and the pair selector
+    anchor       the gravity-aligned, hand-anchored frame the bins live in
+    normals      kNN-PCA surface normals from the observed cloud
+    channels     [N,5] + d -> the [N,7] the network eats
+    retry        the ladder: which direction next, and when to signal the human
+    grasp_pin    scene -> the grasps realising each bin (OMG still needs a pose)
+    collector    DAgger episode collection -> the 8-channel HDF5 schema
+    evaluator    closed-loop eval + the dir_* metrics
+    chained_retry  rewind to part-way along a failed attempt and re-command
 
-The conditioning is not decoration. With four demonstrations per scene the same
-observation carries four different expert labels, so an unconditioned regression
-can only predict their mean — a valid action for none of them. It is also the
-strong form of the fix Phase 4 kept missing: over runs 4-16 the policy closed
-within tolerance of the pinned grasp on 0-8% of episodes because nothing in the
-observation named the pose to arrive at (run 13's auxiliary head tried to force
-that via a PREDICTION; here it is an INPUT).
+WHY A DIRECTION. It is object-agnostic, so coverage is required across the
+DATASET rather than per object; it needs no grasp proposer at deployment; and
+because the network reads a continuous vector rather than a one-hot, `k` is a
+test-time knob (up to 20, past which bins are closer than 40 deg and stop being
+independent hypotheses).
 
-Six modules carry the change: `grasp_select` (new — the flip-invariant metric and
-the selection), `grasp_pin` (a list per scene), `collector` (a `grasp_idx`
-argument and two new episode attrs), `grasp_registry` (keyed on the pair),
-`parallel` (the job tuple), `evaluator` (per-slot rates, retry@k, `cond_track`).
+MEASURED, AND IT BOUNDS EVERYTHING HERE: on s0/train only FOUR of the six bins
+are reachable. `-z` (from beneath) by 0 of 623 scenes and `-x` (over the giver's
+fingers) by 12. Both are kept and masked at runtime so the code stays
+rig-agnostic, but `chained_retry_at_k` saturates at k=4 and `succ_bin_-x` /
+`succ_bin_-z` are NaN rather than zero.
 
-Phase 1/2 shipped DAgger as a *shell* loop over one-shot collector scripts;
-Phase 3 folded DAgger labels inline into the RL rollout. Phase 4/5 are neither:
-Algorithm 3.1 of the paper, run as a single Python loop.
-
-    D <- expert demonstrations (train.h5)          # the beta_1 = 1 iteration
-    pi_1 <- train(D)
-    for i = 1..N:
-        pi_i^mix = beta_i * pi* + (1 - beta_i) * pi_i
-        sample m T-step trajectories with pi_i^mix   # m = episodes_per_iter
-        D_i = {(s, pi*(s)) : s visited}
-        D <- D u D_i                                 # aggregate, never discard
-        pi_{i+1} <- train(D)                         # fresh fit on the union
-        evaluate pi_{i+1}                            # -> best-on-validation
-    return best pi_i, last pi_i
-
-The loop is policy-agnostic. The learner is the Phase-1 single-frame BC policy by
-default; point TRAIN.train_cfg at `act_phase2.yaml` instead and the same loop
-drives the Phase-2 temporal/chunking ACT policy. The kind is inferred from the
-config (`MODEL.chunk_len` present => ACT) and hidden behind `PolicyRunner`, so
-neither the collector nor the evaluator has policy-specific code.
-
-Evaluation scores the PHASE-3 success criterion, not the handover-sim benchmark's:
-there is no carry-to-goal here, so `EpisodeStatus.SUCCESS` could never fire. See
-`evaluator.py`.
-
-Modules:
-    env_setup  one env serving both collection (OMG) and evaluation
-    policy_io  run-dir load/save + the PolicyRunner per-step interface
-    collector  Phase-4 DAgger episode collection -> BC-schema HDF5
-    evaluator  closed-loop eval (Phase-3 criterion) for best-policy selection
-    grasp_box  ray-cast "is the object in the open jaws" opportunity test
-    pregrasp   the CVPR2023 blind endgame, for DAGGER.target: pregrasp
+See README_REGRASP.md for the runbook and docs/run_index.md for run 1's result.
 """
 
 # ── LAZY re-exports (PEP 562) ────────────────────────────────────────────────
@@ -71,10 +42,9 @@ Modules:
 #   * the geometry modules (directions, anchor, normals, channels) are pure numpy
 #     and are needed in DataLoader workers, on login nodes, and eventually on the
 #     robot PC, none of which have or want a simulator;
-#   * `select_regrasp_demos.py` and `analyze_direction_spread.py` had to insert the
-#     package DIRECTORY on sys.path to bypass this file entirely — a hack that
-#     silently broke on the rename, because a path built from string literals is
-#     invisible to every import-graph check;
+#   * login-node scripts used to insert the package DIRECTORY on sys.path to
+#     bypass this file entirely — a hack that silently broke on a rename, because
+#     a path built from string literals is invisible to every import-graph check;
 #   * `parallel.py` is still excluded below for the same class of reason.
 #
 # Names resolve on first attribute access instead, so `import

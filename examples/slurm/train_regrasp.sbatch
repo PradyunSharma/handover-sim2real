@@ -1,51 +1,65 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# DelftBlue SLURM job — Phase-5 DAgger (examples/train_regrasp.py):
-# grasp-conditioned policy, four pinned grasps per scene, regrasping.
-# STEP 4, after the candidate table (1), the K-per-scene demonstrations (2) and
-# select_pinned_grasps.py (3).
+# DelftBlue SLURM job — Regrasp DAgger (examples/train_regrasp.py):
+# approach-direction-conditioned policy, ONE demonstration per reachable bin,
+# retry by re-commanding. STEP 4, after the direction table (1), the demo
+# assignment (2) and the base demonstrations + audit (3) — see README_REGRASP.md.
 #
-#   Default run — request 20 h, NOT the 24 h default (see the budget below):
-#     sbatch --time=20:00:00 --export=ALL,RUN=dagger5_run1 examples/slurm/train_regrasp.sbatch
-#   Short shakedown FIRST (2 iterations, m=8, 3 eval scenes x 4 grasps, ~30 min).
-#   It is not optional here: Phase 5 changes the unit of work from a scene to a
-#   (scene, grasp) pair in six places, and the smoke config's checklist is what
-#   proves all six agree before a 20 h job queues behind them.
+#   Default run — request 24 h (see the budget below; run 2 does not fit in 20):
+#     sbatch --time=24:00:00 --export=ALL,RUN=regrasp_run2 examples/slurm/train_regrasp.sbatch
+#   Short shakedown FIRST (2 iterations, m=8, 3 eval scenes, ~30 min). It is not
+#   optional: Regrasp makes the unit of work a (scene, direction) pair in six
+#   places, and the smoke config's checklist is what proves all six agree before
+#   a 24 h job queues behind them.
 #   ALWAYS override --time here: the 24 h default cannot be backfilled, and with
 #   fairshare depressed after a few GPU jobs that is the difference between
 #   starting in an hour and starting in two days (measured: priority fell 46x
 #   after four allocations in one afternoon, pushing the estimate to +2.5 days).
 #     sbatch --time=01:00:00 --export=ALL,RUN=regrasp_smoke,CFG=examples/configs/regrasp_smoke.yaml \
 #         examples/slurm/train_regrasp.sbatch
-#   From an existing base run (skips the 100-epoch base fit):
-#     sbatch --export=ALL,RUN=dagger5_run2,BASE=output/dagger_runs/dagger5_run1/iters/iter_00 \
+#   From an existing base run (skips the 50-epoch base fit):
+#     sbatch --export=ALL,RUN=regrasp_run3,BASE=output/dagger_runs/regrasp_run2/iters/iter_00 \
 #         examples/slurm/train_regrasp.sbatch
-#   EVALUATION IS NO LONGER IN THIS JOB when the config sets EVAL.every: 0. It is
-#   not on the critical path (train_regrasp.py hands the next collection the
-#   fresh policy before eval runs), so it costs ~19% of wall clock for nothing.
-#   Score the iterations alongside, in a second job:
-#     sbatch --export=ALL,RUN=dagger5_run1 examples/slurm/eval_regrasp_run.sbatch
 #   Watch:  tail -f slurm_logs/regrasp_<jobid>.out
-#   Plot (safe while running — read-only):
+#   Plot (safe while running — read-only; writes five figures):
 #     python examples/plot_regrasp_run.py output/dagger_runs/<RUN>
+#
+# EVALUATION IS BACK INSIDE THIS JOB. regrasp_run2.yaml sets `EVAL.every: 1`.
+# Run 1 split it out because eval is off the critical path (train_regrasp.py
+# hands the next collection the fresh policy before eval runs). It is back
+# because with the split job the metrics arrive AFTER the next iteration has
+# started, so `EVAL.ckpt` + `select_on: success_rate` never actually got to
+# select — run 1's warm starts were decided on val loss alone.
+# To go back to the split: set `EVAL.every: 0` and submit
+#     sbatch --export=ALL,RUN=<RUN> examples/slurm/eval_regrasp_run.sbatch
+# alongside. The plotter reads both layouts.
+#
+# THE HELD-OUT NUMBER IS NOT IN THIS JOB EITHER. `EVAL.holdout: false` means the
+# in-loop scenes are also collected on, so the curves are TRAIN-SET rates by
+# design. Score the s0 test split afterwards:
+#     python examples/eval_regrasp_testset.py --run-dir <run> --chained
 #
 # RESUMABLE. Re-running the SAME command continues: completed iterations are
 # skipped, a finished-but-untrained collection is reused, and an interrupted
 # training resumes from its last.pt. So a 24 h timeout is not a loss — just
 # resubmit the identical command and it picks up where it stopped.
 #
-# Budget (25 iterations x m=200 episodes, eval SPLIT OFF into its own job):
-#   base fit ~78 min      4x Phase-4's base data AND a random PointNet++ init
-#   collect  ~2-3 min/iter with 20 workers (an OMG replan every step is the cost)
-#   refit    grows with |D| to ~50 min at iteration 25; ~13.5 h in total
-#   => ~15-16 h. Request --time=20:00:00. Resumable, so a timeout is not a loss.
+# Budget (20 iterations, m=400 -> ~259 episodes, eval IN the loop):
+#   base fit ~65 min      50 epochs on ~56k steps, random PointNet++ init
+#   collect  ~4 min/iter with 20 workers (an OMG replan every step is the cost)
+#   refit    15 epochs on a |D| growing to ~238k; ~45 min by iteration 20, ~13 h
+#   eval     ~16 min/iter (100 scenes x 2.59 directions)     ~5.5 h
+#   => ~20-21 h. REQUEST --time=24:00:00, NOT 20. Resumable, so a timeout costs
+#      only the queue wait; if the queue is the problem, EVAL.every: 2 saves
+#      2.75 h and halves the number of points on every curve.
 #
-# The aggregate reaches ~220k steps, 2.2x Phase-4 run 16's 99.5k, which is why
-# iter_epochs drops 25 -> 12: total sample-passes then land within 13% of run
-# 16's and the wall clock is comparable despite the extra data.
+# `episodes_per_iter: 400` is 100 scenes x max_grasps=4, and a scene supplies one
+# episode per direction it can REACH (mean 2.59), so the real count is ~259. The
+# refit and eval figures are extrapolated from run 1's LAPTOP timings — treat
+# them as an upper bound on a V100.
 #
-# DISK. ~119 MB per iteration at m=200 (checkpoints + the .h5 shard), so ~3 GB
-# for the run. /home is a hard 30 GB quota that fills SILENTLY — always pass
+# DISK. ~160 MB per iteration at ~259 episodes (checkpoints + the .h5 shard), so
+# ~3.5 GB for the run. /home is a hard 30 GB quota that fills SILENTLY — always pass
 # SCRATCH_ROOT.
 #
 # Unlike steps 1-2 this job is genuinely GPU-bound during the refits (PointNet++),
@@ -64,10 +78,13 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=22            # 20 parallel collection workers + 2 for the
-                                      # main loop and the refit's DataLoader. 20 DIVIDES
-                                      # DAGGER.episodes_per_iter=200 (10 episodes each,
-                                      # 100% utilization); 16 would leave some workers
-                                      # with 13. Past ~20 the gain is minutes on a whole
+                                      # main loop and the refit's DataLoader. The actual
+                                      # episode count is ~259, not the configured m=400
+                                      # (a scene contributes one episode per direction it
+                                      # can reach, and the mean is 2.59 of 4), so no worker
+                                      # count divides it exactly; 20 leaves the stragglers
+                                      # at 13 while most take 12. Past ~20 the gain is
+                                      # minutes on a whole
                                       # run and the queue wait is worse — collection
                                       # drops to ~1 min/iteration and the FTL refit
                                       # becomes the entire cost. A V100 node has 48
@@ -122,8 +139,8 @@ export OPENBLAS_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 
 # ── parameters (override via sbatch --export=ALL,...) ───────────────────────
-CFG="${CFG:-examples/configs/regrasp_run1.yaml}"
-RUN="${RUN:-dagger5_run1}"
+CFG="${CFG:-examples/configs/regrasp_run2.yaml}"
+RUN="${RUN:-regrasp_run2}"
 
 # ── where the run writes — /home has a HARD 30 GB quota on DelftBlue ─────────
 # Hitting it kills the job with exit code 6 and NO traceback: Python cannot flush
@@ -134,7 +151,7 @@ RUN="${RUN:-dagger5_run1}"
 # SCRATCH_ROOT is the ONE knob, shared with train_rl.sbatch and
 # eval_dagger_run.sbatch. Empty (the default) keeps the in-repo behaviour, so
 # nothing differs when running outside the cluster:
-#   sbatch --export=ALL,RUN=dagger5_run1,CFG=examples/configs/regrasp_run1.yaml,\
+#   sbatch --export=ALL,RUN=regrasp_run2,CFG=examples/configs/regrasp_run2.yaml,\
 #       SCRATCH_ROOT=/scratch/pradyunsharma/handover-sim2real \
 #       examples/slurm/train_regrasp.sbatch
 # OUT_ROOT can still be set directly and wins, for a path that is not
@@ -160,6 +177,37 @@ EXTRA="${EXTRA:-}"
 echo "host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
 echo "cfg=${CFG}  run=${RUN}  out-root=${OUT_ROOT}  base=${BASE:-none}  extra=${EXTRA:-none}"
 echo "cpus-per-task=${SLURM_CPUS_PER_TASK}  collection workers=${WORKERS}"
+
+# ── derive SIM.demo_ok_table if the config asks for one and it is missing ────
+# It is a deterministic function of the base shard — the (scene, bin) pairs the
+# collection actually demonstrated — so making the job produce it removes a
+# manual step from between two 3-hour jobs, which is exactly the kind of gap a
+# pipeline forgets. Regenerated only when ABSENT: an existing file is the record
+# of what a particular collection achieved and must not be silently rewritten
+# from a shard that has since been extended.
+DEMO_OK="$(python - "${CFG}" <<'PY'
+import sys, yaml
+c = yaml.safe_load(open(sys.argv[1])) or {}
+print((c.get("SIM") or {}).get("demo_ok_table") or "")
+PY
+)"
+BASE_H5="$(python - "${CFG}" <<'PY'
+import sys, yaml
+c = yaml.safe_load(open(sys.argv[1])) or {}
+print((c.get("TRAIN") or {}).get("base_train_h5") or "")
+PY
+)"
+if [ -n "${DEMO_OK}" ] && [ ! -f "${DEMO_OK}" ]; then
+    if [ ! -f "${BASE_H5}" ]; then
+        echo "ERROR: ${CFG} wants ${DEMO_OK} but ${BASE_H5} does not exist —" >&2
+        echo "  collect the base demonstrations first." >&2
+        exit 1
+    fi
+    echo "[prep] ${DEMO_OK} missing — deriving it from ${BASE_H5}"
+    # The audit EXITS 1 on a schema failure, and that is the right moment to
+    # stop: training on a shard the audit rejects wastes the whole allocation.
+    python examples/audit_regrasp_demos.py --demos "${BASE_H5}" --write-ok "${DEMO_OK}"
+fi
 
 BASE_ARG=()
 [ -n "${BASE}" ] && BASE_ARG=(--base-run "${BASE}")

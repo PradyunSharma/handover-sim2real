@@ -25,7 +25,7 @@
 #   SIM.cfg_file            wlr -> wr        wrist + right; matches what
 #                                            sim2real/ can actually produce
 #   SIM.grasp_pin_table     1 -> 4 grasps    built by build_direction_table
-#                                            then pruned by select_regrasp_demos
+#                                            then assigned by assign_direction_demos
 #   SIM.exclude_scenes      new list         scenes that cannot supply 4 grasps
 #   DAGGER.episodes_per_iter 100 -> 200      50 scenes x 4 slots
 #   TRAIN.train_cfg         bc_regrasp   grasp conditioning ON, aux head OFF
@@ -104,7 +104,7 @@ SIM:
   grasp_pin_match_tol: 0.02
 
   # Scenes that could not supply 4 separated grasps whose demonstrations all
-  # succeeded. Written by select_regrasp_demos.py; subtracted from BOTH the
+  # succeeded. Written by assign_direction_demos.py; subtracted from BOTH the
   # collection pool and the eval set.
   exclude_scenes: output/regrasp_pins_train_excluded.json
 
@@ -161,7 +161,14 @@ TRAIN:
   base_train_h5: output/bc_dataset/train_regrasp.h5
   val_h5: output/bc_dataset/val_regrasp.h5
   base_run: null
-  base_epochs: 100
+  # 100 -> 40, MEASURED on the base fit (output/dagger_runs/regrasp_base).
+  # val_total bottoms at 0.1851 on epoch 16 and degrades to 0.239 by 99 while
+  # train falls to 0.049 — a 4.9x gap. 20386 steps does not support 100 epochs.
+  # Harmless with init_ckpt: best (best.pt really is epoch 16), but ~35 min of
+  # wasted compute. 40 clears the minimum with margin. NOTE the aggregate grows
+  # ~3.5k steps an iteration, so later refits have far more data than this — which
+  # is why iter_epochs stays where it is.
+  base_epochs: 40
   iter_epochs: 12
   train_from_scratch: false
   init_ckpt: best

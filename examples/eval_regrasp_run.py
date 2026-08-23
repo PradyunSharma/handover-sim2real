@@ -55,6 +55,14 @@ from handover_sim2real.regrasp import (          # noqa: E402
 from handover_sim2real.regrasp.setup import build_regrasp_context   # noqa: E402
 
 
+# Imported, not restated: `_status_name` can OR two failures into
+# "DROP|HUMAN_CONTACT" and reason_columns charges both, which a naive dict lookup
+# would drop. Sharing the mapping also means a new reason string cannot end up
+# filed differently here than in dagger_log.csv — and sharing `bin_eval_fields`
+# means the ~180 per-bin columns cannot fall out of order between the two files,
+# which is what plot_regrasp_run.py's splice relies on.
+from train_regrasp import bin_eval_fields, eval_columns    # noqa: E402
+
 # Columns mirror the eval half of dagger_log.csv so the two can be compared or
 # concatenated without a translation table.
 EVAL_FIELDS = [
@@ -64,23 +72,26 @@ EVAL_FIELDS = [
     "box_chance_rate", "box_taken_rate", "box_missed_rate", "miss_given_box",
     "mean_box_steps", "mean_box_frac",
     "eval_min_pos", "eval_min_rot", "mean_dist", "mean_pos_err", "mean_rot_err",
-    "mean_close_step",
+    "mean_close_step", "mean_reach_pos_err", "mean_reach_rot_err",
+    "box_after_rate",
     # Phase 5 — same names and same order as dagger_log.csv, so plot_regrasp_run
     # can splice this file in without a per-column mapping.
-    "cond_track", "cond_ee_spread", "cond_goal_spread",
+    # Regrasp: direction metrics replace cond_track / near_g*. `dir_err` is the
+    # headline (angle between the command and the achieved approach axis);
+    # `bin_hit_rate` is the near_rate analogue; `bin_diag_rate` collapsing means
+    # the policy goes the same way whatever it is told.
+    "dir_err", "dir_err_median", "dir_track", "sector_err",
+    "bin_hit_rate", "bin_diag_rate", "cond_sep",
     "retry_at_1", "retry_at_2", "retry_at_3", "retry_at_4",
-    "succ_g0", "succ_g1", "succ_g2", "succ_g3",
-    "near_g0", "near_g1", "near_g2", "near_g3",
+    "succ_bin_0", "succ_bin_1", "succ_bin_2",
+    "succ_bin_3", "succ_bin_4", "succ_bin_5",
+    "n_bin_0", "n_bin_1", "n_bin_2", "n_bin_3", "n_bin_4", "n_bin_5",
+    "succ_g0", "succ_g1",
     "f_grasp_ok", "f_grasp_miss", "f_no_release", "f_drop", "f_timeout",
     "f_human_contact",
+    "ff_grasp_miss", "ff_no_release", "ff_drop", "ff_timeout", "ff_human_contact",
     "eval_s",
-]
-
-# Imported, not restated: `_status_name` can OR two failures into
-# "DROP|HUMAN_CONTACT" and reason_columns charges both, which a naive dict lookup
-# would drop. Sharing the mapping also means a new reason string cannot end up
-# filed differently here than in dagger_log.csv.
-from train_regrasp import EVAL_REASONS, reason_columns   # noqa: E402
+] + bin_eval_fields()
 
 
 def iteration_dirs(run_root: Path) -> list[tuple[int, Path]]:
@@ -115,11 +126,12 @@ def row_from_metrics(i: int, run_dir: Path, ckpt: str, n_scenes: int,
     row = {k: "" for k in EVAL_FIELDS}
     row.update({"iter": i, "run_dir": str(run_dir), "ckpt": ckpt,
                 "num_scenes": n_scenes, "eval_s": round(eval_s, 1)})
-    for k in EVAL_FIELDS:
-        if k in m:
-            row[k] = m[k]
-    row.update(reason_columns(m.get("reasons"), EVAL_REASONS,
-                              denom=m.get("n") or None))
+    # `eval_columns`, not a second hand-written copy of the same reduction: it is
+    # what writes the eval half of dagger_log.csv, so borrowing it is the only way
+    # the two files cannot disagree about what a column means. Filtered to
+    # EVAL_FIELDS because it also emits pre-grasp-mode columns this file does not
+    # carry.
+    row.update({k: v for k, v in eval_columns(m).items() if k in row})
     return row
 
 
@@ -207,9 +219,11 @@ def main() -> None:
     log_path = run_root / args.out
 
     print("=" * 78)
-    print(f"Phase-5 standalone eval   run={run_root.name}")
-    print(f"  eval scenes : {len(ctx.eval_scenes)} x {ctx.num_grasps} grasps = "
-          f"{len(ctx.eval_scenes) * ctx.num_grasps} episodes per iteration"
+    print(f"Regrasp standalone eval   run={run_root.name}")
+    n_ep = (len(ctx.pin_table.pairs(ctx.eval_scenes)) if ctx.pin_table is not None
+            else len(ctx.eval_scenes))
+    print(f"  eval scenes : {len(ctx.eval_scenes)} scenes -> {n_ep} episodes "
+          f"per iteration (per-scene direction counts, not a uniform slot count)"
           f"{' (OVERRIDDEN)' if args.num_scenes is not None else ''}")
     print(f"  checkpoint  : {ckpt}     success={ctx.eval_params.success_mode}")
     print(f"  pinning     : {ctx.pin_table.describe() if ctx.pin_table else 'OFF'}")
@@ -246,7 +260,9 @@ def main() -> None:
                   f"near={m['near_rate']:.3f} close={m['close_rate']:.3f} "
                   f"chance={m['chance_rate']:.3f}  ({eval_s:.0f}s)")
             if ctx.num_grasps > 1:
-                print(f"  cond_track={m.get('cond_track', float('nan')):.3f} "
+                print(f"  dir_track={m.get('dir_track', float('nan')):.3f} "
+                      f"dir_err={m.get('dir_err', float('nan')):.1f}deg "
+                      f"bin_hit={m.get('bin_hit_rate', float('nan')):.2f} "
                       f"retry@1..{ctx.num_grasps}="
                       + "/".join(f"{m.get(f'retry_at_{k}', float('nan')):.2f}"
                                  for k in range(1, ctx.num_grasps + 1)))

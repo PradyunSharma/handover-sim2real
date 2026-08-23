@@ -5,29 +5,47 @@ Pure combinatorics over `direction_table_<split>.json`. No simulator, no GPU,
 seconds — which is the point: `k`, the tie-break, and the feasibility rule can all
 be re-decided without touching the cluster.
 
-    python examples/assign_direction_pairs.py \\
+    python examples/assign_direction_demos.py \\
         --table output/direction_table_train.json \\
-        --out output/regrasp_pins_train
+        --out output/regrasp_pins_train --mode per-bin \\
+        --drop-bins='-z_beneath,-x_over_fingers'
 
-WHY A PAIR, AND WHY IT IS THE WHOLE POINT. At ONE demonstration per scene, `d` is
-a deterministic function of the observation across the entire dataset: every
-(point cloud, robot state) it ever sees comes with exactly one command, so the
-network can drive the loss to its floor by learning scene -> action and ignoring
-the conditioning channels completely. Two demonstrations of the same scene under
-different `d` map the SAME observation to two DIFFERENT actions, and that is the
-only thing that forces the channels to be read. This is a property of the
-DATASET, not of the architecture — no amount of FiLM or extra capacity reaches it.
+WHY MORE THAN ONE DEMONSTRATION PER SCENE, AND WHY IT IS THE WHOLE POINT. At ONE
+demonstration per scene, `d` is a deterministic function of the observation
+across the entire dataset: every (point cloud, robot state) it ever sees comes
+with exactly one command, so the network can drive the loss to its floor by
+learning scene -> action and ignoring the conditioning channels completely. Two
+or more demonstrations of the same scene under different `d` map the SAME
+observation to DIFFERENT actions, and that is the only thing that forces the
+channels to be read. This is a property of the DATASET, not of the architecture
+— no amount of FiLM or extra capacity reaches it.
 
-SELECTION. Per scene, the maximally-separated pair among the bins that scene can
-actually reach, tie-broken toward globally emptier bins — not the two emptiest
-independently. Antipodal pairs give the sharpest contrast, so separation leads and
-balance only breaks ties.
+TWO MODES.
+
+  --mode per-bin  (run 2 on, the DEFAULT). One demonstration for EVERY bin the
+      scene can reach, each the goal-set grasp CLOSEST TO THAT BIN'S AXIS. The
+      direction table already picked that representative (`angle_to_axis_deg`),
+      and it is the right one precisely because the axis is what the policy is
+      commanded with at deployment — `retry.next_direction` has no grasp to read,
+      so it issues `to_world(BINS[b], anchor_R)`. Picking any other member of the
+      bin would widen the gap between what the policy is told and what it is
+      shown for no benefit. Measured on s0/train: 617 scenes, 1596 demos, mean
+      2.59 per scene, split +x 490 / +y 366 / -y 325 / +z 415, with the
+      demonstration a median 18.4 deg from its bin axis (p90 38.5, max 45).
+
+  --mode pair     (run 1). The single maximally-separated pair among the feasible
+      bins, tie-broken toward globally emptier bins. 1088 demos.
+
+Per-bin supersedes pair rather than extending it: four contrasting commands on
+one observation break the confound harder than two, and — the reason that
+decided it — they populate every bin's EVALUATION sample instead of only the two
+a scene happened to be assigned, which is what makes a per-bin figure readable.
 
 SCENES WITH ONE FEASIBLE BIN STILL GET COLLECTED, once. They teach reaching and
 grasping and carry a valid `d`; they simply contribute nothing to breaking the
-confound. `paired: false` is recorded per scene so `cond_delta_train` can be
-reported on the paired subset separately and the dilution measured rather than
-assumed.
+confound. `paired` and `n_demos` are recorded per scene so `cond_delta_train` can
+be reported on the multi-demo subset separately and the dilution measured rather
+than assumed.
 
 MEASURED ON s0/train (623 planned scenes, 28339 goal-set grasps):
 
@@ -77,11 +95,16 @@ def parse_args() -> argparse.Namespace:
                    help="comma list of bin names or indices to treat as "
                         "infeasible, e.g. '-z_beneath,-x_over_fingers'")
     p.add_argument("--min-sep-deg", type=float, default=40.0,
-                   help="reject a pair whose REALISED directions are closer than "
-                        "this; below ~40 deg the two commands stop being "
-                        "independent hypotheses and the scene contributes a "
-                        "contrast the policy cannot be expected to resolve. The "
-                        "scene falls back to a single demonstration.")
+                   help="PAIR MODE ONLY. Reject a pair whose REALISED directions "
+                        "are closer than this; below ~40 deg the two commands "
+                        "stop being independent hypotheses and the scene "
+                        "contributes a contrast the policy cannot be expected to "
+                        "resolve. The scene falls back to a single demonstration.")
+    p.add_argument("--mode", choices=("per-bin", "pair"), default="per-bin",
+                   help="per-bin (run 2 on, the default): ONE demonstration for "
+                        "every bin the scene can reach, each the goal-set grasp "
+                        "closest to that bin's axis. pair (run 1): the single "
+                        "maximally-separated pair.")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
@@ -105,6 +128,7 @@ def main() -> None:
     table: dict = {}
     excluded, reasons = [], Counter()
     pairs_hist, seps = Counter(), []
+    per_scene_bins = Counter()      # per-bin mode: scenes reaching each bin
     n_paired = n_single = n_too_close = 0
 
     # Scene order is fixed (sorted) so the greedy assignment is reproducible; the
@@ -122,7 +146,35 @@ def main() -> None:
 
         by_bin = {e["bin"]: e for e in feas}
         chosen_bins = sorted(by_bin)
-        if len(chosen_bins) >= 2:
+        if args.mode == "per-bin":
+            # ONE DEMONSTRATION PER REACHABLE BIN, and no selection at all beyond
+            # what the direction table already did: it stores, per bin, the
+            # goal-set grasp whose realised direction is CLOSEST TO THAT BIN'S
+            # AXIS (`angle_to_axis_deg`). That is the right representative
+            # precisely because the axis is what the policy is commanded with —
+            # picking any other member of the bin would widen the gap between
+            # what the policy is told and what it is shown for no benefit.
+            #
+            # This supersedes pair mode rather than extending it. Pair mode
+            # existed to break the scene->action confound with two contrasting
+            # commands on one observation; four commands on one observation break
+            # it strictly harder, and they also populate every bin's eval sample
+            # instead of only the two a scene happened to be assigned.
+            chosen = [by_bin[b] for b in chosen_bins]
+            for b in chosen_bins:
+                per_scene_bins[b] += 1
+            if len(chosen) >= 2:
+                n_paired += 1
+                # Record the WIDEST contrast the scene supplies, so the
+                # separation statistics stay comparable with pair mode's.
+                seps.append(max(
+                    float(D.angle_between(by_bin[a]["d_anchor"],
+                                          by_bin[c]["d_anchor"]))
+                    for ii, a in enumerate(chosen_bins)
+                    for c in chosen_bins[ii + 1:]))
+            else:
+                n_single += 1
+        elif len(chosen_bins) >= 2:
             # MAXIMISE THE REALISED SEPARATION, NOT THE BIN-AXIS SEPARATION.
             # A grasp only has to lie within `max_angle` (45 deg) of its bin's
             # axis, so two grasps in 90-deg-separated bins can realise anywhere
@@ -153,14 +205,15 @@ def main() -> None:
                 seps.append(best_key[0])
                 pairs_hist[tuple(sorted(pick))] += 1
                 n_paired += 1
-        else:
+        elif args.mode == "pair":
             chosen = [by_bin[chosen_bins[0]]]
             n_single += 1
         for e in chosen:
             counts[e["bin"]] += 1
 
         table[str(idx)] = {
-            "paired": len(chosen) == 2,
+            "paired": len(chosen) >= 2,
+            "n_demos": len(chosen),
             "n_feasible_bins": len(feas),
             "anchor_R": s["anchor_R"],
             "anchor_mode": s["anchor_mode"],
@@ -188,7 +241,9 @@ def main() -> None:
     if n_too_close:
         print(f"  demoted to single : {n_too_close}  (best realised contrast "
               f"< {args.min_sep_deg:.0f} deg)")
-    print(f"  demos             : {n_paired * 2 + n_single}")
+    print(f"  mode              : {args.mode}")
+    print(f"  demos             : {int(counts.sum())}"
+          + (f"   ({counts.sum() / max(n, 1):.2f} per scene)" if n else ""))
     if seps:
         sa = np.asarray(seps)
         print(f"  pair separation   : median {np.median(sa):.0f} deg   "
@@ -221,11 +276,12 @@ def main() -> None:
     excl_path = out.parent / f"{out.name}_excluded.json"
     table["_meta"] = {
         **{k: v for k, v in meta.items() if k not in ("scenes_with_bin",)},
-        "stage": "assign_direction_pairs", "schema": "regrasp-pins-v1",
+        "stage": "assign_direction_demos", "mode": args.mode,
+        "schema": "regrasp-pins-v1",
         "source_table": args.table, "min_bins": args.min_bins,
         "dropped_bins": sorted(names[i] for i in drop),
         "n_paired": n_paired, "n_single": n_single,
-        "n_demos": n_paired * 2 + n_single,
+        "n_demos": int(counts.sum()),
         "demos_per_bin": counts.astype(int).tolist(),
         "live_bins": live,
     }
@@ -234,8 +290,9 @@ def main() -> None:
     print(f"\nwrote {tbl_path}   ({n} scenes)")
     print(f"wrote {excl_path}  ({len(excluded)} scene indices)")
     print("\nPoint SIM.grasp_pin_table at the .json and SIM.exclude_scenes at the "
-          "_excluded.json. NOTE the table mixes 1- and 2-grasp scenes, so "
-          "GraspPinTable.num_grasps reads 1 — use pairs() / num_grasps_for().")
+          "_excluded.json. NOTE the table mixes scenes with different numbers of "
+          "grasps, so GraspPinTable.num_grasps (a MIN) reads 1 — use pairs() / "
+          "num_grasps_for() / max_grasps, never num_grasps.")
 
 
 if __name__ == "__main__":

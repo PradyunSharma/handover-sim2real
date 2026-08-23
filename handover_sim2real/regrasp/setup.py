@@ -81,6 +81,10 @@ class RegraspContext:
     select_on: str
     n_excluded: int
     usable: set | None
+    # None when SIM.demo_ok_table is unset; otherwise the prune report from
+    # GraspPinTable.keep_only — how many (scene, bin) pairs base collection
+    # actually demonstrated, and which scenes it emptied.
+    demo_ok: dict | None = None
 
 
 def build_regrasp_context(cfg4: dict, *, seed: int = 0,
@@ -107,6 +111,26 @@ def build_regrasp_context(cfg4: dict, *, seed: int = 0,
             sim_cfg_d.get("grasp_pin_table"),
             match_tol=float(sim_cfg_d.get("grasp_pin_match_tol", 0.02)),
             sim_cfg_block=sim_cfg_d)
+
+    # ---- (scene, BIN) pairs base collection actually demonstrated -----------
+    # `exclude_scenes` below is scene-granular and cannot express "this scene is
+    # fine for +x and +z but OMG could not plan the -y grasp". Run 2 needs that:
+    # it asks for one demonstration per reachable bin, and a per-bin planner
+    # failure would otherwise leave the policy trained on three directions and
+    # EVALUATED on four, scoring an extrapolation as if it were a regression.
+    #
+    # Applied to the pin table rather than checked at each call site, so the
+    # collection pool, the eval loop, `bin_of` and `max_grasps` cannot disagree
+    # about which pairs exist. Written by audit_regrasp_demos.py --write-ok from
+    # the base shard, so it reflects what was collected, not what was hoped for.
+    demo_ok_path = sim_cfg_d.get("demo_ok_table")
+    demo_ok_report = None
+    if demo_ok_path and pin_table is not None:
+        with open(demo_ok_path) as f:
+            raw_ok = json.load(f)
+        demo_ok_report = pin_table.keep_only(
+            raw_ok.get("ok", raw_ok), verbose=verbose)
+
     usable = set(pin_table.entries) if pin_table is not None else None
 
     n_excluded = 0
@@ -173,4 +197,5 @@ def build_regrasp_context(cfg4: dict, *, seed: int = 0,
         eval_params=eval_params,
         eval_ckpt=str(ev.get("ckpt", "best")),
         select_on=str(ev.get("select_on", "success_rate")),
-        n_excluded=n_excluded, usable=usable)
+        n_excluded=n_excluded, usable=usable,
+        demo_ok=demo_ok_report)

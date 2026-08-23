@@ -1,0 +1,13 @@
+{
+  "iterations": [
+    {
+      "iter": 0,
+      "run_dir": "output/dagger_runs/regrasp_base/iters/iter_00",
+      "dagger_h5": null,
+      "beta": 1.0,
+      "eval": null
+    }
+  ],
+  "best": null,
+  "cursor": 0
+}

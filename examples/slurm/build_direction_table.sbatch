@@ -2,7 +2,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # DelftBlue SLURM job — build the Regrasp DIRECTION table: per scene, the anchor
 # frame plus the best goal-set grasp realising each approach-direction bin
-# (examples/build_direction_table.py). STEP 1 of four; assign_direction_pairs.py
+# (examples/build_direction_table.py). STEP 1 of four; assign_direction_demos.py
 # then picks two bins per scene OFFLINE, with no simulator.
 #
 #   Train split:

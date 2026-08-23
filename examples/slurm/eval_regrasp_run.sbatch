@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# DelftBlue SLURM job — score a Phase-5 DAgger run's iterations, OUTSIDE the loop.
+# DelftBlue SLURM job — score a Regrasp DAgger run's iterations, OUTSIDE the loop.
+# ONLY NEEDED WHEN THE RUN CONFIG SETS `EVAL.every: 0`. regrasp_run2.yaml sets 1,
+# so the trainer scores its own iterations and this job is redundant there —
+# running both would write eval_log.csv against metrics dagger_log.csv already has.
 #
 #   Run it alongside the trainer (it polls for new iterations):
-#     sbatch --export=ALL,RUN=dagger5_run6 examples/slurm/eval_regrasp_run.sbatch
+#     sbatch --export=ALL,RUN=regrasp_run2 examples/slurm/eval_regrasp_run.sbatch
 #   Or once, after the run finishes:
-#     sbatch --export=ALL,RUN=dagger5_run6,WATCH=0,PUBLISH=1 \
+#     sbatch --export=ALL,RUN=regrasp_run2,WATCH=0,PUBLISH=1 \
 #         examples/slurm/eval_regrasp_run.sbatch
 #
 # WHY A SEPARATE JOB. Evaluation is ~19% of a DAgger run's wall clock and nothing
@@ -27,7 +30,7 @@
 # collection, there is no worker pool for it — it is off the critical path, so
 # its own latency does not matter.
 # ─────────────────────────────────────────────────────────────────────────────
-#SBATCH --job-name=h2r-dag5-eval
+#SBATCH --job-name=h2r-regrasp-eval
 #SBATCH --partition=gpu-v100
 #SBATCH --account=education-me-msc-ro
 #SBATCH --qos=normal
@@ -85,7 +88,7 @@ export OPENBLAS_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 
 # ── parameters (override via sbatch --export=ALL,...) ───────────────────────
-RUN="${RUN:?set RUN=<run name>, e.g. --export=ALL,RUN=dagger5_run6}"
+RUN="${RUN:?set RUN=<run name>, e.g. --export=ALL,RUN=regrasp_run2}"
 # Same SCRATCH_ROOT knob as train_regrasp.sbatch — pass the SAME value the
 # trainer was submitted with, or this job looks for the run in the repo and exits
 # with "config.yaml not found". Empty default = unchanged in-repo behaviour.
@@ -107,7 +110,7 @@ NUM_SCENES="${NUM_SCENES:-}"          # override EVAL.num_scenes
 EXTRA="${EXTRA:-}"
 
 if [ ! -f "${RUN_DIR}/config.yaml" ]; then
-    echo "ERROR: ${RUN_DIR}/config.yaml not found — is that a Phase-5 run dir?" >&2
+    echo "ERROR: ${RUN_DIR}/config.yaml not found — is that a Regrasp run dir?" >&2
     exit 1
 fi
 

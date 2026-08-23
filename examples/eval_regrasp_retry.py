@@ -48,7 +48,7 @@ of this metric that exists only because the simulator can be rewound.
 
 --render OPENS A PYBULLET WINDOW and draws the chain rather than summarising it.
 The scene's four pinned grasps appear as gripper wireframes colour-coded by slot
-(g0 green, g1 blue, g2 orange, g3 magenta), the commanded one bright and thick
+(+x green, -x magenta, +y blue, -y cyan, +z orange, -z yellow), the commanded one
 and the rest dim; each attempt's EE path is drawn in its slot colour and LEFT UP
 for the whole scene, so the trunk-and-fork shape of a chained retry is the thing
 you actually see. The replayed prefix retraces in grey and the branch point gets
@@ -283,9 +283,9 @@ def write_h5(path: Path, per_scene: dict, save_clouds: bool) -> tuple[int, int]:
     return n_ep, n_steps
 
 
-def write_csv(path: Path, per_scene: dict, num_grasps: int) -> None:
+def write_csv(path: Path, per_scene: dict, max_attempts: int) -> None:
     fields = ["scene_idx", "n_attempts", "solved", "solved_at"]
-    for k in range(num_grasps):
+    for k in range(max_attempts):
         fields += [f"a{k}_success", f"a{k}_reason", f"a{k}_steps",
                    f"a{k}_branch", f"a{k}_min_pos", f"a{k}_replay_err"]
     with path.open("w", newline="") as f:
@@ -334,7 +334,11 @@ def main() -> None:
         raise SystemExit(
             "this run has no grasp pin table, so there is no second grasp to "
             "retry with — chained regrasping is undefined without SIM.grasp_pin_table")
-    if ctx.num_grasps < 2:
+    # NOTE the Phase-5 "num_grasps < 2" precondition is GONE. The retry sequence
+    # now comes from the direction ladder, not from how many grasps a scene was
+    # pinned with, so a scene with one demonstrated direction can still be retried
+    # in the others — that is the whole point of an object-agnostic command.
+    if False:
         raise SystemExit(
             f"the pin table holds {ctx.num_grasps} grasp(s) per scene. Chained "
             f"regrasping needs at least 2; this looks like a Phase-4 table.")
@@ -369,7 +373,7 @@ def main() -> None:
     print(f"Phase-5 CHAINED retry    run={run_root.name}")
     print(f"  policy      : {policy_dir}  ({ckpt})")
     print(f"  scenes      : {len(scenes)} x up to "
-          f"{retry.max_attempts or ctx.num_grasps} attempts")
+          f"{retry.max_attempts or 4} attempts (from the direction ladder)")
     print(f"  rewind      : {retry.rewind_frac:.0%} of the failed trajectory, "
           f"mode={retry.rewind_mode}, budget={retry.budget}")
     print(f"  success     : {ctx.eval_params.success_mode}   "
@@ -379,7 +383,8 @@ def main() -> None:
         print(f"  RENDER      : GUI on, pace={args.pace}s/step   "
               f"grasp colours: " +
               "  ".join(f"g{i}={n}" for i, n in
-                        enumerate(("green", "blue", "orange", "magenta")[:ctx.num_grasps])))
+                        enumerate(("green", "magenta", "blue", "cyan",
+                                   "orange", "yellow"))))
         print("                grey = replayed prefix, white cross = branch point")
         print("  KEYS        : " + ("N next  P prev  R re-run  A run-the-rest  "
                                     "Q stop   (focus the PyBullet window; N "
@@ -426,7 +431,17 @@ def main() -> None:
     i = 0
     while i is not None and i < len(scenes):
         scene = scenes[i]
-        poses = [ctx.pin_table.pose(scene, g) for g in range(ctx.num_grasps)]
+        # bin -> a pose realising it. The ladder commands BINS; a pose is still
+        # needed per attempt for the expert's CLOSE label and the geometric
+        # scores, and a bin with no pose is simply not offered.
+        pose_of_bin = {}
+        for g in range(ctx.pin_table.num_grasps_for(scene)):
+            b = ctx.pin_table.bin_of(scene, g)
+            if b is not None:
+                pose_of_bin[int(b)] = ctx.pin_table.pose(scene, g)
+        meta = ctx.pin_table.scene_meta.get(int(scene), {})
+        anchor_R = meta.get("anchor_R")
+        poses = list(pose_of_bin.values())
         if poses[0] is None:
             print(f"  [skip] scene {scene}: no slot-0 pose in the pin table")
             i = advance(i)
@@ -439,8 +454,9 @@ def main() -> None:
             total = f"/{len(scenes)}" if not stepping else ""
             print(f"  [{i + 1:3d}{total}] scene {scene}")
         per_scene[scene] = chained_retry_scene(
-            ctx.sim, runner, scene, poses,
-            params=ctx.eval_params, retry=retry, viz=viz)
+            ctx.sim, runner, scene, pose_of_bin,
+            params=ctx.eval_params, retry=retry,
+            anchor_R=anchor_R, viz=viz)
 
         if not stepping:
             i = advance(i)
@@ -472,13 +488,13 @@ def main() -> None:
     if viz is not None:
         viz.close()
     elapsed = time.time() - t0
-    m = chained_metrics(per_scene, ctx.num_grasps)
+    m = chained_metrics(per_scene, retry.max_attempts or 4)
     m.update({"run_dir": str(run_root), "policy_dir": str(policy_dir), "ckpt": ckpt,
               "rewind_frac": retry.rewind_frac, "rewind_mode": retry.rewind_mode,
               "budget": retry.budget, "elapsed_s": round(elapsed, 1)})
 
     n_ep, n_steps = write_h5(out.with_suffix(".h5"), per_scene, args.save_clouds)
-    write_csv(out.with_suffix(".csv"), per_scene, ctx.num_grasps)
+    write_csv(out.with_suffix(".csv"), per_scene, retry.max_attempts or 4)
     with out.with_suffix(".json").open("w") as f:
         json.dump(m, f, indent=1)
 

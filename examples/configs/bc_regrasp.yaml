@@ -15,7 +15,27 @@
 #      policy_hidden back to [256,256] comes back flat, adding a small d-MLP is
 #                                     run 2, and the gap between the runs measures
 #                                     how much the SA-layer max-pooling destroys.
-#   3. DATA.d_noise_deg: 12.0         Perturb the command once per EPISODE, train
+#   3. DATA.reach_tail 10 -> 5        MEASURED on train_regrasp.h5. Phase 5 widened
+#                                     this because its four grasps shared a free
+#                                     approach and diverged only into the reach —
+#                                     the profile peaked 5-9 steps out and collapsed
+#                                     to ~0 over the last four. Direction
+#                                     conditioning has NO shared free approach: the
+#                                     two demos come in from opposite sides from
+#                                     step 0. Mean pairwise |dpos| difference by
+#                                     step-from-end over 471 paired scenes:
+#
+#                                       step  0     1     2     4     6     8    12
+#                                       diff  .043  .053  .056  .068  .117  .104 .093
+#
+#                                     last-10 mean 0.083 vs steps 10-15 mean 0.093 —
+#                                     a ratio of 0.89, i.e. the signal is slightly
+#                                     STRONGER early. At reach_tail 10 the weighting
+#                                     sent 74% of draws to 53% of the data and
+#                                     starved the free approach, which is where
+#                                     obstacle avoidance lives. Watch f_human_contact
+#                                     either way.
+#   4. DATA.d_noise_deg: 12.0         Perturb the command once per EPISODE, train
 #                                     only. Teaches interpolation between bins and
 #                                     robustness to the fact that a test-time bin
 #                                     CENTRE never matches a demo's realised
@@ -30,7 +50,8 @@
 # test-time knob up to about 20 (past that the bins are closer than 40 degrees and
 # stop being independent retry hypotheses).
 #
-# AND IT RETIRES PHASE 5's HARDEST BUG FOR FREE. `grasp_select.FLIP` is pi about
+# AND IT MAKES THE WRIST-FLIP AMBIGUITY IMPOSSIBLE. `augment_flip_grasp` appends
+# twins rotated pi about
 # the gripper's own +z, which leaves column 2 of R untouched — so d = -R[:,2] is
 # IDENTICAL for a grasp and its wrist-flip twin (measured at 0.000e+00 over 2000
 # random poses). The flip ambiguity that forced the whole flip-quotient metric
@@ -70,7 +91,7 @@ DATA:
   robot_state_dim: 32
   action_dim: 7
   reach_tail_weight: 2.5
-  reach_tail: 10           # widened from run 16's 5 — see the header
+  reach_tail: 5            # back to run 16's value — MEASURED, see below
 
 MODEL:
   feature_dim: 256
