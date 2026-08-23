@@ -90,8 +90,8 @@ DAGGER:
 TRAIN:
   train_cfg: examples/configs/bc_regrasp.yaml
   pc_pretrained: null
-  base_train_h5: output/bc_dataset/train_regrasp.h5
-  val_h5: output/bc_dataset/val_regrasp.h5
+  base_train_h5: ${REGRASP_DATA}/bc_dataset/train_regrasp.h5
+  val_h5: ${REGRASP_DATA}/bc_dataset/val_regrasp.h5
   base_run: null
   base_epochs: 3
   iter_epochs: 2

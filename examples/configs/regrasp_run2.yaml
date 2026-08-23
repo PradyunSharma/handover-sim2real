@@ -267,8 +267,14 @@ TRAIN:
   # iteration warm-starts the WHOLE network from the previous last.pt and never
   # reads this.
   pc_pretrained:
-  base_train_h5: output/bc_dataset/train_regrasp.h5
-  val_h5: output/bc_dataset/val_regrasp.h5
+  # `${REGRASP_DATA}` defaults to `output` and is set to $SCRATCH_ROOT/output
+  # by the sbatch scripts. Only the two HDF5 shards move: together they are
+  # ~1.1 GB against /home's HARD 30 GB quota, which fills SILENTLY and kills
+  # the job with exit code 6 and no traceback. The JSON tables above stay in
+  # the repo — a few MB, they are INPUTS rather than outputs, and /scratch is
+  # purged by age.
+  base_train_h5: ${REGRASP_DATA}/bc_dataset/train_regrasp.h5
+  val_h5: ${REGRASP_DATA}/bc_dataset/val_regrasp.h5
   base_run: null
   # 50. The measured val minimum on run 1's base fit was epoch 16 (val_total
   # 0.1851, degrading to 0.239 by 99 with a 4.9x train/val gap), so 40 already

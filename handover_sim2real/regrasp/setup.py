@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +28,50 @@ from handover_sim2real.regrasp.evaluator import EvalParams
 from handover_sim2real.regrasp.grasp_box import build_box_params
 from handover_sim2real.regrasp.grasp_pin import load_grasp_pin_table
 from handover_sim2real.regrasp.pregrasp import forward_dist_default
+
+
+# ── WHERE THE BIG FILES LIVE ────────────────────────────────────────────────
+#
+# `${REGRASP_DATA}` in any config path expands from the environment, defaulting
+# to the in-repo `output/`. On DelftBlue the sbatch scripts set it to
+# `$SCRATCH_ROOT/output`, which moves the ~1.1 GB of HDF5 shards off /home — a
+# HARD 30 GB quota that fills SILENTLY, killing the job with exit code 6 and no
+# traceback, because Python cannot write one to a full disk.
+#
+# THE SPLIT IS BY SIZE AND REGENERABILITY, NOT BY KIND. The shards and the run
+# directories are large and reproducible from a table plus a seed, so they go to
+# scratch. The JSON tables are a few megabytes, are INPUTS rather than outputs,
+# and are worth keeping in git — so configs name them plainly and they stay in
+# the repo. /scratch is purged by age; the consequence of getting this backwards
+# is either a full quota or a four-hour re-collection.
+#
+# Expansion happens at LOAD, so the config saved into a run directory records the
+# resolved path. That is deliberate: `<run>/config.yaml` is a record of what the
+# run actually read, and a run whose data has since been purged should say where
+# the data was, not where it might be re-created.
+DATA_ROOT_VAR = "REGRASP_DATA"
+DEFAULT_DATA_ROOT = "output"
+
+
+def data_root() -> str:
+    return os.environ.get(DATA_ROOT_VAR) or DEFAULT_DATA_ROOT
+
+
+def expand_config_paths(cfg):
+    """Expand `${REGRASP_DATA}` and any other env var in every string in `cfg`.
+
+    Recursive and in-place-safe (returns a new structure). A config with no `$`
+    anywhere — every Regrasp config before run 2 — is returned unchanged, so this
+    is free to apply everywhere and cannot alter an older run's meaning.
+    """
+    os.environ.setdefault(DATA_ROOT_VAR, DEFAULT_DATA_ROOT)
+    if isinstance(cfg, dict):
+        return {k: expand_config_paths(v) for k, v in cfg.items()}
+    if isinstance(cfg, list):
+        return [expand_config_paths(v) for v in cfg]
+    if isinstance(cfg, str) and "$" in cfg:
+        return os.path.expandvars(cfg)
+    return cfg
 
 
 def scene_pools(num_scenes: int, ev: dict,

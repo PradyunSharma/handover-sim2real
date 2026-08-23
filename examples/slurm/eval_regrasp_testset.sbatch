@@ -114,6 +114,20 @@ else
     OUT_ROOT="${OUT_ROOT:-output/dagger_runs}"
 fi
 RUN_DIR="${RUN_DIR:-${OUT_ROOT}/${RUN}}"
+
+# ── REGRASP_DATA: the HDF5 shards follow the run onto /scratch ───────────────
+# The configs name their shards as `${REGRASP_DATA}/bc_dataset/...`, which
+# expands at config load (handover_sim2real/regrasp/setup.py) and defaults to the
+# in-repo `output/`. Pointing it at scratch alongside OUT_ROOT is what keeps the
+# ~1.1 GB base set off /home's HARD 30 GB quota — a quota that fills SILENTLY and
+# kills the job with exit code 6 and no traceback, because Python cannot write
+# one to a full disk. The small JSON tables stay in the repo on purpose: they are
+# inputs, they are worth version-controlling, and /scratch is purged by age.
+export REGRASP_DATA="${REGRASP_DATA:-${SCRATCH_ROOT:+${SCRATCH_ROOT}/output}}"
+export REGRASP_DATA="${REGRASP_DATA:-output}"
+mkdir -p "${REGRASP_DATA}/bc_dataset"
+echo "REGRASP_DATA=${REGRASP_DATA}"
+
 SPLIT="${SPLIT:-test}"
 ITERS="${ITERS:-all}"
 CKPT="${CKPT:-last}"                  # matches EVAL.ckpt from run 2 on

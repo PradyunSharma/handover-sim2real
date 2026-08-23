@@ -47,8 +47,21 @@ CFG="${CFG:-examples/configs/regrasp_run2.yaml}"
 SMOKE_CFG="${SMOKE_CFG:-examples/configs/regrasp_smoke.yaml}"
 SIM_CFG="${SIM_CFG:-examples/pretrain_multicam_wr.yaml}"
 SCRATCH_ROOT="${SCRATCH_ROOT:-/scratch/$USER/handover-sim2real}"
-TRAIN_H5="${TRAIN_H5:-output/bc_dataset/train_regrasp.h5}"
-VAL_H5="${VAL_H5:-output/bc_dataset/val_regrasp.h5}"
+# THE BIG FILES GO TO SCRATCH, THE SMALL ONES STAY IN THE REPO.
+#   scratch  the run directory (~3.5 GB) and the two base HDF5 shards (~1.1 GB)
+#   repo     the direction tables, pin tables and demo_ok list (~5 MB total)
+# The split is by size and by kind: the shards and run dirs are large outputs,
+# regenerable from a table plus a seed; the JSON tables are small INPUTS worth
+# version-controlling. /home is a HARD 30 GB quota that fills SILENTLY (exit code
+# 6, no traceback), and /scratch is PURGED BY AGE — putting the inputs there
+# would mean a purge costs a re-collection AND the record of what was collected.
+#
+# `REGRASP_DATA` is the one knob; the configs name their shards through it and
+# handover_sim2real/regrasp/setup.py expands it at load. Set it yourself to put
+# the shards somewhere else, or to `output` to keep everything in the repo.
+export REGRASP_DATA="${REGRASP_DATA:-$SCRATCH_ROOT/output}"
+TRAIN_H5="${TRAIN_H5:-$REGRASP_DATA/bc_dataset/train_regrasp.h5}"
+VAL_H5="${VAL_H5:-$REGRASP_DATA/bc_dataset/val_regrasp.h5}"
 TEST_ITERS="${TEST_ITERS:-0,5,10,15,20}"   # which iterations the test sweep scores
 SKIP_SMOKE="${SKIP_SMOKE:-0}"
 FORCE="${FORCE:-0}"
@@ -92,10 +105,23 @@ for f in output/direction_table_train.json output/direction_table_val.json \
          "$CFG" "$SMOKE_CFG" "$SIM_CFG"; do
     [ -f "$f" ] || { echo "ERROR: missing $f" >&2; exit 1; }
 done
-mkdir -p slurm_logs output/bc_dataset
+mkdir -p slurm_logs output
+# Not in --dry-run: this script is meant to be readable on a laptop that has no
+# /scratch, and a permission error there would hide the graph it was asked to
+# print. In a real run a scratch root that cannot be created is fatal NOW rather
+# than four hours into a collection job that cannot write its output.
+if [ "$DRY" != "1" ]; then
+    if ! mkdir -p "$REGRASP_DATA/bc_dataset" 2>/dev/null; then
+        echo "ERROR: cannot create $REGRASP_DATA/bc_dataset" >&2
+        echo "  Set SCRATCH_ROOT to a writable path, or REGRASP_DATA=output to" >&2
+        echo "  keep the ~1.1 GB of shards in the repo." >&2
+        exit 1
+    fi
+fi
 
 say "Regrasp pipeline   run=$RUN   cfg=$CFG"
-note "scratch : $SCRATCH_ROOT"
+note "run dir : $SCRATCH_ROOT/output/dagger_runs/$RUN"
+note "shards  : $REGRASP_DATA/bc_dataset/   (tables stay in the repo)"
 [ "$DRY" = "1" ] && note "DRY RUN — nothing will be submitted"
 
 # ── stage 0: the per-bin assignment (seconds, here, not in a job) ────────────
@@ -170,6 +196,15 @@ DEPS=()
 # The flags, not just the move, so --dry-run reports the jobs it WOULD submit
 # rather than the ones it would submit if the move it did not perform had.
 TRAIN_STALE=0; VAL_STALE=0
+# Run 1's shards sit in the repo at output/bc_dataset/. With REGRASP_DATA on
+# scratch they are simply not the files run 2 reads, so they are left alone —
+# say so, because "collection was submitted even though a train_regrasp.h5
+# exists" is otherwise a surprise worth a second look.
+for _old in output/bc_dataset/train_regrasp.h5 output/bc_dataset/val_regrasp.h5; do
+    if [ -f "$_old" ] && [ "$REGRASP_DATA" != "output" ]; then
+        note "    (repo copy $_old is run 1's — untouched, and not what run 2 reads)"
+    fi
+done
 if [ -f "$TRAIN_H5" ] && [ "$FORCE" != "1" ] && ! shard_is_current "$TRAIN_H5"; then
     retire_stale "$TRAIN_H5"; TRAIN_STALE=1
 fi
@@ -186,7 +221,7 @@ fi
 
 if [ "$FORCE" = "1" ] || [ "$TRAIN_STALE" = "1" ] || [ ! -f "$TRAIN_H5" ]; then
     A=$(submit "A collect train (~4 h)" --time=20:00:00 \
-        --export=ALL,SPLIT=train,SIM_CFG="$SIM_CFG",OUT="$TRAIN_H5",PIN=output/regrasp_pins_train.json \
+        --export=ALL,SPLIT=train,SIM_CFG="$SIM_CFG",OUT="$TRAIN_H5",PIN=output/regrasp_pins_train.json,REGRASP_DATA="$REGRASP_DATA" \
         examples/slurm/collect_regrasp_demos.sbatch)
     DEPS+=("$A")
 else
@@ -195,7 +230,7 @@ fi
 
 if [ "$FORCE" = "1" ] || [ "$VAL_STALE" = "1" ] || [ ! -f "$VAL_H5" ]; then
     B=$(submit "B collect val (~20 min)" --time=03:00:00 \
-        --export=ALL,SPLIT=val,SIM_CFG="$SIM_CFG",OUT="$VAL_H5",PIN=output/regrasp_pins_val.json \
+        --export=ALL,SPLIT=val,SIM_CFG="$SIM_CFG",OUT="$VAL_H5",PIN=output/regrasp_pins_val.json,REGRASP_DATA="$REGRASP_DATA" \
         examples/slurm/collect_regrasp_demos.sbatch)
     DEPS+=("$B")
 else
@@ -233,7 +268,7 @@ if [ "$SKIP_SMOKE" = "1" ]; then
 else
     say "[D] shakedown"
     D=$(submit "D smoke (~30 min)" --time=01:30:00 $(dep_of "${DEPS[@]:-}") \
-        --export=ALL,RUN=regrasp_smoke,CFG="$SMOKE_CFG",SCRATCH_ROOT="$SCRATCH_ROOT" \
+        --export=ALL,RUN=regrasp_smoke,CFG="$SMOKE_CFG",SCRATCH_ROOT="$SCRATCH_ROOT",REGRASP_DATA="$REGRASP_DATA" \
         examples/slurm/train_regrasp.sbatch)
     PREV=("$D")
 fi
@@ -241,7 +276,7 @@ fi
 # ── stage E: the run ─────────────────────────────────────────────────────────
 say "[E] the run"
 E=$(submit "E train $RUN (~20-21 h)" --time=24:00:00 $(dep_of "${PREV[@]:-}") \
-    --export=ALL,RUN="$RUN",CFG="$CFG",SCRATCH_ROOT="$SCRATCH_ROOT" \
+    --export=ALL,RUN="$RUN",CFG="$CFG",SCRATCH_ROOT="$SCRATCH_ROOT",REGRASP_DATA="$REGRASP_DATA" \
     examples/slurm/train_regrasp.sbatch)
 
 # ── stage F: the held-out number ─────────────────────────────────────────────
@@ -258,7 +293,7 @@ say "[F] test-split evaluation"
 # both simpler and immune.
 F=$(ITERS="$TEST_ITERS" submit "F test eval, iters=$TEST_ITERS (~2 h)" \
     $(dep_of "$E" "$C") \
-    --export=ALL,RUN="$RUN",CHAINED=1,SCRATCH_ROOT="$SCRATCH_ROOT" \
+    --export=ALL,RUN="$RUN",CHAINED=1,SCRATCH_ROOT="$SCRATCH_ROOT",REGRASP_DATA="$REGRASP_DATA" \
     examples/slurm/eval_regrasp_testset.sbatch)
 
 # ── what to do next ──────────────────────────────────────────────────────────
@@ -273,7 +308,10 @@ $(say "Submitted. Nothing further is needed until it finishes.")
   figures   $RD/{training_curve,curves_regrasp,debug_dagger,curves_diag,media_curves}.png
             $RD/test_set_evaluation.png            (after F)
   harvest   python examples/harvest_run.py --run-dir $RD
-            /scratch is purged by age — pull the CSVs and figures into git.
+            /scratch is PURGED BY AGE. That takes the run dir AND the base
+            shards in $REGRASP_DATA/bc_dataset — ~4 h to re-collect. Harvest
+            pulls the small metadata (CSVs, configs, figures) back into git;
+            copy the shards elsewhere if you want to reuse them for run 3.
 
   If a stage fails, fix it and re-run this script: every completed stage is
   skipped, so only the missing work is resubmitted.

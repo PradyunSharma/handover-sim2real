@@ -114,7 +114,12 @@ export PYTHONUNBUFFERED=1
 # ── parameters (override via sbatch --export=ALL,...) ───────────────────────
 SIM_CFG="${SIM_CFG:-examples/pretrain_multicam_wr.yaml}"  # MUST match SIM.cfg_file in the phase-5 config
 SPLIT="${SPLIT:-train}"
-OUT="${OUT:-output/bc_dataset/${SPLIT}_p5_k8.h5}"
+# Follows $SCRATCH_ROOT when one is given, so the ~650 MB train shard does
+# not land on /home's 30 GB quota. An explicit OUT= always wins.
+REGRASP_DATA="${REGRASP_DATA:-${SCRATCH_ROOT:+${SCRATCH_ROOT}/output}}"
+REGRASP_DATA="${REGRASP_DATA:-output}"
+OUT="${OUT:-${REGRASP_DATA}/bc_dataset/${SPLIT}_regrasp.h5}"
+mkdir -p "$(dirname "${OUT}")"
 VGD="${VGD:-examples/valid_grasp_dict_005.pkl}"           # Phase-3/4/5 grasp set
 PIN="${PIN:-output/grasp_cand_table_${SPLIT}_p5.json}"    # K candidates per scene
 SEED="${SEED:-0}"

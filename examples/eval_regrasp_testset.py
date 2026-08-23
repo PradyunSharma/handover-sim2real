@@ -91,7 +91,9 @@ from handover_sim2real.regrasp import (                        # noqa: E402
     evaluate_policy, load_policy_runner,
 )
 from handover_sim2real.regrasp import directions as _D         # noqa: E402
-from handover_sim2real.regrasp.setup import build_regrasp_context  # noqa: E402
+from handover_sim2real.regrasp.setup import (                     # noqa: E402
+    build_regrasp_context, expand_config_paths,
+)
 
 from eval_regrasp_run import iteration_dirs                    # noqa: E402
 from train_regrasp import LOG_FIELDS, eval_columns             # noqa: E402
@@ -305,7 +307,7 @@ def main() -> None:
     if not cfg_path.exists():
         raise SystemExit(f"no config.yaml in {run_root} — is that a Regrasp run dir?")
     with cfg_path.open() as f:
-        cfg4 = yaml.safe_load(f)
+        cfg4 = expand_config_paths(yaml.safe_load(f))
 
     # ---- repoint the run's own config at the test split ---------------------
     # Everything else — the cameras, the standoff, the success criterion, the

@@ -167,6 +167,31 @@ them, so no manual step sits between two multi-hour jobs.
 `--dry-run` prints the whole graph without submitting. `--force` resubmits
 everything. Re-running after a failure resubmits only what is missing.
 
+**Where the data lands.** `SCRATCH_ROOT` (default `/scratch/$USER/handover-sim2real`)
+takes the two things that are large:
+
+| | size | where |
+|---|---|---|
+| run dir — checkpoints + 20 iteration shards | ~3.5 GB | **scratch** |
+| base HDF5 shards — `train_regrasp.h5`, `val_regrasp.h5` | ~1.1 GB | **scratch** |
+| direction tables, pin tables, `demo_ok` list | ~5 MB | repo |
+
+The split is by size and by kind, not by convenience. `/home` is a **hard 30 GB
+quota that fills silently** — the job dies with exit code 6 and no traceback,
+because Python cannot write one to a full disk. `/scratch` is **purged by age**,
+so the small JSON tables stay in the repo where they are version-controlled: they
+are inputs, and losing them would cost both a re-collection *and* the record of
+what was collected.
+
+Configs name the shards as `${REGRASP_DATA}/bc_dataset/...`, which
+`handover_sim2real/regrasp/setup.py` expands at load and which defaults to the
+in-repo `output/`, so nothing changes when running off the cluster. Set
+`REGRASP_DATA=output` to keep everything in the repo, or point it anywhere else.
+
+Note the base shards are on scratch too, so a purge costs ~4 h of re-collection —
+`harvest_run.py` pulls back only the small metadata. Copy the shards aside if you
+want to reuse them for run 3.
+
 The stages below are the same work done by hand, and are what to read when a
 stage fails.
 

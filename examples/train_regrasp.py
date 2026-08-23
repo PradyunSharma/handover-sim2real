@@ -96,14 +96,22 @@ from handover_sim2real.regrasp import (
     policy_kind,
 )
 from handover_sim2real.regrasp.pregrasp import forward_dist_default
-from handover_sim2real.regrasp.setup import build_regrasp_context, scene_pools
+from handover_sim2real.regrasp.setup import (                     # noqa: E402
+    build_regrasp_context, expand_config_paths, scene_pools,
+)
 
 
 # ── config plumbing ──────────────────────────────────────────────────────────
 
 def load_yaml(path) -> dict:
+    """Read a config and expand `${REGRASP_DATA}` in every path it contains.
+
+    The sbatch scripts set that variable to `$SCRATCH_ROOT/output` so the HDF5
+    shards stay off /home's 30 GB quota; it defaults to `output`, so a config
+    with no `$` in it — every Regrasp config before run 2 — is unaffected.
+    """
     with open(path) as f:
-        return yaml.safe_load(f)
+        return expand_config_paths(yaml.safe_load(f))
 
 
 def set_seed(seed: int) -> None:

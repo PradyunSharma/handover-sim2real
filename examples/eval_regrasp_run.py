@@ -52,7 +52,9 @@ from handover_sim2real.regrasp import (          # noqa: E402
     export_run_dir,
     load_policy_runner,
 )
-from handover_sim2real.regrasp.setup import build_regrasp_context   # noqa: E402
+from handover_sim2real.regrasp.setup import (                     # noqa: E402
+    build_regrasp_context, expand_config_paths,
+)
 
 
 # Imported, not restated: `_status_name` can OR two failures into
@@ -206,7 +208,7 @@ def main() -> None:
     if not cfg_path.exists():
         raise SystemExit(f"no config.yaml in {run_root} — is that a Phase-4 run dir?")
     with cfg_path.open() as f:
-        cfg4 = yaml.safe_load(f)
+        cfg4 = expand_config_paths(yaml.safe_load(f))
 
     ev = cfg4.setdefault("EVAL", {})
     if args.num_scenes is not None:
