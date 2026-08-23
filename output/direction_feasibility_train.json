@@ -1,0 +1,8661 @@
+{
+ "_meta": {
+  "split": "train",
+  "k": 6,
+  "table": "output/grasp_cand_table_train_p5.json",
+  "counts": [
+   1486,
+   16,
+   676,
+   646,
+   986,
+   0
+  ],
+  "scenes_with": [
+   494,
+   12,
+   358,
+   341,
+   431,
+   0
+  ],
+  "n_no_hand": 5,
+  "n_fallback": 5
+ },
+ "0": {
+  "scene_id": 5,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "1": {
+  "scene_id": 6,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "2": {
+  "scene_id": 7,
+  "bins": [
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "3": {
+  "scene_id": 8,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "4": {
+  "scene_id": 10,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "6": {
+  "scene_id": 12,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "8": {
+  "scene_id": 15,
+  "bins": [
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "9": {
+  "scene_id": 16,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "10": {
+  "scene_id": 17,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "12": {
+  "scene_id": 20,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "13": {
+  "scene_id": 21,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "14": {
+  "scene_id": 22,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "15": {
+  "scene_id": 23,
+  "bins": [
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "16": {
+  "scene_id": 25,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "17": {
+  "scene_id": 26,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "18": {
+  "scene_id": 27,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "19": {
+  "scene_id": 28,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "20": {
+  "scene_id": 30,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "21": {
+  "scene_id": 31,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "22": {
+  "scene_id": 32,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "23": {
+  "scene_id": 33,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "24": {
+  "scene_id": 35,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "25": {
+  "scene_id": 36,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "26": {
+  "scene_id": 37,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "27": {
+  "scene_id": 38,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "28": {
+  "scene_id": 40,
+  "bins": [
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "29": {
+  "scene_id": 41,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "31": {
+  "scene_id": 43,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "32": {
+  "scene_id": 45,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "33": {
+  "scene_id": 46,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "34": {
+  "scene_id": 47,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "35": {
+  "scene_id": 48,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "37": {
+  "scene_id": 51,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "38": {
+  "scene_id": 52,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "40": {
+  "scene_id": 55,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "41": {
+  "scene_id": 56,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "43": {
+  "scene_id": 58,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "48": {
+  "scene_id": 65,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "49": {
+  "scene_id": 66,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "52": {
+  "scene_id": 70,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "53": {
+  "scene_id": 71,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "54": {
+  "scene_id": 72,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "55": {
+  "scene_id": 73,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "58": {
+  "scene_id": 82,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "60": {
+  "scene_id": 85,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "61": {
+  "scene_id": 86,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "62": {
+  "scene_id": 87,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "63": {
+  "scene_id": 88,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "64": {
+  "scene_id": 90,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "65": {
+  "scene_id": 91,
+  "bins": [
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "66": {
+  "scene_id": 92,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "67": {
+  "scene_id": 93,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "72": {
+  "scene_id": 105,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "73": {
+  "scene_id": 106,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "74": {
+  "scene_id": 107,
+  "bins": [
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "75": {
+  "scene_id": 108,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "76": {
+  "scene_id": 110,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "77": {
+  "scene_id": 111,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "78": {
+  "scene_id": 112,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "79": {
+  "scene_id": 113,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "80": {
+  "scene_id": 115,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "81": {
+  "scene_id": 116,
+  "bins": [
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "82": {
+  "scene_id": 117,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "83": {
+  "scene_id": 118,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "84": {
+  "scene_id": 120,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "85": {
+  "scene_id": 121,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "86": {
+  "scene_id": 122,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "87": {
+  "scene_id": 123,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "88": {
+  "scene_id": 125,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "90": {
+  "scene_id": 127,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "91": {
+  "scene_id": 128,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "92": {
+  "scene_id": 130,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "93": {
+  "scene_id": 131,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "94": {
+  "scene_id": 132,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "95": {
+  "scene_id": 133,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "96": {
+  "scene_id": 135,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "97": {
+  "scene_id": 136,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "98": {
+  "scene_id": 137,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "99": {
+  "scene_id": 138,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "101": {
+  "scene_id": 141,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "102": {
+  "scene_id": 142,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "103": {
+  "scene_id": 143,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "104": {
+  "scene_id": 145,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "105": {
+  "scene_id": 146,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "106": {
+  "scene_id": 147,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "107": {
+  "scene_id": 148,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "108": {
+  "scene_id": 150,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "109": {
+  "scene_id": 151,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "110": {
+  "scene_id": 152,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "112": {
+  "scene_id": 155,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "113": {
+  "scene_id": 156,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "114": {
+  "scene_id": 157,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "115": {
+  "scene_id": 158,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "120": {
+  "scene_id": 165,
+  "bins": [
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "121": {
+  "scene_id": 166,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "122": {
+  "scene_id": 167,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "123": {
+  "scene_id": 168,
+  "bins": [
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "124": {
+  "scene_id": 170,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "125": {
+  "scene_id": 171,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "126": {
+  "scene_id": 172,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "127": {
+  "scene_id": 173,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "129": {
+  "scene_id": 181,
+  "bins": [
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "132": {
+  "scene_id": 185,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "133": {
+  "scene_id": 186,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "134": {
+  "scene_id": 187,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "135": {
+  "scene_id": 188,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "136": {
+  "scene_id": 190,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "137": {
+  "scene_id": 191,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "138": {
+  "scene_id": 192,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "139": {
+  "scene_id": 193,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "140": {
+  "scene_id": 195,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "141": {
+  "scene_id": 196,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "142": {
+  "scene_id": 197,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "143": {
+  "scene_id": 198,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "144": {
+  "scene_id": 205,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "145": {
+  "scene_id": 206,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "146": {
+  "scene_id": 207,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "147": {
+  "scene_id": 208,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "148": {
+  "scene_id": 210,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "149": {
+  "scene_id": 211,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "150": {
+  "scene_id": 212,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "151": {
+  "scene_id": 213,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "152": {
+  "scene_id": 215,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "153": {
+  "scene_id": 216,
+  "bins": [
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "154": {
+  "scene_id": 217,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "156": {
+  "scene_id": 220,
+  "bins": [
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "157": {
+  "scene_id": 221,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "158": {
+  "scene_id": 222,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "159": {
+  "scene_id": 223,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "160": {
+  "scene_id": 225,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "161": {
+  "scene_id": 226,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "162": {
+  "scene_id": 227,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "163": {
+  "scene_id": 228,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "164": {
+  "scene_id": 230,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "165": {
+  "scene_id": 231,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "166": {
+  "scene_id": 232,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "167": {
+  "scene_id": 233,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "168": {
+  "scene_id": 235,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "169": {
+  "scene_id": 236,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "170": {
+  "scene_id": 237,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "171": {
+  "scene_id": 238,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "172": {
+  "scene_id": 240,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "173": {
+  "scene_id": 241,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "175": {
+  "scene_id": 243,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "176": {
+  "scene_id": 245,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "177": {
+  "scene_id": 246,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "178": {
+  "scene_id": 247,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "179": {
+  "scene_id": 248,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "181": {
+  "scene_id": 251,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "182": {
+  "scene_id": 252,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "183": {
+  "scene_id": 253,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "184": {
+  "scene_id": 255,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "185": {
+  "scene_id": 256,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "186": {
+  "scene_id": 257,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "187": {
+  "scene_id": 258,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "192": {
+  "scene_id": 265,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "193": {
+  "scene_id": 266,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "194": {
+  "scene_id": 267,
+  "bins": [
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "195": {
+  "scene_id": 268,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "196": {
+  "scene_id": 270,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "197": {
+  "scene_id": 271,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "198": {
+  "scene_id": 272,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "199": {
+  "scene_id": 273,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "200": {
+  "scene_id": 280,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "201": {
+  "scene_id": 281,
+  "bins": [
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "202": {
+  "scene_id": 282,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "203": {
+  "scene_id": 283,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "204": {
+  "scene_id": 285,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "205": {
+  "scene_id": 286,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "206": {
+  "scene_id": 287,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "207": {
+  "scene_id": 288,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "208": {
+  "scene_id": 290,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "209": {
+  "scene_id": 291,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "210": {
+  "scene_id": 292,
+  "bins": [
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "211": {
+  "scene_id": 293,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "212": {
+  "scene_id": 295,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "213": {
+  "scene_id": 296,
+  "bins": [
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "214": {
+  "scene_id": 297,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "215": {
+  "scene_id": 298,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "216": {
+  "scene_id": 305,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "217": {
+  "scene_id": 306,
+  "bins": [
+   0,
+   1,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   1
+  ]
+ },
+ "218": {
+  "scene_id": 307,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "219": {
+  "scene_id": 308,
+  "bins": [
+   3
+  ],
+  "mode": "base",
+  "side": "left",
+  "hand_present": false
+ },
+ "220": {
+  "scene_id": 310,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "221": {
+  "scene_id": 311,
+  "bins": [
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "222": {
+  "scene_id": 312,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "223": {
+  "scene_id": 313,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "224": {
+  "scene_id": 315,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "225": {
+  "scene_id": 316,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "226": {
+  "scene_id": 317,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "228": {
+  "scene_id": 320,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "229": {
+  "scene_id": 321,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "230": {
+  "scene_id": 322,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "231": {
+  "scene_id": 323,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "232": {
+  "scene_id": 325,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "233": {
+  "scene_id": 326,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "234": {
+  "scene_id": 327,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "235": {
+  "scene_id": 328,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "236": {
+  "scene_id": 330,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "237": {
+  "scene_id": 331,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "238": {
+  "scene_id": 332,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "239": {
+  "scene_id": 333,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "240": {
+  "scene_id": 335,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "241": {
+  "scene_id": 336,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "242": {
+  "scene_id": 337,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "243": {
+  "scene_id": 338,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "244": {
+  "scene_id": 340,
+  "bins": [
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "245": {
+  "scene_id": 341,
+  "bins": [
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "246": {
+  "scene_id": 342,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "247": {
+  "scene_id": 343,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "248": {
+  "scene_id": 345,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "249": {
+  "scene_id": 346,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "250": {
+  "scene_id": 347,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "251": {
+  "scene_id": 348,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "252": {
+  "scene_id": 350,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "253": {
+  "scene_id": 351,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "255": {
+  "scene_id": 353,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "256": {
+  "scene_id": 355,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "257": {
+  "scene_id": 356,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "258": {
+  "scene_id": 357,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "259": {
+  "scene_id": 358,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "264": {
+  "scene_id": 365,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "265": {
+  "scene_id": 366,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "266": {
+  "scene_id": 367,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "267": {
+  "scene_id": 368,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "268": {
+  "scene_id": 370,
+  "bins": [
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "269": {
+  "scene_id": 371,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "270": {
+  "scene_id": 372,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "271": {
+  "scene_id": 373,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "272": {
+  "scene_id": 380,
+  "bins": [
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "273": {
+  "scene_id": 381,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "275": {
+  "scene_id": 383,
+  "bins": [
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "276": {
+  "scene_id": 385,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "277": {
+  "scene_id": 386,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "278": {
+  "scene_id": 387,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "279": {
+  "scene_id": 388,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "280": {
+  "scene_id": 390,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "281": {
+  "scene_id": 391,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "282": {
+  "scene_id": 392,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "283": {
+  "scene_id": 393,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "284": {
+  "scene_id": 395,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "285": {
+  "scene_id": 396,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "286": {
+  "scene_id": 397,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "287": {
+  "scene_id": 398,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "288": {
+  "scene_id": 405,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "289": {
+  "scene_id": 406,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "290": {
+  "scene_id": 407,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "291": {
+  "scene_id": 408,
+  "bins": [
+   0,
+   1,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   1
+  ]
+ },
+ "292": {
+  "scene_id": 410,
+  "bins": [
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "293": {
+  "scene_id": 411,
+  "bins": [
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "294": {
+  "scene_id": 412,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "295": {
+  "scene_id": 413,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "297": {
+  "scene_id": 416,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "298": {
+  "scene_id": 417,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "299": {
+  "scene_id": 418,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "300": {
+  "scene_id": 420,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "301": {
+  "scene_id": 421,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "302": {
+  "scene_id": 422,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "303": {
+  "scene_id": 423,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "304": {
+  "scene_id": 425,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "305": {
+  "scene_id": 426,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "306": {
+  "scene_id": 427,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "307": {
+  "scene_id": 428,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "308": {
+  "scene_id": 430,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "309": {
+  "scene_id": 431,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "310": {
+  "scene_id": 432,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "311": {
+  "scene_id": 433,
+  "bins": [
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "312": {
+  "scene_id": 435,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "313": {
+  "scene_id": 436,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "314": {
+  "scene_id": 437,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "315": {
+  "scene_id": 438,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "316": {
+  "scene_id": 440,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "317": {
+  "scene_id": 441,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "318": {
+  "scene_id": 442,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "319": {
+  "scene_id": 443,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "320": {
+  "scene_id": 445,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "321": {
+  "scene_id": 446,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "322": {
+  "scene_id": 447,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "323": {
+  "scene_id": 448,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "324": {
+  "scene_id": 450,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "326": {
+  "scene_id": 452,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "327": {
+  "scene_id": 453,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "328": {
+  "scene_id": 455,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "329": {
+  "scene_id": 456,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "330": {
+  "scene_id": 457,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "331": {
+  "scene_id": 458,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "336": {
+  "scene_id": 465,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "337": {
+  "scene_id": 466,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "338": {
+  "scene_id": 467,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "339": {
+  "scene_id": 468,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "340": {
+  "scene_id": 470,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "341": {
+  "scene_id": 471,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "342": {
+  "scene_id": 472,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "343": {
+  "scene_id": 473,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "345": {
+  "scene_id": 481,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "348": {
+  "scene_id": 485,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "349": {
+  "scene_id": 486,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "350": {
+  "scene_id": 487,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "351": {
+  "scene_id": 488,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "352": {
+  "scene_id": 490,
+  "bins": [
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "353": {
+  "scene_id": 491,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "354": {
+  "scene_id": 492,
+  "bins": [
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "355": {
+  "scene_id": 493,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "356": {
+  "scene_id": 495,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "357": {
+  "scene_id": 496,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "359": {
+  "scene_id": 498,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "360": {
+  "scene_id": 505,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "361": {
+  "scene_id": 506,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "362": {
+  "scene_id": 507,
+  "bins": [
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "363": {
+  "scene_id": 508,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "364": {
+  "scene_id": 510,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "365": {
+  "scene_id": 511,
+  "bins": [
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "366": {
+  "scene_id": 512,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "368": {
+  "scene_id": 515,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "369": {
+  "scene_id": 516,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "370": {
+  "scene_id": 517,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "371": {
+  "scene_id": 518,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "372": {
+  "scene_id": 520,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "373": {
+  "scene_id": 521,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "374": {
+  "scene_id": 522,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "375": {
+  "scene_id": 523,
+  "bins": [
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "376": {
+  "scene_id": 525,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "377": {
+  "scene_id": 526,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "378": {
+  "scene_id": 527,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "379": {
+  "scene_id": 528,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "380": {
+  "scene_id": 530,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "381": {
+  "scene_id": 531,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "382": {
+  "scene_id": 532,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "383": {
+  "scene_id": 533,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "384": {
+  "scene_id": 535,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "385": {
+  "scene_id": 536,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "386": {
+  "scene_id": 537,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "387": {
+  "scene_id": 538,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "388": {
+  "scene_id": 540,
+  "bins": [
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "390": {
+  "scene_id": 542,
+  "bins": [
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "391": {
+  "scene_id": 543,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "392": {
+  "scene_id": 545,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "393": {
+  "scene_id": 546,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "394": {
+  "scene_id": 547,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "395": {
+  "scene_id": 548,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "397": {
+  "scene_id": 551,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "400": {
+  "scene_id": 555,
+  "bins": [
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "401": {
+  "scene_id": 556,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "402": {
+  "scene_id": 557,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "408": {
+  "scene_id": 565,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "409": {
+  "scene_id": 566,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "410": {
+  "scene_id": 567,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "411": {
+  "scene_id": 568,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "412": {
+  "scene_id": 570,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "413": {
+  "scene_id": 571,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "414": {
+  "scene_id": 572,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "415": {
+  "scene_id": 573,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "416": {
+  "scene_id": 580,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "419": {
+  "scene_id": 583,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "420": {
+  "scene_id": 585,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "421": {
+  "scene_id": 586,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "422": {
+  "scene_id": 587,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "423": {
+  "scene_id": 588,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "424": {
+  "scene_id": 590,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "425": {
+  "scene_id": 591,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "426": {
+  "scene_id": 592,
+  "bins": [
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "427": {
+  "scene_id": 593,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "428": {
+  "scene_id": 595,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "429": {
+  "scene_id": 596,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "431": {
+  "scene_id": 598,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "432": {
+  "scene_id": 605,
+  "bins": [
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "433": {
+  "scene_id": 606,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "434": {
+  "scene_id": 607,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "435": {
+  "scene_id": 608,
+  "bins": [
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "436": {
+  "scene_id": 610,
+  "bins": [
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "437": {
+  "scene_id": 611,
+  "bins": [
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "438": {
+  "scene_id": 612,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "439": {
+  "scene_id": 613,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "440": {
+  "scene_id": 615,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "441": {
+  "scene_id": 616,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "442": {
+  "scene_id": 617,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "443": {
+  "scene_id": 618,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "444": {
+  "scene_id": 620,
+  "bins": [
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "445": {
+  "scene_id": 621,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "446": {
+  "scene_id": 622,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "447": {
+  "scene_id": 623,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "448": {
+  "scene_id": 625,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "449": {
+  "scene_id": 626,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "451": {
+  "scene_id": 628,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "452": {
+  "scene_id": 630,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "453": {
+  "scene_id": 631,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "454": {
+  "scene_id": 632,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "455": {
+  "scene_id": 633,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "456": {
+  "scene_id": 635,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "457": {
+  "scene_id": 636,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "458": {
+  "scene_id": 637,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "459": {
+  "scene_id": 638,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "460": {
+  "scene_id": 640,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "461": {
+  "scene_id": 641,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "462": {
+  "scene_id": 642,
+  "bins": [
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "464": {
+  "scene_id": 645,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "465": {
+  "scene_id": 646,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "466": {
+  "scene_id": 647,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "467": {
+  "scene_id": 648,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "468": {
+  "scene_id": 650,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "469": {
+  "scene_id": 651,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "470": {
+  "scene_id": 652,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "471": {
+  "scene_id": 653,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "472": {
+  "scene_id": 655,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "473": {
+  "scene_id": 656,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "474": {
+  "scene_id": 657,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "475": {
+  "scene_id": 658,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "480": {
+  "scene_id": 665,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "481": {
+  "scene_id": 666,
+  "bins": [
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "482": {
+  "scene_id": 667,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "483": {
+  "scene_id": 668,
+  "bins": [
+   0,
+   1,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   1
+  ]
+ },
+ "484": {
+  "scene_id": 670,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "485": {
+  "scene_id": 671,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "486": {
+  "scene_id": 672,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "487": {
+  "scene_id": 673,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "488": {
+  "scene_id": 680,
+  "bins": [
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "489": {
+  "scene_id": 681,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "490": {
+  "scene_id": 682,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "491": {
+  "scene_id": 683,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "492": {
+  "scene_id": 685,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "493": {
+  "scene_id": 686,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "494": {
+  "scene_id": 687,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "495": {
+  "scene_id": 688,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "496": {
+  "scene_id": 690,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "497": {
+  "scene_id": 691,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "498": {
+  "scene_id": 692,
+  "bins": [
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "499": {
+  "scene_id": 693,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "500": {
+  "scene_id": 695,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "502": {
+  "scene_id": 697,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "503": {
+  "scene_id": 698,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "504": {
+  "scene_id": 705,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "505": {
+  "scene_id": 706,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "506": {
+  "scene_id": 707,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "507": {
+  "scene_id": 708,
+  "bins": [
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "508": {
+  "scene_id": 710,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "509": {
+  "scene_id": 711,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "510": {
+  "scene_id": 712,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "511": {
+  "scene_id": 713,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "512": {
+  "scene_id": 715,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "514": {
+  "scene_id": 717,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "515": {
+  "scene_id": 718,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "516": {
+  "scene_id": 720,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "517": {
+  "scene_id": 721,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "518": {
+  "scene_id": 722,
+  "bins": [
+   1,
+   4
+  ],
+  "mode": "base",
+  "side": "left",
+  "hand_present": false,
+  "pair": [
+   1,
+   4
+  ]
+ },
+ "519": {
+  "scene_id": 723,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "520": {
+  "scene_id": 725,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "521": {
+  "scene_id": 726,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "522": {
+  "scene_id": 727,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "523": {
+  "scene_id": 728,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "524": {
+  "scene_id": 730,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "525": {
+  "scene_id": 731,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "526": {
+  "scene_id": 732,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "527": {
+  "scene_id": 733,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "528": {
+  "scene_id": 735,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "529": {
+  "scene_id": 736,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "530": {
+  "scene_id": 737,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "531": {
+  "scene_id": 738,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "532": {
+  "scene_id": 740,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "533": {
+  "scene_id": 741,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "534": {
+  "scene_id": 742,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "535": {
+  "scene_id": 743,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "536": {
+  "scene_id": 745,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "537": {
+  "scene_id": 746,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "538": {
+  "scene_id": 747,
+  "bins": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   1
+  ]
+ },
+ "539": {
+  "scene_id": 748,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "540": {
+  "scene_id": 750,
+  "bins": [
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "541": {
+  "scene_id": 751,
+  "bins": [
+   0,
+   1,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   1
+  ]
+ },
+ "542": {
+  "scene_id": 752,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "543": {
+  "scene_id": 753,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "544": {
+  "scene_id": 755,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "545": {
+  "scene_id": 756,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "546": {
+  "scene_id": 757,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "547": {
+  "scene_id": 758,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "552": {
+  "scene_id": 765,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "553": {
+  "scene_id": 766,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "554": {
+  "scene_id": 767,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "555": {
+  "scene_id": 768,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "556": {
+  "scene_id": 770,
+  "bins": [
+   1,
+   2,
+   3,
+   4
+  ],
+  "mode": "base",
+  "side": "right",
+  "hand_present": false,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "557": {
+  "scene_id": 771,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "558": {
+  "scene_id": 772,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "559": {
+  "scene_id": 773,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "561": {
+  "scene_id": 781,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "563": {
+  "scene_id": 783,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "564": {
+  "scene_id": 785,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "565": {
+  "scene_id": 786,
+  "bins": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   1
+  ]
+ },
+ "566": {
+  "scene_id": 787,
+  "bins": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   1
+  ]
+ },
+ "567": {
+  "scene_id": 788,
+  "bins": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   1
+  ]
+ },
+ "568": {
+  "scene_id": 790,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "569": {
+  "scene_id": 791,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "570": {
+  "scene_id": 792,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "571": {
+  "scene_id": 793,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "572": {
+  "scene_id": 795,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "573": {
+  "scene_id": 796,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "574": {
+  "scene_id": 797,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "575": {
+  "scene_id": 798,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "576": {
+  "scene_id": 805,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "577": {
+  "scene_id": 806,
+  "bins": [
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "578": {
+  "scene_id": 807,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "579": {
+  "scene_id": 808,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "580": {
+  "scene_id": 810,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "581": {
+  "scene_id": 811,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "582": {
+  "scene_id": 812,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "583": {
+  "scene_id": 813,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "584": {
+  "scene_id": 815,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "585": {
+  "scene_id": 816,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "586": {
+  "scene_id": 817,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "587": {
+  "scene_id": 818,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "588": {
+  "scene_id": 820,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "589": {
+  "scene_id": 821,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "590": {
+  "scene_id": 822,
+  "bins": [
+   0,
+   1,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   1
+  ]
+ },
+ "591": {
+  "scene_id": 823,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "592": {
+  "scene_id": 825,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "594": {
+  "scene_id": 827,
+  "bins": [
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "595": {
+  "scene_id": 828,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "596": {
+  "scene_id": 830,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "597": {
+  "scene_id": 831,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "598": {
+  "scene_id": 832,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "599": {
+  "scene_id": 833,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "600": {
+  "scene_id": 835,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "601": {
+  "scene_id": 836,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "602": {
+  "scene_id": 837,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "603": {
+  "scene_id": 838,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "604": {
+  "scene_id": 840,
+  "bins": [
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "605": {
+  "scene_id": 841,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "606": {
+  "scene_id": 842,
+  "bins": [
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "607": {
+  "scene_id": 843,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "608": {
+  "scene_id": 845,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "609": {
+  "scene_id": 846,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "610": {
+  "scene_id": 847,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "611": {
+  "scene_id": 848,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "612": {
+  "scene_id": 850,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "613": {
+  "scene_id": 851,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "614": {
+  "scene_id": 852,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "615": {
+  "scene_id": 853,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "616": {
+  "scene_id": 855,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "617": {
+  "scene_id": 856,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "618": {
+  "scene_id": 857,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "619": {
+  "scene_id": 858,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "624": {
+  "scene_id": 865,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "625": {
+  "scene_id": 866,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "626": {
+  "scene_id": 867,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "627": {
+  "scene_id": 868,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "628": {
+  "scene_id": 870,
+  "bins": [
+   0,
+   1,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   1
+  ]
+ },
+ "629": {
+  "scene_id": 871,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "630": {
+  "scene_id": 872,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "631": {
+  "scene_id": 873,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "634": {
+  "scene_id": 882,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "636": {
+  "scene_id": 885,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "637": {
+  "scene_id": 886,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "638": {
+  "scene_id": 887,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "639": {
+  "scene_id": 888,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "641": {
+  "scene_id": 891,
+  "bins": [
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "642": {
+  "scene_id": 892,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "643": {
+  "scene_id": 893,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "644": {
+  "scene_id": 895,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "645": {
+  "scene_id": 896,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "646": {
+  "scene_id": 897,
+  "bins": [
+   0
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "647": {
+  "scene_id": 898,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "648": {
+  "scene_id": 905,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "649": {
+  "scene_id": 906,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "650": {
+  "scene_id": 907,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "651": {
+  "scene_id": 908,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "652": {
+  "scene_id": 910,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "653": {
+  "scene_id": 911,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "654": {
+  "scene_id": 912,
+  "bins": [
+   0,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   4
+  ]
+ },
+ "655": {
+  "scene_id": 913,
+  "bins": [
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "656": {
+  "scene_id": 915,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "657": {
+  "scene_id": 916,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "658": {
+  "scene_id": 917,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "659": {
+  "scene_id": 918,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "660": {
+  "scene_id": 920,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "661": {
+  "scene_id": 921,
+  "bins": [
+   0,
+   2
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   2
+  ]
+ },
+ "662": {
+  "scene_id": 922,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "663": {
+  "scene_id": 923,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "664": {
+  "scene_id": 925,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "665": {
+  "scene_id": 926,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "666": {
+  "scene_id": 927,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "667": {
+  "scene_id": 928,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "668": {
+  "scene_id": 930,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "669": {
+  "scene_id": 931,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "670": {
+  "scene_id": 932,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "671": {
+  "scene_id": 933,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "672": {
+  "scene_id": 935,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "673": {
+  "scene_id": 936,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "674": {
+  "scene_id": 937,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "675": {
+  "scene_id": 938,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "676": {
+  "scene_id": 940,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "677": {
+  "scene_id": 941,
+  "bins": [
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "678": {
+  "scene_id": 942,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "679": {
+  "scene_id": 943,
+  "bins": [
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "680": {
+  "scene_id": 945,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "681": {
+  "scene_id": 946,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "682": {
+  "scene_id": 947,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "683": {
+  "scene_id": 948,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "685": {
+  "scene_id": 951,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "686": {
+  "scene_id": 952,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "687": {
+  "scene_id": 953,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "688": {
+  "scene_id": 955,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "689": {
+  "scene_id": 956,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "690": {
+  "scene_id": 957,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "691": {
+  "scene_id": 958,
+  "bins": [
+   0,
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "696": {
+  "scene_id": 965,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "697": {
+  "scene_id": 966,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "698": {
+  "scene_id": 967,
+  "bins": [
+   0,
+   2,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   4
+  ]
+ },
+ "699": {
+  "scene_id": 968,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "700": {
+  "scene_id": 970,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "701": {
+  "scene_id": 971,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "702": {
+  "scene_id": 972,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "703": {
+  "scene_id": 973,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "704": {
+  "scene_id": 980,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "705": {
+  "scene_id": 981,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true
+ },
+ "708": {
+  "scene_id": 985,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "709": {
+  "scene_id": 986,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "710": {
+  "scene_id": 987,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "711": {
+  "scene_id": 988,
+  "bins": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "712": {
+  "scene_id": 990,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "713": {
+  "scene_id": 991,
+  "bins": [
+   2,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "714": {
+  "scene_id": 992,
+  "bins": [
+   0,
+   3,
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   3,
+   4
+  ]
+ },
+ "715": {
+  "scene_id": 993,
+  "bins": [
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ },
+ "716": {
+  "scene_id": 995,
+  "bins": [
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "717": {
+  "scene_id": 996,
+  "bins": [
+   2,
+   3
+  ],
+  "mode": "wrist",
+  "side": "right",
+  "hand_present": true,
+  "pair": [
+   2,
+   3
+  ]
+ },
+ "718": {
+  "scene_id": 997,
+  "bins": [
+   0,
+   3
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true,
+  "pair": [
+   0,
+   3
+  ]
+ },
+ "719": {
+  "scene_id": 998,
+  "bins": [
+   4
+  ],
+  "mode": "wrist",
+  "side": "left",
+  "hand_present": true
+ }
+}

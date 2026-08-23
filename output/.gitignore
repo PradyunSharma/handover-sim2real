@@ -21,6 +21,21 @@
 !bc_dataset/*_regrasp.json
 !bc_dataset/*_regrasp_excluded.json
 
+# REGRASP tables. Same reasoning again, and it bit: none of these matched a
+# whitelist above, so a fresh checkout on the cluster had NO tables at all and
+# the pipeline stopped at its preflight. ~3 MB for all of them.
+#
+# `direction_table_*` is a GPU sim pass (~20 min/split) and is the input every
+# later stage is derived from. `regrasp_pins_*` is what says WHICH direction a
+# run committed to per scene, so a dagger_log cannot be interpreted without it.
+# `regrasp_demos_*_ok.json` records which (scene, bin) pairs the collection
+# actually managed — it is the difference between the table and the data, and
+# the .h5 it came from lives on /scratch and is never committed.
+!direction_table_*.json
+!direction_feasibility_*.json
+!regrasp_pins_*.json
+!regrasp_demos_*_ok.json
+
 # Track lightweight per-run metadata under rl_runs/ (training logs, plots, and
 # configs) so runs can be committed/pushed for record-keeping. The parent dirs
 # must be re-included first, then the specific files. The large checkpoints/

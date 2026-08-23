@@ -18,16 +18,19 @@
 # run in PARALLEL rather than in sequence, and each stage asks for the resources
 # it actually needs instead of the maximum any stage needs.
 #
-#     A  collect train demos      GPU  ~4 h   ──┐
-#     B  collect val demos        GPU  ~20 m  ──┼──> D  smoke   ──> E  train
-#     C  build test dir. table    GPU  ~2 h   ──┼──────────────────────┴──> F  test eval
-#                                               │
-#     (A, B, C start immediately and in parallel)
+#     T  train direction table ──> A  collect train demos ──┐
+#     V  val   direction table ──> B  collect val demos   ──┴─> D  smoke ─> E  train
+#     C  test  direction table ───────────────────────────────────────┴──> F  test eval
 #
-# D also DERIVES `demo_ok_table` from A's shard, and F derives the test pin table
-# from C's direction table — both are seconds of pure combinatorics, and folding
-# them into the job that needs them is what removes the two manual steps that
-# used to sit between the long jobs.
+#     T, V and C start immediately and in PARALLEL. T/V/C are usually skipped —
+#     the direction tables are tracked in git — so the normal case is A, B, C
+#     going in together.
+#
+# Every derived-but-cheap artefact is produced by the job that needs it, which is
+# what removes the manual steps that used to sit between the long jobs: A and B
+# assign their pin tables from the direction table, D derives `demo_ok_table`
+# from A's shard, and F assigns the test pin table from C's direction table. All
+# three are seconds of pure combinatorics.
 #
 # IDEMPOTENT. Every stage whose output already exists is skipped, so re-running
 # this after a partial failure resubmits only what is missing. That matters most
@@ -96,13 +99,13 @@ submit() {
     echo "$jid"
 }
 
-# ── preflight: the two things this pipeline cannot produce ───────────────────
-# The TRAIN direction table is the output of a sim pass that is not part of this
-# chain (it is built once and reused across runs), and the configs are the
-# experiment itself. Failing here costs a second; failing inside job A costs a
-# queue wait plus four hours.
-for f in output/direction_table_train.json output/direction_table_val.json \
-         "$CFG" "$SMOKE_CFG" "$SIM_CFG"; do
+# ── preflight: only the things this pipeline genuinely cannot produce ────────
+# The configs ARE the experiment; nothing can derive them. The direction tables
+# used to be checked here too, and that was wrong — they are the output of a
+# 20-minute GPU pass, so a fresh checkout (where they are the one thing not in
+# git) stopped at the preflight instead of just building them. They are stages
+# now.
+for f in "$CFG" "$SMOKE_CFG" "$SIM_CFG"; do
     [ -f "$f" ] || { echo "ERROR: missing $f" >&2; exit 1; }
 done
 mkdir -p slurm_logs output
@@ -128,24 +131,26 @@ note "shards  : $REGRASP_DATA/bc_dataset/   (tables stay in the repo)"
 # Pure combinatorics over the direction table. Running it inline means a mistake
 # in the bin set or the drop list surfaces NOW, with its histogram printed, and
 # not four hours later inside a collection job.
-if [ "$FORCE" = "1" ] || [ ! -f output/regrasp_pins_train.json ]; then
-    say "[0] assigning train demos (one per reachable bin)"
+# Only when the direction table is already present. When it is not, the
+# collection job derives the pin table itself after the table build lands — the
+# assignment has to happen SOMEWHERE downstream of a job either way, and doing it
+# here as well would just be a second copy of the same call.
+assign_now() {   # $1 = split
+    local sp="$1" dt="output/direction_table_$1.json" out="output/regrasp_pins_$1"
+    if [ "$FORCE" != "1" ] && [ -f "${out}.json" ]; then
+        note "[0] ${out}.json exists — skipping"; return
+    fi
+    if [ ! -f "$dt" ]; then
+        note "[0] $dt not built yet — the collection job will assign $sp pins"
+        return
+    fi
+    say "[0] assigning $sp demos (one per reachable bin)"
     [ "$DRY" = "1" ] || python examples/assign_direction_demos.py \
-        --table output/direction_table_train.json \
-        --out output/regrasp_pins_train --mode per-bin \
+        --table "$dt" --out "$out" --mode per-bin \
         --drop-bins='-z_beneath,-x_over_fingers'
-else
-    note "[0] output/regrasp_pins_train.json exists — skipping"
-fi
-if [ "$FORCE" = "1" ] || [ ! -f output/regrasp_pins_val.json ]; then
-    [ "$DRY" = "1" ] || python examples/assign_direction_demos.py \
-        --table output/direction_table_val.json \
-        --out output/regrasp_pins_val --mode per-bin \
-        --drop-bins='-z_beneath,-x_over_fingers' >/dev/null
-    note "[0] assigned val demos"
-else
-    note "[0] output/regrasp_pins_val.json exists — skipping"
-fi
+}
+assign_now train
+assign_now val
 
 # ── is an existing shard RUN 2's, or run 1's left lying in the same path? ────
 # "The file exists" is not "the file is right". Run 1's shards sit at exactly
@@ -189,7 +194,40 @@ retire_stale() {
     [ "$DRY" = "1" ] || mv "$f" "$to"
 }
 
-# ── stages A, B, C: independent, submitted together ──────────────────────────
+# `--dependency=afterok:a:b` waits for BOTH and refuses to start if either fails,
+# which is what makes a broken stage stop the chain instead of feeding garbage
+# forward. An empty argument list means every predecessor was skipped, and the
+# stage is then submitted with no dependency at all.
+dep_of() {
+    local ids=("$@") out=""
+    for i in "${ids[@]}"; do [ -n "$i" ] && out="${out}:${i}"; done
+    [ -n "$out" ] && echo "--dependency=afterok${out}" || true
+}
+
+# ── stages T, V: the direction tables, when they are not in the repo ─────────
+# One GPU sim pass per split (`run_omg_planner(reset_scene=True)` on every scene,
+# recording each bin's closest-to-axis grasp). They are tracked in git and so are
+# usually already here — but a fresh checkout on a machine where output/ was
+# never populated needs them built, and that is a 20-minute job, not a reason to
+# stop. Collection depends on the matching one.
+T=""; V=""
+say "[T-V] direction tables"
+if [ "$FORCE" = "1" ] || [ ! -f output/direction_table_train.json ]; then
+    T=$(submit "T build train direction table (~20 min)" --time=04:00:00 \
+        --export=ALL,SPLIT=train,SIM_CFG="$SIM_CFG",OUT=output/direction_table_train.json \
+        examples/slurm/build_direction_table.sbatch)
+else
+    note "T output/direction_table_train.json exists — skipping"
+fi
+if [ "$FORCE" = "1" ] || [ ! -f output/direction_table_val.json ]; then
+    V=$(submit "V build val direction table (~3 min)" --time=02:00:00 \
+        --export=ALL,SPLIT=val,SIM_CFG="$SIM_CFG",OUT=output/direction_table_val.json \
+        examples/slurm/build_direction_table.sbatch)
+else
+    note "V output/direction_table_val.json exists — skipping"
+fi
+
+# ── stages A, B, C: collection and the test-split table ──────────────────────
 say "[A-C] collection and the test-split table (parallel)"
 DEPS=()
 
@@ -220,7 +258,7 @@ if { [ ! -f "$TRAIN_H5" ] || [ "$TRAIN_STALE" = "1" ]; } \
 fi
 
 if [ "$FORCE" = "1" ] || [ "$TRAIN_STALE" = "1" ] || [ ! -f "$TRAIN_H5" ]; then
-    A=$(submit "A collect train (~4 h)" --time=20:00:00 \
+    A=$(submit "A collect train (~4 h)" --time=20:00:00 $(dep_of "$T") \
         --export=ALL,SPLIT=train,SIM_CFG="$SIM_CFG",OUT="$TRAIN_H5",PIN=output/regrasp_pins_train.json,REGRASP_DATA="$REGRASP_DATA" \
         examples/slurm/collect_regrasp_demos.sbatch)
     DEPS+=("$A")
@@ -229,7 +267,7 @@ else
 fi
 
 if [ "$FORCE" = "1" ] || [ "$VAL_STALE" = "1" ] || [ ! -f "$VAL_H5" ]; then
-    B=$(submit "B collect val (~20 min)" --time=03:00:00 \
+    B=$(submit "B collect val (~20 min)" --time=03:00:00 $(dep_of "$V") \
         --export=ALL,SPLIT=val,SIM_CFG="$SIM_CFG",OUT="$VAL_H5",PIN=output/regrasp_pins_val.json,REGRASP_DATA="$REGRASP_DATA" \
         examples/slurm/collect_regrasp_demos.sbatch)
     DEPS+=("$B")
@@ -247,15 +285,6 @@ if [ "$FORCE" = "1" ] || [ ! -f output/direction_table_test.json ]; then
 else
     note "C output/direction_table_test.json exists — skipping"
 fi
-
-# `--dependency=afterok:a:b` waits for BOTH and refuses to start if either fails,
-# which is what makes a broken stage stop the chain instead of feeding garbage
-# forward. An empty dependency list means the predecessors were all skipped.
-dep_of() {
-    local ids=("$@") out=""
-    for i in "${ids[@]}"; do [ -n "$i" ] && out="${out}:${i}"; done
-    [ -n "$out" ] && echo "--dependency=afterok${out}" || true
-}
 
 # ── stage D: the shakedown ───────────────────────────────────────────────────
 # Two iterations, m=8, three eval scenes. It also derives `demo_ok_table` from

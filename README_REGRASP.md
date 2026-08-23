@@ -148,10 +148,14 @@ submits six SLURM jobs wired together with `--dependency=afterok`, and returns i
 about a second:
 
 ```
-A  collect train demos      GPU  ~4 h   ──┐
-B  collect val demos        GPU  ~20 m  ──┼──> D  smoke ──> E  train
-C  build test dir. table    GPU  ~2 h   ──┴────────────────────┴──> F  test eval
+T  train direction table ──> A  collect train demos ──┐
+V  val   direction table ──> B  collect val demos   ──┴─> D  smoke ─> E  train
+C  test  direction table ─────────────────────────────────────┴───> F  test eval
 ```
+
+T, V and C are normally **skipped** — the direction tables are tracked in git —
+so the usual case is A, B and C going in together. They exist as stages so a
+checkout whose `output/` was never populated builds them rather than stopping.
 
 It cannot be one job: the chain is ~30 h and DelftBlue caps at 24. Splitting it
 also means A, B and C run in **parallel**, a failure costs only its own stage,

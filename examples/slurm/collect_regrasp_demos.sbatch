@@ -120,6 +120,26 @@ REGRASP_DATA="${REGRASP_DATA:-${SCRATCH_ROOT:+${SCRATCH_ROOT}/output}}"
 REGRASP_DATA="${REGRASP_DATA:-output}"
 OUT="${OUT:-${REGRASP_DATA}/bc_dataset/${SPLIT}_regrasp.h5}"
 mkdir -p "$(dirname "${OUT}")"
+
+# ── derive the pin table from the direction table if it is missing ───────────
+# `assign_direction_demos.py` is pure combinatorics — seconds, no simulator — so
+# an absent pin table is not a reason to fail a job that has already waited in
+# the queue. The DIRECTION table is the real prerequisite: building that needs
+# the planner and its own GPU pass.
+DIR_TABLE="${DIR_TABLE:-output/direction_table_${SPLIT}.json}"
+if [ ! -f "${PIN}" ]; then
+    if [ ! -f "${DIR_TABLE}" ]; then
+        echo "ERROR: neither ${PIN} nor ${DIR_TABLE} exists." >&2
+        echo "  Build the ${SPLIT}-split direction table first:" >&2
+        echo "    sbatch --export=ALL,SPLIT=${SPLIT},OUT=${DIR_TABLE} \\" >&2
+        echo "        examples/slurm/build_direction_table.sbatch" >&2
+        exit 1
+    fi
+    echo "[prep] ${PIN} missing — assigning it from ${DIR_TABLE}"
+    python examples/assign_direction_demos.py --table "${DIR_TABLE}" \
+        --out "${PIN%.json}" --mode per-bin \
+        --drop-bins='-z_beneath,-x_over_fingers'
+fi
 VGD="${VGD:-examples/valid_grasp_dict_005.pkl}"           # Phase-3/4/5 grasp set
 PIN="${PIN:-output/grasp_cand_table_${SPLIT}_p5.json}"    # K candidates per scene
 SEED="${SEED:-0}"
