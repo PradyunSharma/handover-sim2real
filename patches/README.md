@@ -8,20 +8,26 @@ failure this directory exists to prevent.
 Apply after `git submodule update --init --recursive`:
 
 ```bash
-git apply --directory=OMG-Planner patches/omg_planner_handover.patch
+for p in patches/omg_planner_*.patch; do git apply --directory=OMG-Planner "$p"; done
 ```
 
-Idempotent check (prints nothing and exits 0 when already applied):
+`examples/slurm/setup_cluster_env.sh` does this for you, skipping any patch that
+is already applied.
+
+**ONE FILE PER CHANGE, and that is not tidiness.** `git apply` is atomic across a
+whole patch file: if one hunk is already present the entire application fails,
+taking with it the hunks that were still needed. A combined patch did exactly
+that — `planner.py` was already applied on the cluster, so the file was rejected
+whole and the `util.py` crash fix that was the reason for running it never
+landed. Separate files fail separately.
+
+Check whether a patch is already applied (exits 0 = yes):
 
 ```bash
-git apply --check --reverse --directory=OMG-Planner patches/omg_planner_handover.patch
+git apply --check --reverse --directory=OMG-Planner patches/<name>.patch
 ```
 
-## `omg_planner_handover.patch`
-
-Two independent changes to two files.
-
-### `omg/util.py` — `ycb_special_case` crashes on an empty grasp set
+## `omg_planner_util_empty_goalset.patch` — `ycb_special_case` crashes on an empty grasp set
 
 For `037_scissors`, `010_potted_meat_can`, `061_foam_brick`, `024_bowl` and
 `025_mug` the function applies a position constraint and then reads Euler angles
@@ -42,7 +48,7 @@ sat undiscovered through every Phase-4 and Phase-5 run and only surfaced when
 `build_direction_table.py --split test` was first run — job 2656, a deterministic
 failure that resubmitting cannot fix.
 
-### `omg/planner.py` — the `external_grasp_filter` hook
+## `omg_planner_hand_filter.patch` — the `external_grasp_filter` hook
 
 `handover_sim2real/train_env.py:120` registers
 `_hand_grasp_collision_mask` on the OMG scene env so `setup_goal_set` can prune

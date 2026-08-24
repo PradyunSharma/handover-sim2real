@@ -55,15 +55,24 @@ echo "--- pointnet2_ops (GA-DDPG PointNet++) ---"
 # s0 TEST split (`ycb_special_case` indexing an empty array), which is invisible
 # on train and so survived every run until the test tables were first built.
 # See patches/README.md.
-if [ -f patches/omg_planner_handover.patch ]; then
-    if git apply --check --reverse --directory=OMG-Planner \
-            patches/omg_planner_handover.patch 2>/dev/null; then
-        echo "--- OMG-Planner patches already applied ---"
+# ONE FILE PER PATCH, applied independently. `git apply` is ATOMIC across the
+# whole patch: a single hunk that is already present makes the entire file fail,
+# taking the hunks that were still needed with it. That is not hypothetical — a
+# combined patch failed on planner.py (already applied on that machine) and so
+# silently skipped the util.py crash fix that was the reason for running it.
+for _p in patches/omg_planner_*.patch; do
+    [ -f "$_p" ] || continue
+    if git apply --check --reverse --directory=OMG-Planner "$_p" 2>/dev/null; then
+        echo "--- $(basename "$_p"): already applied ---"
+    elif git apply --check --directory=OMG-Planner "$_p" 2>/dev/null; then
+        echo "--- $(basename "$_p"): applying ---"
+        git apply --directory=OMG-Planner "$_p"
     else
-        echo "--- applying OMG-Planner patches ---"
-        git apply --directory=OMG-Planner patches/omg_planner_handover.patch
+        echo "!!! $(basename "$_p"): does NOT apply and is NOT already applied." >&2
+        echo "    OMG-Planner/ has diverged from the pinned $(git ls-tree --abbrev=7 HEAD OMG-Planner | awk '{print $3}')." >&2
+        echo "    Inspect by hand — see patches/README.md." >&2
     fi
-fi
+done
 
 echo "--- omg_cuda (OMG-Planner SDF loss) ---"
 ( cd OMG-Planner/layers

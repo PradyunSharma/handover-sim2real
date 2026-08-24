@@ -1,0 +1,30 @@
+diff --git a/omg/util.py b/omg/util.py
+index 4fa47d3..5a79c3c 100644
+--- a/omg/util.py
++++ b/omg/util.py
+@@ -337,6 +337,14 @@ def ycb_special_case(pose_grasp, name):
+         z_constraint = np.where((np.abs(pose_grasp[:, 2, 3]) > 0.09) * \
+                  (np.abs(pose_grasp[:, 1, 3]) > 0.02) * (np.abs(pose_grasp[:, 0, 3]) < 0.05))
+         pose_grasp = pose_grasp[z_constraint[0]]
++        # The z_constraint above can reject EVERY candidate, in which case
++        # `top_down` below is [] and np.array([]) is 1-D, so the [:,1] raises
++        # "IndexError: too many indices". An empty grasp set is a legitimate
++        # outcome — the caller already handles it as "Planning not run due to
++        # empty goal set" — so return it rather than crashing the process.
++        # Never fires on the s0 TRAIN split; it does on test (scene 75).
++        if len(pose_grasp) == 0:
++            return pose_grasp
+         top_down = []
+ 
+         for pose in pose_grasp:
+@@ -351,6 +359,10 @@ def ycb_special_case(pose_grasp, name):
+             angle = 50 # 30
+         else:
+             angle = 30 # 15
++        # Same guard as the branch above: an upstream filter can hand this an
++        # empty set, and np.array([])[:,1] raises instead of staying empty.
++        if len(pose_grasp) == 0:
++            return pose_grasp
+         top_down = []
+         for pose in pose_grasp:
+             top_down.append(mat2euler(pose[:3, :3]))
