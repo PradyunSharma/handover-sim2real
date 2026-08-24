@@ -135,10 +135,26 @@ note "shards  : $REGRASP_DATA/bc_dataset/   (tables stay in the repo)"
 # collection job derives the pin table itself after the table build lands — the
 # assignment has to happen SOMEWHERE downstream of a job either way, and doing it
 # here as well would just be a second copy of the same call.
+# `_meta.mode` must read per-bin. Run 1's tables live at exactly these paths and
+# hold the max-separated PAIR (1088 demos, `stage: assign_direction_pairs`)
+# rather than one demo per bin (1596). Skipping on existence alone would collect
+# run 2 under run 1's assignment — the same class of silent-wrong-answer as a
+# stale shard, and cheaper to check because the mode is recorded in the file.
+table_is_per_bin() {
+    python - "$1" <<'PROBE' 2>/dev/null
+import json, sys
+m = (json.load(open(sys.argv[1])).get("_meta") or {})
+raise SystemExit(0 if m.get("mode") == "per-bin" else 1)
+PROBE
+}
+
 assign_now() {   # $1 = split
     local sp="$1" dt="output/direction_table_$1.json" out="output/regrasp_pins_$1"
-    if [ "$FORCE" != "1" ] && [ -f "${out}.json" ]; then
-        note "[0] ${out}.json exists — skipping"; return
+    if [ "$FORCE" != "1" ] && [ -f "${out}.json" ] && table_is_per_bin "${out}.json"; then
+        note "[0] ${out}.json exists (per-bin) — skipping"; return
+    fi
+    if [ -f "${out}.json" ]; then
+        note "[0] ${out}.json is NOT per-bin (run 1's pair table) — regenerating"
     fi
     if [ ! -f "$dt" ]; then
         note "[0] $dt not built yet — the collection job will assign $sp pins"

@@ -1,0 +1,66 @@
+diff --git a/omg/planner.py b/omg/planner.py
+index 2e466a7..6ce8c71 100644
+--- a/omg/planner.py
++++ b/omg/planner.py
+@@ -529,9 +529,28 @@ class Planner(object):
+                 ik_goal_num = len(goal_set)
+ 
+                 if filter_collision:
+-                    collision_free = (
+-                        collide <= self.cfg.allow_collision_point
+-                    ).nonzero()  # == 0
++                    keep_mask = collide <= self.cfg.allow_collision_point  # == 0
++
++                    # Human-hand grasp filter (paper: filter out grasps where the
++                    # robot gripper collides with the human hand). handover-sim2real
++                    # registers a callback on the env; a no-op when unset so the
++                    # stock OMG behavior is unchanged. Receives the IK'd goal-set
++                    # joint configs, returns a boolean "hand-free" mask.
++                    hand_fn = getattr(env, "external_grasp_filter", None)
++                    if hand_fn is not None:
++                        # Check the FINAL grasp (reach_goal_set[:, -1]), not the
++                        # standoff configs in goal_set (== reach_goal_set[:, 0]),
++                        # which sit 8 cm back and never collide.
++                        rg = np.asarray(reach_goal_set)
++                        final_grasps = rg[:, -1] if rg.ndim == 3 else rg
++                        try:
++                            hand_free = np.asarray(hand_fn(final_grasps), dtype=bool)
++                            if hand_free.shape == keep_mask.shape:
++                                keep_mask = keep_mask & hand_free
++                        except Exception as e:
++                            print("external_grasp_filter skipped:", e)
++
++                    collision_free = keep_mask.nonzero()  # == 0
+ 
+                     new_goal_set = []
+                     ik_goal_num = len(goal_set)
+diff --git a/omg/util.py b/omg/util.py
+index 4fa47d3..5a79c3c 100644
+--- a/omg/util.py
++++ b/omg/util.py
+@@ -337,6 +337,14 @@ def ycb_special_case(pose_grasp, name):
+         z_constraint = np.where((np.abs(pose_grasp[:, 2, 3]) > 0.09) * \
+                  (np.abs(pose_grasp[:, 1, 3]) > 0.02) * (np.abs(pose_grasp[:, 0, 3]) < 0.05))
+         pose_grasp = pose_grasp[z_constraint[0]]
++        # The z_constraint above can reject EVERY candidate, in which case
++        # `top_down` below is [] and np.array([]) is 1-D, so the [:,1] raises
++        # "IndexError: too many indices". An empty grasp set is a legitimate
++        # outcome — the caller already handles it as "Planning not run due to
++        # empty goal set" — so return it rather than crashing the process.
++        # Never fires on the s0 TRAIN split; it does on test (scene 75).
++        if len(pose_grasp) == 0:
++            return pose_grasp
+         top_down = []
+ 
+         for pose in pose_grasp:
+@@ -351,6 +359,10 @@ def ycb_special_case(pose_grasp, name):
+             angle = 50 # 30
+         else:
+             angle = 30 # 15
++        # Same guard as the branch above: an upstream filter can hand this an
++        # empty set, and np.array([])[:,1] raises instead of staying empty.
++        if len(pose_grasp) == 0:
++            return pose_grasp
+         top_down = []
+         for pose in pose_grasp:
+             top_down.append(mat2euler(pose[:3, :3]))

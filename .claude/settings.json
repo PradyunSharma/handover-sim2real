@@ -97,7 +97,8 @@
       "Bash(bash -n examples/slurm/eval_regrasp_run.sbatch)",
       "Bash(grep -E \"dagger4_run\\(16|20\\)$\")",
       "Bash(bash -n examples/slurm/eval_regrasp_testset.sbatch)",
-      "Bash(chmod +x examples/slurm/eval_regrasp_testset.sbatch)"
+      "Bash(chmod +x examples/slurm/eval_regrasp_testset.sbatch)",
+      "Bash(bash -n examples/slurm/setup_cluster_env.sh)"
     ],
     "additionalDirectories": [
       "/home/pradyun/h2r/handover-sim2real/examples/configs",

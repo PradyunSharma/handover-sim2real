@@ -48,6 +48,23 @@ echo "--- pointnet2_ops (GA-DDPG PointNet++) ---"
 ( cd GA-DDPG/Pointnet2_PyTorch/pointnet2_ops_lib
   rm -rf build pointnet2_ops/_ext.cpython-38*.so *.egg-info
   TORCH_CUDA_ARCH_LIST=7.0 pip install -e . --no-build-isolation )
+# ── local patches to the vendored submodules ────────────────────────────────
+# OMG-Planner is pinned to upstream NVlabs, which we cannot push to, so source
+# fixes live in patches/ rather than as submodule commits — and a fresh clone
+# therefore does NOT have them. One of the two is a deterministic crash on the
+# s0 TEST split (`ycb_special_case` indexing an empty array), which is invisible
+# on train and so survived every run until the test tables were first built.
+# See patches/README.md.
+if [ -f patches/omg_planner_handover.patch ]; then
+    if git apply --check --reverse --directory=OMG-Planner \
+            patches/omg_planner_handover.patch 2>/dev/null; then
+        echo "--- OMG-Planner patches already applied ---"
+    else
+        echo "--- applying OMG-Planner patches ---"
+        git apply --directory=OMG-Planner patches/omg_planner_handover.patch
+    fi
+fi
+
 echo "--- omg_cuda (OMG-Planner SDF loss) ---"
 ( cd OMG-Planner/layers
   rm -rf build dist omg.egg-info
