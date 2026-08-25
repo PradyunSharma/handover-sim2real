@@ -392,15 +392,25 @@ reach. On failure it is commanded a different side. `pc_channels` 5 → 7,
 `GraspEncoder` deleted, no global conditioning branch.
 
 Columns are Phase 4's, so a Regrasp row can be read straight across against a
-Phase-4 one, plus three this phase needs: `config`, `dirs/scene` (how many
-directions a scene demonstrates) and `command` (what vector the policy is
-actually told). β params are `beta_start`→`beta_end` for the given
-`beta_schedule`.
+Phase-4 one, plus four this phase needs: `config`, `dirs/scene` (how many
+directions a scene demonstrates), `command` (what vector the policy is actually
+told) and `epochs` (`TRAIN.base_epochs` / `TRAIN.iter_epochs` — the fit at
+iteration 0 and the refit every round after). β params are
+`beta_start`→`beta_end` for the given `beta_schedule`.
 
-| run | config | camera | iters | m | dirs/scene | command | init | β | DART free | DART reach | DART variant | aux task | loss | model flags | best iter | final | notes |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **regrasp_run1** | `regrasp_run1.yaml` | wrist+right | **19 of 25** | 354 → 176 | 1–2 (max-separated pair) | grasp axis `−R[:,2]` | warm-start (**best**.pt), PointNet++ from scratch | constant 0.75 | 0.3 | 0.3 | replace | no | pm (w=7) | nojoint, reach-tail ×2.5 (window **5**), **direction_cond**, head [256,256] | 8 (`success 0.354`) | `success 0.139` | Stopped at 19 by choice. `m` was 354 for iterations 1–5 and 176 for 6–19 — a budget correction, so **`D_steps` changes slope at iteration 6**. Base set 1087 episodes / 20386 steps over 617 scenes (471 paired, 146 single). Eval/collection read `best.pt`, the warm start read `best.pt` too. |
-| **regrasp_run2** | `regrasp_run2.yaml` | wrist+right | 20 (planned) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | warm-start (**last**.pt), PointNet++ from scratch | **linear 1.0→0.75** | 0.3 | 0.3 | replace | **yes** (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 1 with the protocol fixed and two method changes. See below. |
+**`epochs` only means what it says next to `init`.** Under `train_from_scratch:
+true` the per-iteration budget is a full refit from the pretrained encoder, and
+under a warm start it is a continuation of the previous iteration's weights — so
+"15 epochs" is a much larger fraction of the training a warm-started run gets
+than of a from-scratch one, and the two numbers are not comparable across rows
+with different `init`. Phase-4 run 16, for reference, was 100 / 25 from scratch.
+
+| run | config | camera | iters | m | dirs/scene | command | init | epochs (base/iter) | β | DART free | DART reach | DART variant | aux task | loss | model flags | best iter | final | notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **regrasp_run1** | `regrasp_run1.yaml` | wrist+right | **19 of 25** | 354 → 176 | 1–2 (max-separated pair) | grasp axis `−R[:,2]` | warm-start (**best**.pt), PointNet++ from scratch | 40 / 12 | constant 0.75 | 0.3 | 0.3 | replace | no | pm (w=7) | nojoint, reach-tail ×2.5 (window **5**), **direction_cond**, head [256,256] | 8 (`success 0.354`) | `success 0.139` | Stopped at 19 by choice. `m` was 354 for iterations 1–5 and 176 for 6–19 — a budget correction, so **`D_steps` changes slope at iteration 6**. Base set 1087 episodes / 20386 steps over 617 scenes (471 paired, 146 single). Eval/collection read `best.pt`, the warm start read `best.pt` too. |
+| **regrasp_run2** | `regrasp_run2.yaml` | wrist+right | 20 (planned) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | warm-start (**last**.pt), PointNet++ from scratch | 50 / 15 | **linear 1.0→0.75** | 0.3 | 0.3 | replace | **yes** (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 1 with the protocol fixed and two method changes. See below. |
+| **regrasp_fast1** | `regrasp_run2_fast.yaml` | wrist+right | **8 of 8** | 126 → 138 | **1–4 (one per bin)** | **bin axis** | warm-start (**last**.pt), PointNet++ from scratch | **20 / 6** | **linear 1.0→0.75** | 0.3 | 0.3 | replace | **yes** (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | 8 (`success 0.457`) | `success 0.457`, `dir_track 0.611`, `bin_diag 0.771` | Run 2's method at a fifth of the compute, on this laptop rather than DelftBlue, while the cluster was in maintenance. Five numbers turned down and nothing else: `num_iters` 20→8, `episodes_per_iter` 400→200, `base_epochs` 50→20, `iter_epochs` 15→6, `EVAL.num_scenes` 100→40. Base set 1596 episodes / 30028 steps over 617 scenes; ended at \|D\| 2624 episodes / 64257 steps, 53% of it on-policy. **First run in which DAgger moved anything.** See below. |
+| **regrasp_run3** | `regrasp_run3.yaml` | wrist+right | 20 (planned) | 1200 → ~742 | **1–4 bins × 3 grasps** (~7.4 slots) | **bin axis** | warm-start (**last**.pt), PointNet++ from scratch | 50 / 15 | linear 1.0→0.75 | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 2 with **three demonstrations per bin** instead of one, and nothing else: same frame, same k=6, same command, same network. Base set 1596 → **4578** demos over the same 617 scenes (91% of (scene, bin) pairs have ≥3 goal-set members). `episodes_per_iter` goes 400 → 1200 to hold the scene count at 100 — `max_grasps` triples, and leaving it at 400 would have drawn 33 scenes instead. See below. |
 
 ### Result: DAgger did not move success; the conditioning is read but not obeyed
 
@@ -534,6 +544,166 @@ plus `debug_dagger.png`, `media_curves.png`, a 2×3 `curves_regrasp.png` carryin
 `test_set_evaluation.png` from the test-split script, which also reports the
 **chained** retry ladder beside the independent `retry@k`. See
 [`README_REGRASP.md`](../README_REGRASP.md) steps 8–9.
+
+### regrasp_run3 — configured, not yet run
+
+`examples/configs/regrasp_run3.yaml`. **Six config diffs from run 2, five of them
+paths**; the only behavioural one is `episodes_per_iter`. The frame, `k`, the
+command, the network, the loss, DART and the β schedule are all run 2's, verbatim.
+
+**The change.** Each (scene, bin) carries **three** demonstrations instead of
+one — the three goal-set grasps closest to that bin's axis, or all of them where
+the bin holds fewer. 91% of (scene, bin) pairs on s0/train have three or more
+members, and the assignment emits **4578** demonstrations against run 2's 1596,
+over the same 617 scenes.
+
+**What it teaches is not what run 2's per-bin change taught.** The three share
+one command, so they do nothing further to break the scene→action confound —
+that job belongs to the four *different* commands a scene supplies, unchanged
+from run 2. What they teach is that a direction does not name a single pose,
+which is true and is exactly the situation at deployment: `retry.next_direction`
+issues a bin axis, and every grasp inside that bin is a correct answer to it.
+
+**The risk is mode-averaging, and it is worth stating before the run rather than
+diagnosing after.** `pose_loss: pm` is unimodal; three valid targets for one
+input get averaged, and the mean of three grasps need not be a grasp. This is the
+same failure that made multi-grasp Phase-4 data unusable without conditioning,
+arriving now from within a single command rather than across several. It is not a
+certainty — the three members lie within 45° of one axis rather than anywhere on
+the sphere, so the modes are far closer together than Phase-4's were. The
+signature to watch is `cond_sep` and the per-bin `bin_diag_rate` falling *while*
+`train_loss` also falls. If that appears, `--per-bin 2` is the response, not an
+architecture change.
+
+**Two consequences that are not obvious from the diff.**
+
+`max_grasps` goes 4 → 12, and `sample_pairs` draws `episodes_per_iter //
+max_grasps` scenes. Leaving `m` at 400 would therefore have drawn **33** scenes
+per iteration instead of 100, holding the episode count almost constant (~248 vs
+~259) while quietly collapsing scene diversity — which is this project's measured
+bottleneck, not episode count. Hence 1200, which holds 100 scenes and lets the
+episode count rise to ~742. That is 2.9× run 2's collection *and* a |D| growing
+2.9× faster, so budget roughly 2.5–3× run 2's wall clock. 800 (66 scenes, ~495
+episodes) is the honest middle if that does not fit.
+
+The pin table's slot order is **member-major** — `+x, +y, −y, +z, +x, …` rather
+than `+x, +x, +x, +y, …` — and that is load-bearing rather than cosmetic. The
+retry ladder reads a scene's slots in order, so bin-major grouping would make
+`retry@2` a second attempt at the *same* direction under an *identical* command:
+the policy would do the identical thing and `retry_at_k` would collapse into a
+measure of simulator noise. Verified on the assignment: 0 of 617 scenes have a
+repeated direction inside their first `n_bins` slots.
+
+**Prerequisite: the direction table must be rebuilt.** `--members-per-bin` is a
+build-time setting and run 2's table recorded one member per bin, so it cannot
+serve this run — the assignment refuses rather than silently emitting one. Build
+with 5 recorded and use 3, so trying 2 or 4 later is an offline re-run in seconds
+instead of another 20-minute simulator pass.
+
+**One known gap.** `GraspPinTable.keep_only` filters `(scene, bin)` pairs, not
+slots, so `demo_ok_table` keeps or drops all three members of a bin together. At
+one member per bin that was exactly right; at three, a bin whose first member
+demonstrated cleanly but whose third had a pin miss survives whole. The audit's
+`command vs bin axis` fingerprint (median 0.00° on run 2's clean shard) is the
+check, and `BCDataset`'s per-episode `bin_assigned != bin_realized` filter is the
+second line of defence.
+
+### regrasp_fast1 — run 2's method at a fifth of the compute, and the first run where DAgger moved
+
+DelftBlue went into a seven-day cluster-wide maintenance reservation before run 2
+could start, so run 2's config was copied to `regrasp_run2_fast.yaml` with five
+numbers turned down and **nothing else changed** — same one-demo-per-bin data,
+same bin-axis command, same aux head, same β schedule, same `last` everywhere —
+and run on this laptop instead. It completed all 8 iterations. Treat every level
+below as unreliable and every *direction* as the thing worth reading: 40 eval
+scenes give ~105 episodes and ~26 per bin, so a single per-bin point carries a
+binomial standard error near 0.09.
+
+| metric | first 4 iters (0–3) | last 4 iters (5–8) | Δ | run 1's Δ | chance |
+|---|---|---|---|---|---|
+| `success_rate` | 0.302 | 0.421 | **+0.119** | −0.008 | — |
+| `grasp_rate` | 0.293 | 0.412 | +0.119 | — | — |
+| `close_rate` | 0.369 | 0.493 | +0.124 | — | — |
+| `dir_err` | 51.98° | 35.22° | **−16.8°** | — | — |
+| `dir_track` | 0.422 | 0.609 | **+0.186** | +0.029 | — |
+| `bin_diag_rate` | 0.562 | 0.745 | **+0.183** | +0.033 | **0.25** |
+| `bin_hit_rate` | 0.236 | 0.298 | +0.062 | +0.046 | **0.25** |
+| `cond_sep` | 0.542 | 0.594 | +0.052 | −0.045 | — |
+| `retry@1` | 0.369 | 0.406 | +0.037 | — | — |
+| `retry@4` | 0.481 | 0.606 | +0.125 | — | — |
+
+**The conditioning is now obeyed, not merely read.** `bin_diag_rate` runs
+0.467 → 0.771 across the eight iterations against a chance level of 0.25, where
+run 1 sat essentially flat at 0.476 → 0.509 over nineteen. `dir_err` falls from
+62° to 35°, i.e. from "barely better than a random axis" to "within a bin
+half-width of the commanded one". Run 1's headline conclusion — *the channels
+reach the network but not the action* — does not survive the two method changes,
+and this is the result the phase existed to get.
+
+**Success moved too, which run 1's does not let you assume.** 0.30 → 0.46 is
+larger than the ±0.115 noise floor, but that floor was measured on 100 scenes and
+this eval has 40, so a single-run success comparison is still not something to
+lean on. What makes it more than noise is that it moves *together* with
+`grasp_rate`, `close_rate` and the retry ladder, all monotone-ish over the same
+iterations, and that `dir_track` — which starts near its floor and has room to
+move — carries the same trend far outside its own error.
+
+**`bin_hit_rate` is still the lagging metric, and the per-bin split says why.**
+Pooled it reads 0.276 at the end, barely above chance, exactly as in run 1 — but
+the four bins are nothing alike:
+
+| bin | n | `success` | `dir_track` | `bin_diag` | `bin_hit` | `f_human_contact` |
+|---|---|---|---|---|---|---|
+| `+x` free end | 28 | 0.250 | 0.612 | 0.821 | **0.536** | 0.286 |
+| `+y` lateral | 25 | **0.720** | 0.656 | 0.760 | 0.280 | 0.040 |
+| `−y` lateral | 23 | 0.435 | 0.562 | 0.696 | 0.130 | 0.043 |
+| `+z` top-down | 29 | 0.448 | 0.608 | 0.793 | 0.138 | 0.103 |
+
+The gripper *orients* correctly for all four bins (`bin_diag` 0.70–0.82) but only
+*arrives from* the commanded side for `+x`. `dir_err` and `sector_err` were split
+apart for precisely this reason and the split is earning its keep. Note also that
+`+x` — the free end, away from the giver, nominally the easiest approach and the
+best-represented bin in the data at 490 scenes — has both the **lowest** success
+and by far the highest human-contact failure rate. That is worth a look rather
+than an explanation; nothing in the design predicts it.
+
+**Retry is doing real work now.** At iteration 8 the ladder reads
+0.375 / 0.600 / 0.700 / 0.700 — a **+0.325** spread from one attempt to four,
+against run 1's `retry@2 − retry@1` of +0.054. Independent hypotheses that
+actually differ are what the whole retry story needs, and this is the first
+direct evidence of them.
+
+**It is a combination run, not a controlled test.** Five things moved against
+run 1 at once — the bin-axis command, one demo per bin instead of a separated
+pair, the aux head on, β scheduled from 1.0, and `last` everywhere — so nothing
+here attributes the gain to any single change. The two method changes are the
+likely cause and the bin-axis fix is the one with a mechanism (run 1 trained on a
+target a measured median 18.4° from the vector it would be commanded with at
+deployment), but that is reasoning, not measurement.
+
+**Caveats specific to how this run was executed.**
+
+- `EVAL.holdout: false`, as in run 1 — the 40 eval scenes are also collected on,
+  so these are train-set rates. The held-out number still has to come from
+  `examples/eval_regrasp_testset.py`, which needs `output/direction_table_test.json`
+  — the build that failed on DelftBlue (job 2656) and has not been re-run.
+- Val loss climbs monotonically 0.255 → 0.297 while train loss falls, and
+  `EVAL.ckpt: last` means the scored checkpoint is the progressively more overfit
+  one. The success rate rose anyway, which is a second data point for the standing
+  conclusion that val loss is a poor selection target here.
+- The laptop suspended twice mid-run, breaking CUDA both times (`nvidia_uvm`
+  needed reloading) and killing the process; the run resumed from `state.json`
+  with no data lost. **Iteration 6's `collect_s` and `train_s` read 0** because
+  its collection and refit had already completed before the crash — its wall time
+  is not comparable with the others.
+- `near_rate` is 0.000 throughout and remains dead under this methodology, as in
+  run 1: it measures distance to a pose the policy is never given.
+
+**What this licenses.** Running the full `regrasp_run2.yaml` on DelftBlue when the
+reservation lifts, unchanged. The fast run was scoped to answer "does the
+plumbing work and does `bin_diag_rate` leave chance" and it answered both yes; it
+cannot settle levels, and the per-bin `bin_hit` disparity above is the thing the
+full run should be read for first.
 
 ---
 
@@ -685,9 +855,13 @@ Configs without a numbered run file were shared across several runs.
 | `bc_phase4_reachw.yaml` | run 14 `TRAIN.train_cfg` — `DATA.reach_tail_weight: 2.5` |
 | `bc_phase4_all.yaml` | runs 15, 16 `TRAIN.train_cfg` — pm + aux + reach-tail weighting |
 | `bc_phase4_all_prevact.yaml` | run 17 `TRAIN.train_cfg` — same, `MODEL.use_prev_act: true` |
-| `dagger_phase5_run1.yaml` | p5_run1 (`examples/train_regrasp.py`) |
-| `dagger_phase5_smoke.yaml` | Phase-5 shakedown — 2 iters, m=8, 3 eval scenes |
-| `bc_phase5_cond.yaml` | p5_run1 `TRAIN.train_cfg` — `MODEL.grasp_cond`, aux head off, head `[512,256]` |
+| `regrasp_run1.yaml` | regrasp_run1 (`examples/train_regrasp.py`) |
+| `regrasp_run2.yaml` | regrasp_run2 — configured, awaiting the cluster |
+| `regrasp_run2_fast.yaml` | regrasp_fast1 — = run 2 with five numbers turned down, laptop-sized |
+| `regrasp_run3.yaml` | regrasp_run3 — = run 2 with three demonstrations per bin |
+| `regrasp_smoke.yaml` | Regrasp shakedown — 2 iters, m=8, 3 eval scenes |
+| `bc_regrasp.yaml` | regrasp_run1 `TRAIN.train_cfg` — `direction_cond`, aux head **off**, head `[256,256]` |
+| `bc_regrasp_run2.yaml` | regrasp_run2 and regrasp_fast1 `TRAIN.train_cfg` — = `bc_regrasp.yaml` + aux head **on** (`aux_weight: 1.0`) |
 
 ---
 

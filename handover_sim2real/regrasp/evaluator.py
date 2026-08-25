@@ -666,6 +666,25 @@ def _regrasp_metrics(rows, num_grasps: int) -> dict:
                    if any(per[g]["success"] for g in range(k) if g in per))
         out[f"retry_at_{k}"] = hits / n_scenes
 
+        # WHICH DIRECTION THE k-TH RUNG ACTUALLY WAS. The ladder walks a scene's
+        # pin slots in table order, and `assign_direction_demos --mode per-bin`
+        # emits them in ASCENDING BIN INDEX — so slot 0 is `+x` for a scene that
+        # can reach `+x` and `+y` for one that cannot. A rung is therefore a
+        # MIXTURE of directions across scenes, not one direction, and a legend
+        # naming a single bin would be wrong for every scene in the minority.
+        # Log the modal bin and its share so the figure can say "+x (79%)" and
+        # remain true. `retry_bin_frac` well below 1.0 is the signal that the
+        # ladder is not a fixed direction order and should not be read as one.
+        slot = [r for r in rows if int(r.get("grasp_idx", 0)) == k - 1]
+        if slot:
+            counts: dict[int, int] = {}
+            for r in slot:
+                b = int(r.get("bin_idx", -1))
+                counts[b] = counts.get(b, 0) + 1
+            top = max(counts.items(), key=lambda kv: (kv[1], -kv[0]))
+            out[f"retry_bin_{k}"] = top[0]
+            out[f"retry_bin_frac_{k}"] = top[1] / len(slot)
+
     # ---- DID IT GO WHERE IT WAS TOLD ---------------------------------------
     # This replaces `near_rate`, which measured distance to a pinned POSE the
     # policy was never given and now reads low for a reason that says nothing

@@ -1,24 +1,38 @@
 """
-Score a finished Regrasp run on the HELD-OUT s0 TEST split.
+Score a finished Regrasp run on a WHOLE split — held-out test, or the full train set.
 
     python examples/eval_regrasp_testset.py --run-dir output/dagger_runs/regrasp_run2
     python examples/eval_regrasp_testset.py --run-dir output/dagger_runs/regrasp_run2 \\
+        --split train                    # every train scene, not the eval subsample
+    python examples/eval_regrasp_testset.py --run-dir output/dagger_runs/regrasp_run2 \\
         --iters 0,5,10,15,20 --chained
     python examples/eval_regrasp_testset.py --run-dir output/dagger_runs/regrasp_run2 \\
-        --plot-only                      # re-render from an existing CSV
+        --split train --plot-only        # re-render from an existing CSV
 
 WHY THIS IS A SEPARATE SCRIPT AND NOT A FLAG ON THE TRAINER
 
-The in-loop evaluation runs with `EVAL.holdout: false` on the TRAIN split, which
-means its scenes are also collected on. That is deliberate — it makes the curves
-a clean read of "is the policy getting better at the thing it is being taught",
-uncontaminated by the extra variance of a small held-out sample — but it is a
-train-set number and must never be reported as anything else.
+The in-loop evaluation runs with `EVAL.holdout: false` on a `np.linspace`
+SUBSAMPLE of the train split — 100 scenes of ~617 in run 2, 40 in the fast run —
+and those scenes are also collected on. That is deliberate: a fixed subsample
+makes consecutive iterations a PAIRED comparison, so a trend is readable at a
+sample size where a single point is not. But it is a train-set number on a tenth
+of the train set, and it must never be reported as anything else.
 
-This script answers the other question, on scenes the run has never seen in any
-form: not held out from a pool, held out by the benchmark's own s0 split. It runs
-after training because it needs the whole iteration sequence and because putting
-it inline would double an already-long job for a number nobody acts on mid-run.
+This script answers the other two questions over a WHOLE split, once, after
+training — after, because it needs the entire iteration sequence and because
+putting it inline would double an already-long job for a number nobody acts on
+mid-run.
+
+  --split test   (the default) scenes the run has never seen in any form: not
+      held out from a pool, held out by the benchmark's own s0 split. THE
+      generalisation number.
+
+  --split train  every scene the run could have collected on, at ~6x the in-loop
+      sample. Still not held out — it is the in-loop curve's own question asked
+      at a sample size where per-BIN rates stop being noise. Use it to decide
+      whether a per-bin gap seen in `training_curve.png` is real, and never as
+      evidence the policy generalises. `demo_ok_table` is applied here (see
+      `main`) so the sweep scores the pairs the policy was actually taught.
 
 TWO EVALUATIONS, AND THEY ANSWER DIFFERENT QUESTIONS
 
@@ -40,12 +54,12 @@ TWO EVALUATIONS, AND THEY ANSWER DIFFERENT QUESTIONS
       with it. A real retreat controller drives the arm back along its own joint
       path without touching the human. That is the deferred experiment.
 
-OUTPUT
+OUTPUT, named by split so a train sweep cannot overwrite a test one
 
-  <run>/test_eval_log.csv        one row per iteration, the same ~340-column
+  <run>/<split>_eval_log.csv     one row per iteration, the same ~340-column
                                  schema as dagger_log.csv, so the two are
                                  directly diffable column for column
-  <run>/test_set_evaluation.png  the training_curve.png layout — one ROW per
+  <run>/<split>_set_evaluation.png  the training_curve.png layout — one ROW per
                                  commanded direction, columns success stages /
                                  chance vs conversion / approach error — plus a
                                  conditioning row: ended-in-the-commanded-bin per
@@ -58,19 +72,23 @@ run scored `best.pt`; from run 2 on the whole pipeline — collection, in-loop e
 warm start and this script — reads the same `last.pt`, so "the policy at iteration
 i" names one set of weights everywhere instead of three.
 
-PREREQUISITE: a TEST-split direction table and pin table, which are a separate
-sim pass:
+PREREQUISITE: a direction table and pin table for the split, which are a separate
+sim pass — except on train, where the run's own tables already exist and are
+reused as-is:
 
     python examples/build_direction_table.py --split test \\
         --out output/direction_table_test.json
     python examples/assign_direction_demos.py --table output/direction_table_test.json \\
         --out output/regrasp_pins_test --drop-bins='-z_beneath,-x_over_fingers'
 
-There is deliberately NO `demo_ok_table` on test. That file records which pairs
-base COLLECTION managed to demonstrate, and nothing is collected on test — the
-pin table itself is the feasibility statement, because it was built by calling
-the planner on every scene. Filtering test by the train split's collection
-failures would be scoring on a set defined by an unrelated run.
+There is deliberately NO `demo_ok_table` on test, and there deliberately IS one
+on train. The file records which (scene, bin) pairs base COLLECTION managed to
+demonstrate. Nothing is collected on test, so the pin table alone states
+feasibility there — it was built by calling the planner on every scene, and
+filtering test by the train split's collection failures would score on a set
+defined by an unrelated run. On train the pairs OMG could not demonstrate are
+pairs the policy was never taught, so scoring them charges the policy for
+directions absent from its data and breaks comparability with the in-loop curve.
 """
 
 from __future__ import annotations
@@ -119,17 +137,31 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run-dir", required=True, help="output/dagger_runs/<name>")
-    p.add_argument("--out", default="test_eval_log.csv")
+    p.add_argument("--out", default=None,
+                   help="default <split>_eval_log.csv, so a train sweep cannot "
+                        "silently overwrite a test one")
     p.add_argument("--iters", default="all",
                    help="'all' or a comma list, e.g. 0,5,10,15,20")
-    p.add_argument("--split", default="test",
-                   help="handover-sim split to score on (test | val)")
+    p.add_argument("--split", default="test", choices=["test", "val", "train"],
+                   help="handover-sim split to score on. `train` scores the FULL "
+                        "training set — every scene the run could have collected "
+                        "on, not the ~100-scene subsample the in-loop eval uses. "
+                        "It is not a held-out number and must never be reported "
+                        "as one; it answers 'how well did it learn what it was "
+                        "taught', at a sample size where per-bin rates are "
+                        "actually readable.")
     p.add_argument("--pin-table", default=None,
                    help="default output/regrasp_pins_<split>.json")
     p.add_argument("--exclude-scenes", default=None,
                    help="default output/regrasp_pins_<split>_excluded.json")
+    p.add_argument("--demo-ok-table", default=None,
+                   help="TRAIN ONLY, defaults to the run's own. Restricts scoring "
+                        "to the (scene, bin) pairs base collection actually "
+                        "demonstrated — without it a full-train sweep scores "
+                        "directions the policy was never taught. Pass '' to "
+                        "score every planned pair instead.")
     p.add_argument("--num-scenes", type=int, default=None,
-                   help="cap the number of test scenes (default: all of them)")
+                   help="cap the number of scenes (default: all of them)")
     p.add_argument("--ckpt", default="last", choices=["best", "last"],
                    help="which checkpoint of each iteration to score (default last, "
                         "matching everything else in the run)")
@@ -222,6 +254,10 @@ def plot(run_root: Path, log_path: Path, args) -> None:
     ctx = P._Ctx(num, it, args, "grasp")
     bins = P._bins_to_plot(num)
     cols = [P._BIN_COLOURS_BY_BIN[b] for b in bins]
+    # Panel titles carry the split, because the whole hazard of this figure is
+    # someone reading a full-TRAIN number as a held-out one. "TRAIN" on every
+    # axis is cheap insurance against that.
+    TAG = args.split.upper()
 
     nrow = max(len(bins), 1) + 1                 # + the conditioning row
     fig, ax = plt.subplots(nrow, 3, figsize=(17, 3.7 * nrow), squeeze=False)
@@ -247,7 +283,7 @@ def plot(run_root: Path, log_path: Path, args) -> None:
            va="top", transform=a.get_yaxis_transform())
     a.set_ylim(-0.02, 1.02)
     P._note_empty(a)
-    P._grid(a, "TEST: ended in the COMMANDED bin (per bin)",
+    P._grid(a, f"{TAG}: ended in the COMMANDED bin (per bin)",
             ylabel="fraction of that bin's episodes")
     P._legend(a, loc="upper left", ncol=2)
 
@@ -262,7 +298,7 @@ def plot(run_root: Path, log_path: Path, args) -> None:
     a.axhline(0.25, color="0.6", ls=":", lw=1.0)
     a.set_ylim(-0.02, 1.02)
     P._note_empty(a)
-    P._grid(a, "TEST: arrived from the COMMANDED side (per bin)",
+    P._grid(a, f"{TAG}: arrived from the COMMANDED side (per bin)",
             ylabel="fraction of that bin's episodes")
     P._legend(a, loc="upper left", ncol=2)
 
@@ -272,25 +308,27 @@ def plot(run_root: Path, log_path: Path, args) -> None:
     # attempt 1 actually left the arm.
     a = ax[nrow - 1][2]
     for k, col in zip(range(1, 5), ("tab:blue", "tab:green", "tab:orange", "tab:red")):
+        rung = P._rung(num, k)
         ys = num(f"retry_at_{k}")
         if P._finite(ys):
             P._plot(a, it, ys, "-", marker="o", ms=3, lw=1.4 + 0.2 * k, color=col,
-                    label=f"independent @ {k}")
+                    label=f"independent @ {k}{rung}")
         yc = num(f"chained_retry_at_{k}")
         if P._finite(yc):
             P._plot(a, it, yc, "--", marker="s", ms=3, lw=1.4, color=col,
-                    label=f"chained @ {k}")
+                    label=f"chained @ {k}{rung}")
     a.set_ylim(-0.02, 1.02)
     P._note_empty(a)
-    P._grid(a, "TEST: regrasping — success with k tries",
-            ylabel="fraction of test scenes")
+    P._grid(a, f"{TAG}: regrasping — success with k tries",
+            ylabel=f"fraction of {args.split} scenes")
     P._legend(a, loc="lower right", ncol=2)
 
     P._fix_x(fig, it)
-    fig.suptitle(f"Regrasp on the HELD-OUT {args.split} split — {run_root.name}",
+    held = "HELD-OUT " if args.split != "train" else "FULL "
+    fig.suptitle(f"Regrasp on the {held}{args.split} split — {run_root.name}",
                  fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 1 - 0.03 / nrow * 2])
-    out = run_root / "test_set_evaluation.png"
+    out = run_root / f"{args.split}_set_evaluation.png"
     fig.savefig(out, dpi=140)
     print(f"wrote {out}")
 
@@ -298,7 +336,7 @@ def plot(run_root: Path, log_path: Path, args) -> None:
 def main() -> None:
     args = parse_args()
     run_root = Path(args.run_dir)
-    log_path = run_root / args.out
+    log_path = run_root / (args.out or f"{args.split}_eval_log.csv")
     if args.plot_only:
         plot(run_root, log_path, args)
         return
@@ -321,9 +359,27 @@ def main() -> None:
                               or f"output/regrasp_pins_{args.split}.json")
     sim["exclude_scenes"] = (args.exclude_scenes
                              or f"output/regrasp_pins_{args.split}_excluded.json")
-    # No collection happens on test, so there is no collection outcome to filter
-    # by; the pin table already encodes what the planner could reach.
-    sim.pop("demo_ok_table", None)
+    # THE demo_ok_table IS SPLIT-DEPENDENT, and getting it wrong is silent.
+    #
+    # On test/val nothing was ever collected, so there is no collection outcome
+    # to filter by and the pin table alone states feasibility — it was built by
+    # calling the planner on every scene. Filtering test by the TRAIN split's
+    # collection failures would score on a set defined by an unrelated run.
+    #
+    # On train the opposite holds. The run itself trained with the table applied,
+    # so the (scene, bin) pairs OMG could not demonstrate are pairs the policy
+    # was never taught; scoring them would charge the policy for directions
+    # absent from its data and make the full-train number incomparable with the
+    # in-loop curve it is supposed to extend.
+    if args.split == "train":
+        if args.demo_ok_table is not None:
+            if args.demo_ok_table:
+                sim["demo_ok_table"] = args.demo_ok_table
+            else:
+                sim.pop("demo_ok_table", None)
+        # else: whatever the run's own config carried, which is the right default
+    else:
+        sim.pop("demo_ok_table", None)
     for path_key in ("grasp_pin_table", "exclude_scenes"):
         if not Path(sim[path_key]).exists():
             raise SystemExit(
@@ -348,10 +404,14 @@ def main() -> None:
     ctx = build_regrasp_context(cfg4, seed=seed)
     n_ep = len(ctx.pin_table.pairs(ctx.eval_scenes))
 
+    held_out = args.split != "train"
     print("=" * 78)
-    print(f"Regrasp TEST-SPLIT eval   run={run_root.name}")
-    print(f"  split       : {args.split}   (held out by the benchmark, never "
-          f"collected on)")
+    print(f"Regrasp {'HELD-OUT' if held_out else 'FULL-TRAIN'} eval   "
+          f"run={run_root.name}")
+    print(f"  split       : {args.split}   "
+          + ("(held out by the benchmark, never collected on)" if held_out else
+             "(COLLECTED ON — this is a train-set number, not a generalisation "
+             "one)"))
     print(f"  scenes      : {len(ctx.eval_scenes)} -> {n_ep} independent episodes "
           f"per iteration")
     print(f"  checkpoint  : {args.ckpt}     success={ctx.eval_params.success_mode}")

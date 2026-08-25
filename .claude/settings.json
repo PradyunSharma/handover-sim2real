@@ -98,7 +98,18 @@
       "Bash(grep -E \"dagger4_run\\(16|20\\)$\")",
       "Bash(bash -n examples/slurm/eval_regrasp_testset.sbatch)",
       "Bash(chmod +x examples/slurm/eval_regrasp_testset.sbatch)",
-      "Bash(bash -n examples/slurm/setup_cluster_env.sh)"
+      "Bash(bash -n examples/slurm/setup_cluster_env.sh)",
+      "Bash(nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv)",
+      "Bash(ps -p 3220512 -o pid,etime,%cpu,rss,stat --no-headers)",
+      "Bash(awk '{print $2, $10, $11, $12, $13}')",
+      "Bash(python examples/status_regrasp_run.py output/dagger_runs/regrasp_fast1)",
+      "Bash(/home/pradyun/anaconda3/envs/pch2r_dev/bin/python examples/status_regrasp_run.py output/dagger_runs/regrasp_fast1)",
+      "Bash(grep -v \"^\\\\s*$\")",
+      "Bash(bash -n examples/run_regrasp3_local.sh)",
+      "Bash(/home/pradyun/anaconda3/envs/pch2r_dev/bin/python -m py_compile examples/collect_regrasp_demos.py examples/train_regrasp.py)",
+      "Bash(bash -n examples/watch_regrasp.sh)",
+      "Bash(bash examples/watch_regrasp.sh)",
+      "Bash(/home/pradyun/anaconda3/envs/pch2r_dev/bin/python examples/status_regrasp_run.py output/dagger_runs/regrasp3_fast1)"
     ],
     "additionalDirectories": [
       "/home/pradyun/h2r/handover-sim2real/examples/configs",

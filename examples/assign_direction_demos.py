@@ -22,8 +22,9 @@ channels to be read. This is a property of the DATASET, not of the architecture
 
 TWO MODES.
 
-  --mode per-bin  (run 2 on, the DEFAULT). One demonstration for EVERY bin the
-      scene can reach, each the goal-set grasp CLOSEST TO THAT BIN'S AXIS. The
+  --mode per-bin  (run 2 on, the DEFAULT). `--per-bin N` demonstrations for EVERY
+      bin the scene can reach, the N goal-set grasps CLOSEST TO THAT BIN'S AXIS.
+      N defaults to 1, which is run 2; run 3 uses 3. The
       direction table already picked that representative (`angle_to_axis_deg`),
       and it is the right one precisely because the axis is what the policy is
       commanded with at deployment — `retry.next_direction` has no grasp to read,
@@ -40,6 +41,25 @@ Per-bin supersedes pair rather than extending it: four contrasting commands on
 one observation break the confound harder than two, and — the reason that
 decided it — they populate every bin's EVALUATION sample instead of only the two
 a scene happened to be assigned, which is what makes a per-bin figure readable.
+
+`--per-bin N` DOES NOT BREAK THE CONFOUND FURTHER, AND IS NOT MEANT TO. N demos
+of one bin share ONE command, so they map the same observation to N different
+actions with nothing to distinguish them — the opposite of the paragraph above.
+What they teach is that a direction does not name a single pose, which is true
+and is what the policy meets at deployment. The cost is that a unimodal
+regression loss (`pose_loss: pm`) resolves conflicting targets by AVERAGING them,
+and the mean of three valid grasps need not be a valid grasp. Measured on
+s0/train: 91% of (scene, bin) pairs have three or more goal-set members, and
+`--per-bin 3` yields ~4601 demonstrations against run 2's 1596. The diagnostic if
+it goes wrong is `cond_sep` and the per-bin `bin_diag_rate` falling WHILE
+`train_loss` also falls — the signature of fitting a mean nobody asked for.
+`--per-bin 1` reproduces run 2 exactly and is the control.
+
+EMISSION ORDER IS MEMBER-MAJOR under `--per-bin N`: slots cycle the bins
+(+x, +y, -y, +z, +x, ...) rather than exhausting one bin at a time. The retry
+ladder reads a scene's slots IN ORDER, so bin-major grouping would make retry@2 a
+second attempt at the same direction under an identical command — a repeat, not a
+retry. See the comment at the emission site.
 
 SCENES WITH ONE FEASIBLE BIN STILL GET COLLECTED, once. They teach reaching and
 grasping and carry a valid `d`; they simply contribute nothing to breaking the
@@ -101,12 +121,43 @@ def parse_args() -> argparse.Namespace:
                         "contributes a contrast the policy cannot be expected to "
                         "resolve. The scene falls back to a single demonstration.")
     p.add_argument("--mode", choices=("per-bin", "pair"), default="per-bin",
-                   help="per-bin (run 2 on, the default): ONE demonstration for "
+                   help="per-bin (run 2 on, the default): a demonstration for "
                         "every bin the scene can reach, each the goal-set grasp "
                         "closest to that bin's axis. pair (run 1): the single "
                         "maximally-separated pair.")
+    p.add_argument("--per-bin", type=int, default=1,
+                   help="PER-BIN MODE ONLY. How many demonstrations each bin "
+                        "gets, taken as a prefix of the table's `members` list "
+                        "(closest to the bin axis first). 1 reproduces run 2; 3 "
+                        "is run 3. Capped per bin by what the goal set actually "
+                        "holds, so a bin with one member still contributes one. "
+                        "Requires a table built with --members-per-bin >= N; an "
+                        "older table has only the head and this silently reads "
+                        "as 1, so the count is checked and reported.")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
+
+
+def bin_members(entry: dict, n: int) -> list:
+    """Up to `n` demonstrations of one bin, closest to that bin's axis first.
+
+    `build_direction_table.py --members-per-bin M` writes a `members` list whose
+    head IS the single grasp run 2 recorded, so a prefix of length 1 reproduces
+    run 2 exactly and a table built before `members` existed degrades to that one
+    grasp rather than failing. The caller reports the shortfall — silently
+    collecting one demonstration where three were asked for would look like a
+    successful run of the wrong experiment.
+
+    Each returned dict carries the per-bin keys (`bin`, `bin_name`, `n_members`)
+    that live on the parent entry, so downstream code sees one flat record per
+    demonstration and does not care whether it came from `members` or the head.
+    """
+    head = {k: entry[k] for k in ("ee_pose_world", "d_anchor", "d_world",
+                                  "angle_to_axis_deg", "goal_set_idx")}
+    ms = entry.get("members") or [head]
+    keep = ms[:max(1, int(n))]
+    return [dict(m, bin=entry["bin"], bin_name=entry["bin_name"],
+                 n_members=entry["n_members"]) for m in keep]
 
 
 def main() -> None:
@@ -129,7 +180,7 @@ def main() -> None:
     excluded, reasons = [], Counter()
     pairs_hist, seps = Counter(), []
     per_scene_bins = Counter()      # per-bin mode: scenes reaching each bin
-    n_paired = n_single = n_too_close = 0
+    n_paired = n_single = n_too_close = n_short = 0
 
     # Scene order is fixed (sorted) so the greedy assignment is reproducible; the
     # emptiness tie-break makes it order-dependent, and an unstable order would
@@ -160,10 +211,35 @@ def main() -> None:
             # commands on one observation; four commands on one observation break
             # it strictly harder, and they also populate every bin's eval sample
             # instead of only the two a scene happened to be assigned.
-            chosen = [by_bin[b] for b in chosen_bins]
+            #
+            # `--per-bin N` gives each bin N demonstrations instead of one: N
+            # different expert trajectories under the SAME command, which is what
+            # teaches the policy that a direction does not name a single pose.
+            #
+            # EMISSION ORDER IS MEMBER-MAJOR, AND THAT IS LOAD-BEARING. The retry
+            # ladder walks a scene's slots in table order — `retry_at_k` is
+            # "success given the first k slots" — so bin-major order
+            # (+x,+x,+x,+y,...) would make retry@2 a SECOND ATTEMPT AT THE SAME
+            # DIRECTION. The command is identical for both, so the policy would
+            # do the identical thing, and `retry_at_k` would flatten into a
+            # measure of simulator noise rather than of regrasping. Cycling the
+            # bins first (+x,+y,-y,+z,+x,...) keeps rungs 1..4 four DISTINCT
+            # directions exactly as in run 2, and pushes the repeats to slots 5+
+            # where the ladder no longer looks.
+            n_per = max(1, int(args.per_bin))
+            got = {b: bin_members(by_bin[b], n_per) for b in chosen_bins}
+            chosen = [got[b][m] for m in range(n_per)
+                      for b in chosen_bins if m < len(got[b])]
             for b in chosen_bins:
                 per_scene_bins[b] += 1
-            if len(chosen) >= 2:
+                n_short += max(0, n_per - len(got[b]))
+            # `paired` COUNTS DISTINCT BINS, NOT DEMONSTRATIONS. Under
+            # `--per-bin 3` a one-bin scene emits three episodes, and calling
+            # that "paired" would claim a contrast that does not exist: three
+            # demonstrations of ONE command teach multimodality, not
+            # conditioning. Only a second BIN maps the same observation to a
+            # different command, which is the confound this whole file is about.
+            if len(chosen_bins) >= 2:
                 n_paired += 1
                 # Record the WIDEST contrast the scene supplies, so the
                 # separation statistics stay comparable with pair mode's.
@@ -212,8 +288,9 @@ def main() -> None:
             counts[e["bin"]] += 1
 
         table[str(idx)] = {
-            "paired": len(chosen) >= 2,
+            "paired": len({e["bin"] for e in chosen}) >= 2,
             "n_demos": len(chosen),
+            "n_bins": len({e["bin"] for e in chosen}),
             "n_feasible_bins": len(feas),
             "anchor_R": s["anchor_R"],
             "anchor_mode": s["anchor_mode"],
@@ -238,7 +315,20 @@ def main() -> None:
     print(f"  scenes in table   : {len(scenes)}")
     print(f"  kept              : {n}   (paired {n_paired}, single {n_single})")
     print(f"  excluded          : {len(excluded)}  {dict(reasons)}")
-    if n_too_close:
+    if args.mode == "per-bin" and args.per_bin > 1:
+        have = int(meta.get("members_per_bin", 1) or 1)
+        print(f"  demos per bin     : {args.per_bin} requested, table records up "
+              f"to {have} per bin")
+        if have < args.per_bin:
+            print(f"  ERROR the table was built with --members-per-bin {have}, so "
+                  f"at most {have} can be emitted per bin. Rebuild it:\n"
+                  f"        python examples/build_direction_table.py --split "
+                  f"<split> --members-per-bin {args.per_bin} --out {args.table}")
+            raise SystemExit(2)
+        if n_short:
+            print(f"  short of {args.per_bin}          : {n_short} bin-slots — "
+                  f"that bin's goal set held fewer members. Expected and "
+                  f"harmless; the bin still contributes what it has.")
         print(f"  demoted to single : {n_too_close}  (best realised contrast "
               f"< {args.min_sep_deg:.0f} deg)")
     print(f"  mode              : {args.mode}")
@@ -277,6 +367,10 @@ def main() -> None:
     table["_meta"] = {
         **{k: v for k, v in meta.items() if k not in ("scenes_with_bin",)},
         "stage": "assign_direction_demos", "mode": args.mode,
+        # Recorded so the pipeline's staleness probe can tell a run-2 table
+        # (1 per bin) from a run-3 one (3) without reparsing every scene, and so
+        # a shard collected under one can never be mixed with the other.
+        "per_bin": int(args.per_bin) if args.mode == "per-bin" else None,
         "schema": "regrasp-pins-v1",
         "source_table": args.table, "min_bins": args.min_bins,
         "dropped_bins": sorted(names[i] for i in drop),

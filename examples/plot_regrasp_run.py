@@ -354,6 +354,32 @@ def _bin_title(b: str | int) -> str:
     return f"{_D.BIN_SHORT[b]} ({_D.BIN_NAMES[b].split('_', 1)[1].replace('_', ' ')})"
 
 
+def _rung(num, k: int) -> str:
+    """" — mostly +x (79%)" for the k-th rung of the retry ladder, else "".
+
+    THE RUNG IS NOT ONE DIRECTION. `retry_at_k` walks each scene's pin slots in
+    ascending bin order, so rung 1 is `+x` for a scene that can reach `+x` and
+    `+y` for one that cannot — the rung is a mixture across scenes. Naming the
+    modal bin AND its share is the only honest label: a share near 1.0 means the
+    ladder really is that direction, and a share near 0.4 is the reader's warning
+    not to read the curve as "then it tried +y".
+
+    The composition is a property of the pin table and the eval scene set, not of
+    the checkpoint, so it is constant across iterations and the modal bin is
+    taken over the whole run rather than per point.
+    """
+    bs = [b for b in num(f"retry_bin_{k}") if b == b]
+    fr = [f for f in num(f"retry_bin_frac_{k}") if f == f]
+    if not bs:
+        return ""
+    b = int(round(max(set(bs), key=bs.count)))
+    if not 0 <= b < len(_D.BIN_SHORT):
+        return ""
+    if not fr:
+        return f" — mostly {_D.BIN_SHORT[b]}"
+    return f" — mostly {_D.BIN_SHORT[b]} ({sum(fr) / len(fr):.0%})"
+
+
 def _panel_nested(a, c: _Ctx, sfx="", title=None):
     """close -> near -> grasp -> success, which are NESTED. The vertical GAPS are
     the diagnosis: close-near is closing in the wrong place, near-grasp is closing
@@ -845,18 +871,22 @@ def main() -> None:
         else:
             a.axis("off")
 
-    # Row 2 — of the episodes that came away with NOTHING, what went wrong.
-    # Conditioned on failure, so the categories stack to 1.0 and the profile is
-    # readable independently of how often that bin fails at all: two bins can
-    # fail at 0.8 for completely different reasons, and `f_*` cannot tell them
-    # apart while `ff_*` can.
+    # Row 2 — the FULL outcome split per direction: what fraction succeeded, and
+    # what the rest failed of. `f_*` (fractions of all that bin's episodes,
+    # stacking to 1.0 with `f_grasp_ok` in green) rather than `ff_*` (fractions
+    # of the failures alone), because the success share is what makes the panel
+    # readable on its own — under `ff_*` a bin that fails 20% of the time and one
+    # that fails 80% draw identical stacks, and the reader has to cross-reference
+    # a different panel to tell them apart. The failure-conditional view is still
+    # the sharper one for COMPARING two bins' failure profiles at equal height,
+    # and it remains one keyword away (`failures_only=True`).
     for j in range(4):
         a = dx[1][j]
         if j < len(bins):
             b = bins[j]
-            _panel_outcomes(a, ctx, sfx=f"_b{b}", failures_only=True,
-                            legend=(j == 0),
-                            title=f"{_D.BIN_SHORT[b]} — why the failures failed")
+            _panel_outcomes(a, ctx, sfx=f"_b{b}", legend=(j == 0),
+                            title=f"{_D.BIN_SHORT[b]} — outcomes: secured vs "
+                                  f"how it failed")
         else:
             a.axis("off")
 
@@ -994,7 +1024,7 @@ def main() -> None:
             ys = num(f"retry_at_{k}")
             if _finite(ys):
                 _plot(a, it, ys, "-", marker="o", ms=3, lw=1.6 + 0.2 * k,
-                      color=col, label=f"success @ {k} attempt(s)")
+                      color=col, label=f"success @ {k} attempt(s){_rung(num, k)}")
         a.set_ylim(-0.02, 1.02)
         _grid(a, "regrasping: success with k tries", ylabel="fraction of eval scenes")
         _legend(a, loc="lower right")

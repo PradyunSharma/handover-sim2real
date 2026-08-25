@@ -248,7 +248,16 @@ scene happened to draw.
 python examples/collect_regrasp_demos.py --cfg-file examples/pretrain_multicam_wr.yaml --split train --grasp-pin-table output/regrasp_pins_train.json --output output/bc_dataset/train_regrasp.h5
 ```
 
-~3.5 h for train at 1596 demos, ~5 min for val. Repeat with `--split val`.
+**~1.6 h for train at 1596 demos, ~4 min for val** — a measured 3.62 s/episode,
+serial, on the laptop's GPU. (An earlier version of this line said 3.5 h; that
+was wrong by 2.2x and it mis-budgeted a whole run. The figure comes from the
+HDF5's birth-to-last-write span divided by its episode count, and run 2's train
+and val collections agree on it to within 0.3%. Run 1's was 4.2 s/episode.)
+
+Repeat with `--split val`. For a large collection — three demonstrations per bin
+is 4578 episodes, ~4.6 h serial — use `--shard i/n` to split it round-robin over
+scenes across concurrent processes; `TRAIN.base_train_h5` takes the resulting
+files as a list, so they are never merged.
 
 ### 5. Audit, and write the usable-pair list
 
@@ -284,6 +293,28 @@ python examples/train_regrasp.py --cfg-file examples/configs/regrasp_run2.yaml -
 # the full DAgger loop
 python examples/train_regrasp.py --cfg-file examples/configs/regrasp_run2.yaml --run-name regrasp_run2
 ```
+
+**Watching it.** `tail` on a training log shows nothing useful: tqdm redraws its
+progress bar with a CARRIAGE RETURN and no newline, so hundreds of bar frames and
+the per-epoch summary share one physical line. Translate `\r` to `\n` first —
+which is all this wrapper does, plus a filter for the lines worth seeing:
+
+```bash
+cd /home/pradyun/h2r/handover-sim2real && bash examples/watch_regrasp.sh -f
+```
+
+```
+epoch 011  train_total=0.1512  ...  |  val_total=0.2349  ...  (134.6s)
+==============================================================================
+[iter 02/6]  beta=0.950  m=357 episodes over 50 scenes (49 paired)
+==============================================================================
+  [collect] 357 episodes -> dagger_iter_02.h5
+```
+
+Drop `-f` for a snapshot, or pass a log path as the last argument for another
+run. It only reads the file, so it is safe against a live job. For
+iteration-level progress and an ETA instead, `examples/status_regrasp_run.py`
+reads `dagger_log.csv` and updates once per completed iteration.
 
 Resumable — re-run the same command. ~50 min/iteration on a laptop; ~13 h for the
 whole of `regrasp_run2.yaml` on a DelftBlue V100 with 20 collection workers:

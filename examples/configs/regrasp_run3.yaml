@@ -1,0 +1,222 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRASP RUN 3 — THREE DEMONSTRATIONS PER BIN.
+#
+# = regrasp_run2.yaml with ONE method change and the budget that follows from it.
+# The frame is run 2's (gravity-aligned, wrist-anchored azimuth), k is run 2's
+# (6 octahedral bins, 4 live), the command is run 2's (the bin axis), the
+# network, loss, DART and β schedule are run 2's. Only the number of expert
+# trajectories behind each command moves.
+#
+# THE CHANGE. Each (scene, bin) now carries THREE demonstrations instead of one:
+# the three goal-set grasps closest to that bin's axis, or all of them when the
+# bin holds fewer. Measured on s0/train: 91% of (scene, bin) pairs have three or
+# more members, and the assignment emits 4578 demonstrations against run 2's
+# 1596 — a 2.87x base set over the same 617 scenes.
+#
+# WHAT IT TEACHES, AND WHAT IT DOES NOT. The three share ONE command, so they do
+# NOT break the scene->action confound any further than run 2 did — that job
+# belongs to the four DIFFERENT commands a scene supplies, and it is unchanged.
+# What they teach is that a direction does not name a single pose, which is true
+# and is what the policy meets at deployment: `retry.next_direction` issues a bin
+# axis, and any grasp within that bin is a correct answer to it.
+#
+# THE RISK, STATED PLAINLY. `pose_loss: pm` is a UNIMODAL regression loss. Three
+# valid targets for one input are resolved by AVERAGING, and the mean of three
+# grasps need not be a grasp — this is the same mode-averaging that made
+# multi-grasp Phase-4 data unusable without conditioning, arriving now from
+# within a single command instead of across several. It is a real possibility,
+# not a certainty: the three members sit within 45 deg of one axis rather than
+# anywhere on the sphere, so the modes are much closer together than Phase-4's
+# were. The diagnostic is `cond_sep` and the per-bin `bin_diag_rate` FALLING
+# while `train_loss` also falls — a network fitting a mean nobody asked for.
+# Watch those two before the success rate; if they go, turn `--per-bin` down to
+# 2 rather than reaching for the architecture.
+#
+# BUILD THE TABLES FIRST. `--members-per-bin` is a BUILD-time setting, and run
+# 2's table recorded one member per bin, so it cannot serve this run — the
+# assignment refuses rather than silently emitting one:
+#
+#   python examples/build_direction_table.py --split train --members-per-bin 5 \
+#       --out output/direction_table_train.json
+#   python examples/assign_direction_demos.py --table output/direction_table_train.json \
+#       --out output/regrasp_pins_train_p3 --per-bin 3 \
+#       --drop-bins='-z_beneath,-x_over_fingers'
+#
+# 5 is recorded and 3 are used on purpose: trying 2 or 4 later is then an offline
+# re-run of the assignment in seconds, not another 20-minute simulator pass.
+# Read the build's `spread within a bin` line BEFORE collecting — if most bins
+# report under 2 cm the extra members are near-duplicates and this run buys 3x
+# the mode-averaging for no new information.
+#
+# EMISSION ORDER IS MEMBER-MAJOR, and it has to be. The retry ladder reads a
+# scene's slots IN ORDER, so grouping by bin (+x,+x,+x,+y,...) would make retry@2
+# a second attempt at the SAME direction under an IDENTICAL command — the policy
+# would do the identical thing and `retry_at_k` would collapse into a measure of
+# simulator noise. The assignment cycles the bins instead (+x,+y,-y,+z,+x,...),
+# so rungs 1-4 stay four distinct directions exactly as in run 2. Verified: 0 of
+# 617 scenes have a repeated direction inside their first `n_bins` slots.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SIM:
+  cfg_file: examples/pretrain_multicam_wr.yaml   # wrist + right, as run 2
+
+  split: train
+  egl: false
+
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08
+  hand_points_radius: 0.35
+
+  use_standoff: true
+  standoff_dist: 0.08
+
+  # THE RUN-3 TABLES. Separate paths from run 2's, never an overwrite: a shard
+  # collected under one is not mixable with the other, and the pin tables are the
+  # only record of which is which. `_meta.per_bin` reads 3 here and 1 in run 2's.
+  grasp_pin_table: output/regrasp_pins_train_p3.json
+  grasp_pin_match_tol: 0.02
+  exclude_scenes: output/regrasp_pins_train_p3_excluded.json
+
+  # Re-audit after collecting. Written by audit_regrasp_demos.py --write-ok, and
+  # a run-3 file, not run 2's — the collection is different, so the failures are.
+  #
+  # KNOWN GRANULARITY GAP, AND IT IS NEW IN THIS RUN. `GraspPinTable.keep_only`
+  # filters (scene, BIN) pairs, not slots: `int(g["bin"]) in allow` keeps or
+  # drops every member of a bin together. With one member per bin that is exactly
+  # right and is what run 2 relied on. With three, a bin whose first member
+  # demonstrated cleanly but whose third had a pin miss is kept WHOLE, bad member
+  # included — an episode captioned `+z` whose trajectory goes elsewhere, which
+  # is precisely what the file exists to remove.
+  #
+  # Read the audit's `command vs bin axis` fingerprint before training: run 2's
+  # clean shard reported median 0.00 deg, and anything above ~1 deg means
+  # mis-captioned episodes survived. If it fires, either drop the affected bins
+  # wholesale by hand or extend `keep_only` to a (scene, bin, goal_set_idx) key.
+  # The BCDataset mis-caption filter (bin_assigned != bin_realized) is the second
+  # line of defence and is unaffected by this — it works per episode.
+  demo_ok_table: output/regrasp_demos_train_p3_ok.json
+
+DAGGER:
+  num_iters: 20
+  # 1200, NOT run 2's 400, AND THIS IS THE ONE NUMBER TO ARGUE WITH.
+  #
+  # `sample_pairs` draws `m // max_grasps` scenes and rolls out every slot each
+  # one has. `max_grasps` is 4 in run 2 and 12 here, so leaving m at 400 would
+  # draw 33 scenes instead of 100 and spend the whole iteration re-visiting a
+  # third of the scenes from three angles each. Episode COUNT would barely move
+  # (~248 against run 2's ~259) while scene DIVERSITY collapsed — and scene
+  # diversity, not episode count, is this project's measured bottleneck.
+  #
+  # 1200 holds the scene count at 100 and lets the episode count rise to ~742
+  # (100 x the 7.42 slots a scene averages). That is 2.9x run 2's collection per
+  # iteration and a |D| that grows 2.9x faster, so the refits lengthen too:
+  # budget ~2.5-3x run 2's wall clock, and check the queue limit before
+  # submitting. If that does not fit, 800 (66 scenes, ~495 episodes) is the
+  # honest middle; 400 keeps run 2's wall clock and is NOT recommended, because
+  # it changes two things at once and the one it changes silently is the one that
+  # matters.
+  episodes_per_iter: 1200
+  max_steps: 50
+  scene_sampling: random
+  seed: 0
+
+  beta_schedule: linear
+  beta_start: 1.0
+  beta_end: 0.75
+  beta_mid: 0.5
+  beta_knee: 0.66
+  beta_p: 0.7
+
+  close_pos_thresh: 0.02
+  close_rot_thresh: 0.34
+  stop_on_close_label: true
+  stop_on_policy_close: false
+
+  ee_step: 0.04
+  reach_tail: 5
+  min_free: 1
+  max_horizon: 40
+  first_horizon: null
+
+  reach_commit_dist: 0.05
+  reach_skip_eps: 0.01
+  expert_after_commit: true
+
+  # Run 2's DART verbatim, both bands. Not re-tuned: DART is not the variable.
+  dart_ratio: 0.3
+  dart_max_dist: 10.0
+  dart_pos_mag: 0.04
+  dart_rot_mag: 0.3
+  dart_reach_ratio: 0.3
+  dart_reach_pos_mag: 0.01202
+  dart_reach_rot_mag: 0.3
+  dart_reach_max_tries: 5
+  dart_reach_clearance: 0.01
+  dart_reach_path_steps: 4
+
+  outcome_check: true
+
+TRAIN:
+  # Unchanged from run 2, INCLUDING the two things worth restating because they
+  # are easy to assume are missing:
+  #
+  #   DIRECTION NOISE IS ALREADY ON. bc_regrasp_run2.yaml sets
+  #   `DATA.d_noise_deg: 12.0` — the command is perturbed by ~12 deg before the
+  #   d.n / d.r channels are built, on train only (val is forced to 0.0). See
+  #   that file, and note the seeding caveat in regrasp_bc/dataset.py: the draw
+  #   is keyed on the EPISODE, so an episode's offset is fixed for the whole run
+  #   rather than redrawn each epoch.
+  #
+  #   THE WARM START ALREADY INCLUDES PointNet++. `train_from_scratch: false`
+  #   plus `init_ckpt: last` loads the FULL state dict of the previous
+  #   iteration's last.pt — encoder included — via `model.load_state_dict`, not
+  #   just the head. `pc_pretrained` is consulted at iteration 0 ONLY, and it is
+  #   empty, so iteration 0 starts from a random encoder and every iteration
+  #   after continues the chain.
+  train_cfg: examples/configs/bc_regrasp_run2.yaml
+  pc_pretrained:
+  base_train_h5: ${REGRASP_DATA}/bc_dataset/train_regrasp_p3.h5
+  val_h5: ${REGRASP_DATA}/bc_dataset/val_regrasp_p3.h5
+  base_run: null
+  # The base set is 2.87x run 2's, so 50 epochs is 2.87x the gradient steps it
+  # was there. Left at 50 anyway: the val minimum is what matters and more data
+  # reaches it in FEWER epochs, not more. Watch `best_epoch` on iteration 0 — if
+  # it lands well before 50, cut this rather than paying for the tail.
+  base_epochs: 50
+  iter_epochs: 15
+  train_from_scratch: false
+  init_ckpt: last
+  num_workers: 2
+  device: cuda
+
+EVAL:
+  every: 1
+  # 100 scenes as in run 2 — but note this is now ~742 episodes rather than ~259,
+  # because a scene contributes every slot it has. Per-BIN samples roughly triple
+  # (~185 against ~65), which is the one place run 3 is strictly better
+  # instrumented than run 2 and the reason the per-bin panels should finally be
+  # readable point by point rather than only as trends.
+  #
+  # It also means eval costs ~2.9x. Set `every: 2` if the job runs long; the
+  # scene set is fixed across iterations either way, so the comparison stays
+  # paired.
+  num_scenes: 100
+  holdout: false
+  max_steps: 50
+  ckpt: last
+  success_mode: stable_grasp
+  hold_steps: 3
+  select_on: success_rate
+  verbose: false
+
+  box_check: true
+  box:
+    min_frac: 0.50
+    open_thresh: 0.8
+    half_x: 0.0088
+    z_lo: 0.0946
+    z_hi: 0.1122
+    inset: 0.002
+    grid_x: 7
+    grid_z: 7

@@ -259,9 +259,12 @@ def collect_episode(env, point_listener, cfg, scene_idx,
     anchor_R = anchor_mode = None
     wrist = _rg_anchor.wrist_world(env)
     mano_side = _rg_anchor.handedness(env)
-    d_world = _rg_directions.approach_direction(grasp_pose)
     _ba = pin_table.bin_of(scene_idx, grasp_idx) if pin_table is not None else None
     _bin_assigned = None if _ba is None else int(_ba)
+    # What the expert actually flies, kept as a diagnostic. It is NOT the command
+    # any more — see the step-0 block below.
+    d_grasp_world = _rg_directions.approach_direction(grasp_pose)
+    d_world = d_grasp_world
 
     for step in range(stop_step):
         pc5   = _point_cloud(obs, point_listener, panda_base_inv_tf)
@@ -276,6 +279,28 @@ def collect_episode(env, point_listener, cfg, scene_idx,
                     c_w, wrist, np.asarray(cfg.ENV.PANDA_BASE_POSITION),
                     _rg_anchor.AnchorState())
                 anchor_mode = _am["mode"]
+                # ---- THE COMMAND IS THE BIN AXIS, NOT THE GRASP -------------
+                # It has to be computed HERE and not above, because the anchor
+                # frame only exists once the step-0 cloud has given us the object
+                # centroid. `retry.next_direction` has no grasp to read at
+                # deployment and issues `to_world(BINS[b], anchor_R)`; training
+                # on `-R_grasp[:,2]` instead is a MEASURED median-18-degree
+                # train/deploy skew, which is the same order as the effect the
+                # conditioning is supposed to have. The demonstration is already
+                # chosen to be the goal-set grasp closest to this axis, so the
+                # residual is honest label noise (`demo_off_deg`), not a shift.
+                #
+                # THE DAGGER COLLECTOR DOES THE SAME THING, and that is the
+                # trap this comment exists to flag: base demonstrations come
+                # from THIS file, DAgger shards from
+                # handover_sim2real/regrasp/collector.py. Changing one and not
+                # the other produces an aggregate whose halves are captioned
+                # under different rules — invisible in every rate, and caught
+                # only by `audit_regrasp_demos.py`'s `command vs bin axis` line.
+                if anchor_R is not None and _bin_assigned is not None \
+                        and _bin_assigned >= 0:
+                    d_world = _rg_directions.to_world(
+                        _rg_directions.BINS[_bin_assigned], anchor_R)
         rs    = _robot_state(obs, prev_act6d)
         delta = env.convert_target_joint_position_to_action(expert_plan[step])  # [6]
         act   = np.concatenate([delta, [1.0]]).astype(np.float32)  # gripper open
@@ -318,12 +343,23 @@ def collect_episode(env, point_listener, cfg, scene_idx,
         "grasp_pose_world": grasp_pose,                                # [4, 4]
         # ---- Regrasp conditioning + provenance ----
         "d_world":        np.asarray(d_world, dtype=np.float32),
+        # ...and what the expert actually flew, which is a different vector: the
+        # demonstration sits a median ~18 deg from its bin's axis (max 45, the
+        # bin half-width). That gap is the label noise the conditioning has to
+        # tolerate, recorded so it can be measured rather than assumed.
+        "d_grasp_world":  np.asarray(d_grasp_world, dtype=np.float32),
+        "demo_off_deg":   float(_rg_directions.angle_between(d_world,
+                                                             d_grasp_world)),
         # `x or -1` would map bin 0 (+x, the MOST common bin) to -1, because 0
         # is falsy. Explicit None check, always.
         "bin_assigned":   _bin_assigned if _bin_assigned is not None else -1,
+        # The bin the DEMONSTRATION lands in — derived from the grasp, not from
+        # the command, so it still disagrees with `bin_assigned` exactly when the
+        # pin missed. Deriving it from `d_world` would make it trivially equal.
         "bin_realized":   (-1 if anchor_R is None else
                            int(_rg_directions.bin_of(
-                               _rg_directions.from_world(d_world, anchor_R)))),
+                               _rg_directions.from_world(d_grasp_world,
+                                                         anchor_R)))),
         "anchor_R":       (np.eye(3, dtype=np.float32) if anchor_R is None
                            else np.asarray(anchor_R, dtype=np.float32)),
         "anchor_mode":    str(anchor_mode or "unset"),
@@ -353,6 +389,18 @@ def parse_args():
                    help="per-scene candidate grasps "
                         "(examples/build_direction_table.py). Required: it "
                         "is what defines the slots this script iterates over.")
+    p.add_argument("--shard", default=None,
+                   help="'i/n' — collect only scenes with scene_idx %% n == i, "
+                        "writing an independent HDF5. Base collection is SERIAL "
+                        "(~8 s/episode) and is the long pole of a run: at three "
+                        "demonstrations per bin it is ~10 h on one process. Four "
+                        "shards run concurrently cut that to ~2.6 h, and the "
+                        "trainer takes a LIST for TRAIN.base_train_h5, so the "
+                        "pieces never need merging. Round-robin over scenes "
+                        "rather than a contiguous block because scenes carry "
+                        "different slot counts, and interleaving balances them "
+                        "without measuring anything. Each shard holds WHOLE "
+                        "scenes, so no episode is split across files.")
     p.add_argument("--grasps-per-scene", type=int, default=None,
                    help="cap on slots per scene (default: every slot the table "
                         "holds, i.e. K from build_direction_table.py)")
@@ -397,6 +445,29 @@ def main():
     # global omg_cfg, so setting it afterwards is a no-op. Pass the SAME dict the
     # DAgger/RL phases use or the two aim at different grasp sets (measured: ~1
     # scene in 5 disagrees, median 10.7 cm apart).
+    # DEFAULT IT FROM THE PIN TABLE, which records the dict it was built with.
+    # Omitting the flag used to mean "no filter", so the goal set at collection
+    # was a DIFFERENT set from the one the table's poses came from and the pins
+    # could not match: `[grasp-pin] pinned pose not in the current goal set`,
+    # then OMG's own pick, then — under bin-axis conditioning — an episode
+    # captioned with a direction it did not fly. The table knows the answer, the
+    # env has to be built before the table is normally loaded, and a bare
+    # `json.load` costs nothing, so read it here rather than requiring a human to
+    # keep two command lines in sync.
+    if not args.valid_grasp_dict and args.grasp_pin_table:
+        try:
+            import json as _json
+            with open(args.grasp_pin_table) as _f:
+                _meta = (_json.load(_f).get("_meta") or {})
+            _from_table = _meta.get("valid_grasp_dict_path")
+        except Exception as _e:                                # noqa: BLE001
+            _from_table = None
+            print(f"[valid_grasp_dict] could not read {args.grasp_pin_table}: {_e}")
+        if _from_table:
+            args.valid_grasp_dict = _from_table
+            print(f"[valid_grasp_dict] not given — taking the table's own: "
+                  f"{_from_table}")
+
     if args.valid_grasp_dict:
         from handover_sim2real.utils import resolve_valid_grasp_dict_path
         _vgd = resolve_valid_grasp_dict_path(
@@ -429,15 +500,28 @@ def main():
 
     # The work list: every (scene, slot) the table offers, scene-major, so a
     # partial run still covers whole scenes and `--num-episodes` stays readable.
+    shard_i = shard_n = None
+    if args.shard:
+        try:
+            shard_i, shard_n = (int(x) for x in str(args.shard).split("/"))
+        except ValueError:
+            raise SystemExit(f"--shard wants 'i/n', got {args.shard!r}")
+        if not 0 <= shard_i < shard_n:
+            raise SystemExit(f"--shard needs 0 <= i < n, got {shard_i}/{shard_n}")
+
     jobs = []
     for scene_idx in range(num_scenes):
+        if shard_n is not None and scene_idx % shard_n != shard_i:
+            continue
         n_slots = pin_table.num_grasps_for(scene_idx)
         if args.grasps_per_scene is not None:
             n_slots = min(n_slots, int(args.grasps_per_scene))
         jobs.extend((scene_idx, g) for g in range(n_slots))
     if args.num_episodes is not None:
         jobs = jobs[:int(args.num_episodes)]
-    print(f"  {len(jobs)} (scene, grasp) pairs over {num_scenes} scenes")
+    n_sc = len({s for s, _ in jobs})
+    print(f"  {len(jobs)} (scene, grasp) pairs over {n_sc} scenes"
+          + (f"   [shard {shard_i}/{shard_n}]" if shard_n else ""))
 
     out_dir = os.path.dirname(os.path.abspath(args.output))
     os.makedirs(out_dir, exist_ok=True)
@@ -514,7 +598,8 @@ def main():
             # Regrasp: `d_world` is the one BCDataset requires; the rest are
             # provenance. `wrist_world` in particular lets the anchor frame be
             # re-derived under a different definition as a relabelling pass.
-            for _k in ("d_world", "bin_assigned", "bin_realized", "anchor_R",
+            for _k in ("d_world", "d_grasp_world", "demo_off_deg",
+                       "bin_assigned", "bin_realized", "anchor_R",
                        "anchor_mode", "wrist_world", "mano_side", "pin_ok"):
                 if _k in episode:
                     grp.attrs[_k] = episode[_k]

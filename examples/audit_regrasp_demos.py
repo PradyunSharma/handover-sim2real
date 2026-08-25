@@ -183,27 +183,63 @@ def main() -> None:
         print(f"  pin ok / failed   : {pin_ok.get(1, 0)} / {pin_ok.get(0, 0)}"
               f"   re-binned {rebinned}")
         if rebinned:
-            print(f"    ({rebinned} episodes flew to a different bin than assigned "
-                  f"— kept and relabelled, which is the point of deriving the "
-                  f"command from the realised pose)")
+            # RUN 1 relabelled these; RUN 2 DROPS them, and the message said the
+            # wrong one — while `--write-ok` was already excluding them, so the
+            # printed explanation contradicted the file written two lines later.
+            # The command is the bin AXIS now and does not move when the pin
+            # misses, so the episode is a correct caption over the wrong
+            # trajectory, and the scene already has a demonstration for the bin
+            # it actually flew to. There is nothing to relabel it as.
+            print(f"    ({rebinned} episodes flew to a different bin than "
+                  f"assigned — the pin missed. EXCLUDED by --write-ok: the "
+                  f"command is the bin axis and did not move, so these are "
+                  f"correct captions over wrong trajectories.)")
 
         # ---- pairing: the number the design rests on ----------------------
+        # COUNTED OVER DISTINCT BINS, NOT OVER THE FIRST TWO EPISODES.
+        #
+        # From run 3 a scene carries `--per-bin N` demonstrations of EACH bin, so
+        # `eps[0]` and `eps[1]` are routinely the same bin by design and a check
+        # written against them reports ~18% "collapsed pairs" on data that is
+        # perfectly healthy. What the design actually rests on is whether a scene
+        # was ASSIGNED two or more different commands, and whether it REALISED
+        # them — so both counts come from the bin sets, and one representative
+        # episode per bin is used for the contrast statistics.
         n_pair = n_single = n_same_bin = 0
         seps, divs = [], []
         for sc, eps in by_scene.items():
-            if len(eps) < 2:
+            assigned = {e["assigned"] for e in eps if e["assigned"] >= 0}
+            realised = {e["bin"] for e in eps if e["bin"] >= 0}
+            if len(assigned) < 2:
                 n_single += 1
                 continue
             n_pair += 1
-            a, b = eps[0], eps[1]
-            sep = float(D.angle_between(a["d"], b["d"]))
-            seps.append(sep)
-            if a["bin"] == b["bin"]:
+            # A genuine collapse: the scene was told two or more directions and
+            # came back having flown fewer. That is a failed pin diluting the
+            # contrast, and it is what the FAIL below is for. Two demonstrations
+            # of the SAME assigned bin are not a collapse under --per-bin N.
+            if len(realised) < len(assigned):
                 n_same_bin += 1
-            n = min(len(a["act"]), len(b["act"]))
+            # One representative per assigned bin, then the WIDEST contrast the
+            # scene supplies — the same quantity assign_direction_demos reports,
+            # so the two remain comparable.
+            rep = {}
+            for e in eps:
+                rep.setdefault(e["assigned"], e)
+            reps = [rep[b] for b in sorted(rep) if b >= 0]
+            best, ba, bb = -1.0, None, None
+            for i, x in enumerate(reps):
+                for y in reps[i + 1:]:
+                    s = float(D.angle_between(x["d"], y["d"]))
+                    if s > best:
+                        best, ba, bb = s, x, y
+            if ba is None:
+                continue
+            seps.append(best)
+            n = min(len(ba["act"]), len(bb["act"]))
             if n:
                 # aligned from the END: it is the reach that has to line up
-                diff = np.abs(a["act"][-n:] - b["act"][-n:]).sum(axis=1)
+                diff = np.abs(ba["act"][-n:] - bb["act"][-n:]).sum(axis=1)
                 divs.append(float(np.mean(diff > args.noise_floor)))
 
         print(f"\n  scenes            : {len(by_scene)}   paired {n_pair}, "
@@ -217,9 +253,9 @@ def main() -> None:
         frac_same = n_same_bin / max(n_pair, 1)
         if frac_same > 0.05:
             fails.append(
-                f"{n_same_bin}/{n_pair} ({100*frac_same:.1f}%) paired scenes have "
-                f"BOTH demos in one bin — too many to dismiss; the paired subset "
-                f"is substantially diluted")
+                f"{n_same_bin}/{n_pair} ({100*frac_same:.1f}%) multi-bin scenes "
+                f"REALISED fewer bins than they were assigned — too many to "
+                f"dismiss; the contrasting subset is substantially diluted")
         elif n_same_bin:
             warns.append(
                 f"{n_same_bin}/{n_pair} ({100*frac_same:.1f}%) paired scenes "

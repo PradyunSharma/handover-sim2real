@@ -201,6 +201,33 @@ def sample_pairs(pool: list[int], m: int, num_grasps: int, mode: str, rng,
             for g in range(max(pin_table.num_grasps_for(int(s)), 1))], cursor
 
 
+def base_files(trn: dict) -> list[str]:
+    """`TRAIN.base_train_h5` as a LIST, accepting one path or several.
+
+    Base collection is serial (~8 s/episode) and is the long pole of a run — at
+    three demonstrations per bin it is ~10 h in one process. `collect_regrasp_demos
+    --shard i/n` splits it across concurrent processes, and each writes its own
+    HDF5. Taking a list here means those pieces are read directly and never
+    merged: no 2.6 GB copy, no merge step to get wrong, and `episode_counts()`
+    still prints one line per file so a missing shard is visible rather than
+    silently reducing the training set.
+
+    Order is preserved as written, and every path is checked here rather than at
+    the first batch — a typo in shard 3 of 4 would otherwise train happily on
+    three quarters of the data and report nothing.
+    """
+    v = trn["base_train_h5"]
+    files = [v] if isinstance(v, str) else list(v)
+    missing = [f for f in files if not os.path.exists(f)]
+    if missing:
+        raise SystemExit(
+            "TRAIN.base_train_h5 lists files that do not exist:\n  "
+            + "\n  ".join(missing)
+            + "\nA shard that failed to collect must be re-run, not dropped: "
+              "training on the survivors is a different and smaller experiment.")
+    return files
+
+
 # ── per-iteration training (a fresh fit on the whole aggregate) ──────────────
 
 def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | None,
@@ -530,6 +557,13 @@ LOG_FIELDS = [
     "dir_err", "dir_err_median", "dir_track", "sector_err",
     "bin_hit_rate", "bin_diag_rate", "cond_sep",
     "retry_at_1", "retry_at_2", "retry_at_3", "retry_at_4",
+    # WHICH DIRECTION EACH RUNG OF THE LADDER WAS. The ladder walks pin slots in
+    # ascending bin order, so rung k is a MIXTURE across scenes rather than one
+    # direction — `retry_bin_k` is the modal bin and `retry_bin_frac_k` its
+    # share. A share well under 1.0 means the ladder is not a fixed direction
+    # sequence and the retry curve must not be read as "then it tried +y".
+    "retry_bin_1", "retry_bin_2", "retry_bin_3", "retry_bin_4",
+    "retry_bin_frac_1", "retry_bin_frac_2", "retry_bin_frac_3", "retry_bin_frac_4",
     "succ_bin_0", "succ_bin_1", "succ_bin_2",
     "succ_bin_3", "succ_bin_4", "succ_bin_5",
     "n_bin_0", "n_bin_1", "n_bin_2", "n_bin_3", "n_bin_4", "n_bin_5",
@@ -662,10 +696,17 @@ def eval_columns(m: dict | None) -> dict:
         "dir_err", "dir_err_median", "dir_track", "sector_err",
         "bin_hit_rate", "bin_diag_rate", "cond_sep",
         "retry_at_1", "retry_at_2", "retry_at_3", "retry_at_4",
+        "retry_bin_frac_1", "retry_bin_frac_2", "retry_bin_frac_3",
+        "retry_bin_frac_4",
         "succ_bin_0", "succ_bin_1", "succ_bin_2",
         "succ_bin_3", "succ_bin_4", "succ_bin_5",
         "n_bin_0", "n_bin_1", "n_bin_2", "n_bin_3", "n_bin_4", "n_bin_5",
         "succ_g0", "succ_g1")}
+    # The modal bin of each rung is an INDEX, not a rate — blank when the rung
+    # collected nothing, never 0, since 0 is a real bin (`+x`).
+    for k in range(1, 5):
+        v = m.get(f"retry_bin_{k}")
+        out[f"retry_bin_{k}"] = "" if v is None else int(v)
     out.update(reason_columns(m.get("reasons"), EVAL_REASONS, denom=m.get("n") or None))
     out.update(reason_columns(m.get("reasons_fail"), EVAL_FAIL_REASONS,
                               denom=m.get("n_fail") or None))
@@ -1151,7 +1192,7 @@ def main() -> None:
         print(f"[iter 00] training the base policy on {trn['base_train_h5']} "
               f"({trn['base_epochs']} epochs)")
         base_dir = train_on_aggregate(
-            train_cfg, [trn["base_train_h5"]], trn.get("val_h5"),
+            train_cfg, base_files(trn), trn.get("val_h5"),
             run_root / "iters" / "iter_00", epochs=int(trn["base_epochs"]),
             device=device, num_workers=int(trn.get("num_workers", 2)), seed=seed)
 
@@ -1195,7 +1236,7 @@ def main() -> None:
         export_run_dir(base_dir, run_root / "last", ckpt=eval_ckpt,
                        note="DAgger iteration 0 (base policy)")
         save_state(run_root / "state.json", state)
-        d_ep, d_steps = dataset_size([trn["base_train_h5"]])
+        d_ep, d_steps = dataset_size(base_files(trn))
         row0 = {
             "iter": 0, "beta": 1.0, "m": 0, "episodes": 0, "steps": 0,
             "skipped": 0, "aggregate_files": 1,
@@ -1369,7 +1410,7 @@ def main() -> None:
         # already use. Inert when train_from_scratch is true.
         init_ckpt = str(trn.get("init_ckpt", "last"))
         train_on_aggregate(
-            train_cfg, [trn["base_train_h5"]] + dagger_files, trn.get("val_h5"),
+            train_cfg, base_files(trn) + dagger_files, trn.get("val_h5"),
             iter_dir, epochs=int(trn["iter_epochs"]), device=device,
             num_workers=int(trn.get("num_workers", 2)), init_from=init_from,
             init_ckpt=init_ckpt, seed=seed + i)
@@ -1426,7 +1467,7 @@ def main() -> None:
         # D as the refit actually saw it: demonstrations + every D_j so far.
         # `D_dagger_frac` is the axis that separates "DAgger helps" from "more
         # data helps" — success against |D| with the on-policy share alongside.
-        d_ep, d_steps = dataset_size([trn["base_train_h5"]] + dagger_files)
+        d_ep, d_steps = dataset_size(base_files(trn) + dagger_files)
         _, dag_steps = dataset_size(dagger_files)
 
         row = {

@@ -87,6 +87,15 @@ def parse_args() -> argparse.Namespace:
                         "its axis (45 = the Voronoi half-angle at k=6, so every "
                         "grasp lands in exactly one bin)")
     p.add_argument("--valid-grasp-dict", default="examples/valid_grasp_dict_005.pkl")
+    p.add_argument("--members-per-bin", type=int, default=5,
+                   help="how many goal-set grasps to RECORD per bin, closest to "
+                        "the bin axis first (run 2 recorded 1). Recording more "
+                        "than are wanted is the point: `assign_direction_demos "
+                        "--per-bin N` then picks N of them OFFLINE, so changing "
+                        "how many demonstrations a bin gets costs seconds "
+                        "instead of another simulator pass. 5 covers the "
+                        "3-per-bin setting with headroom at ~5x the pose "
+                        "payload (a few MB).")
     p.add_argument("--egl", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
@@ -132,6 +141,7 @@ def main() -> None:
 
     scenes_with = np.zeros(len(bins), dtype=np.int64)
     goal_hist = np.zeros(len(bins), dtype=np.int64)
+    member_spread: list[float] = []
     n_ok = n_no_plan = n_no_hand = n_fallback = n_no_object = 0
     modes, sides = Counter(), Counter()
     t0 = time.time()
@@ -197,7 +207,17 @@ def main() -> None:
             # Closest to the bin axis: the most canonical realisation of "come
             # from this direction", and the least likely to be re-binned by a
             # small anchor difference at collection time.
-            pick = int(members[int(np.argmin(best_ang[members]))])
+            order = members[np.argsort(best_ang[members], kind="stable")]
+            pick = int(order[0])
+            # MEMBERS, ordered by the same rule as `pick`. Run 2 recorded only
+            # the head of this list and could therefore demonstrate a bin exactly
+            # once; recording the first few lets `assign_direction_demos
+            # --per-bin N` emit N demonstrations of ONE command without another
+            # simulator pass. The ordering is load-bearing — the assignment takes
+            # a PREFIX of it, so `members[0]` must stay the closest-to-axis grasp
+            # that run 2 used, which is what keeps `--per-bin 1` byte-identical
+            # to run 2's table.
+            keep = order[:max(1, int(args.members_per_bin))]
             entries.append({
                 "bin": b, "bin_name": names[b],
                 "ee_pose_world": poses[pick].tolist(),
@@ -206,7 +226,25 @@ def main() -> None:
                 "angle_to_axis_deg": float(best_ang[pick]),
                 "goal_set_idx": pick,
                 "n_members": int(len(members)),
+                "members": [{
+                    "ee_pose_world": poses[int(j)].tolist(),
+                    "d_anchor": d_anchor[int(j)].tolist(),
+                    "d_world": d_world[int(j)].tolist(),
+                    "angle_to_axis_deg": float(best_ang[int(j)]),
+                    "goal_set_idx": int(j),
+                } for j in keep],
             })
+            # HOW DIFFERENT THE RECORDED MEMBERS ACTUALLY ARE. Three
+            # demonstrations of one command are worth collecting only if they are
+            # three different grasps; if the goal set holds near-duplicates, this
+            # buys 3x the episodes, 3x the mode-averaging under a unimodal loss,
+            # and no new information. Palm-origin spread in metres is the cheap
+            # read on that, printed in the summary so it is seen before a
+            # 3x-longer collection is launched rather than after.
+            if len(keep) > 1:
+                pts = np.stack([poses[int(j)][:3, 3] for j in keep])
+                member_spread.append(float(np.linalg.norm(
+                    pts[:, None, :] - pts[None, :, :], axis=-1).max()))
             scenes_with[b] += 1
 
         table[str(idx)] = {
@@ -234,6 +272,7 @@ def main() -> None:
         "n_anchor_fallback": n_fallback,
         "scenes_with_bin": scenes_with.tolist(),
         "goal_set_bin_histogram": goal_hist.tolist(),
+        "members_per_bin": int(args.members_per_bin),
         "handedness": dict(sides), "elapsed_s": round(time.time() - t0, 1),
     })
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -252,6 +291,23 @@ def main() -> None:
               f"({100 * scenes_with[b] / max(n_ok, 1):4.1f}%){flag}")
     live = int((scenes_with > 0).sum())
     print(f"\n  live bins: {live}/{len(bins)}   retry ladder has {live} rungs")
+
+    # ARE THE EXTRA MEMBERS ACTUALLY DIFFERENT GRASPS? Recording N per bin is
+    # worth a 3x-longer collection only if the N are distinct; near-duplicates
+    # buy 3x the episodes, 3x the mode-averaging under a unimodal regression
+    # loss, and nothing else. Read this BEFORE launching the collection.
+    if member_spread:
+        ms = np.asarray(member_spread)
+        print(f"\n  members recorded   : up to {args.members_per_bin} per bin, "
+              f"{len(ms)} bins with more than one")
+        print(f"  spread within a bin: median {np.median(ms) * 100:.1f} cm   "
+              f"p10 {np.percentile(ms, 10) * 100:.1f}   "
+              f"max {ms.max() * 100:.1f}   (palm origins, widest pair)")
+        thin = float((ms < 0.02).mean())
+        if thin > 0.25:
+            print(f"  WARNING {100 * thin:.0f}% of bins spread under 2 cm — those "
+                  f"extra demonstrations are near-duplicates of the first and "
+                  f"will mostly add mode-averaging, not information.")
     print(f"\nwrote {out}  ({time.time() - t0:.0f}s)")
     print("Next: examples/assign_direction_demos.py — pure combinatorics over this "
           "file, no simulator.")

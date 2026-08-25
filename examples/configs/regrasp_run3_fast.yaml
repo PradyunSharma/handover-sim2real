@@ -1,0 +1,213 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRASP RUN 3 — FAST VARIANT, sized to finish overnight on THIS laptop.
+#
+# = regrasp_run3.yaml (three demonstrations per bin, run 2's frame / k / command
+# / network / loss / DART / beta) with FOUR numbers turned down and a SHARDED
+# base set. The method is identical; only the amount of compute differs, so a
+# result here transfers as a DIRECTION and never as a level.
+#
+# THE 9-HOUR BUDGET, from rates MEASURED on this machine
+#
+#   base collection  3.62 s/episode  SERIAL
+#   DAgger collect   2.06 s/episode  4 workers (fast1: 283.9 s / 138 ep)
+#   eval             4.15 s/episode  serial    (fast1: 435.7 s / 105 ep)
+#   refit            1.36 s per epoch per 1k steps (fast1: 524.5 s / 6 ep / 64k)
+#   direction table  0.86 s/scene
+#
+# The collection rate is the HDF5's birth-to-last-write span over its episode
+# count, and it replicates: run 2's train read 3.62 s/ep (1596 episodes, 96 min)
+# and its val 3.62 (69 episodes, 4 min) — agreement to 0.3% across two
+# independent collections. Run 1's was 4.2. README_REGRASP step 4 previously
+# claimed ~3.5 h for 1596 demos; that was wrong by 2.2x and is now corrected.
+#
+#   direction tables (train 720 + val 36)                   11 min
+#   assignment x2                                            1 min
+#   val collection    ~200 episodes, serial                 12 min
+#   train collection  4578 episodes / 4 SHARDS              69 min
+#   audits + merge                                           5 min
+#   base fit          15 epochs x 86k steps                 29 min
+#   6 DAgger iterations, 55 -> 70 min as |D| grows         377 min
+#   figures                                                  2 min
+#                                                        ---------
+#                                                        ~8.4 h
+#
+# THE SHARDING. 4578 episodes is 4.6 h in one process. `collect_regrasp_demos
+# --shard i/4` splits it round-robin over scenes into four concurrent processes
+# (~1.2 h), and `base_train_h5` below takes the four files as a LIST, so they are
+# read directly and never merged.
+#
+# WHAT WAS TURNED DOWN AGAINST regrasp_run3.yaml
+#
+#   iter_epochs       15 -> 15    NOT turned down. Held at run 3's value on
+#                                 purpose, and it is now the DOMINANT cost of the
+#                                 run: |D| starts at 86k steps (2.87x fast1's
+#                                 base), so a 15-epoch refit is 32 min at
+#                                 iteration 1 and 47 by iteration 6 — more than
+#                                 collection and eval combined. Everything below
+#                                 is what pays for it.
+#   num_iters         20 -> 6     THE cut that pays for iter_epochs. At 5 epochs
+#                                 8 iterations fit; at 15 only 6 do. This is the
+#                                 real trade in this file: three times the
+#                                 gradient steps per round against two fewer
+#                                 rounds. fast1's trend was legible by iteration
+#                                 4, so 6 should still show one — but it is
+#                                 fewer DAgger rounds than any Regrasp run so far
+#                                 and the on-policy share of |D| ends lower.
+#   episodes_per_iter 1200 -> 600 50 scenes/iteration instead of 100 (~371
+#                                 episodes). Halves collection AND slows |D|
+#                                 growth, which under a 15-epoch refit is worth
+#                                 more than the collection saving.
+#   base_epochs       50 -> 15    The base set is 2.87x run 2's, so 15 epochs
+#                                 here is 2.15x the gradient steps fast1's 20
+#                                 bought on its 30k-step set.
+#   EVAL.num_scenes  100 -> 20    ~148 episodes, ~37 per live bin — BETTER per-bin
+#                                 resolution than fast1's 26, because a scene now
+#                                 contributes 7.42 episodes instead of 2.59.
+#
+# IF YOU WOULD RATHER HAVE ROUNDS THAN SCENES: `episodes_per_iter: 400` (33
+# scenes, ~245 episodes) fits SEVEN iterations in the same wall clock. 6 x 50
+# scenes is chosen over 7 x 33 because scene coverage is this project's measured
+# bottleneck, but it is a close call and one line to change.
+#
+# WHAT THIS RUN CAN AND CANNOT TELL YOU
+#
+# CAN: whether three-per-bin collection, the sharding and the member-major slot
+# order all work end to end; whether `cond_sep` and per-bin `bin_diag_rate` HOLD
+# (they must, if mode-averaging is not eating the extra data) or FALL while
+# `train_loss` falls (the mode-averaging signature — the one thing this run
+# exists to rule in or out); whether `retry_at_k` still separates.
+#
+# CANNOT: any success_rate comparison against fast1, run 2 or Phase-4 run 16.
+# Different data, different iteration count, 20 eval scenes.
+#
+# THE CONTROL IS fast1. Same laptop, same eval protocol, 8 iterations, one demo
+# per bin. Read this run against THAT, not against the cluster runs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SIM:
+  cfg_file: examples/pretrain_multicam_wr.yaml   # wrist + right, as run 2
+
+  split: train
+  egl: false
+
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08
+  hand_points_radius: 0.35
+
+  use_standoff: true
+  standoff_dist: 0.08
+
+  # Run-3 tables (per_bin: 3). Separate paths from run 2's, never an overwrite —
+  # a shard collected under one is not mixable with the other.
+  grasp_pin_table: output/regrasp_pins_train_p3.json
+  grasp_pin_match_tol: 0.02
+  exclude_scenes: output/regrasp_pins_train_p3_excluded.json
+
+  # See regrasp_run3.yaml for the KNOWN GRANULARITY GAP: keep_only filters
+  # (scene, BIN), not slots, so all three members of a bin are kept or dropped
+  # together. Read the audit's `command vs bin axis` line before training.
+  demo_ok_table: output/regrasp_demos_train_p3_ok.json
+
+DAGGER:
+  num_iters: 6             # FAST: 20 -> 6 (this is what pays for iter_epochs 15)
+  # FAST: 1200 -> 600. `sample_pairs` draws m // max_grasps scenes, and
+  # max_grasps is 12 here, so this is 50 scenes rolling out every slot they have
+  # -> ~371 episodes. Run 3 proper uses 1200 to hold 100 scenes; halving it
+  # halves the scene count, which is the honest cost of the budget.
+  episodes_per_iter: 600
+  max_steps: 50
+  scene_sampling: random
+  seed: 0
+
+  beta_schedule: linear
+  beta_start: 1.0
+  beta_end: 0.75
+  beta_mid: 0.5
+  beta_knee: 0.66
+  beta_p: 0.7
+
+  close_pos_thresh: 0.02
+  close_rot_thresh: 0.34
+  stop_on_close_label: true
+  stop_on_policy_close: false
+
+  ee_step: 0.04
+  reach_tail: 5
+  min_free: 1
+  max_horizon: 40
+  first_horizon: null
+
+  reach_commit_dist: 0.05
+  reach_skip_eps: 0.01
+  expert_after_commit: true
+
+  # Run 2's DART verbatim, both bands. Not re-tuned: DART is not the variable.
+  dart_ratio: 0.3
+  dart_max_dist: 10.0
+  dart_pos_mag: 0.04
+  dart_rot_mag: 0.3
+  dart_reach_ratio: 0.3
+  dart_reach_pos_mag: 0.01202
+  dart_reach_rot_mag: 0.3
+  dart_reach_max_tries: 5
+  dart_reach_clearance: 0.01
+  dart_reach_path_steps: 4
+
+  outcome_check: true
+
+TRAIN:
+  # Direction noise (d_noise_deg: 12.0) and the aux head both live here, both on,
+  # both unchanged from run 2.
+  train_cfg: examples/configs/bc_regrasp_run2.yaml
+  # Empty => PointNet++ random at iteration 0. Every later iteration warm-starts
+  # the WHOLE network (encoder included) from the previous last.pt and never
+  # reads this.
+  pc_pretrained:
+  # FOUR SHARDS, read as a list. Written concurrently by
+  # `collect_regrasp_demos --shard i/4`; the trainer checks all four exist and
+  # refuses to train on a subset, because a missing shard is a smaller
+  # experiment that would otherwise report itself as a successful one.
+  base_train_h5:
+    - ${REGRASP_DATA}/bc_dataset/train_regrasp_p3.s0.h5
+    - ${REGRASP_DATA}/bc_dataset/train_regrasp_p3.s1.h5
+    - ${REGRASP_DATA}/bc_dataset/train_regrasp_p3.s2.h5
+    - ${REGRASP_DATA}/bc_dataset/train_regrasp_p3.s3.h5
+  val_h5: ${REGRASP_DATA}/bc_dataset/val_regrasp_p3.h5
+  base_run: null
+  base_epochs: 15          # FAST: 50 -> 15 (on 2.87x the data)
+  # RUN 3'S VALUE, HELD. Not reduced, and it is the run's dominant cost: 15
+  # epochs over an 86k-step aggregate is ~32 min at iteration 1 rising to ~47 by
+  # iteration 6, against 12.7 min of collection and 10.3 of eval. `num_iters`
+  # came down from 8 to 6 to pay for it.
+  iter_epochs: 15
+  train_from_scratch: false
+  init_ckpt: last
+  num_workers: 2
+  device: cuda
+
+EVAL:
+  every: 1
+  # FAST: 100 -> 20. ~148 episodes, ~37 per live bin. A scene now contributes
+  # 7.42 episodes instead of run 2's 2.59, so this is BETTER per-bin resolution
+  # than fast1 had at 40 scenes. The scene set is a fixed np.linspace either way,
+  # so consecutive iterations stay a PAIRED comparison and the trend is readable.
+  num_scenes: 20
+  holdout: false
+  max_steps: 50
+  ckpt: last
+  success_mode: stable_grasp
+  hold_steps: 3
+  select_on: success_rate
+  verbose: false
+
+  box_check: true
+  box:
+    min_frac: 0.50
+    open_thresh: 0.8
+    half_x: 0.0088
+    z_lo: 0.0946
+    z_hi: 0.1122
+    inset: 0.002
+    grid_x: 7
+    grid_z: 7

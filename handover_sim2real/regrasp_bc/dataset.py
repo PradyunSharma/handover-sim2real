@@ -381,7 +381,7 @@ class BCDataset(Dataset):
         dir_of: dict[tuple[int, str], np.ndarray] = {}
         want_grasp = goal_table is not None
         n_from_attr = n_from_table = n_unresolved = 0
-        n_dir = n_dir_missing = 0
+        n_dir = n_dir_missing = n_miscaptioned = 0
         widths: set[int] = set()
         # Per-item sampling weight, aligned with `index`. Built here because
         # step-from-end needs the episode length, which is only known while the
@@ -393,6 +393,39 @@ class BCDataset(Dataset):
                 if not ep_keys:
                     raise RuntimeError(f"No episodes found in {path}")
                 for k in ep_keys:
+                    # ---- DROP EPISODES WHOSE CAPTION AND TRAJECTORY DISAGREE --
+                    # `bin_assigned` is what the policy is TOLD; `bin_realized`
+                    # is the bin the expert's grasp actually lies in. They differ
+                    # exactly when the pin missed — measured 19 of 1596 (1.2%) on
+                    # the run-2 base set, one of them 151.9 deg apart.
+                    #
+                    # Under run 1's rule this could not happen: the command was
+                    # DERIVED from the realised pose, so a missed pin just meant
+                    # the episode demonstrated a different direction than
+                    # intended, correctly labelled. Run 2 commands the BIN AXIS,
+                    # which does not move when the pin misses, so the episode
+                    # becomes a correct caption over the wrong trajectory —
+                    # systematically teaching "when told +z, approach from -y".
+                    # That is worse than random label noise, because it is
+                    # consistent within the episode.
+                    #
+                    # THE PIN TABLE FILTER IS NOT ENOUGH, which is the reason
+                    # this lives here. `SIM.demo_ok_table` prunes the TABLE, so
+                    # the pair is never collected or evaluated again — but the
+                    # base shard on disk still holds the episode, and this loader
+                    # reads every episode in the file. Filtering at the table
+                    # alone left them in D (`D_episodes` 1596, not 1575).
+                    #
+                    # Self-contained on purpose: both attrs ride on the episode,
+                    # so no external table is consulted and a shard cannot be
+                    # filtered against the wrong run's ok-list.
+                    _ba = f[k].attrs.get("bin_assigned")
+                    _br = f[k].attrs.get("bin_realized")
+                    if (self.direction_cond and _ba is not None and _br is not None
+                            and int(_ba) >= 0 and int(_br) >= 0
+                            and int(_ba) != int(_br)):
+                        n_miscaptioned += 1
+                        continue
                     T = int(f[k].attrs["num_steps"])
                     widths.add(int(f[k]["point_clouds"].shape[-1]))
                     if self.direction_cond:
@@ -454,6 +487,15 @@ class BCDataset(Dataset):
                 f"{MODEL_PC_CHANNELS} in the MODEL and re-collect with "
                 f"examples/collect_regrasp_demos.py, which writes the normals.")
         if self.direction_cond:
+            # Reported, never silent: dropping ~1% of a 3.5-hour collection is a
+            # thing the run's log should say out loud, and a SPIKE here means the
+            # pin table and the shard have come apart — a different failure from
+            # the irreducible re-draw, and one that wants investigating rather
+            # than absorbing.
+            if n_miscaptioned:
+                print(f"[direction] DROPPED {n_miscaptioned} episode(s) whose "
+                      f"bin_realized != bin_assigned (the pin missed, so the "
+                      f"caption is the commanded bin but the trajectory is not)")
             print(f"[direction] d_world resolved for {n_dir} episodes"
                   + (f", MISSING on {n_dir_missing}" if n_dir_missing else "")
                   + f"; clouds {self.stored_pc_channels}ch -> model "
