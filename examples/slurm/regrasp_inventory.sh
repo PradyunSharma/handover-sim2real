@@ -90,14 +90,51 @@ echo
 
 bold "HDF5 shards (scratch, large)"
 shopt -s nullglob
+# h5py is in the `pch2r_dev` conda env, not in a DelftBlue login node's default
+# python. Check ONCE and degrade to a size listing, rather than letting every
+# shard print its own ModuleNotFoundError traceback — 40 identical stack traces
+# bury the JSON results above them and say nothing the first one did not.
+HAVE_H5=1
+$PY -c "import h5py, numpy" 2>/dev/null || HAVE_H5=0
+if [ "$HAVE_H5" = "0" ]; then
+    echo "  (h5py not importable by '$PY' — sizes only, no completeness or rule check)"
+    echo "  For the full probe:  module load miniconda3 && conda activate pch2r_dev"
+    ls -la "$REGRASP_DATA"/bc_dataset/*.h5 2>/dev/null \
+        | awk '{printf "  %-40s %8.2f GB  %s %s\n", $9, $5/1e9, $6, $7}' \
+        || echo "  (none in $REGRASP_DATA/bc_dataset/)"
+    echo
+    bold "run directories (scratch)"
+    for d in "$REGRASP_DATA"/dagger_runs/*/; do
+        n=$(grep -c . "$d/dagger_log.csv" 2>/dev/null || echo 0)
+        echo "  $(basename "$d"):  $(( n > 0 ? n - 1 : 0 )) iterations logged"
+    done
+    echo
+    bold "queue"; squeue -u "$USER" 2>/dev/null || true
+    echo
+    echo "Next: conda activate pch2r_dev, re-run this, then"
+    echo "      bash examples/slurm/regrasp_pipeline.sh --dry-run"
+    exit 0
+fi
+# Only the Regrasp shards by default. The bc_dataset directory accumulates every
+# phase's data — 40-odd Phase-1/4 files that predate `bin_assigned` and can only
+# ever report "unknown", burying the two lines this script exists to show.
+# ALL=1 lists everything.
+PAT='*regrasp*.h5'
+[ "${ALL:-0}" = "1" ] && PAT='*.h5'
 found=0
-for h in "$REGRASP_DATA"/bc_dataset/*.h5; do
+for h in "$REGRASP_DATA"/bc_dataset/$PAT; do
     found=1
     $PY - "$h" <<'PROBE'
 import sys, os
 import h5py, numpy as np
-sys.path.insert(0, ".")
-from handover_sim2real.regrasp import directions as D
+# Load directions.py AS A FILE, not through `handover_sim2real.regrasp`. The
+# package __init__ pulls in the simulator, which prints four lines of gym
+# deprecation warning per import — once per shard, drowning the table. The module
+# itself is pure numpy by design (see its header) and imports standalone.
+import importlib.util as _u
+_s = _u.spec_from_file_location(
+    "_rg_dirs", os.path.join("handover_sim2real", "regrasp", "directions.py"))
+D = _u.module_from_spec(_s); _s.loader.exec_module(D)
 p = sys.argv[1]
 try:
     with h5py.File(p, "r") as f:
