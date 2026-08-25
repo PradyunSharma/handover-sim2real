@@ -232,11 +232,19 @@ class ParallelDaggerCollector:
     def evaluate(self, run_dir, ckpt, pairs, params, iteration=0):
         """[(scene, gi), ...] -> [row, ...] in the order given.
 
-        WHY THIS IS EXACT. `_eval_episode` uses no RNG and each episode resets
-        the sim to its own scene, so an eval episode is a pure function of
-        (scene, gi, weights). Fanning them out changes nothing but the wall
-        clock — unlike collection, which needed the frozen-checkpoint argument
-        above to be exact.
+        WHAT IS ACTUALLY GUARANTEED, AND WHAT IS NOT.
+        GUARANTEED: `_eval_episode` draws no random numbers, every episode
+        resets the sim to its own scene, and results are reassembled by JOB
+        INDEX rather than completion order — so the row sequence, and therefore
+        every rate, per-bin block and retry@k, does not depend on which worker
+        finished first.
+        NOT VERIFIED: bit-identity with the serial path. The equivalence test
+        was attempted and abandoned (the 2-worker pool stalled in env
+        construction), so this is an argument from the code, not a measurement.
+        It is also bounded from below by GPU nondeterminism, which makes two
+        SERIAL evals of the same checkpoint differ at some digit anyway — so
+        "identical to serial" was never the right bar. Treat parallel eval as
+        equivalent to re-running eval, not to replaying it.
 
         Eval was the second-largest cost of a run and the only serial one:
         measured on run 3's sizing, 742 episodes/iteration x 25 iterations is

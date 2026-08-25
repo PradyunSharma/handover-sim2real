@@ -243,11 +243,13 @@ def run_eval(pool, sim, run_dir, ckpt, device, eval_scenes, eval_params,
     iteration and ~18.5 h over the run, which made eval the second-largest cost
     of a DAgger run and the only serial one.
 
-    EXACT, NOT APPROXIMATE. `_eval_episode` draws no random numbers and every
-    episode resets the sim to its own scene, so an eval episode is a pure
-    function of (scene, direction, weights). Results come back in job order, so
-    the row sequence — and therefore every rate, the per-bin blocks and
-    `retry@k` — is bit-identical to the serial path.
+    ORDER-STABLE, NOT BIT-IDENTICAL. `_eval_episode` draws no random numbers
+    and every episode resets the sim to its own scene, and rows come back in JOB
+    ORDER, so no metric depends on which worker finished first. That is the
+    property this needs. It is NOT a claim of bit-identity with the serial path:
+    that was never measured, and GPU nondeterminism means two serial evals of
+    one checkpoint already disagree at some digit. Read a parallel eval as
+    equivalent to re-running eval, not to replaying it.
 
     Falls back to the serial loop when there is no pool, which is what a
     `--num-workers 0` run and every local smoke test take.
