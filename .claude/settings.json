@@ -115,7 +115,11 @@
       "Bash(nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv)",
       "Bash(awk '{print \"  \"$9}')",
       "Bash(ps -o etime= -p 311189)",
-      "Bash(/home/pradyun/anaconda3/envs/pch2r_dev/bin/python -m py_compile handover_sim2real/regrasp/parallel.py examples/train_regrasp.py)"
+      "Bash(/home/pradyun/anaconda3/envs/pch2r_dev/bin/python -m py_compile handover_sim2real/regrasp/parallel.py examples/train_regrasp.py)",
+      "Bash(echo \"=== exit $? ===\")",
+      "Bash(REPO=/home/pradyun/h2r/handover-sim2real python3 /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/faa38ba3-e255-48f1-9964-915b0926f8c6/scratchpad/check_inputs.py regrasp_run3 regrasp_run4 regrasp_run5)",
+      "Bash(python3 examples/check_regrasp_inputs.py regrasp_run3 regrasp_run4 regrasp_run5)",
+      "Bash(echo \"EXIT=$?\")"
     ],
     "additionalDirectories": [
       "/home/pradyun/h2r/handover-sim2real/examples/configs",
