@@ -192,7 +192,7 @@ DAGGER:
   # 20, planned — not 25 abandoned at 19. Run 1 was flat in `success_rate` from
   # iteration 6 on and the marginal iteration is ~40 min of refit against a
   # change inside the +-0.115 noise floor.
-  num_iters: 20
+  num_iters: 25
   # A TARGET, not an exact count. `sample_pairs` draws m // max_grasps = 100
   # scenes and rolls out EVERY bin each can reach, so the iteration lands near
   # 259 (the mean is 2.59 bins per scene). Drawing a scene's directions TOGETHER
@@ -209,9 +209,13 @@ DAGGER:
   # shift starting at iteration 2. Run 1 and Phase-4 run 16 both held 0.75
   # constant, so the late iterations here match them and the early ones are
   # gentler.
+  # 0.9 -> 0.5 linearly over the 25 iterations. NO pure-expert round: the
+  # distribution shift starts at iteration 1, and by the end HALF of every
+  # trajectory is the learner's own actions — a considerably harder and more
+  # on-policy schedule than run 1's constant 0.75 or Phase-4 run 16's.
   beta_schedule: linear
-  beta_start: 1.0
-  beta_end: 0.75
+  beta_start: 0.9
+  beta_end: 0.5
   beta_mid: 0.5          # unused by `linear`; kept so a switch to `piecewise`
   beta_knee: 0.66        # needs no other edit
   beta_p: 0.7
@@ -282,13 +286,43 @@ TRAIN:
   # and iteration 0 now has ~1.47x the data. Harmless either way — the epoch that
   # matters is whichever `last.pt` ends on.
   base_epochs: 50
+  # 15 epochs, and under `train_from_scratch: true` below this is a COMPLETE
+  # refit budget — the model starts from a random PointNet++ every iteration and
+  # has 15 epochs over the whole aggregate to get back.
+  #
+  # THE BUDGET IS TIGHT EARLY AND COMFORTABLE LATE, because epochs are over a
+  # GROWING D. In gradient steps (batch 64):
+  #     iteration 0   50 epochs x  86k steps  =  67k steps
+  #     iteration 1   15 epochs x  95k steps  =  22k steps   <- a third of it
+  #     iteration 25  15 epochs x ~530k steps = 125k steps   <- twice it
+  # So expect the early iterations to sit BELOW the base fit and recover as D
+  # grows. That dip is a property of this schedule, not a failure.
+  #
+  # 15 from random is known to be enough for a working policy: regrasp3_fast1's
+  # base fit was exactly that (15 epochs, empty pc_pretrained, 86k steps) and
+  # scored success 0.406 / bin_diag 0.406 at iteration 0.
   iter_epochs: 15
-  # Warm start the WHOLE network (not just the encoder) from the previous
-  # iteration's LAST checkpoint — the same weights that collected the data and
-  # were scored. `train_from_scratch: true` would discard it and refit from the
-  # pretrained encoder every round, which is Phase-4 run 16's behaviour.
-  train_from_scratch: false
-  init_ckpt: last
+  # TRUE — paper-faithful Follow-The-Leader (Ross et al.): every iteration refits
+  # from the initialisation on the whole aggregate, discarding the previous
+  # iteration's weights. Phase-4 run 16, the best run in the project at 0.80,
+  # did this.
+  #
+  # WITH `pc_pretrained` EMPTY THAT MEANS A RANDOM PointNet++ EVERY ITERATION,
+  # not just at iteration 0. That is deliberate here — regrasp does not borrow
+  # the CVPR2023 encoder — but it is the thing to check first if the run
+  # underperforms: see the gradient-step table above, and compare
+  # `success_rate` at iterations 1-3 against iteration 0. A run that never gets
+  # back above its base fit is telling you 15 epochs from random is not enough
+  # on this aggregate, and the fix is `pc_pretrained` or more epochs, not more
+  # iterations.
+  #
+  # Costs nothing extra in wall clock: train_on_aggregate fits the whole D for
+  # `iter_epochs` either way, so warm start and from-scratch differ only in the
+  # starting weights.
+  train_from_scratch: true
+  # Inert while train_from_scratch is true (nothing is loaded from the previous
+  # iteration). Kept so flipping that flag back needs no other edit.
+  init_ckpt: best
   num_workers: 2
   device: cuda
 
@@ -312,7 +346,26 @@ EVAL:
   max_steps: 50
   # LAST. Also picks the policy that collects the next iteration (train_regrasp
   # hands this same string to the workers), so one set of weights per iteration.
-  ckpt: last
+  # BEST. Selected on the lowest val loss of the fit; also picks the policy that
+  # collects the next iteration, so one set of weights per iteration either way.
+  #
+  # THE HONEST CAVEAT, MEASURED. The val set is collected ONCE at beta=1 from
+  # expert demonstrations and never changes, while D grows toward majority
+  # on-policy states (53% by iteration 8 of regrasp_fast1). So val loss measures
+  # the fit to a distribution that is a SHRINKING minority of the training data,
+  # and it rises monotonically while success rises: corr(val_loss, success) =
+  # +0.71 and +0.83 on the two fast runs, corr(on-policy share, val_loss) = +0.85
+  # and +0.96. Selecting on it is therefore selecting on a drifting target.
+  #
+  # WHY IT IS STILL DEFENSIBLE HERE: at these epoch budgets `best` and `last` are
+  # nearly the same checkpoint. Measured val gap between them is +0.000 to +0.001
+  # at iter_epochs 6 and +0.002 to +0.005 at 15 — far below anything that moves
+  # success. The choice is close to free in both directions.
+  #
+  # THE SELECTION THAT ACTUALLY MATTERS is `select_on: success_rate` below, which
+  # picks the best ITERATION on rollouts, where the differences (0.30 -> 0.48
+  # across a run) are much larger than the eval noise.
+  ckpt: best
   success_mode: stable_grasp
   hold_steps: 3
   select_on: success_rate

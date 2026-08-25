@@ -356,6 +356,22 @@ handles either layout.
 python examples/plot_regrasp_run.py output/dagger_runs/regrasp_run2
 ```
 
+**Per-epoch curves for each refit** — a different question, and `dagger_log.csv`
+cannot answer it, because it records only the END of each fit:
+
+```bash
+python examples/plot_regrasp_fits.py output/dagger_runs/regrasp_fast1
+```
+
+Reads `<run>/iters/iter_NN/log.csv` (one row per epoch, 36 columns) and writes
+`<run>/fit_curves.png`: one panel per refit, train solid / val dashed, a red
+marker at the val minimum, and a **shared y axis** so a fit that shifted bodily
+upward cannot be mistaken for one that did not. Use it to see whether a refit
+converged (val still descending at the last epoch means `iter_epochs` is too
+small — measured on `regrasp_fast1`, where 6 was), and how far `best.pt` sits
+from `last.pt`. `--metric val_cond_delta` or any other column, `--iters 0,4,8`
+for a subset.
+
 Five figures, written into the run directory:
 
 | file | what it shows |

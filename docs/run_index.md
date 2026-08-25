@@ -408,9 +408,10 @@ with different `init`. Phase-4 run 16, for reference, was 100 / 25 from scratch.
 | run | config | camera | iters | m | dirs/scene | command | init | epochs (base/iter) | β | DART free | DART reach | DART variant | aux task | loss | model flags | best iter | final | notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **regrasp_run1** | `regrasp_run1.yaml` | wrist+right | **19 of 25** | 354 → 176 | 1–2 (max-separated pair) | grasp axis `−R[:,2]` | warm-start (**best**.pt), PointNet++ from scratch | 40 / 12 | constant 0.75 | 0.3 | 0.3 | replace | no | pm (w=7) | nojoint, reach-tail ×2.5 (window **5**), **direction_cond**, head [256,256] | 8 (`success 0.354`) | `success 0.139` | Stopped at 19 by choice. `m` was 354 for iterations 1–5 and 176 for 6–19 — a budget correction, so **`D_steps` changes slope at iteration 6**. Base set 1087 episodes / 20386 steps over 617 scenes (471 paired, 146 single). Eval/collection read `best.pt`, the warm start read `best.pt` too. |
-| **regrasp_run2** | `regrasp_run2.yaml` | wrist+right | 20 (planned) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | warm-start (**last**.pt), PointNet++ from scratch | 50 / 15 | **linear 1.0→0.75** | 0.3 | 0.3 | replace | **yes** (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 1 with the protocol fixed and two method changes. See below. |
+| **regrasp_run2** | `regrasp_run2.yaml` | wrist+right | 25 (planned) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.5** | 0.3 | 0.3 | replace | **yes** (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 1 with the protocol fixed and two method changes. See below. |
 | **regrasp_fast1** | `regrasp_run2_fast.yaml` | wrist+right | **8 of 8** | 126 → 138 | **1–4 (one per bin)** | **bin axis** | warm-start (**last**.pt), PointNet++ from scratch | **20 / 6** | **linear 1.0→0.75** | 0.3 | 0.3 | replace | **yes** (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | 8 (`success 0.457`) | `success 0.457`, `dir_track 0.611`, `bin_diag 0.771` | Run 2's method at a fifth of the compute, on this laptop rather than DelftBlue, while the cluster was in maintenance. Five numbers turned down and nothing else: `num_iters` 20→8, `episodes_per_iter` 400→200, `base_epochs` 50→20, `iter_epochs` 15→6, `EVAL.num_scenes` 100→40. Base set 1596 episodes / 30028 steps over 617 scenes; ended at \|D\| 2624 episodes / 64257 steps, 53% of it on-policy. **First run in which DAgger moved anything.** See below. |
-| **regrasp_run3** | `regrasp_run3.yaml` | wrist+right | 20 (planned) | 1200 → ~742 | **1–4 bins × 3 grasps** (~7.4 slots) | **bin axis** | warm-start (**last**.pt), PointNet++ from scratch | 50 / 15 | linear 1.0→0.75 | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 2 with **three demonstrations per bin** instead of one, and nothing else: same frame, same k=6, same command, same network. Base set 1596 → **4578** demos over the same 617 scenes (91% of (scene, bin) pairs have ≥3 goal-set members). `episodes_per_iter` goes 400 → 1200 to hold the scene count at 100 — `max_grasps` triples, and leaving it at 400 would have drawn 33 scenes instead. See below. |
+| **regrasp3_fast1** | `regrasp_run3_fast.yaml` | wrist+right | **3 of 6** (running) | 368 → 356 | **3 per bin** (7.42/scene) | **bin axis** | warm-start (**last**.pt), PointNet++ from scratch | **15 / 15** | **linear 1.0→0.75** | 0.3 | 0.3 | replace | **yes** (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | 3 so far (`success 0.478`) | in progress — `dir_track 0.686`, `bin_diag 0.826` | Three demonstrations per bin instead of one, on the same 617 scenes. Base set **4578 episodes / 86315 steps**, 2.87× regrasp_fast1's, collected in 4 concurrent `--shard i/4` processes. Laptop run, `iter_epochs` held at run 3's 15 so `num_iters` came down to 6. **Already past regrasp_fast1's FINAL numbers at iteration 3.** See below. |
+| **regrasp_run3** | `regrasp_run3.yaml` | wrist+right | 25 (planned) | 1200 → ~742 | **1–4 bins × 3 grasps** (~7.4 slots) | **bin axis** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.5** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 2 with **three demonstrations per bin** instead of one, and nothing else: same frame, same k=6, same command, same network. Base set 1596 → **4578** demos over the same 617 scenes (91% of (scene, bin) pairs have ≥3 goal-set members). `episodes_per_iter` goes 400 → 1200 to hold the scene count at 100 — `max_grasps` triples, and leaving it at 400 would have drawn 33 scenes instead. See below. |
 
 ### Result: DAgger did not move success; the conditioning is read but not obeyed
 
@@ -704,6 +705,69 @@ reservation lifts, unchanged. The fast run was scoped to answer "does the
 plumbing work and does `bin_diag_rate` leave chance" and it answered both yes; it
 cannot settle levels, and the per-bin `bin_hit` disparity above is the thing the
 full run should be read for first.
+
+### regrasp3_fast1 — three demonstrations per bin (IN PROGRESS, 3 of 6)
+
+**Every number here is provisional** — the run is at iteration 3 of 6 as of
+2026-08-25 14:16, on 20 eval scenes (~148 episodes, ~37 per live bin). Recorded
+now because the trend is already decisive and because it changes what the full
+run 3 should be.
+
+Same 617 scenes and the same frame, k, command, network, loss, DART and β as run
+2. The one method change is **three demonstrations per bin instead of one**: for
+each (scene, bin) the three goal-set grasps closest to that bin's axis, giving
+**4578 base episodes / 86315 steps**, 2.87× regrasp_fast1's. Collected in ~1.2 h
+by four concurrent `collect_regrasp_demos --shard i/4` processes, read by the
+trainer as a list rather than merged. `iter_epochs` was held at run 3's 15, which
+is what forced `num_iters` down to 6.
+
+| iter | `succ` | `dir_track` | `bin_diag` | `retry@1→@4` |
+|---|---|---|---|---|
+| 0 (base fit) | 0.406 | 0.344 | 0.406 | 0.55 → 0.60 |
+| 1 | 0.435 | 0.586 | 0.739 | 0.35 → 0.60 |
+| 2 | 0.435 | 0.658 | 0.739 | 0.50 → 0.70 |
+| 3 | **0.478** | **0.686** | **0.826** | 0.50 → 0.70 |
+| *regrasp_fast1, it 8 (final)* | *0.457* | *0.611* | *0.771* | *0.375 → 0.70* |
+
+**It passed regrasp_fast1's FINAL numbers at iteration 1 and has kept going.**
+One demonstration per bin took eight DAgger rounds to reach `bin_diag` 0.771;
+three per bin reached 0.739 in ONE round and 0.826 by the third, against a chance
+level of 0.25. `dir_err` is down to 28.2° from the base fit's 62°.
+
+**The mode-averaging risk did not materialise, and that is the result.** Three
+valid grasps sharing one command under a unimodal `pm` loss could have been
+averaged into an invalid one; the signature would have been `bin_diag` and
+`cond_sep` FALLING while `train_loss` fell. Train loss fell (0.156 → 0.130) and
+`bin_diag` rose 0.406 → 0.826. `cond_sep` is flat-to-up (0.548). The direction
+table's own warning that **37% of bins have their members within 2 cm** — i.e.
+those extra demonstrations are near-duplicates — evidently costs nothing either.
+
+**`bin_hit_rate` is still the lagging metric but it has moved**: 0.391 pooled
+against fast1's 0.276, and the per-bin split is no longer one bin carrying it.
+
+| bin | n | `succ` | `dir_track` | `bin_diag` | `bin_hit` |
+|---|---|---|---|---|---|
+| `+x` free end | 36 | 0.417 | 0.718 | **0.917** | 0.667 |
+| `+y` lateral | 35 | **0.600** | 0.608 | 0.829 | 0.086 |
+| `−y` lateral | 24 | 0.375 | 0.654 | 0.625 | 0.625 |
+| `+z` top-down | 43 | 0.488 | 0.741 | 0.861 | 0.279 |
+
+`−y` now arrives from the commanded side 62.5% of the time where fast1 read 0.130
+— so "only `+x` arrives correctly" was a property of the thinner dataset, not of
+the method. `+y` remains the outlier: highest success, near-zero `bin_hit`. It
+succeeds by coming in from somewhere else, which is worth understanding before
+run 3 proper.
+
+**Caveats.** 20 eval scenes, `EVAL.holdout: false`, one run, and three iterations
+still to come. Iteration 2's `collect_s` reads 0 because the run was killed and
+resumed at that point, so its wall time is not comparable. `near_rate` is 0.000
+throughout, dead under this methodology as in every Regrasp run.
+
+**What this changes for run 3 proper.** The per-bin count is worth keeping at 3;
+the open question is no longer "does it average" but whether `num_iters: 6` is
+enough, since the gain is arriving almost entirely in the first two rounds and
+the last three may be flat. If the remaining iterations are flat, run 3 on the
+cluster should spend its budget on iterations rather than on `iter_epochs: 15`.
 
 ---
 
