@@ -120,6 +120,9 @@
       "Bash(REPO=/home/pradyun/h2r/handover-sim2real python3 /tmp/claude-1000/-home-pradyun-h2r-handover-sim2real/faa38ba3-e255-48f1-9964-915b0926f8c6/scratchpad/check_inputs.py regrasp_run3 regrasp_run4 regrasp_run5)",
       "Bash(python3 examples/check_regrasp_inputs.py regrasp_run3 regrasp_run4 regrasp_run5)",
       "Bash(echo \"EXIT=$?\")"
+      "Bash(sacct -j 6836 --format=JobID%10,JobName%16,State%20,ExitCode,Elapsed,Start%20,End%20)",
+      "Bash(squeue --me -o \"%.12i %.16j %.10T %.10M %.10L %.30R\")",
+      "Bash(sacct -j 8017 --format=JobID%10,JobName%16,State%20,ExitCode,Elapsed,Start%20,End%20)"
     ],
     "additionalDirectories": [
       "/home/pradyun/h2r/handover-sim2real/examples/configs",

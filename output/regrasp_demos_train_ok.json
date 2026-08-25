@@ -1,9 +1,9 @@
 {
  "_meta": {
   "stage": "audit_regrasp_demos --write-ok",
-  "source": "output/bc_dataset/train_regrasp.h5",
+  "source": "/scratch/pradyunsharma/handover-sim2real/output/bc_dataset/train_regrasp.h5",
   "n_scenes": 617,
-  "n_pairs": 1575
+  "n_pairs": 1576
  },
  "ok": {
   "0": [
@@ -1428,6 +1428,7 @@
   ],
   "380": [
    0,
+   2,
    3
   ],
   "381": [
@@ -1630,8 +1631,7 @@
    4
   ],
   "436": [
-   2,
-   4
+   2
   ],
   "437": [
    3
@@ -1774,7 +1774,8 @@
   ],
   "469": [
    0,
-   3
+   3,
+   4
   ],
   "470": [
    2,
@@ -2253,6 +2254,7 @@
   "585": [
    0,
    2,
+   3,
    4
   ],
   "586": [
@@ -2392,8 +2394,7 @@
   ],
   "616": [
    2,
-   3,
-   4
+   3
   ],
   "617": [
    0,

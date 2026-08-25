@@ -1,2 +1,9 @@
 #!/bin/bash
-exec /home/pradyunsharma/.conda/envs/pn2build/bin/x86_64-conda-linux-gnu-gcc "$@" -idirafter /usr/include
+args=()
+for a in "$@"; do
+  case "$a" in
+    -Wl,--sysroot=*|--sysroot=*) ;;
+    *) args+=("$a") ;;
+  esac
+done
+exec /home/pradyunsharma/.conda/envs/pn2build/bin/x86_64-conda-linux-gnu-gcc "${args[@]}" -idirafter /usr/include --sysroot=/home/pradyunsharma/.conda/envs/pn2build/x86_64-conda-linux-gnu/sysroot -Wl,--sysroot=/home/pradyunsharma/.conda/envs/pn2build/x86_64-conda-linux-gnu/sysroot
