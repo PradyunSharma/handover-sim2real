@@ -1,0 +1,92 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN 4's learner config = bc_regrasp_run2.yaml with the DIRECTION NOISE OFF.
+#
+# THAT IS THE ONLY CHANGE: `d_noise_deg` 12.0 -> 0.0. Everything else — the 7
+# channels, the per-point injection, the aux head, `reach_tail: 5`, the
+# [256, 256] head, no global `d` branch — is byte-identical, so run 4 against
+# run 3 isolates the augmentation.
+#
+# WHAT THE NOISE WAS FOR, AND WHY TURNING IT OFF IS A REAL QUESTION
+#
+# At evaluation the policy is commanded a BIN AXIS — `to_world(BINS[b],
+# anchor_R)` — exactly, every time. During training it is shown a demonstration
+# whose realised approach direction sits a measured median 18.4 deg from that
+# axis (p90 38.5, max 45 = the bin half-width), because the demo is the goal-set
+# grasp CLOSEST to the axis, not a grasp on it. `d_noise_deg: 12` perturbs the
+# commanded direction per episode so the policy sees a spread of commands rather
+# than one exact vector, on the theory that this buys tolerance to the gap.
+#
+# THE COUNTER-ARGUMENT, WHICH IS WHY THIS RUN EXISTS. The command at deployment
+# is NOISELESS and exact. Training on perturbed commands may simply blur the
+# conditioning: the network learns "somewhere near this direction" when the
+# retry machine will always ask for the axis itself. If run 4 beats run 3 on
+# `dir_err` / `bin_diag_rate`, the augmentation was costing precision it was
+# supposed to protect.
+#
+# NOTE THE SEEDING SUBTLETY IN THE OTHER DIRECTION. The perturbation is seeded
+# on the EPISODE KEY, so within one training run each episode always draws the
+# SAME offset across every epoch — it is a fixed relabelling, not a fresh sample
+# per epoch. So run 3 is not "12 deg of augmentation" so much as "every episode's
+# command displaced by a fixed random 12 deg", which is a weaker regulariser than
+# it looks and arguably just label noise. That makes the ablation more
+# interesting, not less.
+# ─────────────────────────────────────────────────────────────────────────────
+
+DATA:
+  # Overwritten by train_regrasp.py with the aggregate file list.
+  train_h5: output/bc_dataset/train_p5.h5
+  val_h5: null
+  pc_channels: 7              # xyz + ycb + hand + d.n + d.r  (the last two
+                              # are the conditioning, appended per point)
+  d_noise_deg: 0.0            # RUN 4: OFF. The command is the bin axis at
+                              # deployment, exactly; train on it exactly too.
+  robot_state_dim: 32
+  action_dim: 7
+  reach_tail_weight: 2.5
+  reach_tail: 5            # back to run 16's value — MEASURED, see below
+
+MODEL:
+  feature_dim: 256
+  robot_hidden: 128
+  policy_hidden: [256, 256]
+  pointnet_scale: 1
+  pointnet_radius: 0.02
+  pointnet_nclusters: 32
+  use_prev_act: false
+  drop_joint_state: true      # the single largest effect measured in this project
+  joint_state_dim: 18
+  # ---- Regrasp ----
+  direction_cond: true        # the command is per-point in the cloud, not an MLP
+  # ---- off, and why: see the header ----
+  aux_head: true            # RUN 2: on — see the header
+  aux_dim: 7
+  aux_hidden: [256, 256]
+  # Empty => random PointNet++ init. Only iteration 0 is affected; later
+  # iterations warm-start from the previous checkpoint and never read this.
+  pc_pretrained:
+  freeze_pc: false
+
+OPTIM:
+  kind: adamw
+  lr: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+
+LOSS:
+  gripper_weight: 1.0
+  pose_loss: pm
+  pm_weight: 7.0
+  aux_weight: 1.0             # RUN 2: the paper's unit weight, and Phase-4
+                              # run 13's. Untuned on purpose — a tuned weight
+                              # would make run 1 -> run 2 two changes.
+
+TRAIN:
+  batch_size: 64
+  num_epochs: 100             # overridden per fit by DAGGER's base/iter epochs
+  num_workers: 4
+  device: cuda
+  mixed_precision: false
+  val_every: 1
+  save_every: 5
+  grad_clip: 1.0
+  seed: 0

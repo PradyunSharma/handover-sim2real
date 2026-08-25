@@ -109,7 +109,12 @@
       "Bash(/home/pradyun/anaconda3/envs/pch2r_dev/bin/python -m py_compile examples/collect_regrasp_demos.py examples/train_regrasp.py)",
       "Bash(bash -n examples/watch_regrasp.sh)",
       "Bash(bash examples/watch_regrasp.sh)",
-      "Bash(/home/pradyun/anaconda3/envs/pch2r_dev/bin/python examples/status_regrasp_run.py output/dagger_runs/regrasp3_fast1)"
+      "Bash(/home/pradyun/anaconda3/envs/pch2r_dev/bin/python examples/status_regrasp_run.py output/dagger_runs/regrasp3_fast1)",
+      "Bash(/home/pradyun/anaconda3/envs/pch2r_dev/bin/python -m py_compile handover_sim2real/regrasp/evaluator.py)",
+      "Bash(/home/pradyun/anaconda3/envs/pch2r_dev/bin/python -m py_compile handover_sim2real/regrasp/parallel.py)",
+      "Bash(nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv)",
+      "Bash(awk '{print \"  \"$9}')",
+      "Bash(ps -o etime= -p 311189)"
     ],
     "additionalDirectories": [
       "/home/pradyun/h2r/handover-sim2real/examples/configs",

@@ -1,60 +1,44 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# REGRASP RUN 3 — THREE DEMONSTRATIONS PER BIN.
+# REGRASP RUN 6 = RUN 4 with EVERY SCENE collected on EVERY iteration. ONE
+# change:
 #
-# = regrasp_run2.yaml with ONE method change and the budget that follows from it.
-# The frame is run 2's (gravity-aligned, wrist-anchored azimuth), k is run 2's
-# (6 octahedral bins, 4 live), the command is run 2's (the bin axis), the
-# network, loss, DART and β schedule are run 2's. Only the number of expert
-# trajectories behind each command moves.
+#   DAGGER.episodes_per_iter   1200 -> 7404      (100 scenes -> ALL 617)
 #
-# THE CHANGE. Each (scene, bin) now carries THREE demonstrations instead of one:
-# the three goal-set grasps closest to that bin's axis, or all of them when the
-# bin holds fewer. Measured on s0/train: 91% of (scene, bin) pairs have three or
-# more members, and the assignment emits 4578 demonstrations against run 2's
-# 1596 — a 2.87x base set over the same 617 scenes.
+# Everything else is run 4 verbatim: three grasps per bin, bin-axis command,
+# NO direction noise (bc_regrasp_run4), beta 0.9 -> 0.5, from-scratch FTL,
+# 25 iterations, 50/15 epochs, ckpt `best`. Shares run 3/4's pin tables and
+# shards, so nothing needs re-collecting.
 #
-# WHAT IT TEACHES, AND WHAT IT DOES NOT. The three share ONE command, so they do
-# NOT break the scene->action confound any further than run 2 did — that job
-# belongs to the four DIFFERENT commands a scene supplies, and it is unchanged.
-# What they teach is that a direction does not name a single pose, which is true
-# and is what the policy meets at deployment: `retry.next_direction` issues a bin
-# axis, and any grasp within that bin is a correct answer to it.
+# 7404 = 617 scenes x max_grasps 12. `sample_scenes` caps at `len(pool)`, so any
+# value at or above the cap means "all of them" and the number self-corrects
+# downward if `demo_ok_table` prunes the pool further.
 #
-# THE RISK, STATED PLAINLY. `pose_loss: pm` is a UNIMODAL regression loss. Three
-# valid targets for one input are resolved by AVERAGING, and the mean of three
-# grasps need not be a grasp — this is the same mode-averaging that made
-# multi-grasp Phase-4 data unusable without conditioning, arriving now from
-# within a single command instead of across several. It is a real possibility,
-# not a certainty: the three members sit within 45 deg of one axis rather than
-# anywhere on the sphere, so the modes are much closer together than Phase-4's
-# were. The diagnostic is `cond_sep` and the per-bin `bin_diag_rate` FALLING
-# while `train_loss` also falls — a network fitting a mean nobody asked for.
-# Watch those two before the success rate; if they go, turn `--per-bin` down to
-# 2 rather than reaching for the architecture.
+# WHAT THIS IS TESTING. Every other run samples 100 of 617 scenes a round, so a
+# given scene is revisited roughly once every six iterations and the aggregate
+# grows slowly. Here every scene is rolled out under the CURRENT policy every
+# round: maximum on-policy coverage, and the DAgger share of D passes half after
+# a SINGLE iteration (110k new steps against an 86k base) instead of after
+# thirteen. If DAgger's benefit is bounded by how much on-policy data it sees,
+# this is the run that shows it.
 #
-# BUILD THE TABLES FIRST. `--members-per-bin` is a BUILD-time setting, and run
-# 2's table recorded one member per bin, so it cannot serve this run — the
-# assignment refuses rather than silently emitting one:
+# !! IT IS ALSO ~9 DAYS OF GPU. Read this before submitting.
 #
-#   python examples/build_direction_table.py --split train --members-per-bin 5 \
-#       --out output/direction_table_train.json
-#   python examples/assign_direction_demos.py --table output/direction_table_train.json \
-#       --out output/regrasp_pins_train_p3 --per-bin 3 \
-#       --drop-bins='-z_beneath,-x_over_fingers'
+#   per iteration   collect 4578 episodes / 20 workers   ~14 min
+#                   eval    742 episodes / 20 workers     ~2 min
+#                   refit   15 epochs x |D|, and |D| grows by 110k steps
+#                           EVERY iteration instead of 18k
 #
-# 5 is recorded and 3 are used on purpose: trying 2 or 4 later is then an offline
-# re-run of the assignment in seconds, not another 20-minute simulator pass.
-# Read the build's `spread within a bin` line BEFORE collecting — if most bins
-# report under 2 cm the extra members are near-duplicates and this run buys 3x
-# the mode-averaging for no new information.
+#   |D| after 25 iterations   2.84M steps   (run 4 ends at 530k)
+#   refit total               ~215 h        (run 4: ~45 h)
+#   whole run                 ~223 h = 9.3 days, over TEN chained 24 h jobs
+#   scratch                   ~47 GB of DAgger shards
 #
-# EMISSION ORDER IS MEMBER-MAJOR, and it has to be. The retry ladder reads a
-# scene's slots IN ORDER, so grouping by bin (+x,+x,+x,+y,...) would make retry@2
-# a second attempt at the SAME direction under an IDENTICAL command — the policy
-# would do the identical thing and `retry_at_k` would collapse into a measure of
-# simulator noise. The assignment cycles the bins instead (+x,+y,-y,+z,+x,...),
-# so rungs 1-4 stay four distinct directions exactly as in run 2. Verified: 0 of
-# 617 scenes have a repeated direction inside their first `n_bins` slots.
+# The refit is quadratic in the iteration count here — every round refits from
+# scratch over an aggregate that grew by 110k — so the cost is dominated by the
+# LAST few iterations. `num_iters: 8` costs ~30 h and still drives the on-policy
+# share past 0.9; `num_iters: 25` costs 9 days for the tail. If this run is
+# worth doing at all it is probably worth doing at 8, and that is a one-line
+# change below.
 # ─────────────────────────────────────────────────────────────────────────────
 
 SIM:
@@ -116,27 +100,22 @@ DAGGER:
   # honest middle; 400 keeps run 2's wall clock and is NOT recommended, because
   # it changes two things at once and the one it changes silently is the one that
   # matters.
-  # 100 SCENES per iteration. max_grasps is 12 here, and
-  # `sample_pairs` draws m // max_grasps scenes, so this is
-  # 1200 // 12 = 100.
-  episodes_per_iter: 1200
+  # ALL 617 SCENES per iteration, not 100. 7404 = 617 x max_grasps 12, and
+  # `sample_scenes` caps at len(pool), so this means "every scene" and shrinks
+  # with the pool rather than going stale. ~4578 episodes an iteration.
+  episodes_per_iter: 7404
   max_steps: 50
   scene_sampling: random
   seed: 0
 
-  # 0.9 -> 0.75 linearly over the 25 iterations. NO pure-expert round: the
-  # distribution shift starts at iteration 1, and by the end a QUARTER of every
-  # trajectory is the learner's own actions.
-  #
-  # 0.75 is the floor Phase-4 run 16 (0.80, the best run in the project) and
-  # regrasp run 1 both held CONSTANT, so the late iterations here sit exactly
-  # where those runs sat and the early ones are gentler. That makes this schedule
-  # a strict interpolation between known-good settings rather than an
-  # extrapolation past them — which 0.5 would have been, at double run 16's
-  # on-policy fraction and beyond anything measured on this task.
+  # 0.9 -> 0.5 linearly over the 25 iterations. NO pure-expert round, and by the
+  # end HALF of every trajectory is the learner's own actions — double Phase-4
+  # run 16's on-policy fraction and beyond anything measured on this task. See
+  # the header: this is the second of two changes against run 3 and it is why
+  # run 4 is not a clean noise ablation.
   beta_schedule: linear
   beta_start: 0.9
-  beta_end: 0.75
+  beta_end: 0.5
   beta_mid: 0.5
   beta_knee: 0.66
   beta_p: 0.7
@@ -187,7 +166,7 @@ TRAIN:
   #   just the head. `pc_pretrained` is consulted at iteration 0 ONLY, and it is
   #   empty, so iteration 0 starts from a random encoder and every iteration
   #   after continues the chain.
-  train_cfg: examples/configs/bc_regrasp_run2.yaml
+  train_cfg: examples/configs/bc_regrasp_run4.yaml
   pc_pretrained:
   base_train_h5: ${REGRASP_DATA}/bc_dataset/train_regrasp_p3.h5
   val_h5: ${REGRASP_DATA}/bc_dataset/val_regrasp_p3.h5

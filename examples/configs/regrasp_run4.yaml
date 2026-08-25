@@ -1,60 +1,38 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# REGRASP RUN 3 — THREE DEMONSTRATIONS PER BIN.
+# REGRASP RUN 4 = RUN 3 with the DIRECTION NOISE OFF and a lower beta floor.
 #
-# = regrasp_run2.yaml with ONE method change and the budget that follows from it.
-# The frame is run 2's (gravity-aligned, wrist-anchored azimuth), k is run 2's
-# (6 octahedral bins, 4 live), the command is run 2's (the bin axis), the
-# network, loss, DART and β schedule are run 2's. Only the number of expert
-# trajectories behind each command moves.
+# TWO CHANGES, and they are NOT independent — read the caveat below before
+# attributing anything to either one:
 #
-# THE CHANGE. Each (scene, bin) now carries THREE demonstrations instead of one:
-# the three goal-set grasps closest to that bin's axis, or all of them when the
-# bin holds fewer. Measured on s0/train: 91% of (scene, bin) pairs have three or
-# more members, and the assignment emits 4578 demonstrations against run 2's
-# 1596 — a 2.87x base set over the same 617 scenes.
+#   TRAIN.train_cfg   bc_regrasp_run2 -> bc_regrasp_run4   (d_noise_deg 12 -> 0)
+#   DAGGER.beta_end   0.75 -> 0.5
 #
-# WHAT IT TEACHES, AND WHAT IT DOES NOT. The three share ONE command, so they do
-# NOT break the scene->action confound any further than run 2 did — that job
-# belongs to the four DIFFERENT commands a scene supplies, and it is unchanged.
-# What they teach is that a direction does not name a single pose, which is true
-# and is what the policy meets at deployment: `retry.next_direction` issues a bin
-# axis, and any grasp within that bin is a correct answer to it.
+# Everything else is run 3 verbatim: the same p3 pin tables (three grasps per
+# bin), the same shards, the same frame, k=6, bin-axis command, network, loss,
+# DART, 25 iterations, 50/15 epochs, from-scratch FTL, ckpt `best`.
 #
-# THE RISK, STATED PLAINLY. `pose_loss: pm` is a UNIMODAL regression loss. Three
-# valid targets for one input are resolved by AVERAGING, and the mean of three
-# grasps need not be a grasp — this is the same mode-averaging that made
-# multi-grasp Phase-4 data unusable without conditioning, arriving now from
-# within a single command instead of across several. It is a real possibility,
-# not a certainty: the three members sit within 45 deg of one axis rather than
-# anywhere on the sphere, so the modes are much closer together than Phase-4's
-# were. The diagnostic is `cond_sep` and the per-bin `bin_diag_rate` FALLING
-# while `train_loss` also falls — a network fitting a mean nobody asked for.
-# Watch those two before the success rate; if they go, turn `--per-bin` down to
-# 2 rather than reaching for the architecture.
+# THE QUESTION: DOES PERTURBING THE COMMAND HELP OR BLUR IT?
 #
-# BUILD THE TABLES FIRST. `--members-per-bin` is a BUILD-time setting, and run
-# 2's table recorded one member per bin, so it cannot serve this run — the
-# assignment refuses rather than silently emitting one:
+# At evaluation the policy is commanded the bin axis exactly. In training it is
+# shown a demonstration a measured median 18.4 deg off that axis, and run 3 adds
+# `d_noise_deg: 12` on top. The case for the noise is tolerance to that gap; the
+# case against is that it teaches "somewhere near this direction" when the retry
+# machine will only ever ask for the axis. Run 4 removes it.
 #
-#   python examples/build_direction_table.py --split train --members-per-bin 5 \
-#       --out output/direction_table_train.json
-#   python examples/assign_direction_demos.py --table output/direction_table_train.json \
-#       --out output/regrasp_pins_train_p3 --per-bin 3 \
-#       --drop-bins='-z_beneath,-x_over_fingers'
+# Sharpening the question: the perturbation is seeded on the EPISODE KEY, so
+# each episode draws the SAME offset every epoch. It is a fixed relabelling
+# rather than a fresh draw — closer to label noise than to augmentation.
 #
-# 5 is recorded and 3 are used on purpose: trying 2 or 4 later is then an offline
-# re-run of the assignment in seconds, not another 20-minute simulator pass.
-# Read the build's `spread within a bin` line BEFORE collecting — if most bins
-# report under 2 cm the extra members are near-duplicates and this run buys 3x
-# the mode-averaging for no new information.
+# !! THIS IS NOT A CLEAN ABLATION. `beta_end` moves too, from 0.75 to 0.5, so a
+# difference against run 3 has two candidate causes. 0.5 is also OUTSIDE the
+# range anything on this task has been run at: Phase-4 run 16 (0.80, the best
+# run) and regrasp run 1 both held 0.75 CONSTANT, and every regrasp run to date
+# has floored at 0.75. At 0.5 half of every late trajectory is the learner's own
+# actions, which is double run 16's on-policy fraction. If run 4 differs from
+# run 3, a third run at (noise off, beta_end 0.75) is what separates the two.
 #
-# EMISSION ORDER IS MEMBER-MAJOR, and it has to be. The retry ladder reads a
-# scene's slots IN ORDER, so grouping by bin (+x,+x,+x,+y,...) would make retry@2
-# a second attempt at the SAME direction under an IDENTICAL command — the policy
-# would do the identical thing and `retry_at_k` would collapse into a measure of
-# simulator noise. The assignment cycles the bins instead (+x,+y,-y,+z,+x,...),
-# so rungs 1-4 stay four distinct directions exactly as in run 2. Verified: 0 of
-# 617 scenes have a repeated direction inside their first `n_bins` slots.
+# SHARES RUN 3'S DATA. Same pin tables, same collected shards, nothing to
+# re-collect. The only cost of this run is training time.
 # ─────────────────────────────────────────────────────────────────────────────
 
 SIM:
@@ -124,19 +102,14 @@ DAGGER:
   scene_sampling: random
   seed: 0
 
-  # 0.9 -> 0.75 linearly over the 25 iterations. NO pure-expert round: the
-  # distribution shift starts at iteration 1, and by the end a QUARTER of every
-  # trajectory is the learner's own actions.
-  #
-  # 0.75 is the floor Phase-4 run 16 (0.80, the best run in the project) and
-  # regrasp run 1 both held CONSTANT, so the late iterations here sit exactly
-  # where those runs sat and the early ones are gentler. That makes this schedule
-  # a strict interpolation between known-good settings rather than an
-  # extrapolation past them — which 0.5 would have been, at double run 16's
-  # on-policy fraction and beyond anything measured on this task.
+  # 0.9 -> 0.5 linearly over the 25 iterations. NO pure-expert round, and by the
+  # end HALF of every trajectory is the learner's own actions — double Phase-4
+  # run 16's on-policy fraction and beyond anything measured on this task. See
+  # the header: this is the second of two changes against run 3 and it is why
+  # run 4 is not a clean noise ablation.
   beta_schedule: linear
   beta_start: 0.9
-  beta_end: 0.75
+  beta_end: 0.5
   beta_mid: 0.5
   beta_knee: 0.66
   beta_p: 0.7
@@ -187,7 +160,7 @@ TRAIN:
   #   just the head. `pc_pretrained` is consulted at iteration 0 ONLY, and it is
   #   empty, so iteration 0 starts from a random encoder and every iteration
   #   after continues the chain.
-  train_cfg: examples/configs/bc_regrasp_run2.yaml
+  train_cfg: examples/configs/bc_regrasp_run4.yaml
   pc_pretrained:
   base_train_h5: ${REGRASP_DATA}/bc_dataset/train_regrasp_p3.h5
   val_h5: ${REGRASP_DATA}/bc_dataset/val_regrasp_p3.h5

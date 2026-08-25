@@ -386,100 +386,122 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
     measuring pin agreement); the second counts off-pose grasps as the
     opportunities they are. `box_taken_rate` is the conversion of the latter.
     """
-    pregrasp = str(params.target) == "pregrasp"
-    # Every scene is scored under EVERY direction it can supply, and each episode
-    # carries the slot it was conditioned on — that is what makes the per-bin
-    # rates, retry@k and dir_track all fall out of one pass.
-    #
-    # `max_grasps`, NOT `num_grasps`: the latter is a MIN over scenes and reads 1
-    # on a Regrasp table (which mixes 1- and 2-direction scenes), which would
-    # score only the first direction of every scene and quietly halve the eval.
-    # The per-scene count drives the actual iteration.
-    num_grasps = int(getattr(pin_table, "max_grasps", 0) or
-                     getattr(pin_table, "num_grasps", 1) or 1)
+    num_grasps = eval_num_grasps(pin_table)
+    jobs = eval_jobs(scenes, pin_table, num_grasps)
     rows = []
-    for i, scene in enumerate(scenes):
+    for n, (scene, gi) in enumerate(jobs):
+        row = eval_one(sim, runner, scene, gi, params=params, pin_table=pin_table)
+        rows.append(row)
+        if params.verbose:
+            _print_eval_row(row, n, len(jobs), scene, gi, params)
+    return aggregate_eval_rows(rows, params, num_grasps)
+
+
+def eval_num_grasps(pin_table) -> int:
+    """`max_grasps`, NOT `num_grasps`.
+
+    The latter is a MIN over scenes and reads 1 on a Regrasp table (which mixes
+    1- and 4-direction scenes), which would score only the first direction of
+    every scene and quietly halve the eval.
+    """
+    return int(getattr(pin_table, "max_grasps", 0) or
+               getattr(pin_table, "num_grasps", 1) or 1)
+
+
+def eval_jobs(scenes, pin_table, num_grasps=None):
+    """[(scene, gi)] — every (scene, direction) pair scored, in order.
+
+    Split out so the serial loop and the parallel pool enumerate the SAME work
+    in the SAME order. Results are reassembled by job index, which is what makes
+    the parallel path bit-identical to the serial one rather than merely
+    equivalent in distribution.
+    """
+    num_grasps = eval_num_grasps(pin_table) if num_grasps is None else num_grasps
+    out = []
+    for scene in scenes:
         n_here = (pin_table.num_grasps_for(int(scene))
                   if pin_table is not None else num_grasps)
-        for gi in range(max(int(n_here), 1)):
-            # proximity needs a grasp pose; stable_grasp only wants one if a pin
-            # table makes it free (it is a diagnostic there, not the score).
-            grasp_pose = None
-            if params.success_mode == "proximity" or pin_table is not None:
-                grasp_pose = _resolve_grasp_pose(sim, int(scene), pin_table, gi)
-                if grasp_pose is None and params.success_mode == "proximity":
-                    print(f"    [eval] scene {scene} g{gi}: no grasp pose (OMG "
-                          f"failed and no pin entry) — proximity cannot score it; "
-                          f"counted as failure")
+        out += [(int(scene), gi) for gi in range(max(int(n_here), 1))]
+    return out
 
-            # The pose the POLICY is steering to. Derived, never planned for: it
-            # is a fixed function of the grasp (`derived_standoff_pose`, 5.6e-7 m
-            # from the planner's own traj[-reach_tail]), so eval still makes no
-            # OMG call it was not already making.
-            target_pose = grasp_pose
-            if pregrasp and grasp_pose is not None:
-                target_pose = derived_standoff_pose(
-                    grasp_pose, params.standoff_dist, params.reach_tail)
 
-            # THE COMMAND IS THE BIN AXIS, matching the collector and matching
-            # what `retry.next_direction` issues at deployment. Run 1 used
-            # `-R_grasp[:,2]` here, which is a different vector: the pinned grasp
-            # sits a median 18.4 deg off its bin's axis, so eval was scoring the
-            # policy on a command no deployment would ever give it — and
-            # `dir_err`, which is the angle between the command and the achieved
-            # axis, was measuring against that same shifted target and so hid the
-            # discrepancy rather than showing it.
-            meta = (pin_table.scene_meta.get(int(scene), {})
-                    if pin_table is not None else {})
-            anchor_R = meta.get("anchor_R")
-            b = (pin_table.bin_of(int(scene), gi)
-                 if pin_table is not None else None)
-            if b is not None and anchor_R is not None and int(b) >= 0:
-                d_world = _rg_dirs.to_world(_rg_dirs.BINS[int(b)],
-                                            np.asarray(anchor_R))
-            else:
-                # No bin or no anchor (a Phase-5-shaped table): run 1's rule, so
-                # an old pin table still scores rather than scoring nothing.
-                d_world = (None if grasp_pose is None
-                           else _rg_dirs.approach_direction(grasp_pose))
-            row = _eval_episode(sim, runner, int(scene), params=params,
-                                grasp_pose=grasp_pose, target_pose=target_pose,
-                                d_world=d_world)
-            row["grasp_idx"] = gi
-            row["grasp_pose"] = grasp_pose
-            row["d_world"] = d_world
-            row["anchor_R"] = np.asarray(anchor_R) if anchor_R is not None else None
-            row["centroid_world"] = meta.get("centroid_world")
-            row["bin_idx"] = -1 if b is None else int(b)
-            rows.append(row)
-            if params.verbose:
-                reach = (f"reach={row['reach_pos_err']:.3f}/{row['box_after']} "
-                         if pregrasp else "")
-                print(f"    eval [{i+1:3d}/{len(scenes)}] scene={scene:4d} "
-                      f"g{gi} "
-                      f"success={row['success']} grasped={row['grasped']} "
-                      f"close@{row['close_step']} pos_err={row['pos_err']:.3f} "
-                      f"{reach}"
-                      f"ee->ycb={row['dist']:.3f} "
-                      f"box={row['box_chance']}/{row['box_taken']}"
-                      f"@{row['box_steps']}st({row['box_frac_max']:.2f}) "
-                      f"{row['reason']}")
+def eval_one(sim, runner, scene, gi, *, params: EvalParams, pin_table=None) -> dict:
+    """ONE (scene, direction) episode -> its row. DETERMINISTIC: draws no RNG.
 
+    The body of the old double loop, extracted so a worker process can call it
+    on its own env. Everything beyond `sim`/`runner` is a plain argument or
+    lives in `pin_table`, which every worker already builds.
+    """
+    pregrasp = str(params.target) == "pregrasp"
+    scene = int(scene)
+    # proximity needs a grasp pose; stable_grasp only wants one if a pin table
+    # makes it free (a diagnostic there, not the score).
+    grasp_pose = None
+    if params.success_mode == "proximity" or pin_table is not None:
+        grasp_pose = _resolve_grasp_pose(sim, scene, pin_table, gi)
+        if grasp_pose is None and params.success_mode == "proximity":
+            print(f"    [eval] scene {scene} g{gi}: no grasp pose (OMG failed "
+                  f"and no pin entry) — proximity cannot score it; counted as "
+                  f"failure")
+
+    # The pose the POLICY steers to. Derived, never planned for, so eval makes
+    # no OMG call it was not already making.
+    target_pose = grasp_pose
+    if pregrasp and grasp_pose is not None:
+        target_pose = derived_standoff_pose(
+            grasp_pose, params.standoff_dist, params.reach_tail)
+
+    # THE COMMAND IS THE BIN AXIS, matching the collector and what
+    # `retry.next_direction` issues at deployment. Run 1 used `-R_grasp[:,2]`,
+    # a different vector: the pinned grasp sits a median 18.4 deg off its bin's
+    # axis, so eval scored the policy on a command no deployment would give it,
+    # and `dir_err` measured against that same shifted target.
+    meta = (pin_table.scene_meta.get(scene, {}) if pin_table is not None else {})
+    anchor_R = meta.get("anchor_R")
+    b = pin_table.bin_of(scene, gi) if pin_table is not None else None
+    if b is not None and anchor_R is not None and int(b) >= 0:
+        d_world = _rg_dirs.to_world(_rg_dirs.BINS[int(b)], np.asarray(anchor_R))
+    else:
+        # No bin or no anchor (a Phase-5-shaped table): run 1's rule, so an old
+        # pin table still scores rather than scoring nothing.
+        d_world = (None if grasp_pose is None
+                   else _rg_dirs.approach_direction(grasp_pose))
+
+    row = _eval_episode(sim, runner, scene, params=params,
+                        grasp_pose=grasp_pose, target_pose=target_pose,
+                        d_world=d_world)
+    row["grasp_idx"] = gi
+    row["grasp_pose"] = grasp_pose
+    row["d_world"] = d_world
+    row["anchor_R"] = np.asarray(anchor_R) if anchor_R is not None else None
+    row["centroid_world"] = meta.get("centroid_world")
+    row["bin_idx"] = -1 if b is None else int(b)
+    return row
+
+
+def _print_eval_row(row, n, total, scene, gi, params) -> None:
+    reach = (f"reach={row['reach_pos_err']:.3f}/{row['box_after']} "
+             if str(params.target) == "pregrasp" else "")
+    print(f"    eval [{n+1:3d}/{total}] scene={scene:4d} g{gi} "
+          f"success={row['success']} grasped={row['grasped']} "
+          f"close@{row['close_step']} pos_err={row['pos_err']:.3f} {reach}"
+          f"ee->ycb={row['dist']:.3f} "
+          f"box={row['box_chance']}/{row['box_taken']}"
+          f"@{row['box_steps']}st({row['box_frac_max']:.2f}) {row['reason']}")
+
+
+def aggregate_eval_rows(rows, params, num_grasps) -> dict:
+    """rows -> the metric dict. Shared by the serial and parallel eval paths."""
     out = _rate_block(rows, params)
     out["rows"] = rows
     out.update(_regrasp_metrics(rows, num_grasps))
     # ---- THE SAME BLOCK AGAIN, ONE BIN AT A TIME ---------------------------
-    # Pooled rates hide the thing the phase is about. `success_rate` is an
-    # average over four physically different commands, and a policy that solves
-    # `+x` and ignores `+z` reads identically to one that is mediocre at both.
-    # Every panel of the training figure is therefore drawn per bin, which needs
-    # the whole family per bin rather than just `succ_bin_*`.
-    #
-    # Suffix `_b{b}`, and EVERY bin gets keys — including the two that are empty
-    # on this dataset. A fixed schema means the CSV header does not change with
-    # what a run happened to command, so two runs stay diffable and a plotter can
-    # ask for a column without first asking whether it exists. Empty bins yield
-    # NaN, which `_r` writes as a blank cell and matplotlib renders as a gap.
+    # Pooled rates hide the thing the phase is about: `success_rate` averages
+    # four physically different commands, and a policy that solves `+x` and
+    # ignores `+z` reads identically to one mediocre at both. EVERY bin gets
+    # keys, including the two empty on this dataset, so the CSV header does not
+    # change with what a run happened to command. Empty bins yield NaN, which
+    # `_r` writes blank and matplotlib renders as a gap.
     for b in range(len(_rg_dirs.BINS)):
         rs = [r for r in rows if int(r.get("bin_idx", -1)) == b]
         for k, v in _rate_block(rs, params).items():

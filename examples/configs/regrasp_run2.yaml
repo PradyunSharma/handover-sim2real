@@ -199,6 +199,9 @@ DAGGER:
   # is the point: rollouts differing only in the command are the only data that
   # can teach the network the command matters, and independent draws would spread
   # that contrast across the whole run.
+  # 100 SCENES per iteration. max_grasps is 4 here, and
+  # `sample_pairs` draws m // max_grasps scenes, so this is
+  # 400 // 4 = 100.
   episodes_per_iter: 400
   max_steps: 50
   scene_sampling: random
@@ -329,7 +332,12 @@ TRAIN:
   # Inert while train_from_scratch is true (nothing is loaded from the previous
   # iteration). Kept so flipping that flag back needs no other edit.
   init_ckpt: best
-  num_workers: 2
+  # 8, not 2. These are DataLoader workers for the REFIT, and during the refit
+  # all 20 collection workers are idle — the node has 22 CPUs and two were
+  # feeding the loader. Each sample is a 1024x8 float array read from HDF5, so
+  # the loader is plausibly the bottleneck on an aggregate this size. Costs
+  # nothing and cannot change results.
+  num_workers: 8
   device: cuda
 
 EVAL:

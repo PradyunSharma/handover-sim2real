@@ -1,60 +1,42 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# REGRASP RUN 3 — THREE DEMONSTRATIONS PER BIN.
+# REGRASP RUN 5 = RUN 3 with the WARM START back on. ONE change:
 #
-# = regrasp_run2.yaml with ONE method change and the budget that follows from it.
-# The frame is run 2's (gravity-aligned, wrist-anchored azimuth), k is run 2's
-# (6 octahedral bins, 4 live), the command is run 2's (the bin axis), the
-# network, loss, DART and β schedule are run 2's. Only the number of expert
-# trajectories behind each command moves.
+#   TRAIN.train_from_scratch   true -> false
 #
-# THE CHANGE. Each (scene, bin) now carries THREE demonstrations instead of one:
-# the three goal-set grasps closest to that bin's axis, or all of them when the
-# bin holds fewer. Measured on s0/train: 91% of (scene, bin) pairs have three or
-# more members, and the assignment emits 4578 demonstrations against run 2's
-# 1596 — a 2.87x base set over the same 617 scenes.
+# A CLEAN SINGLE-VARIABLE ABLATION, unlike run 4. Everything else is run 3
+# verbatim — the same p3 pin tables, the same collected shards, the same frame,
+# k=6, bin-axis command, `d_noise_deg: 12`, network, loss, DART, 25 iterations,
+# 50/15 epochs, beta 0.9 -> 0.75, ckpt `best`. Shares run 3's data entirely, so
+# the only cost is training time.
 #
-# WHAT IT TEACHES, AND WHAT IT DOES NOT. The three share ONE command, so they do
-# NOT break the scene->action confound any further than run 2 did — that job
-# belongs to the four DIFFERENT commands a scene supplies, and it is unchanged.
-# What they teach is that a direction does not name a single pose, which is true
-# and is what the policy meets at deployment: `retry.next_direction` issues a bin
-# axis, and any grasp within that bin is a correct answer to it.
+# WHAT THE FLAG ACTUALLY CHANGES, AND WHY IT IS NOT A SMALL THING
 #
-# THE RISK, STATED PLAINLY. `pose_loss: pm` is a UNIMODAL regression loss. Three
-# valid targets for one input are resolved by AVERAGING, and the mean of three
-# grasps need not be a grasp — this is the same mode-averaging that made
-# multi-grasp Phase-4 data unusable without conditioning, arriving now from
-# within a single command instead of across several. It is a real possibility,
-# not a certainty: the three members sit within 45 deg of one axis rather than
-# anywhere on the sphere, so the modes are much closer together than Phase-4's
-# were. The diagnostic is `cond_sep` and the per-bin `bin_diag_rate` FALLING
-# while `train_loss` also falls — a network fitting a mean nobody asked for.
-# Watch those two before the success rate; if they go, turn `--per-bin` down to
-# 2 rather than reaching for the architecture.
+# `train_from_scratch: true` is paper-faithful Follow-The-Leader: every iteration
+# discards the previous weights and refits from the initialisation. With
+# `pc_pretrained` empty that initialisation is a RANDOM PointNet++, so run 3
+# rebuilds the encoder from noise 25 times. `false` instead loads the previous
+# iteration's `best.pt` — encoder included — and continues it.
 #
-# BUILD THE TABLES FIRST. `--members-per-bin` is a BUILD-time setting, and run
-# 2's table recorded one member per bin, so it cannot serve this run — the
-# assignment refuses rather than silently emitting one:
+# So the SAME `iter_epochs: 15` means two different things:
 #
-#   python examples/build_direction_table.py --split train --members-per-bin 5 \
-#       --out output/direction_table_train.json
-#   python examples/assign_direction_demos.py --table output/direction_table_train.json \
-#       --out output/regrasp_pins_train_p3 --per-bin 3 \
-#       --drop-bins='-z_beneath,-x_over_fingers'
+#   run 3 (scratch)    15 epochs is a COMPLETE fit budget. In gradient steps at
+#                      batch 64: iteration 0 gets 50 x 86k = 67k; iteration 1
+#                      gets 15 x 95k = 22k, a THIRD of it; iteration 25 gets
+#                      15 x 530k = 125k, twice it. Expect early iterations to sit
+#                      below the base fit and recover as |D| grows.
+#   run 5 (warm)       15 epochs is 15 MORE epochs on an already-trained network.
+#                      No dip; the model never unlearns.
 #
-# 5 is recorded and 3 are used on purpose: trying 2 or 4 later is then an offline
-# re-run of the assignment in seconds, not another 20-minute simulator pass.
-# Read the build's `spread within a bin` line BEFORE collecting — if most bins
-# report under 2 cm the extra members are near-duplicates and this run buys 3x
-# the mode-averaging for no new information.
+# WHY BOTH ARE WORTH RUNNING. FTL is what Ross et al. specify and what Phase-4
+# run 16 (0.80, the best run in the project) did, and it has a real theoretical
+# claim: a fresh fit on the whole aggregate cannot inherit an early iteration's
+# mistakes. The warm start is what both fast runs used — regrasp_fast1 and
+# regrasp3_fast1 — and is the only configuration in which this project has yet
+# seen `bin_diag_rate` climb past 0.8. This pair settles which matters more here.
 #
-# EMISSION ORDER IS MEMBER-MAJOR, and it has to be. The retry ladder reads a
-# scene's slots IN ORDER, so grouping by bin (+x,+x,+x,+y,...) would make retry@2
-# a second attempt at the SAME direction under an IDENTICAL command — the policy
-# would do the identical thing and `retry_at_k` would collapse into a measure of
-# simulator noise. The assignment cycles the bins instead (+x,+y,-y,+z,+x,...),
-# so rungs 1-4 stay four distinct directions exactly as in run 2. Verified: 0 of
-# 617 scenes have a repeated direction inside their first `n_bins` slots.
+# MEASURED ON THE FAST RUNS, both warm-started: regrasp3_fast1 reached
+# success 0.565 / bin_diag 0.848 by iteration 4 and bin_diag 0.891 by 5.
+# Whatever run 3 does from scratch is the comparison.
 # ─────────────────────────────────────────────────────────────────────────────
 
 SIM:
@@ -230,7 +212,7 @@ TRAIN:
   # Costs nothing extra in wall clock: train_on_aggregate fits the whole D for
   # `iter_epochs` either way, so warm start and from-scratch differ only in the
   # starting weights.
-  train_from_scratch: true
+  train_from_scratch: false
   # Inert while train_from_scratch is true (nothing is loaded from the previous
   # iteration). Kept so flipping that flag back needs no other edit.
   init_ckpt: best

@@ -69,6 +69,7 @@ def _worker_main(worker_id, cfg4, seed, worker_device, task_q, result_q):
         import torch
 
         from handover_sim2real.regrasp.collector import collect_dagger_episode
+        from handover_sim2real.regrasp.evaluator import eval_one
         from handover_sim2real.regrasp.policy_io import load_policy_runner
         from handover_sim2real.regrasp.setup import build_regrasp_context
 
@@ -86,7 +87,13 @@ def _worker_main(worker_id, cfg4, seed, worker_device, task_q, result_q):
             job = task_q.get()
             if job is None:
                 break
-            run_dir, ckpt, beta, params, iteration, items = job
+            # A 7-tuple carries an explicit kind; a 6-tuple is a collection
+            # job, kept so nothing outside this file has to change at once.
+            if len(job) == 7:
+                kind, run_dir, ckpt, beta, params, iteration, items = job
+            else:
+                kind = "collect"
+                run_dir, ckpt, beta, params, iteration, items = job
 
             if loaded != (run_dir, ckpt):
                 del runner
@@ -100,13 +107,24 @@ def _worker_main(worker_id, cfg4, seed, worker_device, task_q, result_q):
                 loaded = (run_dir, ckpt)
 
             out = []
-            for idx, scene, grasp_i, ep_seed in items:
-                rng = np.random.RandomState(ep_seed)
-                episode, st = collect_dagger_episode(
-                    ctx.sim, runner, int(scene), rng=rng, beta=float(beta),
-                    params=params, pin_table=ctx.pin_table,
-                    grasp_idx=int(grasp_i))
-                out.append((int(idx), episode, st))
+            if kind == "eval":
+                # EVAL, not collection. Same env, same frozen checkpoint, a
+                # different per-episode call: `eval_one` rolls the policy with
+                # NO beta mixture and returns a metrics row instead of an
+                # episode. It draws no random numbers, so `ep_seed` is ignored
+                # and the parallel result is bit-identical to the serial one.
+                for idx, scene, grasp_i, _ in items:
+                    row = eval_one(ctx.sim, runner, int(scene), int(grasp_i),
+                                   params=params, pin_table=ctx.pin_table)
+                    out.append((int(idx), row, None))
+            else:
+                for idx, scene, grasp_i, ep_seed in items:
+                    rng = np.random.RandomState(ep_seed)
+                    episode, st = collect_dagger_episode(
+                        ctx.sim, runner, int(scene), rng=rng, beta=float(beta),
+                        params=params, pin_table=ctx.pin_table,
+                        grasp_idx=int(grasp_i))
+                    out.append((int(idx), episode, st))
             result_q.put(("done", worker_id, out))
     except Exception:                                    # noqa: BLE001
         try:
@@ -184,6 +202,53 @@ class ParallelDaggerCollector:
                     raise RuntimeError(f"collection worker(s) died mid-iteration: {dead}")
                 # alive, just slow — OMG can be. Keep waiting.
 
+    def _fan_out(self, kind, run_dir, ckpt, pairs, seeds, beta, params, iteration):
+        """Round-robin `pairs` over the workers and gather in JOB ORDER.
+
+        Shared by `collect` and `evaluate`: the two differ only in what the
+        worker calls per item, and returning by job index rather than completion
+        order is what keeps either path independent of which worker finished
+        first.
+        """
+        jobs = [(i, s, g, sd) for i, ((s, g), sd) in enumerate(zip(pairs, seeds))]
+        buckets = [[] for _ in range(self.num_workers)]
+        for k, j in enumerate(jobs):
+            buckets[k % self.num_workers].append(j)
+        # Dispatch to ALL workers, including empty buckets, so the reply count is
+        # fixed at num_workers and a short iteration cannot leave the gather loop
+        # waiting on a worker that was never given anything.
+        for wid in range(self.num_workers):
+            self.task_qs[wid].put((kind, str(run_dir), str(ckpt), float(beta),
+                                   params, int(iteration), buckets[wid]))
+        got = {}
+        for _ in range(self.num_workers):
+            tag, wid, payload = self._get_one()
+            if tag == "error":
+                raise RuntimeError(f"{kind} worker {wid} crashed:\n{payload}")
+            for idx, a, b in payload:
+                got[idx] = (a, b)
+        return [got[k] for k in range(len(jobs))]
+
+    def evaluate(self, run_dir, ckpt, pairs, params, iteration=0):
+        """[(scene, gi), ...] -> [row, ...] in the order given.
+
+        WHY THIS IS EXACT. `_eval_episode` uses no RNG and each episode resets
+        the sim to its own scene, so an eval episode is a pure function of
+        (scene, gi, weights). Fanning them out changes nothing but the wall
+        clock — unlike collection, which needed the frozen-checkpoint argument
+        above to be exact.
+
+        Eval was the second-largest cost of a run and the only serial one:
+        measured on run 3's sizing, 742 episodes/iteration x 25 iterations is
+        ~18.5 h on a node whose 20 collection workers sit idle throughout.
+        """
+        if not pairs:
+            return []
+        pairs = [(int(p[0]), int(p[1])) for p in pairs]
+        out = self._fan_out("eval", run_dir, ckpt, pairs, [0] * len(pairs),
+                            0.0, params, iteration)
+        return [row for row, _ in out]
+
     def collect(self, run_dir, ckpt, pairs, seeds, beta, params, iteration):
         """`pairs` is [(scene_idx, grasp_idx), ...] — the Phase-5 work unit. A
         bare list of scene ids is read as slot 0, so a Phase-4-shaped call still
@@ -192,25 +257,8 @@ class ParallelDaggerCollector:
             return []
         pairs = [(int(p), 0) if isinstance(p, (int, np.integer))
                  else (int(p[0]), int(p[1])) for p in pairs]
-        jobs = [(i, s, g, sd) for i, ((s, g), sd) in enumerate(zip(pairs, seeds))]
-        buckets = [[] for _ in range(self.num_workers)]
-        for k, j in enumerate(jobs):
-            buckets[k % self.num_workers].append(j)
-
-        # Dispatch to ALL workers, including empty buckets, so the reply count is
-        # fixed at num_workers and a short iteration cannot leave the gather loop
-        # waiting on a worker that was never given anything.
-        for wid in range(self.num_workers):
-            self.task_qs[wid].put((str(run_dir), str(ckpt), float(beta), params,
-                                   int(iteration), buckets[wid]))
-        collected = {}
-        for _ in range(self.num_workers):
-            tag, wid, payload = self._get_one()
-            if tag == "error":
-                raise RuntimeError(f"collection worker {wid} crashed:\n{payload}")
-            for idx, episode, st in payload:
-                collected[idx] = (episode, st)
-        return [collected[k] for k in range(len(jobs))]
+        return self._fan_out("collect", run_dir, ckpt, pairs, seeds, beta,
+                             params, iteration)
 
     def close(self):
         for tq in self.task_qs:

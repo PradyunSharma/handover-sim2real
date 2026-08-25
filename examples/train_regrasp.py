@@ -95,6 +95,9 @@ from handover_sim2real.regrasp import (
     load_policy_runner,
     policy_kind,
 )
+from handover_sim2real.regrasp.evaluator import (               # noqa: E402
+    aggregate_eval_rows, eval_jobs, eval_num_grasps,
+)
 from handover_sim2real.regrasp.pregrasp import forward_dist_default
 from handover_sim2real.regrasp.setup import (                     # noqa: E402
     build_regrasp_context, expand_config_paths, scene_pools,
@@ -229,6 +232,39 @@ def base_files(trn: dict) -> list[str]:
 
 
 # ── per-iteration training (a fresh fit on the whole aggregate) ──────────────
+
+def run_eval(pool, sim, run_dir, ckpt, device, eval_scenes, eval_params,
+             pin_table, iteration=0):
+    """Evaluate one checkpoint, on the worker pool when there is one.
+
+    THE POOL IS THE SAME ONE COLLECTION USES, and it is otherwise IDLE here:
+    collection has finished, the refit is done, and eval is the only thing left
+    in the iteration. Measured on run 3's sizing that idle time is ~44 min an
+    iteration and ~18.5 h over the run, which made eval the second-largest cost
+    of a DAgger run and the only serial one.
+
+    EXACT, NOT APPROXIMATE. `_eval_episode` draws no random numbers and every
+    episode resets the sim to its own scene, so an eval episode is a pure
+    function of (scene, direction, weights). Results come back in job order, so
+    the row sequence — and therefore every rate, the per-bin blocks and
+    `retry@k` — is bit-identical to the serial path.
+
+    Falls back to the serial loop when there is no pool, which is what a
+    `--num-workers 0` run and every local smoke test take.
+    """
+    if pool is None:
+        runner, _ = load_policy_runner(Path(run_dir), device, ckpt=ckpt)
+        out = evaluate_policy(sim, runner, eval_scenes, params=eval_params,
+                              pin_table=pin_table)
+        del runner
+        if device != "cpu":
+            torch.cuda.empty_cache()
+        return out
+    jobs = eval_jobs(eval_scenes, pin_table)
+    rows = pool.evaluate(str(run_dir), str(ckpt), jobs, eval_params,
+                         iteration=iteration)
+    return aggregate_eval_rows(rows, eval_params, eval_num_grasps(pin_table))
+
 
 def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | None,
                        run_dir: Path, *, epochs: int, device: str,
@@ -1216,12 +1252,9 @@ def main() -> None:
                       else len(eval_scenes))
         print(f"[iter 00] evaluating the base policy on {len(eval_scenes)} scenes "
               f"= {_n_eval_ep} episodes (per-scene direction counts) ...")
-        base_metrics = evaluate_policy(sim, runner, eval_scenes, params=eval_params,
-                                       pin_table=pin_table)
+        base_metrics = run_eval(collector_pool, sim, base_dir, eval_ckpt, device,
+                                eval_scenes, eval_params, pin_table, iteration=0)
         base_metrics.pop("rows")
-        del runner
-        if device != "cpu":
-            torch.cuda.empty_cache()
         print(f"[iter 00] success={base_metrics['success_rate']:.3f} "
               f"grasp={base_metrics['grasp_rate']:.3f} "
               f"near={base_metrics['near_rate']:.3f} "
@@ -1422,15 +1455,13 @@ def main() -> None:
         eval_s = 0.0          # stays 0 on the iterations EVAL.every skips
         emetrics = None
         if eval_every > 0 and eval_scenes and (i % eval_every == 0 or i == num_iters):
-            runner, _ = load_policy_runner(iter_dir, device, ckpt=eval_ckpt)
-            print(f"  [eval] {len(eval_scenes)} scenes x {num_grasps} grasps = "
-                  f"{len(eval_scenes)*num_grasps} episodes ...")
-            emetrics = evaluate_policy(sim, runner, eval_scenes, params=eval_params,
-                                       pin_table=pin_table)
+            _njobs = len(eval_jobs(eval_scenes, pin_table))
+            print(f"  [eval] {len(eval_scenes)} scenes = {_njobs} episodes"
+                  + (f" on {collector_pool.num_workers} workers ..."
+                     if collector_pool is not None else " (serial) ..."))
+            emetrics = run_eval(collector_pool, sim, iter_dir, eval_ckpt, device,
+                                eval_scenes, eval_params, pin_table, iteration=i)
             emetrics.pop("rows")
-            del runner
-            if device != "cpu":
-                torch.cuda.empty_cache()
             print(f"  [eval] success={emetrics['success_rate']:.3f} "
                   f"grasp={emetrics['grasp_rate']:.3f} "
                   f"near={emetrics['near_rate']:.3f} "
