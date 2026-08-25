@@ -121,13 +121,19 @@ DAGGER:
   scene_sampling: random
   seed: 0
 
-  # 0.9 -> 0.5 linearly over the 25 iterations. NO pure-expert round: the
-  # distribution shift starts at iteration 1, and by the end HALF of every
-  # trajectory is the learner's own actions — a considerably harder and more
-  # on-policy schedule than run 1's constant 0.75 or Phase-4 run 16's.
+  # 0.9 -> 0.75 linearly over the 25 iterations. NO pure-expert round: the
+  # distribution shift starts at iteration 1, and by the end a QUARTER of every
+  # trajectory is the learner's own actions.
+  #
+  # 0.75 is the floor Phase-4 run 16 (0.80, the best run in the project) and
+  # regrasp run 1 both held CONSTANT, so the late iterations here sit exactly
+  # where those runs sat and the early ones are gentler. That makes this schedule
+  # a strict interpolation between known-good settings rather than an
+  # extrapolation past them — which 0.5 would have been, at double run 16's
+  # on-policy fraction and beyond anything measured on this task.
   beta_schedule: linear
   beta_start: 0.9
-  beta_end: 0.5
+  beta_end: 0.75
   beta_mid: 0.5
   beta_knee: 0.66
   beta_p: 0.7
