@@ -962,6 +962,28 @@ def main() -> None:
         sim_cfg_d.get("grasp_pin_table"),
         match_tol=float(sim_cfg_d.get("grasp_pin_match_tol", 0.02)),
         sim_cfg_block=sim_cfg_d)
+
+    # THE SAME PRUNE THE WORKERS APPLY, and it MUST happen here too.
+    #
+    # Every parallel worker builds its context with `build_regrasp_context`
+    # (regrasp/setup.py), which calls `keep_only` on the pin table. A manager
+    # that skips it holds a DIFFERENT table from the processes it dispatches to,
+    # and `keep_only` RENUMBERS SLOTS — so a `grasp_idx` the manager emits names
+    # a different bin in the worker, or no slot at all when it runs past the
+    # pruned count. The latter resolves to `bin_of -> None` and `pose -> None`,
+    # which makes `d_world` None and the worker dies at the first `act()` with
+    # "asked to act with no direction set". Both the eval fan-out and the
+    # collection sampler index into this table, so both were affected.
+    #
+    # It goes BEFORE `usable`, because that set is the pruned key list — a scene
+    # the filter empties is removed from `entries` entirely and must not reach
+    # the pools.
+    demo_ok_path = sim_cfg_d.get("demo_ok_table")
+    if demo_ok_path and pin_table is not None:
+        with open(demo_ok_path) as f:
+            raw_ok = json.load(f)
+        pin_table.keep_only(raw_ok.get("ok", raw_ok))
+
     usable = set(pin_table.entries) if pin_table is not None else None
     # Phase 5: how many pinned grasps every scene carries. The sampler expands
     # each drawn scene into this many episodes and the evaluator scores each eval
