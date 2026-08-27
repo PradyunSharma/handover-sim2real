@@ -1,0 +1,121 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN 9's learner config = bc_regrasp_run4.yaml with the LABEL SOURCE MOVED.
+#
+# THAT IS THE ONLY CHANGE: `d_source` d_world -> d_grasp_world. The noise is
+# already off in run 4's file, the 7 channels, the per-point injection, the aux
+# head, `reach_tail: 5`, the [256, 256] head and the absence of a global `d`
+# branch are byte-identical, so the pair (run 7, run 9) isolates the label rule
+# and nothing else on the learner side.
+#
+# ── WHAT `d_source` DECIDES ──────────────────────────────────────────────────
+#
+# Every Regrasp episode carries two unit vectors, written by both collectors:
+#
+#   d_world        the direction the episode was COMMANDED — `SIM.command_deploy`
+#                  turned the assigned bin into a vector, and under runs 1-8 that
+#                  same vector was also the caption.
+#   d_grasp_world  `-R_grasp[:,2]`, the approach axis the expert ACTUALLY FLEW.
+#
+# Runs 1-8 trained on the first. Run 9 trains on the second, which is what
+# "give the policy `d` as it is" means: the label is the true direction of the
+# grasp being imitated, not the sector that grasp was filed under.
+#
+# BOTH ATTRS ARE ALREADY ON DISK, so this is a relabelling and NOT a
+# re-collection. The base shards run 2 collected — `train_regrasp.h5`,
+# `val_regrasp.h5` — are reused byte-for-byte. Base collection replays an OMG
+# plan with no policy in the loop, so `d_world` never influenced a single
+# recorded state there; it was only ever a caption, and this reads the other one.
+#
+# ── WHAT IT COSTS, AND THIS IS THE POINT OF THE RUN ──────────────────────────
+#
+# `d_grasp_world` is NOT PRODUCIBLE AT DEPLOYMENT. There is no grasp to read —
+# that dependency is the whole reason the Regrasp fork exists. So a run that
+# trains on it must deploy on something else, and the gap between the two is
+# real train/deploy skew rather than label noise. Measured over the 1576 demos
+# of the pruned run-2 table:
+#
+#   train label -> deploy command       median   p90     max
+#   grasp axis  -> bin axis  (run 1)     18.45   38.36   44.98
+#   grasp axis  -> bin CENTROID (run 9)  16.20   32.68   55.08
+#
+# So the centroid buys 2.25 deg of median and 5.68 deg of p90 against run 1's
+# arrangement, and the run is a sharper version of run 1 rather than a variant
+# of run 2. Runs 2-8 have zero skew by construction and pay instead in label
+# noise: the policy is told a sector and shown a grasp a median 18.45 deg inside
+# it. The angular budget is comparable either way; which end of it a policy
+# tolerates better is not something the project has measured, and is the
+# question this run asks.
+#
+# ── VAL IS RELABELLED TOO ────────────────────────────────────────────────────
+#
+# train_regrasp.py passes this to BOTH datasets. A val set captioned under a
+# different rule than the train set measures nothing, and `val_total` would stop
+# being comparable with runs 2-8 either way — the fit is against a different
+# target. Read `success_rate` and `dir_err`, not the loss, when comparing across
+# the label change.
+# ─────────────────────────────────────────────────────────────────────────────
+
+DATA:
+  # Overwritten by train_regrasp.py with the aggregate file list.
+  train_h5: output/bc_dataset/train_p5.h5
+  val_h5: null
+  pc_channels: 7              # xyz + ycb + hand + d.n + d.r  (the last two
+                              # are the conditioning, appended per point)
+  # RUN 9: the label is the grasp's own approach axis, not the commanded bin.
+  # Pairs with SIM.command_deploy: bin_centroid in regrasp_run9.yaml —
+  # train_regrasp.py REFUSES `d_world` alongside a non-default command_deploy,
+  # because the base shards were captioned `bin_axis` and the aggregate's halves
+  # would then disagree.
+  d_source: d_grasp_world
+  d_noise_deg: 0.0            # OFF, as in run 4. With the label already the
+                              # exact demonstrated direction there is nothing
+                              # left for a perturbation to smooth over — it
+                              # would only blur a command that is now precise.
+  robot_state_dim: 32
+  action_dim: 7
+  reach_tail_weight: 2.5
+  reach_tail: 5            # back to run 16's value — MEASURED, see below
+
+MODEL:
+  feature_dim: 256
+  robot_hidden: 128
+  policy_hidden: [256, 256]
+  pointnet_scale: 1
+  pointnet_radius: 0.02
+  pointnet_nclusters: 32
+  use_prev_act: false
+  drop_joint_state: true      # the single largest effect measured in this project
+  joint_state_dim: 18
+  # ---- Regrasp ----
+  direction_cond: true        # the command is per-point in the cloud, not an MLP
+  aux_head: true              # RUN 2: on — see that file's header
+  aux_dim: 7
+  aux_hidden: [256, 256]
+  # Empty => random PointNet++ init. Only iteration 0 is affected; later
+  # iterations warm-start from the previous checkpoint and never read this.
+  pc_pretrained:
+  freeze_pc: false
+
+OPTIM:
+  kind: adamw
+  lr: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+
+LOSS:
+  gripper_weight: 1.0
+  pose_loss: pm
+  pm_weight: 7.0
+  aux_weight: 1.0             # RUN 2: the paper's unit weight, and Phase-4
+                              # run 13's. Untuned on purpose.
+
+TRAIN:
+  batch_size: 64
+  num_epochs: 100             # overridden per fit by DAGGER's base/iter epochs
+  num_workers: 4
+  device: cuda
+  mixed_precision: false
+  val_every: 1
+  save_every: 5
+  grad_clip: 1.0
+  seed: 0

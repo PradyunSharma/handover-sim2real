@@ -128,6 +128,27 @@ class GraspPinTable:
         b = grasps[int(grasp_idx)].get("bin")
         return None if b is None else int(b)
 
+    def bin_centroids(self):
+        """[k, 3] the ANCHOR-frame mean direction of each bin's surviving members.
+
+        Call this AFTER `keep_only`, always. The centroid is a summary of what
+        the policy is actually trained on, and the demo filter is what decides
+        that — computing it over the unpruned table would command the policy
+        toward demonstrations the aggregate does not contain. `build_regrasp_
+        context` and `train_regrasp.py` both order it that way.
+
+        `d_anchor` is written per grasp by `assign_direction_demos.py`, so
+        nothing is re-derived here and this agrees by construction with what
+        `plot_regrasp_bin_spread.py` measures. A Phase-4/5 table has no such key
+        and every bin falls back to its geometric axis, which is the right
+        degenerate answer: with no assignment recorded there is nothing to
+        average.
+        """
+        from handover_sim2real.regrasp import directions as _D
+        return _D.centroid_axes(
+            (g.get("bin"), g.get("d_anchor"))
+            for grasps in self.entries.values() for g in grasps)
+
     def keep_only(self, ok, *, verbose: bool = True) -> dict:
         """Prune to the (scene, BIN) pairs listed in `ok`, renumbering the slots.
 

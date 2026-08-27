@@ -118,9 +118,31 @@ class EvalParams:
     # meaning it had in runs 4-14 and the two remain comparable.
     box_check: bool = True
     box: BoxParams = None
+    # ---- what the policy is COMMANDED (SIM.command_deploy) ------------------
+    # [k, 3] axis set, or None for the grasp-axis rule. The default is the STRING
+    # "BINS", resolved below, because None is a MEANINGFUL value here — it
+    # selects run 1's grasp-axis rule — and a None default would make "omitted"
+    # and "grasp_axis" the same request. Every config written before this field
+    # existed therefore scores exactly what it scored.
+    #
+    # Carried on the params rather than resolved per call site because the
+    # parallel evaluator SHIPS these to its workers, and a command the manager
+    # did not choose is the one bug that reports nothing unusual.
+    command_axes: object = "BINS"
+    # ---- what `d` is DERIVED FROM (`SIM.d_rule`) ---------------------------
+    # A `directions.DirectionRule`, and it decides what "the direction the
+    # gripper ACHIEVED" means — `dir_err` and `bin_realized` are measured with
+    # it. Must match the rule the pin table was built under: scoring a
+    # `grasp_offset` command against an `approach_axis` achievement compares two
+    # different questions and reports the difference as policy error.
+    d_rule: object = None
     verbose: bool = False
 
     def __post_init__(self):
+        if isinstance(self.command_axes, str):
+            self.command_axes = _rg_dirs.BINS.copy()
+        if self.d_rule is None:
+            self.d_rule = _rg_dirs.DirectionRule()
         if self.success_mode not in SUCCESS_MODES:
             raise ValueError(f"success_mode must be one of {SUCCESS_MODES}, "
                              f"got {self.success_mode!r}")
@@ -451,21 +473,21 @@ def eval_one(sim, runner, scene, gi, *, params: EvalParams, pin_table=None) -> d
         target_pose = derived_standoff_pose(
             grasp_pose, params.standoff_dist, params.reach_tail)
 
-    # THE COMMAND IS THE BIN AXIS, matching the collector and what
-    # `retry.next_direction` issues at deployment. Run 1 used `-R_grasp[:,2]`,
-    # a different vector: the pinned grasp sits a median 18.4 deg off its bin's
-    # axis, so eval scored the policy on a command no deployment would give it,
-    # and `dir_err` measured against that same shifted target.
+    # THE COMMAND IS WHATEVER `SIM.command_deploy` SAYS, and it is the same
+    # `command_direction` call the collector makes — a shared definition rather
+    # than a duplicated one, because the two drifting apart is silent in every
+    # rate: the policy is told one thing and scored on another, and `dir_err`
+    # measures against the shifted target too.
+    #
+    # The default is the bin axis. Run 1 used `-R_grasp[:,2]`, a different
+    # vector: the pinned grasp sits a median 18.4 deg off its bin's axis, so
+    # eval scored the policy on a command no deployment could give it.
     meta = (pin_table.scene_meta.get(scene, {}) if pin_table is not None else {})
     anchor_R = meta.get("anchor_R")
     b = pin_table.bin_of(scene, gi) if pin_table is not None else None
-    if b is not None and anchor_R is not None and int(b) >= 0:
-        d_world = _rg_dirs.to_world(_rg_dirs.BINS[int(b)], np.asarray(anchor_R))
-    else:
-        # No bin or no anchor (a Phase-5-shaped table): run 1's rule, so an old
-        # pin table still scores rather than scoring nothing.
-        d_world = (None if grasp_pose is None
-                   else _rg_dirs.approach_direction(grasp_pose))
+    d_world = _rg_dirs.command_direction(
+        b, None if anchor_R is None else np.asarray(anchor_R),
+        grasp_pose=grasp_pose, axes=params.command_axes)
 
     row = _eval_episode(sim, runner, scene, params=params,
                         grasp_pose=grasp_pose, target_pose=target_pose,
@@ -494,7 +516,7 @@ def aggregate_eval_rows(rows, params, num_grasps) -> dict:
     """rows -> the metric dict. Shared by the serial and parallel eval paths."""
     out = _rate_block(rows, params)
     out["rows"] = rows
-    out.update(_regrasp_metrics(rows, num_grasps))
+    out.update(_regrasp_metrics(rows, num_grasps, getattr(params, "d_rule", None)))
     # ---- THE SAME BLOCK AGAIN, ONE BIN AT A TIME ---------------------------
     # Pooled rates hide the thing the phase is about: `success_rate` averages
     # four physically different commands, and a policy that solves `+x` and
@@ -633,7 +655,7 @@ def _rate_block(rows, params) -> dict:
     }
 
 
-def _regrasp_metrics(rows, num_grasps: int) -> dict:
+def _regrasp_metrics(rows, num_grasps: int, d_rule=None) -> dict:
     """The three things Phase 5 exists to measure, all from one eval pass.
 
     **Per-slot rates** (`succ_g0..`, `near_g0..`). Slot 0 is OMG's own pick, so
@@ -722,7 +744,7 @@ def _regrasp_metrics(rows, num_grasps: int) -> dict:
     #                 30 rather than the 45-deg Voronoi half-angle, for margin.
     #   dir_track     1 - mean(dir_err)/90, so it reads like cond_track did:
     #                 1 = follows the command, 0 = ignores it.
-    dir_all, conf_all = _dir_block(rows)
+    dir_all, conf_all = _dir_block(rows, d_rule)
     out.update(dir_all)
     out["bin_confusion"] = conf_all.tolist()
     # ...and the same four numbers restricted to each commanded bin. `dir_track`
@@ -732,7 +754,7 @@ def _regrasp_metrics(rows, num_grasps: int) -> dict:
     # being read at all.
     for b in range(len(_D.BINS)):
         rs = [r for r in rows if int(r.get("bin_idx", -1)) == b]
-        blk, _ = _dir_block(rs)
+        blk, _ = _dir_block(rs, d_rule)
         for k, v in blk.items():
             out[f"{k}_b{b}"] = v
 
@@ -758,7 +780,7 @@ def _regrasp_metrics(rows, num_grasps: int) -> dict:
     return out
 
 
-def _dir_block(rows):
+def _dir_block(rows, d_rule=None):
     """Did the gripper go where it was told, over one set of eval episodes.
 
     Returns `(metrics, confusion)`. Factored out for the same reason as
@@ -782,6 +804,13 @@ def _dir_block(rows):
     """
     from handover_sim2real.regrasp import directions as _D
 
+    # THE ACHIEVED DIRECTION IS MEASURED UNDER THE SAME RULE AS THE COMMAND.
+    # Under `grasp_offset` the command means "close on this part of the object",
+    # so scoring it against `-R_ee[:,2]` ("which way is the wrist pointing")
+    # compares two different questions and reports the difference as policy
+    # error. Defaults to `approach_axis`, which is what runs 1-9 measured.
+    d_rule = d_rule or _D.DirectionRule()
+
     dir_errs, sector_errs = [], []
     confusion = np.zeros((len(_D.BINS), len(_D.BINS)), dtype=np.int64)
     for r in rows:
@@ -791,9 +820,11 @@ def _dir_block(rows):
         ee = r.get("ee_final")
         if ee is None:
             continue
-        achieved = _D.approach_direction(np.asarray(ee))
-        dir_errs.append(float(_D.angle_between(d_cmd, achieved)))
         c = r.get("centroid_world")
+        achieved = d_rule.of(np.asarray(ee), None if c is None else np.asarray(c))
+        if achieved is None:
+            continue
+        dir_errs.append(float(_D.angle_between(d_cmd, achieved)))
         if c is not None:
             arrived = _D.normalize(np.asarray(ee)[:3, 3] - np.asarray(c))
             if float(np.linalg.norm(arrived)) > 0.5:

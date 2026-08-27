@@ -121,11 +121,26 @@ REGRASP_DATA="${REGRASP_DATA:-output}"
 OUT="${OUT:-${REGRASP_DATA}/bc_dataset/${SPLIT}_regrasp.h5}"
 mkdir -p "$(dirname "${OUT}")"
 
+VGD="${VGD:-examples/valid_grasp_dict_005.pkl}"           # Phase-3/4/5 grasp set
+PIN="${PIN:-output/grasp_cand_table_${SPLIT}_p5.json}"    # K candidates per scene
+SEED="${SEED:-0}"
+EXTRA="${EXTRA:-}"                    # e.g. EXTRA="--num-scenes 5" for a smoke run
+
 # ── derive the pin table from the direction table if it is missing ───────────
 # `assign_direction_demos.py` is pure combinatorics — seconds, no simulator — so
 # an absent pin table is not a reason to fail a job that has already waited in
 # the queue. The DIRECTION table is the real prerequisite: building that needs
 # the planner and its own GPU pass.
+#
+# THE DEFAULTS ABOVE HAVE TO COME FIRST. This block tests `${PIN}`, and under
+# `set -u` an unset PIN aborted the job here with "unbound variable" — so the
+# fallback path only ever worked when PIN was passed explicitly, which is
+# exactly the case that does not need it.
+#
+# DROP_BINS IS NOT A CONSTANT. `-z` and `-x` are empty only under
+# `d_rule: approach_axis`; under `grasp_offset` they hold 526 and 392 grasps and
+# dropping them would silently discard a third of the data. So it is read from
+# the direction table's own `_meta` rather than hard-wired, and overridable.
 DIR_TABLE="${DIR_TABLE:-output/direction_table_${SPLIT}.json}"
 if [ ! -f "${PIN}" ]; then
     if [ ! -f "${DIR_TABLE}" ]; then
@@ -135,15 +150,19 @@ if [ ! -f "${PIN}" ]; then
         echo "        examples/slurm/build_direction_table.sbatch" >&2
         exit 1
     fi
+    if [ -z "${DROP_BINS+x}" ]; then
+        DROP_BINS="$(python - "${DIR_TABLE}" <<'PY'
+import json, sys
+m = (json.load(open(sys.argv[1])).get("_meta") or {})
+print("" if m.get("d_rule") == "grasp_offset" else "-z_beneath,-x_over_fingers")
+PY
+)"
+    fi
     echo "[prep] ${PIN} missing — assigning it from ${DIR_TABLE}"
+    echo "[prep] drop-bins='${DROP_BINS}'"
     python examples/assign_direction_demos.py --table "${DIR_TABLE}" \
-        --out "${PIN%.json}" --mode per-bin \
-        --drop-bins='-z_beneath,-x_over_fingers'
+        --out "${PIN%.json}" --mode per-bin --drop-bins="${DROP_BINS}"
 fi
-VGD="${VGD:-examples/valid_grasp_dict_005.pkl}"           # Phase-3/4/5 grasp set
-PIN="${PIN:-output/grasp_cand_table_${SPLIT}_p5.json}"    # K candidates per scene
-SEED="${SEED:-0}"
-EXTRA="${EXTRA:-}"                    # e.g. EXTRA="--num-scenes 5" for a smoke run
 
 if [ ! -f "${PIN}" ]; then
     echo "ERROR: candidate table ${PIN} not found. Run build_pin_table_multi.sbatch first" >&2

@@ -172,11 +172,13 @@ def load_policy(run_dir: Path, device: str):
         aux_head           = bool(m.get("aux_head", False)),
         aux_dim            = int(m.get("aux_dim", 7)),
         aux_hidden         = tuple(m.get("aux_hidden", (256, 256))),
-        # Phase 5's goal-grasp conditioning. Unlike the aux head this changes
-        # policy_head's in_dim, so getting it wrong is a shape error at load
-        # rather than a silent behavioural difference.
-        grasp_hidden       = int(m.get("grasp_hidden", 128)),
-        grasp_feat_dim     = int(m.get("grasp_feat_dim", 128)),
+        # NO grasp_hidden / grasp_feat_dim. Phase 5 conditioned on a goal GRASP
+        # POSE through a `GraspEncoder` branch; Regrasp conditions on a
+        # DIRECTION injected per-point into the cloud, so that branch was deleted
+        # along with both constructor args. This script was renamed from
+        # rollout_bc_policy_p5.py and kept passing them, which is a TypeError the
+        # moment it is run — the rename's acceptance test only checked imports,
+        # not that every renamed entry point still constructs its model.
         normalizer         = normalizer,
     ).to(device)
 
@@ -256,6 +258,86 @@ def draw_gripper(pose_mat, colour, line_ids, line_width=2.0):
             p.tolist(), q.tolist(), lineColorRGB=colour, lineWidth=line_width))
 
 
+# ── anchor frame + bin sphere ────────────────────────────────────────────────
+
+# Matches plot_regrasp_run.py's `_BIN_COLOURS_BY_BIN`, so a bin is the same
+# colour in the GUI as on every figure. tab10, as RGB.
+_BIN_RGB = ((0.12, 0.47, 0.71),      # +x  free end        tab:blue
+            (0.55, 0.34, 0.29),      # -x  over fingers    tab:brown
+            (0.17, 0.63, 0.17),      # +y  lateral         tab:green
+            (1.00, 0.50, 0.05),      # -y  lateral         tab:orange
+            (0.84, 0.15, 0.16),      # +z  top-down        tab:red
+            (0.58, 0.40, 0.74))      # -z  from beneath    tab:purple
+
+
+def draw_anchor_frame(anchor_R, origin, ids, length=0.15, width=3.0):
+    """The gravity-aligned, wrist-anchored frame every direction is expressed in.
+
+        x = horizontal(object centroid - giver's wrist)   "away from the hand"
+        z = world up
+        y = z x x
+
+    Drawn at the object centroid, which is the frame's origin by construction:
+    `d` points FROM the object OUTWARD toward where the gripper comes from, and
+    the two conditioning channels are `d.n_i` and `d.normalize(p_i - c)`.
+
+    Positive axes are solid and labelled; negatives are drawn at half length so
+    the handedness is readable without cluttering the object.
+    """
+    origin = np.asarray(origin, dtype=np.float64)
+    R = np.asarray(anchor_R, dtype=np.float64)
+    for k, (col, lab) in enumerate(((( 1.0, 0.25, 0.25), "x  away from hand"),
+                                    (( 0.25, 1.0, 0.25), "y  lateral"),
+                                    (( 0.35, 0.55, 1.0), "z  world up"))):
+        a = R[:, k]
+        ids.append(pybullet.addUserDebugLine(
+            origin.tolist(), (origin + length * a).tolist(),
+            lineColorRGB=list(col), lineWidth=width))
+        ids.append(pybullet.addUserDebugLine(
+            origin.tolist(), (origin - 0.5 * length * a).tolist(),
+            lineColorRGB=[c * 0.45 for c in col], lineWidth=width * 0.5))
+        ids.append(pybullet.addUserDebugText(
+            lab, (origin + 1.12 * length * a).tolist(),
+            textColorRGB=list(col), textSize=1.0))
+
+
+def draw_bin_sphere(anchor_R, origin, ids, radius=0.10, n_points=2400,
+                    point_size=3):
+    """A see-through sphere around the object, painted by BIN.
+
+    Every point is a candidate approach direction, coloured by which of the k
+    bins it falls in — so the six Voronoi cells of the octahedral set are
+    directly visible, and `--grasp-idx` picks one of them. The 45 deg cell
+    half-angle that `bin_of` implements is the boundary between colours.
+
+    POINTS RATHER THAN A MESH, deliberately. A PyBullet visual shape carries ONE
+    rgba, so a genuinely segmented sphere would need six meshes; and a solid
+    translucent shell hides the object it is centred on. A point shell is
+    see-through by construction, needs no bodies to clean up, and goes away with
+    the other debug items.
+    """
+    origin = np.asarray(origin, dtype=np.float64)
+    R = np.asarray(anchor_R, dtype=np.float64)
+    d = _dirs.fibonacci_directions(int(n_points))          # anchor frame
+    bins = np.array([_dirs.bin_of(v) for v in d])
+    pts = origin + radius * (R @ d.T).T
+    cols = np.array([_BIN_RGB[b % len(_BIN_RGB)] for b in bins])
+    ids.append(pybullet.addUserDebugPoints(
+        pts.tolist(), cols.tolist(), pointSize=int(point_size)))
+
+    # A labelled ray down each bin's axis, so the colours have names. These are
+    # the vectors `retry.next_direction` issues; at k=6 they coincide with the
+    # frame axes above, which is the interpretability the octahedral set buys.
+    for b in range(len(_dirs.BINS)):
+        a = _dirs.to_world(_dirs.BINS[b], R)
+        ids.append(pybullet.addUserDebugLine(
+            origin.tolist(), (origin + radius * 1.35 * a).tolist(),
+            lineColorRGB=list(_BIN_RGB[b]), lineWidth=2.0))
+        ids.append(pybullet.addUserDebugText(
+            _dirs.BIN_SHORT[b], (origin + radius * 1.45 * a).tolist(),
+            textColorRGB=list(_BIN_RGB[b]), textSize=1.1))
+
+
 # ── rollout ──────────────────────────────────────────────────────────────────
 
 def rollout(env, model, point_listener, scene_idx, device,
@@ -264,22 +346,90 @@ def rollout(env, model, point_listener, scene_idx, device,
             show_goal_grasp=False, show_grasp_set=False,
             omg_steps=None, goal_marker_ids=None, pin_table=None,
             hold_steps=3, dwell_steps=20, show_pred_grasp=False,
-            grasp_idx=0):
+            grasp_idx=0, show_anchor_frame=False, show_bin_sphere=False,
+            bin_sphere_radius=0.10, bin_sphere_points=2400,
+            command_axes="BINS"):
     obs = env.reset(idx=scene_idx)
 
     # REGRASP: which DIRECTION this roll is commanded to approach from. It is
     # both the policy's conditioning and what the overlay draws, so watching two
-    # different slots of one scene is the eyeball version of `dir_track`. The
-    # command is derived from the pinned grasp exactly as the collector derives
-    # it — d = -R[:,2] — so the overlay and the policy cannot disagree.
+    # different slots of one scene is the eyeball version of `dir_track`.
+    #
+    # THIS USED TO BE `-R_grasp[:,2]` UNCONDITIONALLY, which is run 1's rule.
+    # From run 2 on the evaluator has commanded the BIN AXIS, so what this viewer
+    # showed was a median 18.4 deg away from what the policy is actually scored
+    # under — you were watching a slightly different experiment. It now makes the
+    # same `command_direction` call every other producer makes, under the run's
+    # own `SIM.command_deploy` (`--command`).
+    if isinstance(command_axes, str):
+        command_axes = _dirs.BINS
     cond_goal = None if pin_table is None else pin_table.pose(scene_idx, grasp_idx)
-    d_world = None if cond_goal is None else _dirs.approach_direction(cond_goal)
+    _meta = ({} if pin_table is None
+             else pin_table.scene_meta.get(int(scene_idx), {}))
+    _anchor_R = _meta.get("anchor_R")
+    d_world = _dirs.command_direction(
+        None if pin_table is None else pin_table.bin_of(scene_idx, grasp_idx),
+        None if _anchor_R is None else np.asarray(_anchor_R),
+        grasp_pose=cond_goal, axes=command_axes)
     if d_world is None:
+        # SAY WHICH OF THE THREE THINGS WENT WRONG. They need different fixes and
+        # the message used to name only the first, which sends you looking for a
+        # missing flag you already passed.
+        if pin_table is None:
+            why = ("no pin table was loaded. Pass --grasp-pin-table (the run's "
+                   "SIM.grasp_pin_table).")
+        elif pin_table.num_grasps_for(scene_idx) == 0:
+            why = (f"scene {scene_idx} is NOT IN the pin table — it is one of the "
+                   f"~100 scenes with no reachable goal set, so it has no slots "
+                   f"at all. Pick another scene.")
+        else:
+            n = pin_table.num_grasps_for(scene_idx)
+            def _slot(i):
+                b = pin_table.bin_of(scene_idx, i)
+                return f"{i}={_dirs.BIN_SHORT[b]}" if b is not None and b >= 0 else str(i)
+            why = (f"scene {scene_idx} has {n} slot(s), so --grasp-idx "
+                   f"{grasp_idx} is out of range. Available: "
+                   f"{', '.join(_slot(i) for i in range(n))}")
         raise SystemExit(
-            f"no pinned grasp for scene {scene_idx} slot {grasp_idx}, so there is "
-            f"no direction to command. Pass --grasp-pin-table (the run's "
-            f"SIM.grasp_pin_table). Conditioning on nothing is not a safe "
-            f"default: the two channels would read 0 everywhere.")
+            f"no direction to command for scene {scene_idx} slot {grasp_idx}: "
+            f"{why}\nConditioning on nothing is not a safe default: the two "
+            f"direction channels would read 0 everywhere.")
+
+    # The anchor frame and the bin sphere, both read from the PIN TABLE's
+    # scene_meta rather than recomputed: that is the frame the demonstrations
+    # were captioned in, so the overlay shows what the policy was actually told
+    # rather than a fresh derivation that could differ.
+    # ONE clear for every overlay that lives on `goal_marker_ids`. It used to sit
+    # inside the show_goal_grasp branch, which would wipe whatever the frame
+    # overlay had just drawn whenever both flags were on.
+    if show_anchor_frame or show_bin_sphere or show_goal_grasp:
+        if goal_marker_ids is None:
+            goal_marker_ids = []
+        for _d in goal_marker_ids:
+            pybullet.removeUserDebugItem(_d)
+        goal_marker_ids.clear()
+
+    if show_anchor_frame or show_bin_sphere:
+        meta = (pin_table.scene_meta.get(int(scene_idx), {})
+                if pin_table is not None else {})
+        a_R = meta.get("anchor_R")
+        c_w = meta.get("centroid_world")
+        if a_R is None or c_w is None:
+            print("  (no anchor_R / centroid_world in the pin table for this "
+                  "scene — skipping the frame overlay)")
+        else:
+            a_R = np.asarray(a_R, dtype=np.float64)
+            c_w = np.asarray(c_w, dtype=np.float64)
+            if show_bin_sphere:
+                draw_bin_sphere(a_R, c_w, goal_marker_ids,
+                                radius=bin_sphere_radius,
+                                n_points=bin_sphere_points)
+            if show_anchor_frame:
+                draw_anchor_frame(a_R, c_w, goal_marker_ids,
+                                  length=max(bin_sphere_radius * 1.5, 0.12))
+            print(f"  anchor frame at centroid {c_w.round(3)}  mode="
+                  f"{meta.get('anchor_mode', '?')}  commanded bin="
+                  f"{_dirs.BIN_SHORT[pin_table.bin_of(int(scene_idx), grasp_idx)]}")
 
     # Optionally overlay the grasp the policy is supposed to be aiming at. Drawn
     # once (the object is static) and left up for the whole roll so you can watch
@@ -291,12 +441,6 @@ def rollout(env, model, point_listener, scene_idx, device,
     # the green gripper lands somewhere the policy was never taught to go, and a
     # correct rollout looks like a miss.
     if show_goal_grasp:
-        if goal_marker_ids is None:
-            goal_marker_ids = []
-        for d in goal_marker_ids:
-            pybullet.removeUserDebugItem(d)
-        goal_marker_ids.clear()
-
         env.run_omg_planner(omg_steps or max_steps, scene_idx)  # plans, no sim step
         if pin_table is not None and pin_table.apply(env, scene_idx, grasp_idx):
             # Pruning the goal set renumbers it, so replan to re-resolve the goal
@@ -527,6 +671,31 @@ def parse_args():
                         "what the aux head is being asked to close, and it is a "
                         "different quantity from the gap between the gripper and "
                         "the green pose. Ignored in --no-render / --benchmark.")
+    p.add_argument("--show-anchor-frame", action="store_true",
+                   help="draw the hand-object ANCHOR FRAME at the object "
+                        "centroid: x away from the giver's wrist, z world up, "
+                        "y = z x x. This is the frame every commanded direction "
+                        "is expressed in, read from the pin table's scene_meta "
+                        "so it matches what the demonstrations were captioned "
+                        "with. Needs --grasp-pin-table.")
+    p.add_argument("--show-bin-sphere", action="store_true",
+                   help="draw a see-through sphere around the object whose "
+                        "points are coloured by BIN, so the k Voronoi cells and "
+                        "their 45 deg boundaries are visible, plus a labelled "
+                        "ray down each bin axis. Colours match "
+                        "plot_regrasp_run.py. Needs --grasp-pin-table.")
+    p.add_argument("--bin-sphere-radius", type=float, default=0.10,
+                   help="--show-bin-sphere radius in metres (default 0.10)")
+    p.add_argument("--bin-sphere-points", type=int, default=2400,
+                   help="--show-bin-sphere point count (default 2400)")
+    p.add_argument("--command", default="bin_axis",
+                   choices=["bin_axis", "bin_centroid", "grasp_axis"],
+                   help="which rule builds the commanded direction. MUST match "
+                        "SIM.command_deploy in the run's config.yaml, or you are "
+                        "watching a different experiment than the one that was "
+                        "scored: bin_axis (default) is runs 2-8, bin_centroid is "
+                        "run 9, grasp_axis is run 1. bin_centroid needs "
+                        "--grasp-pin-table (the centroid is computed from it).")
     p.add_argument("--grasp-pin-table", default=None,
                    help="per-scene committed grasp(s) (examples/build_direction_table.py). "
                         "Pass the table the policy was TRAINED with, or the green "
@@ -593,6 +762,14 @@ def main():
         pin_table = load_grasp_pin_table(args.grasp_pin_table)
         print(f"Grasp pin table: {args.grasp_pin_table}")
 
+    # NO `keep_only` HERE, deliberately: this viewer takes no demo_ok table, so a
+    # `bin_centroid` command is over the full assignment while the run's was over
+    # the pruned one. Measured at ~1% of pairs, i.e. a fraction of a degree on
+    # each centroid — visible in a diff of the vectors, not in a rollout. Pass
+    # the run's own `command_axes.json` if you need them exact.
+    from handover_sim2real.regrasp.setup import resolve_command_axes
+    command_axes = resolve_command_axes(pin_table, args.command)
+
     def do_rollout(s, draw=render, g=None):
         return rollout(env, model, point_listener, s, args.device,
                        panda_base_inv_tf, steps_action_repeat, args.max_steps,
@@ -605,7 +782,12 @@ def main():
                        hold_steps=args.hold_steps,
                        dwell_steps=args.dwell_steps,
                        show_pred_grasp=(args.show_pred_grasp and draw),
-                       grasp_idx=(args.grasp_idx if g is None else g))
+                       grasp_idx=(args.grasp_idx if g is None else g),
+                       show_anchor_frame=(args.show_anchor_frame and draw),
+                       show_bin_sphere=(args.show_bin_sphere and draw),
+                       bin_sphere_radius=args.bin_sphere_radius,
+                       bin_sphere_points=args.bin_sphere_points,
+                       command_axes=command_axes)
 
     # Headless benchmark: roll out many scenes, report success / grasp / dist.
     if args.benchmark:

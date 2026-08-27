@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 from pathlib import Path
 
 import matplotlib
@@ -49,16 +50,40 @@ import matplotlib.pyplot as plt
 
 
 def iteration_logs(run: Path):
-    """[(iter_index, rows)] for every iters/iter_NN/log.csv, in iteration order."""
+    """[(iter_index, rows)] for every iters/iter_NN/log.csv, in iteration order.
+
+    TOLERANT OF A DAMAGED LOG, because one is the normal case here rather than
+    the exception. These runs are resumable and get rsync'd off /scratch WHILE
+    THE JOB IS STILL WRITING, and a file copied mid-append arrives with its size
+    metadata allocated but its data blocks unflushed — i.e. as a run of NUL
+    bytes. `csv.DictReader` raises `_csv.Error: line contains NUL` on the header
+    line and takes the whole figure down with it, over one iteration out of
+    twenty.
+
+    So NULs are stripped, unreadable files are skipped with a warning naming the
+    file, and the remaining iterations still plot. A file that is ENTIRELY NUL
+    strips to nothing and is skipped by the existing `if rows` — which is the
+    right outcome: the cluster's copy is fine, the local one needs re-fetching,
+    and that is a transfer problem rather than something the figure should
+    pretend to render.
+    """
     out = []
     for d in sorted((run / "iters").glob("iter_*")):
         p = d / "log.csv"
         if not p.exists():
             continue
-        with p.open() as f:
-            rows = [r for r in csv.DictReader(f) if r.get("epoch", "").strip()]
+        try:
+            text = p.read_text(errors="replace").replace("\x00", "")
+            rows = [r for r in csv.DictReader(io.StringIO(text))
+                    if r.get("epoch", "").strip()]
+        except (OSError, csv.Error) as e:
+            print(f"  [skip] {p}: {type(e).__name__}: {e}")
+            continue
         if rows:
             out.append((int(d.name.split("_")[1]), rows))
+        else:
+            print(f"  [skip] {p}: no usable rows (truncated or NUL-filled "
+                  f"transfer — re-fetch this file)")
     return out
 
 

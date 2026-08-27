@@ -95,12 +95,14 @@ from handover_sim2real.regrasp import (
     load_policy_runner,
     policy_kind,
 )
+from handover_sim2real.regrasp.directions import BINS as _rg_dirs_BINS  # noqa: E402
 from handover_sim2real.regrasp.evaluator import (               # noqa: E402
     aggregate_eval_rows, eval_jobs, eval_num_grasps,
 )
 from handover_sim2real.regrasp.pregrasp import forward_dist_default
 from handover_sim2real.regrasp.setup import (                     # noqa: E402
-    build_regrasp_context, expand_config_paths, scene_pools,
+    build_regrasp_context, expand_config_paths, resolve_command_axes,
+    resolve_d_rule, scene_pools,
 )
 
 
@@ -342,6 +344,12 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
         # Perturb the command by this much, TRAIN ONLY. Weighting or perturbing
         # val would change what val_loss means across epochs.
         d_noise = float(cfg["DATA"].get("d_noise_deg", 0.0))
+        # WHICH ATTR IS THE LABEL — `d_world` (what the episode was commanded,
+        # runs 1-8) or `d_grasp_world` (the axis the expert actually flew). Both
+        # ride on every Regrasp episode, so this is a relabelling switch and
+        # needs no re-collection. Applied to TRAIN AND VAL: a val set captioned
+        # under a different rule than the train set measures nothing.
+        d_source = str(cfg["DATA"].get("d_source", "d_world"))
         # Reach-tail oversampling (run 14). TRAIN ONLY — weighting val would
         # change what val_loss means and break comparability across runs. Under
         # conditioning it matters more, not less: the four grasps of a scene look
@@ -350,11 +358,13 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
         train_ds = BCDataset(cfg["DATA"]["train_h5"], normalizer=normalizer,
                              goal_table=goal_table,
                              direction_cond=direction_cond, d_noise_deg=d_noise,
+                             d_source=d_source,
                              reach_tail_weight=float(cfg["DATA"].get(
                                  "reach_tail_weight", 1.0)),
                              reach_tail=int(cfg["DATA"].get("reach_tail", 5)))
         val_ds = (BCDataset(val_h5, normalizer=normalizer, goal_table=goal_table,
-                            direction_cond=direction_cond, d_noise_deg=0.0)
+                            direction_cond=direction_cond, d_noise_deg=0.0,
+                            d_source=d_source)
                   if val_h5 and os.path.exists(val_h5) else None)
     else:
         T = int(cfg["MODEL"]["history_len"])
@@ -984,6 +994,30 @@ def main() -> None:
             raw_ok = json.load(f)
         pin_table.keep_only(raw_ok.get("ok", raw_ok))
 
+    # WHAT THE POLICY IS COMMANDED WHENEVER IT ACTS. Resolved here, AFTER the
+    # demo filter (the centroid summarises the assignment that survived it), and
+    # handed to both the collection params and the eval params so the manager,
+    # its twenty collection workers and its eval workers all issue one vector.
+    # `build_regrasp_context` resolves the same key the same way in each worker;
+    # this is the manager's copy and the one that is shipped.
+    command_mode = str(sim_cfg_d.get("command_deploy", "bin_axis"))
+    command_axes = resolve_command_axes(pin_table, command_mode)
+    # WHAT `d` IS DERIVED FROM. A different question from `command_deploy`: the
+    # rule decides what a bin MEANS, the axes decide which vector names it.
+    # Cross-checked against the table, which is what actually populated the bins.
+    d_rule = resolve_d_rule(pin_table, sim_cfg_d)
+    # Written out because under `bin_centroid` the six vectors are a function of
+    # the pin table AND the demo filter, and both are files that get rebuilt.
+    # Reproducing a run's command a year later should not require re-deriving
+    # them from inputs that may have moved; and this is the file that would be
+    # copied to the robot.
+    with (run_root / "command_axes.json").open("w") as f:
+        json.dump({"mode": command_mode,
+                   "axes": (None if command_axes is None
+                            else np.asarray(command_axes).tolist()),
+                   "bins": _rg_dirs_BINS.tolist(),
+                   **d_rule.as_meta()}, f, indent=2)
+
     usable = set(pin_table.entries) if pin_table is not None else None
     # Phase 5: how many pinned grasps every scene carries. The sampler expands
     # each drawn scene into this many episodes and the evaluator scores each eval
@@ -1064,6 +1098,33 @@ def main() -> None:
             f"(xyz|ycb|hand|d.n|d.r); {trn['train_cfg']} says "
             f"{train_cfg.get('DATA', {}).get('pc_channels')}.")
 
+    # ---- THE TWO COMMAND RULES, AND THE ONE COMBINATION THAT CANNOT WORK ----
+    # `SIM.command_deploy` decides what the policy is CONDITIONED ON; the learner
+    # config's `DATA.d_source` decides what the aggregate is CAPTIONED WITH.
+    # Independent on purpose — run 9 is the first run in which they differ — but
+    # `d_source: d_world` means "caption with whatever the episode was commanded",
+    # and the BASE shards were commanded under whatever rule collected them
+    # (recorded in their `command_rule` attr, `bin_axis` for every shard on disk
+    # today). So a run that moves `command_deploy` while leaving `d_source` at
+    # `d_world` produces an aggregate whose base half is captioned `bin_axis` and
+    # whose DAgger half is captioned with the new rule. That is not a design
+    # choice, it is two datasets in one file, and every rate absorbs it silently.
+    d_source = str(train_cfg.get("DATA", {}).get("d_source", "d_world"))
+    if d_source == "d_world" and command_mode != "bin_axis":
+        raise SystemExit(
+            f"[cfg] SIM.command_deploy: {command_mode} with DATA.d_source: "
+            f"d_world. The base shards were collected under `bin_axis` and carry "
+            f"that in `d_world`, so the aggregate's halves would be captioned "
+            f"under different rules. Either set DATA.d_source: d_grasp_world in "
+            f"{trn['train_cfg']} (the label stops depending on the command rule "
+            f"at all — this is what run 9 does), or re-collect the base set with "
+            f"`examples/collect_regrasp_demos.py --command {command_mode}`.")
+    print(f"[command] deploy={command_mode}   label={d_source}"
+          + ("   (SAME vector — runs 1-8)" if
+             (d_source == "d_world") else
+             "   (DIFFERENT vectors: the policy is trained on the grasp's own "
+             "axis and deployed on the bin's)"))
+
     collect_params = CollectParams(
         max_steps=int(dag.get("max_steps", 30)),
         close_pos_thresh=float(dag.get("close_pos_thresh", 0.02)),
@@ -1133,6 +1194,12 @@ def main() -> None:
         dart_reach_max_tries=int(dag.get("dart_reach_max_tries", 5)),
         dart_reach_clearance=float(dag.get("dart_reach_clearance", 0.01)),
         dart_reach_path_steps=int(dag.get("dart_reach_path_steps", 4)),
+        # What the LEARNER is conditioned on during the rollout. Not necessarily
+        # what the aggregate is captioned with — see the d_source guard above.
+        command_axes=command_axes,
+        # ...and what `d` MEANS, so `d_grasp_world` and `bin_realized` on every
+        # DAgger episode are computed the way the pin table's bins were.
+        d_rule=d_rule,
     )
     # (pin_table is loaded above, before the scene pools, because its key set
     # defines which scenes the expert can plan for.)
@@ -1184,6 +1251,13 @@ def main() -> None:
         forward_steps=collect_params.forward_steps,
         standoff_dist=collect_params.standoff_dist,
         reach_tail=collect_params.reach_tail,
+        # The SAME axis set the collection rollouts used. Taken from the collect
+        # params rather than re-resolved, for the same reason the thresholds are:
+        # there is no configuration in which eval should command something the
+        # collection did not, and a second resolution is a second thing to keep
+        # in sync.
+        command_axes=collect_params.command_axes,
+        d_rule=collect_params.d_rule,
         verbose=bool(ev.get("verbose", False)))
     eval_every = int(ev.get("every", 1))
     eval_ckpt = str(ev.get("ckpt", "best"))

@@ -287,7 +287,7 @@ class BCDataset(Dataset):
     def __init__(self, hdf5_paths, normalizer: Normalizer | None = None,
                  goal_table=None, reach_tail_weight: float = 1.0,
                  reach_tail: int = 5, direction_cond: bool = True,
-                 d_noise_deg: float = 0.0):
+                 d_noise_deg: float = 0.0, d_source: str = "d_world"):
         self.hdf5_paths = _as_path_list(hdf5_paths)
         self.normalizer = normalizer
         # Oversampling weight for the last `reach_tail` steps of every episode —
@@ -345,6 +345,28 @@ class BCDataset(Dataset):
         # direction. MUST be 0 on the val set or val loss stops being comparable
         # across epochs — train_regrasp builds both from one config block.
         self.d_noise_deg = float(d_noise_deg)
+        # WHICH EPISODE ATTR IS THE LABEL. Both are written by both collectors on
+        # every Regrasp episode, so this is a relabelling switch and NOT a
+        # re-collection:
+        #
+        #   d_world        what the episode was COMMANDED (`SIM.command_deploy`).
+        #                  Runs 1-8. Training and deployment then see the same
+        #                  vector by construction, which is what run 2 bought.
+        #   d_grasp_world  `-R_grasp[:,2]`, the approach axis the expert actually
+        #                  flew. The command a bin's demonstration would give if
+        #                  a demonstration were available at test time — it is
+        #                  not, which is exactly why this is a TRAINING-side
+        #                  choice paired with a different deployment rule.
+        #
+        # Under `d_grasp_world` the label carries no quantisation: the policy is
+        # shown the true direction of the grasp it is imitating rather than the
+        # sector that grasp was filed under. What it gives up is the guarantee
+        # that the training command is producible at deployment, which is then
+        # the deployment rule's problem — see run 9.
+        if d_source not in ("d_world", "d_grasp_world"):
+            raise ValueError(f"DATA.d_source must be 'd_world' or "
+                             f"'d_grasp_world', got {d_source!r}")
+        self.d_source = str(d_source)
         self.goal_table = goal_table
         self._goal_tables: list[dict[tuple[int, int], np.ndarray]] | None = None
         if goal_table is not None:
@@ -381,7 +403,7 @@ class BCDataset(Dataset):
         dir_of: dict[tuple[int, str], np.ndarray] = {}
         want_grasp = goal_table is not None
         n_from_attr = n_from_table = n_unresolved = 0
-        n_dir = n_dir_missing = n_miscaptioned = 0
+        n_dir = n_dir_missing = n_miscaptioned = n_dir_zero = 0
         widths: set[int] = set()
         # Per-item sampling weight, aligned with `index`. Built here because
         # step-from-end needs the episode length, which is only known while the
@@ -419,6 +441,16 @@ class BCDataset(Dataset):
                     # Self-contained on purpose: both attrs ride on the episode,
                     # so no external table is consulted and a shard cannot be
                     # filtered against the wrong run's ok-list.
+                    #
+                    # KEPT UNCONDITIONAL, including under `d_source:
+                    # d_grasp_world` where the justification above does not
+                    # apply — a grasp-axis caption is DERIVED from the flown
+                    # pose, so a missed pin relabels the episode correctly and
+                    # these 19 episodes are usable. Dropping them anyway is what
+                    # makes run 9's aggregate the same 1575 episodes as run 2's,
+                    # so the two differ in their captions and in nothing else.
+                    # Recovering them would be a second change inside a
+                    # one-change comparison.
                     _ba = f[k].attrs.get("bin_assigned")
                     _br = f[k].attrs.get("bin_realized")
                     if (self.direction_cond and _ba is not None and _br is not None
@@ -429,9 +461,19 @@ class BCDataset(Dataset):
                     T = int(f[k].attrs["num_steps"])
                     widths.add(int(f[k]["point_clouds"].shape[-1]))
                     if self.direction_cond:
-                        dw = f[k].attrs.get("d_world")
+                        dw = f[k].attrs.get(self.d_source)
                         if dw is None:
                             n_dir_missing += 1
+                        elif np.linalg.norm(np.asarray(dw, float)) < 0.5:
+                            # ZERO IS NOT MISSING, IT IS WRONG. Both collectors
+                            # write zeros when the vector could not be formed (no
+                            # anchor, or no grasp pose), and `normalize` returns
+                            # zeros rather than NaN by design so the case is
+                            # detectable here instead of poisoning `d.n` on every
+                            # point and then the loss. Dropped and counted, the
+                            # same treatment the miscaptioned episodes get.
+                            n_dir_zero += 1
+                            continue
                         else:
                             dir_of[(fi, k)] = _rg_directions.normalize(
                                 np.asarray(dw, dtype=np.float64))
@@ -496,17 +538,23 @@ class BCDataset(Dataset):
                 print(f"[direction] DROPPED {n_miscaptioned} episode(s) whose "
                       f"bin_realized != bin_assigned (the pin missed, so the "
                       f"caption is the commanded bin but the trajectory is not)")
-            print(f"[direction] d_world resolved for {n_dir} episodes"
+            if n_dir_zero:
+                print(f"[direction] DROPPED {n_dir_zero} episode(s) whose "
+                      f"`{self.d_source}` is the zero vector (no anchor frame, or "
+                      f"no grasp pose to derive it from)")
+            print(f"[direction] {self.d_source} resolved for {n_dir} episodes"
                   + (f", MISSING on {n_dir_missing}" if n_dir_missing else "")
                   + f"; clouds {self.stored_pc_channels}ch -> model "
                     f"{MODEL_PC_CHANNELS}ch"
                   + (f", d noise {self.d_noise_deg} deg" if self.d_noise_deg else ""))
             if n_dir_missing:
                 raise RuntimeError(
-                    f"{n_dir_missing} episode(s) have no `d_world` attr. A zeroed "
-                    f"direction is not a missing label, it is a wrong one — the "
-                    f"two conditioning channels would read 0 everywhere, which the "
-                    f"policy cannot tell from 'approach from nowhere'. Re-collect.")
+                    f"{n_dir_missing} episode(s) have no `{self.d_source}` attr. "
+                    f"A zeroed direction is not a missing label, it is a wrong "
+                    f"one — the two conditioning channels would read 0 "
+                    f"everywhere, which the policy cannot tell from 'approach "
+                    f"from nowhere'. Re-collect, or set DATA.d_source to an attr "
+                    f"these shards carry.")
         # None when uniform, so callers can branch on "is this dataset weighted"
         # without comparing floats.
         self.sample_weights = weights if self.reach_tail_weight != 1.0 else None

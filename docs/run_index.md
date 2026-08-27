@@ -409,15 +409,17 @@ with different `init`. Phase-4 run 16, for reference, was 100 / 25 from scratch.
 | run | config | camera | iters | m | dirs/scene | command | d noise | init | epochs (base/iter) | β | DART free | DART reach | DART variant | aux task | loss | model flags | best iter | final | notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **regrasp_run1** | `regrasp_run1.yaml` | wrist+right | **19 of 25** | 354 → 176 | 1–2 (max-separated pair) | grasp axis `−R[:,2]` | 12° | warm-start (**best**.pt), PointNet++ from scratch | 40 / 12 | constant 0.75 | 0.3 | 0.3 | replace | no | pm (w=7) | nojoint, reach-tail ×2.5 (window **5**), **direction_cond**, head [256,256] | 8 (`success 0.354`) | `success 0.139` | Stopped at 19 by choice. `m` was 354 for iterations 1–5 and 176 for 6–19 — a budget correction, so **`D_steps` changes slope at iteration 6**. Base set 1087 episodes / 20386 steps over 617 scenes (471 paired, 146 single). Eval/collection read `best.pt`, the warm start read `best.pt` too. |
-| **regrasp_run2** | `regrasp_run2.yaml` | wrist+right | 25 (planned) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | 12° | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | **yes** (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 1 with the protocol fixed and two method changes. See below. |
+| **regrasp_run2** | `regrasp_run2.yaml` | wrist+right | **19 of 25** (running) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | 12° | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | **yes** (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | **13** (`success 0.563`) | it19 `success 0.487`, `dir_track 0.722`, `bin_diag 0.924` | = run 1 with the protocol fixed and two method changes. **The best run in the phase**, and the first at cluster scale: `success 0.143 → 0.563`, `bin_diag 0.517 → 0.971` (it 16) against a chance level of 0.25. First cluster run to survive the manager/worker pin-table fix (`c47e551`), and the run that confirmed it. See below. |
 | **regrasp_fast1** | `regrasp_run2_fast.yaml` | wrist+right | **8 of 8** | 126 → 138 | **1–4 (one per bin)** | **bin axis** | 12° | warm-start (**last**.pt), PointNet++ from scratch | **20 / 6** | **linear 1.0→0.75** | 0.3 | 0.3 | replace | **yes** (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | 8 (`success 0.457`) | `success 0.457`, `dir_track 0.611`, `bin_diag 0.771` | Run 2's method at a fifth of the compute, on this laptop rather than DelftBlue, while the cluster was in maintenance. Five numbers turned down and nothing else: `num_iters` 20→8, `episodes_per_iter` 400→200, `base_epochs` 50→20, `iter_epochs` 15→6, `EVAL.num_scenes` 100→40. Base set 1596 episodes / 30028 steps over 617 scenes; ended at \|D\| 2624 episodes / 64257 steps, 53% of it on-policy. **First run in which DAgger moved anything.** See below. |
 | **regrasp3_fast1** | `regrasp_run3_fast.yaml` | wrist+right | **6 of 6** | 368 → 356 | **3 per bin** (7.42/scene) | **bin axis** | 12° | warm-start (**last**.pt), PointNet++ from scratch | **15 / 15** | **linear 1.0→0.75** | 0.3 | 0.3 | replace | **yes** (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | **4** (`success 0.565`) | `success 0.500`, `dir_track 0.687`, `bin_diag 0.855` | Three demonstrations per bin instead of one, on the same 617 scenes. Base set **4578 episodes / 86315 steps**, 2.87× regrasp_fast1's, collected in 4 concurrent `--shard i/4` processes; ended at \|D\| 6730 episodes / 157463 steps. Laptop run, `iter_epochs` held at run 3's 15 so `num_iters` came down to 6. **Past regrasp_fast1's FINAL numbers from iteration 1 on.** See below. |
 | **regrasp_run3** | `regrasp_run3.yaml` | wrist+right | 25 (planned) | 1200 → ~742 | **1–4 bins × 3 grasps** (~7.4 slots) | **bin axis** | 12° | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 2 with **three demonstrations per bin** instead of one, and nothing else: same frame, same k=6, same command, same network. Base set 1596 → **4578** demos over the same 617 scenes (91% of (scene, bin) pairs have ≥3 goal-set members). `episodes_per_iter` goes 400 → 1200 to hold the scene count at 100 — `max_grasps` triples, and leaving it at 400 would have drawn 33 scenes instead. See below. |
 | **regrasp_run4** | `regrasp_run4.yaml` | wrist+right | 25 (planned) | 1200 → ~742 | **1–4 bins × 3 grasps** (~7.4 slots) | **bin axis** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.5** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 3 with the direction-vector noise removed (`bc_regrasp_run4.yaml`, `d_noise_deg` 12 → 0) **and** `beta_end` 0.75 → 0.5. Shares run 3's pin tables and shards — nothing to re-collect. **Two changes, so not a clean ablation**; see below. |
 | **regrasp_run5** | `regrasp_run5.yaml` | wrist+right | 25 (planned) | 1200 → ~742 | **1–4 bins × 3 grasps** (~7.4 slots) | **bin axis** | 12° | **warm-start (best.pt)**, PointNet++ from scratch at iter 0 only | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 3 with `train_from_scratch` **false**. ONE change — a clean ablation, unlike run 4. Shares run 3's pin tables and shards. Under a warm start `iter_epochs: 15` is 15 MORE epochs on a trained network rather than a complete refit, so no early dip. See below. |
 | **regrasp_run6** | `regrasp_run6.yaml` | wrist+right | 25 (planned) | **7404 → ~4578 (ALL 617 scenes)** | **1–4 bins × 3 grasps** (~7.4 slots) | **bin axis** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.5** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 4 with `episodes_per_iter` 1200 → **7404** = every scene, every iteration. Maximum on-policy coverage: \|D\| passes half DAgger data after ONE iteration instead of thirteen. **~223 h ≈ 9.3 days of GPU and ~47 GB of scratch** — the refit is quadratic in the iteration count, so `num_iters: 8` costs ~30 h and gets most of it. Shares run 3/4's tables and shards. See below. |
-| **regrasp_run7** | `regrasp_run7.yaml` | wrist+right | 25 (planned) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.5** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 2 with **the same two changes run 4 made to run 3** (`bc_regrasp_run4.yaml`, `d_noise_deg` 12 → 0, **and** `beta_end` 0.75 → 0.5). Closes the 2×2 of {noise, β floor} × {1, 3} demos per bin. Shares run 2's pin tables and shards — nothing to re-collect. **Two changes, so not a clean ablation**, deliberately: run 7−run 2 is the same comparison as run 4−run 3, at a third the data. See below. |
-| **regrasp_run8** | `regrasp_run8.yaml` | wrist+right | 25 (planned) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | **0° (OFF)** | **warm-start (best.pt)**, PointNet++ from scratch at iter 0 only | 50 / 15 | **linear 0.9→0.5** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 7 with `train_from_scratch` **false**. ONE change — the one-demo-per-bin twin of run 5's ablation. Shares run 2/7's tables and shards. The FTL dip it removes is **deeper here than in run 5**: run 7's base set is 30k steps against run 3's 86k, so a from-scratch refit has under half the data per epoch. See below. |
+| **regrasp_run7** | `regrasp_run7.yaml` | wrist+right | **17 of 25** (running) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.5** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | **12** (`success 0.555`) | it17 `success 0.496`, `dir_track 0.704`, `bin_diag 0.903` | = run 2 with **the same two changes run 4 made to run 3** (`bc_regrasp_run4.yaml`, `d_noise_deg` 12 → 0, **and** `beta_end` 0.75 → 0.5). Shares run 2's pin tables and shards. **The noise transformed the BASE FIT and nothing after it**: iteration 0 went `success 0.143 → 0.370` against run 2, and by iteration 7 the two runs are indistinguishable. Shows the FTL dip textbook-clean (0.370 → 0.244 at it 1, back above base by it 5). See below. |
+| **regrasp_run8** | `regrasp_run8.yaml` | wrist+right | **19 of 25** (running) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | **0° (OFF)** | **warm-start (best.pt)**, PointNet++ from scratch at iter 0 only | 50 / 15 | **linear 0.9→0.5** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | **14** (`success 0.487`) | it19 `success 0.475`, `dir_track 0.704`, `bin_diag 0.908` | = run 7 with `train_from_scratch` **false**. ONE change — the clean warm-start ablation at one demo per bin. **The warm start removes the FTL dip and buys nothing**: no early trough, `train_loss` half run 7's (0.14 vs 0.235), and success/`dir_track`/`bin_diag` all at or below run 7's from iteration 7 on. Its iteration 0 is configured identically to run 7's and scored 0.282 against 0.370 — **that 0.088 gap is the run-to-run noise floor** for this setup and the yardstick for everything else here. See below. |
+| **regrasp_run9** | `regrasp_run9.yaml` | wrist+right | 25 (planned) | 400 → ~259 | **1–4 (one per bin)** | **train: grasp axis `−R[:,2]` / deploy: BIN CENTROID** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | **The first run whose training label and deployment command are different vectors.** = run 2 + `SIM.command_deploy: bin_centroid` + `bc_regrasp_run9.yaml` (`d_noise_deg` 12 → 0, `DATA.d_source` `d_world` → `d_grasp_world`). Trains on the grasp's own approach axis — no quantisation, no perturbation — and deploys on the unit mean of each bin's assigned `d_anchor`, which needs no grasp and so is producible on the robot. Reuses run 2's tables and shards **verbatim**: both vectors have always been written per episode, so this is a relabelling. Read it as **run 1 done properly**, not as a run-2 variant. See below. |
+| **regrasp_run10** | `regrasp_run10.yaml` | wrist+right | 25 (planned) | 600 → TBD | **1–6 (one per bin, ALL SIX LIVE)** | bin axis, but **`d` = centroid → fingertip** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | **The first run to change what `d` MEANS.** = run 2 + `SIM.d_rule: grasp_offset` + `bc_regrasp_run4.yaml` (noise off). `d` is no longer `−R_grasp[:,2]` but the direction from the object centroid to the midpoint between the fingertips — a function of the grasp's **position**, not its orientation. **This unlocks the two dead bins**: `−z` goes from 0 scenes to 235 and `−x` from 12 to 191, because you cannot *approach* from beneath a held object but you can close your fingers on its underside. Retry ladder gains two rungs; chance level moves 1/4 → 1/6. **Needs the whole upstream chain rebuilt** — table, assignment, base collection, audit. See below. |
 
 ### Result: DAgger did not move success; the conditioning is read but not obeyed
 
@@ -489,7 +491,34 @@ k=21, below the ~40° where bins stop being independent hypotheses).
   adding a small global `d` branch as run 2, since the SA layers max-pool and two
   scalars among ten input features are what pooling discards.
 
-### regrasp_run2 — configured, not yet run
+### regrasp_run2 — the best run in the phase (19 of 25)
+
+**RESULT.** `success 0.143 → 0.563` (iteration 13), `dir_track 0.405 → 0.737`,
+`bin_diag 0.517 → 0.971` (iteration 16) against a chance level of 0.25. Latest
+point, iteration 19: `success 0.487`, `dir_track 0.722`, `bin_diag 0.924`. |D|
+has grown to 6452 episodes / 194264 steps.
+
+**This is the first Regrasp run at cluster scale**, on 100 eval scenes (~259
+episodes, ~65 per live bin) rather than the fast runs' 20–40, so the per-bin
+numbers are readable for the first time — a single point's binomial standard
+error is ~0.05 here against ~0.08 on `regrasp3_fast1`.
+
+Two things that look alarming and are not. `train_loss` rose 0.111 → 0.235 and
+flattened: that is from-scratch FTL refitting a growing, increasingly on-policy
+aggregate, exactly what the schedule predicts. `val_loss` rose monotonically
+0.261 → 0.352 while success more than tripled: the val set is expert-only and
+frozen while D turns on-policy, and `corr(val_loss, success)` was measured at
++0.71 / +0.83 on the two fast runs. Neither is a warning.
+
+It is also the run that **confirmed the manager/worker pin-table fix**
+(`c47e551`): its eval set contains scenes 127, 253 and 616 — the exact three
+computed to kill a parallel worker under the old code — and it has scored them
+19 times without incident.
+
+The standing caveat holds: `EVAL.holdout: false`, so these are train-split rates.
+The held-out number comes from `eval_regrasp_testset.py` on the s0 test split.
+
+---
 
 `examples/configs/regrasp_run2.yaml`, submitted with
 `examples/slurm/train_regrasp.sbatch` (`--time=24:00:00`, ~20–21 h budgeted).
@@ -557,7 +586,52 @@ plus `debug_dagger.png`, `media_curves.png`, a 2×3 `curves_regrasp.png` carryin
 **chained** retry ladder beside the independent `retry@k`. See
 [`README_REGRASP.md`](../README_REGRASP.md) steps 8–9.
 
-### regrasp_run7 — run 4's two changes at ONE demo per bin, configured, not yet run
+### regrasp_run7 — the direction noise transformed the base fit and nothing after it (17 of 25)
+
+**RESULT.** The comparison against run 2 is the one this run was built for, and
+it splits cleanly in two.
+
+| iter | run 2 `succ` | **run 7 `succ`** | run 2 `bin_diag` | **run 7 `bin_diag`** |
+|---|---|---|---|---|
+| 0 (base fit) | 0.143 | **0.370** | 0.517 | 0.521 |
+| 1 | 0.198 | 0.244 | 0.567 | 0.588 |
+| 3 | 0.269 | 0.357 | 0.592 | 0.803 |
+| 5 | 0.265 | 0.370 | 0.794 | 0.866 |
+| 7 | 0.416 | 0.508 | 0.882 | 0.933 |
+| 12 | 0.500 | 0.555 | 0.945 | 0.920 |
+| best | **0.563** (it 13) | **0.555** (it 12) | 0.971 (it 16) | 0.933 |
+| latest | 0.487 (it 19) | 0.496 (it 17) | 0.924 | 0.903 |
+
+**Iteration 0 is a clean single-variable comparison, and it is the finding.** β
+does not enter until iteration 1, so the base fit isolates `d_noise_deg`
+perfectly — and turning the noise off took `success` from **0.143 to 0.370**,
+two and a half times, on the identical shard with the identical 50 epochs.
+
+**But DAgger erases it.** By iteration 7 the two runs are indistinguishable and
+they stay that way: the peaks are 0.563 and 0.555, the latest points 0.487 and
+0.496. Whatever the perturbation was costing, on-policy data repairs it within
+about six rounds. The honest reading is that `d_noise_deg: 12` hurts a *pure BC*
+fit substantially and is irrelevant to a converged DAgger run — which also means
+it is not the lever worth pulling on this task.
+
+**How much of that 0.227 is real?** Run 8's iteration 0 is configured
+*identically* to run 7's — same `bc_regrasp_run4.yaml`, same shard, same 50
+epochs, same seed — and scored **0.282** against run 7's 0.370. So the run-to-run
+spread on a base fit is about **0.088**, and the two noise-off samples average
+0.326 against noise-on's single 0.143. That is roughly a 2σ separation from n=1
+on one side, so treat it as strong evidence rather than a measurement.
+
+**One thing that did not move.** `bin_diag` at iteration 0 is 0.517 vs 0.521 and
+`dir_track` actually favours run 2 (0.405 vs 0.333). The noise was costing
+*grasp success*, not *command compliance* — which is the opposite of the
+mechanism the augmentation was introduced to protect.
+
+**Caveat.** `beta_end` moves too (0.75 → 0.5), so everything from iteration 1
+onward has two candidate causes. Since the two runs converge, the β difference is
+evidently doing nothing visible either — but the clean statement is confined to
+iteration 0.
+
+---
 
 `examples/configs/regrasp_run7.yaml`. The same two changes run 4 made to run 3,
 applied to run 2 instead — verified as exactly two value diffs against
@@ -615,7 +689,55 @@ points at `beta_end: 0.5` against the smaller aggregate, not at the noise.
 
 ---
 
-### regrasp_run8 — the warm-start ablation at one demo per bin, configured, not yet run
+### regrasp_run8 — the warm start removes the FTL dip and buys nothing (19 of 25)
+
+**RESULT.** A clean single-variable comparison against run 7, and it answers the
+question the pair was built to ask.
+
+| iter | run 7 (scratch) | **run 8 (warm)** | run 7 `train_loss` | **run 8 `train_loss`** |
+|---|---|---|---|---|
+| 0 (base fit) | 0.370 | 0.282 | 0.110 | 0.110 |
+| 1 | **0.244** ← dip | 0.290 | 0.220 | 0.149 |
+| 2 | 0.256 | 0.328 | 0.229 | 0.147 |
+| 3 | 0.357 | **0.450** | 0.232 | 0.151 |
+| 5 | 0.370 | 0.340 | 0.235 | 0.141 |
+| 7 | **0.508** | 0.324 | 0.237 | 0.142 |
+| 12 | 0.555 | 0.441 | 0.235 | 0.146 |
+| best | **0.555** (it 12) | **0.487** (it 14) | | |
+| latest | 0.496 (it 17) | 0.475 (it 19) | 0.233 | 0.140 |
+
+**The predicted FTL dip is real and it is exactly where the config said it would
+be.** Run 7 falls from 0.370 to 0.244 at iteration 1 — 15 epochs from a random
+PointNet++ over an aggregate barely larger than the base set — and does not clear
+its base fit again until iteration 5. Run 8 never dips: 0.282 → 0.290 → 0.328 →
+0.450, monotone.
+
+**And then run 7 wins it all back.** By iteration 7 run 7 is at 0.508 against run
+8's 0.324, and it stays ahead through iteration 17. On the conditioning metrics
+the two are identical — `dir_track` 0.704 vs 0.704, `bin_diag` 0.903 vs 0.908 —
+so the warm start is not trading command-following for success either.
+
+**The train/val split says why.** Run 8's `train_loss` sits at ~0.14 against run
+7's ~0.235, so the warm-started network fits the aggregate visibly better and
+generalises no better at all. That is the signature of a model continuing its own
+earlier solution rather than re-deriving one: it inherits what it already
+believed, which is precisely the failure Follow-The-Leader's fresh refit exists
+to prevent.
+
+**Read the gaps against 0.088.** Run 8's iteration 0 uses the identical config to
+run 7's and scored 0.282 against 0.370, so ~0.088 is the run-to-run noise floor
+here. The final gap (0.496 vs 0.475) sits *below* it and should be read as no
+difference; the iteration-7 gap (0.508 vs 0.324) is more than double it and is
+real.
+
+**What this licenses.** At one demonstration per bin, from-scratch FTL is the
+right default: it costs about five iterations of early dip and then matches or
+beats the warm start, with a cleaner theoretical story. Run 5 is the same
+ablation at three demos per bin, where run 3's base set is 2.87× larger and the
+dip should therefore be shallower — if run 5 also fails to beat run 3, the
+warm-start question is settled for this phase.
+
+---
 
 `examples/configs/regrasp_run8.yaml`. **One change** against run 7:
 `TRAIN.train_from_scratch` true → **false**. The one-demo-per-bin twin of run 5,
@@ -665,6 +787,179 @@ argument survives. Run 8 ahead to the end means FTL loses more to the 15-epoch
 budget than it gains, and every future regrasp run should warm-start. Run 8 ahead
 early and **behind** late is the inherited-mistake failure FTL exists to prevent,
 arriving as the aggregate turns majority on-policy.
+
+---
+
+### regrasp_run10 — `d` from the grasp's position, not its orientation, configured, not yet run
+
+`examples/configs/regrasp_run10.yaml`. **The first run in the phase to change
+what `d` means.** Runs 1–9 argued about which *vector* to hand the policy; this
+one changes the *question* the vector answers.
+
+| | definition | what it says |
+|---|---|---|
+| `approach_axis` (runs 1–9) | `d = −R_grasp[:,2]` | which side the gripper **comes from** — a property of the grasp's **orientation** alone |
+| `grasp_offset` (run 10) | `d = normalize(T_grasp · [0,0,0.1122] − c)` | which part of the object the fingers **close on** — a property of the grasp's **position** relative to the object |
+
+0.1122 m is the fingertip end of the Panda pads (`grasp_box.py`, from
+`meshes/collision/finger.obj`: the joints originate at 0.0584 and the pad runs
+0.0362–0.0538 finger-local). GA-DDPG's control points put the fingertips at
+0.105. The midpoint *between* the two fingertips lies on the gripper's local z
+axis by symmetry, so only the depth has to be named.
+
+**It is not a refinement, and the measurement says so.** Over the 3477 goal-set
+grasps recorded in `direction_table_train.json`:
+
+| definition | `+x` | `−x` | `+y` | `−y` | `+z` | `−z` | within 45° |
+|---|---|---|---|---|---|---|---|
+| `approach_axis` | 1162 | 20 | 822 | 684 | 789 | **0** | 100.0% |
+| `grasp_offset` | 714 | **392** | 637 | 450 | 418 | **526** | 90.2% |
+
+scenes reaching each bin: 490/12/365/324/415/**0** against
+248/**191**/241/205/142/**235**.
+
+**`−z` goes from dead to the third-largest bin and `−x` from 12 scenes to 191.**
+That is physically right rather than a bug: you cannot *approach* an object from
+beneath while it is held over a table — which is exactly why `−z` has been empty
+since the feasibility census — but you can perfectly well close your fingers on
+its underside. So the retry ladder gains two rungs, `chained_retry_at_k`
+saturates at 6, `assign_direction_demos.py` runs **without** `--drop-bins`, and
+`max_grasps` becomes 6 (hence `episodes_per_iter` 400 → 600).
+
+**The cost is conditioning.** The fingertip point sits *on* the object, so
+`tip − c` is short: a median 3.85 cm, and **14.4% of grasps land inside 2 cm**,
+where the direction is centroid noise rather than geometry — and the centroid
+comes from a partial, occluded cloud. `d_min_offset: 0.02` drops those at
+table-build time and records the count as `_meta.n_short_offset`.
+`approach_axis` has no such failure mode, which is the honest argument for the
+older rule.
+
+**The conservative fallback is one number.** `d_point_depth: 0.0` puts the point
+at the **palm origin**: a median 12.48 cm from the centroid (minimum 4.55, never
+degenerate) and a median 14.49° from `−R[:,2]`. Still position-derived and still
+orientation-independent — but it answers the `approach_axis` question, so it
+would *not* unlock `−z`.
+
+**Everything upstream has to be rebuilt, and it cannot be done offline.**
+`d_rule` is decided in `build_direction_table.py` — it is what fills `d_anchor`,
+and every later stage reads that field. The existing table stores only the
+members that survived the 45° cutoff under the *old* rule — 3477 of 32107,
+**10.8%** — so relabelling it would be a badly biased subsample of the goal sets.
+The chain is: build table → assign → collect → audit → run.
+`build_regrasp_context` refuses a table whose `_meta.d_rule` disagrees with the
+config, because that failure is silent: bins populated by one rule and
+`bin_realized` measured by the other disagree on most episodes, the miscaption
+filter empties the aggregate, and the symptom is "the collection produced almost
+nothing".
+
+**What would falsify it.** The premise is that "close on this part of the
+object" is a *more learnable* instruction than "come from this side", because it
+names a target the policy can see in its own cloud rather than a wrist
+orientation it has to infer — `d·r = d · normalize(pᵢ − c)` becomes almost a
+direct readout of the target. So `bin_diag_rate` should rise against run 7's
+0.903 and `dir_err` should fall. `bin_diag_rate` at chance means the per-point
+channels cannot express a position-derived command. High `bin_diag_rate` with
+low `success_rate` in the `−z`/`−x` rows means the policy obediently drives at an
+underside it cannot grasp from — the feasibility mask's problem, not the
+conditioning's. **Note the chance level moves, 1/4 → 1/6**, so `bin_diag_rate` is
+not comparable across the change without saying which chance it is against.
+
+---
+
+### regrasp_run9 — train on the true direction, deploy on the bin's centroid, configured, not yet run
+
+`examples/configs/regrasp_run9.yaml`. **The first run in the phase whose training
+label and deployment command are different vectors**, and the first that needs
+the distinction to exist at all.
+
+Every Regrasp episode has always carried two unit vectors: `d_world`, the
+direction it was *commanded*, and `d_grasp_world` = `−R_grasp[:,2]`, the approach
+axis the expert *actually flew*. Runs 1–8 made those the same vector, so nothing
+ever had to choose between them. Run 9 chooses:
+
+| | training label | deployment command |
+|---|---|---|
+| **run 1** | grasp axis | bin axis `BINS[b]` |
+| **runs 2–8** | bin axis | bin axis |
+| **run 9** | grasp axis | **bin centroid** |
+
+The centroid is the unit mean of every `d_anchor` assigned to a bin, over the
+pin table *after* `demo_ok_table` prunes it — so it summarises the
+demonstrations the run is actually trained on. Six vectors, no grasp needed, so
+it deploys on the robot exactly as `BINS` does. Measured over the 1576 surviving
+(scene, bin) pairs:
+
+| bin | centroid (anchor frame) | angle to `BINS[b]` | n |
+|---|---|---|---|
+| `+x` | `[ 0.9909, −0.0095,  0.1341]` | 7.73° | 486 |
+| `+y` | `[ 0.2184,  0.9640,  0.1520]` | **15.43°** | 359 |
+| `−y` | `[ 0.2058, −0.9699,  0.1304]` | **14.10°** | 319 |
+| `+z` | `[ 0.1365,  0.0245,  0.9903]` | 7.97° | 412 |
+
+Every bin leans toward `+x`/`+z` — the region the hand-collision filter leaves
+feasible — so `BINS[b]` is not the middle of its own members, and the lateral
+bins miss by twice what the front and top ones do. Commanding the centroid moves
+the deployment vector to where the demonstrations are:
+
+| train label → deploy command | median | p90 | max |
+|---|---|---|---|
+| grasp axis → bin axis *(run 1)* | 18.45° | 38.36° | 44.98° |
+| grasp axis → **bin centroid** *(run 9)* | **16.20°** | **32.68°** | 55.08° |
+
+**Be honest about the size of that: 2.25° of median and 5.68° of p90.** The
+centroid does not remove the skew, and run 2's header is still right that a skew
+of this order is comparable to the effect the conditioning is supposed to have.
+What run 9 really moves is *where the same ~16–18° of angular budget is spent* —
+runs 2–8 have zero skew and ~18.45° of label noise (told a sector, shown one
+grasp inside it); run 9 has zero label noise (the label *is* the demonstration)
+and ~16.20° of skew. Which end a policy tolerates better has never been measured
+here. That is the question.
+
+**Three things run 9 has that run 1 did not**, which is why it is the cleaner
+test of the same idea rather than a repeat: the per-bin table (one demonstration
+per reachable direction, not a max-separated pair), the demo filter, and — the
+substantive one — **DAgger collection under the deployment command**. Run 1
+rolled out conditioned on the grasp axis, so its on-policy states were states no
+deployment ever visits. Run 9's collector conditions the learner on the centroid
+while captioning the episode with the grasp axis, which is what DAgger actually
+asks for: visit the states the deployed policy visits, label them with the
+expert.
+
+**No re-collection.** Run 2's tables and shards are the inputs verbatim — both
+attrs are on all 1596 train and 69 val episodes, none zero-norm, checked. Base
+collection replays an OMG plan with no policy in the loop, so `d_world` never
+influenced a recorded state there. The miscaption filter stays on even though its
+justification does not apply under a grasp-axis label, so run 9's aggregate is
+the same 1575 episodes run 2's was and the two differ in captions and nothing
+else.
+
+**There is no single-change reference run.** Against run 2 this is two changes
+(`d_noise_deg` 12 → 0 and the label/command rule); against run 7 it is also two
+(`beta_end` 0.5 → 0.75 and the same rule). Run 9 keeps run 2's β because it is
+"run 2 with the `d` changes" — matching run 7's 0.5 would buy a clean pair at the
+cost of no longer building on the best run in the phase. What makes that
+tolerable is that **one of the two is already measured**: run 7 against run 2
+isolated `d_noise_deg` exactly, and it moved the base fit (0.143 → 0.370) and
+nothing after it — by iteration 7 the two are indistinguishable. So from
+iteration 7 on, run 9 against run 2 reads as one change. **The base fit does not:
+compare it with run 7's 0.370, not run 2's 0.143.** Run 8's identically
+configured iteration 0 scored 0.282 against run 7's 0.370, so **0.088 is the
+noise floor** and nothing smaller is readable.
+
+**What would falsify it.** `dir_err` should improve if precise labels beat an
+exactly matched command. `dir_err` at run 7's level with `bin_diag_rate_b*`
+falling means the skew dominates and run 2's argument wins — the response is then
+to re-collect with `--command bin_centroid` so training and deployment agree *on
+the centroid*, a third arm this run's data makes cheap to justify.
+
+**One bug this run's plumbing fixed, affecting every earlier run's chained
+number.** `chained_retry._run_attempt` conditioned the policy on
+`approach_direction(grasp_pose)` — run 1's rule — while `chained_retry_scene`
+picked `to_world(BINS[b], anchor_R)` and recorded *that* on the attempt. So from
+run 2 on, the retry ladder commanded one vector and reported another, and no
+metric could show it because `att.d_world` was the reported one. **Every
+`chained_retry_at_k` produced before this fix was measured under the grasp axis
+regardless of config.** Single-shot `success_rate` is unaffected.
 
 ---
 
@@ -1189,6 +1484,9 @@ Configs without a numbered run file were shared across several runs.
 | `regrasp_run6.yaml` | regrasp_run6 — = run 4 + every scene every iteration (~9 days) |
 | `regrasp_run7.yaml` | regrasp_run7 — = run 2 + noise off + `beta_end` 0.5 (run 4's changes at 1 demo/bin) |
 | `regrasp_run8.yaml` | regrasp_run8 — = run 7 + warm start (run 5's ablation at 1 demo/bin) |
+| `regrasp_run9.yaml` | regrasp_run9 — = run 2 + train on the grasp axis, deploy on the bin centroid |
+| `bc_regrasp_run9.yaml` | run 9 `TRAIN.train_cfg` — = `bc_regrasp_run4.yaml` + `DATA.d_source: d_grasp_world` |
+| `regrasp_run10.yaml` | regrasp_run10 — = run 2 + `d` from the grasp's position (`SIM.d_rule: grasp_offset`), noise off |
 | `regrasp_smoke.yaml` | Regrasp shakedown — 2 iters, m=8, 3 eval scenes |
 | `bc_regrasp.yaml` | regrasp_run1 `TRAIN.train_cfg` — `direction_cond`, aux head **off**, head `[256,256]` |
 | `bc_regrasp_run2.yaml` | regrasp_run2, regrasp_run3, regrasp_run5 and both fast runs `TRAIN.train_cfg` — = `bc_regrasp.yaml` + aux head **on** (`aux_weight: 1.0`) |

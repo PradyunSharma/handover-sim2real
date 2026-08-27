@@ -208,7 +208,7 @@ def _run_attempt(sim, runner, scene_idx: int, *, grasp_pose, target_pose,
                  params: EvalParams, prefix_rows: list, prefix_jp: list,
                  expect_ee, budget_steps: int, save_clouds: bool,
                  attempt: int = 0, grasp_idx: int = 0, branch_step: int = 0,
-                 n_attempts: int = 1, viz=None) -> Attempt:
+                 n_attempts: int = 1, viz=None, d_world=None) -> Attempt:
     """Reset, replay `prefix_jp`, then roll the policy under `grasp_pose`.
 
     The replay is silent about the policy: it re-executes recorded joint targets,
@@ -266,14 +266,26 @@ def _run_attempt(sim, runner, scene_idx: int, *, grasp_pose, target_pose,
             dtype=np.float64)
         att.replay_err = float(np.linalg.norm(got - np.asarray(expect_ee)))
 
-    # ---- resume: the policy takes over, conditioned on the NEW grasp --------
+    # ---- resume: the policy takes over, conditioned on the NEW direction ----
     runner.reset()
-    # The command is the DIRECTION, derived from the grasp exactly as the
-    # collector derives it. `grasp_pose` stays around because the expert's CLOSE
-    # label and the geometric scores are still measured against it — it just is
-    # no longer what the policy is told.
-    runner.set_direction(None if grasp_pose is None
-                         else _rg_dirs.approach_direction(grasp_pose))
+    # THE LADDER'S OWN CHOICE, passed in — not re-derived from the grasp here.
+    #
+    # This line used to read `approach_direction(grasp_pose)`, which is run 1's
+    # rule, while `chained_retry_scene` was already picking `to_world(BINS[b],
+    # anchor_R)` and recording THAT on the attempt. So from run 2 on the chain
+    # commanded one vector, reported another, and disagreed with single-shot
+    # eval by the same median 18.4 deg the phase exists to remove — with nothing
+    # in any metric able to show it, because `att.d_world` was the reported one.
+    # Every `chained_retry_at_k` before this fix was measured under the grasp
+    # axis regardless of what its config said.
+    #
+    # `grasp_pose` stays around because the expert's CLOSE label and the
+    # geometric scores are still measured against it — it just is not what the
+    # policy is told. The fallback keeps a caller that passes no direction (and
+    # a Phase-5-shaped table, which has no bins) working as before.
+    if d_world is None and grasp_pose is not None:
+        d_world = _rg_dirs.approach_direction(grasp_pose)
+    runner.set_direction(d_world)
 
     rows = list(prefix_rows)
     # The inherited steps are re-scored against THIS attempt's grasp: the arm
@@ -428,7 +440,16 @@ def chained_retry_scene(sim, runner, scene_idx: int, pose_of_bin, *,
     have = {int(b) for b, p in dict(pose_of_bin).items() if p is not None}
     if feasible is not None:
         have &= {int(b) for b in feasible}
-    rp = _rg_retry.RetryParams(max_attempts=int(retry.max_attempts or 4))
+    # The ladder commands, ranks and excludes in the SAME axis set the evaluator
+    # conditions on (`SIM.command_deploy`). Passing only the max_attempts would
+    # leave the chain issuing `BINS[b]` while single-shot eval issued the
+    # centroid — the retry rate would then be measuring a command the policy is
+    # never scored on anywhere else. `resolve_bins` maps None back to `BINS`, so
+    # the grasp-axis rule (which has no axis set) still orders the ladder
+    # geometrically; only the vector handed to the policy differs, and that comes
+    # from `_run_attempt`'s own `set_direction`.
+    rp = _rg_retry.RetryParams(max_attempts=int(retry.max_attempts or 4),
+                               bins=params.command_axes)
     st = _rg_retry.RetryState()
 
     if viz is not None:
@@ -469,7 +490,7 @@ def chained_retry_scene(sim, runner, scene_idx: int, pose_of_bin, *,
             prefix_rows=prefix_rows, prefix_jp=prefix_jp, expect_ee=expect_ee,
             budget_steps=max(1, int(budget)), save_clouds=retry.save_clouds,
             attempt=k, grasp_idx=bin_idx, branch_step=branch_step,
-            n_attempts=rp.max_attempts, viz=viz)
+            n_attempts=rp.max_attempts, viz=viz, d_world=d_world)
         att.d_world = np.asarray(d_world, dtype=np.float64)
         att.bin_idx = int(bin_idx)
         if att.ee_final is not None:

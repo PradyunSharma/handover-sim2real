@@ -1,0 +1,409 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRASP RUN 10 — `d` FROM THE GRASP'S POSITION, NOT ITS ORIENTATION.
+#
+# Run 2 with the DEFINITION OF `d` CHANGED, plus the direction noise off.
+# Everything structural is byte-identical to regrasp_run2.yaml: one demonstration
+# per reachable bin, the bin axis as the command, `train_from_scratch: true`,
+# `EVAL.every: 1`, 25 iterations, beta 0.9 -> 0.75, the aux head, DART on both
+# bands.
+#
+#   SIM.d_rule           (new key)  approach_axis -> grasp_offset
+#   SIM.grasp_pin_table  + exclude / demo_ok / shards -> the `_off` set
+#   DAGGER.episodes_per_iter        400 -> 600   (six live bins, not four)
+#   TRAIN.train_cfg      bc_regrasp_run2.yaml -> bc_regrasp_run4.yaml
+#                        (`d_noise_deg` 12 -> 0; nothing else differs)
+#
+# ── THE TWO DEFINITIONS ──────────────────────────────────────────────────────
+#
+#   approach_axis (runs 1-9)   d = -R_grasp[:,2]
+#       "WHICH SIDE THE GRIPPER COMES FROM." A property of the grasp's
+#       ORIENTATION alone. Two grasps that approach along the same axis but close
+#       on opposite ends of a long object are the same command.
+#
+#   grasp_offset (RUN 10)      d = normalize(T_grasp @ [0,0,0.1122] - c)
+#       "WHICH PART OF THE OBJECT THE FINGERS CLOSE ON." The direction from the
+#       anchor origin — the observed object point-cloud centroid — to the
+#       midpoint between the fingertips. Depends only on the grasp's POSITION
+#       relative to the object; the same closure point reached by a rotated wrist
+#       is the same command.
+#
+# 0.1122 m is the fingertip end of the Panda pads, from meshes/collision/finger
+# .obj via grasp_box.py: the finger joints originate at z = 0.0584 and the pad
+# runs 0.0362..0.0538 in finger-local coordinates. GA-DDPG's own control points
+# put the fingertips at 0.105. The midpoint BETWEEN the two fingertips lies on
+# the gripper's local z axis by symmetry, so only the depth has to be named.
+#
+# ── THIS IS NOT A REFINEMENT. IT IS A DIFFERENT QUESTION, AND IT UNLOCKS THE
+#    TWO DEAD BINS ─────────────────────────────────────────────────────────────
+#
+# Measured over the 3477 goal-set grasps recorded in direction_table_train.json,
+# 623 scenes:
+#
+#                      +x     -x     +y     -y     +z     -z    within 45 deg
+#   approach_axis    1162     20    822    684    789      0       100.0%
+#   grasp_offset      714    392    637    450    418    526        90.2%
+#
+#   scenes reaching   490     12    365    324    415      0   (approach_axis)
+#                     248    191    241    205    142    235   (grasp_offset)
+#
+# `-z` GOES FROM DEAD TO THE THIRD-LARGEST BIN and `-x` FROM 12 SCENES TO 191.
+# That is physically right rather than a bug: you cannot APPROACH an object from
+# beneath while it is held over a table — which is what made `-z` empty in every
+# run so far — but you can perfectly well close your fingers on its UNDERSIDE.
+#
+# CONSEQUENCE: THE RETRY LADDER HAS SIX LIVE RUNGS, NOT FOUR. `chained_retry_at_k`
+# saturates at 6, `--drop-bins` is EMPTY where run 2 dropped `-z` and `-x`, and
+# `max_grasps` becomes 6 — which is why `episodes_per_iter` goes 400 -> 600 to
+# hold the scene count at 100.
+#
+# ── THE COST, AND THE ESCAPE HATCH ───────────────────────────────────────────
+#
+# The fingertip point sits ON the object, so `tip - c` is SHORT: a median 3.85 cm,
+# and 14.4% of grasps land inside 2 cm, where the direction is dominated by
+# centroid noise rather than geometry — and the centroid comes from a partial,
+# occluded cloud that is resampled every step. `d_min_offset: 0.02` drops those at
+# table-build time; the count is printed and lands in the table's `_meta` as
+# `n_short_offset`. `approach_axis` has no such failure mode, which is the honest
+# argument for the older rule.
+#
+# IF THAT NOISE PROVES FATAL, THE FIX IS ONE NUMBER: `d_point_depth: 0.0` puts the
+# point at the PALM ORIGIN instead, which is a median 12.48 cm from the centroid
+# (minimum 4.55 — never degenerate) and a median 14.49 deg from `-R[:,2]`. That is
+# still position-derived and still orientation-independent, but it answers the
+# approach_axis question, so it would NOT unlock `-z`. It is the conservative
+# version of this run, not a tuning knob.
+#
+# ── EVERYTHING UPSTREAM HAS TO BE REBUILT. THIS IS THE EXPENSIVE PART ────────
+#
+# `d_rule` is decided in `build_direction_table.py`: it is what fills `d_anchor`,
+# and every later stage either reads that field or recomputes it under the rule
+# recorded in `_meta`. So the whole chain moves, and NONE of run 2's data is
+# reusable:
+#
+#   1. build_direction_table.py --d-rule grasp_offset   (simulator pass, hours)
+#   2. assign_direction_demos.py                        (seconds)
+#   3. collect_regrasp_demos.py                         (the long pole)
+#   4. audit_regrasp_demos.py --write-ok
+#
+# The existing direction table CANNOT be relabelled offline into this one: it
+# stores only the goal-set members that survived the 45 deg cutoff under the OLD
+# rule — 3477 of 32107, 10.8% — so an offline rebuild would be a badly biased
+# subsample of the goal sets. Step 1 is not optional.
+#
+# `build_regrasp_context` REFUSES a table whose `_meta.d_rule` disagrees with
+# this config, because the failure it prevents is silent: bins populated by one
+# rule and `bin_realized` measured by the other disagree on most episodes, the
+# dataset's miscaption filter then drops most of the aggregate, and the symptom
+# is "the collection produced almost nothing".
+#
+# ── CHECK THE HISTOGRAM BEFORE COLLECTING ────────────────────────────────────
+#
+# The numbers above are over the 10.8% subsample, so treat them as the SHAPE and
+# not the count. Step 1 prints the real per-bin histogram over the FULL goal sets.
+# Read it before launching step 3, and if the live-bin count is not 6, set
+# `episodes_per_iter` to 100 x max_grasps rather than leaving 600.
+#
+# ── WHAT WOULD FALSIFY IT ────────────────────────────────────────────────────
+#
+# The premise is that "close on this part of the object" is a MORE learnable
+# instruction than "come from this side", because it names a target the policy can
+# see in its own point cloud rather than a wrist orientation it has to infer. So
+# `bin_diag_rate` should rise against run 7's 0.903 and `dir_err` should fall.
+#
+# `bin_diag_rate` at chance (now 1/6 = 0.167, not 0.25) means the per-point
+# channels cannot express a position-derived command — plausible, since `d.r =
+# d . normalize(p_i - c)` is exactly "is this point on the side I am approaching
+# from", and under this rule that channel becomes almost a direct readout of the
+# target. High `bin_diag_rate` with low `success_rate` in the `-z` and `-x` rows
+# means the policy obediently drives at the underside of an object it cannot
+# actually grasp from there — which would say the bins are now nameable but not
+# reachable, and that the feasibility mask, not the conditioning, is what needs
+# work.
+#
+# COMPARISON RUN IS RUN 7 (run 2 + noise off + beta_end 0.5). Against it run 10
+# is two changes: `beta_end` 0.5 -> 0.75 and the rule. Against run 2 it is also
+# two: noise off and the rule. Run 7 already measured the noise to move only the
+# base fit, so from iteration 7 on run 10 against run 2 reads as one change.
+# The noise floor is 0.088 (run 7's iteration 0 scored 0.370, run 8's identically
+# configured one 0.282). And note the CHANCE LEVEL MOVES: 1/6 here against 1/4
+# everywhere else, so `bin_diag_rate` is not directly comparable across the
+# change without saying which chance level it is against.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+SIM:
+  cfg_file: examples/pretrain_multicam_wr.yaml   # wrist + right
+
+  split: train
+  egl: false
+
+  # The paper's offline hand-collision-filtered grasp dict. Must be on
+  # cfg.omg_config BEFORE the env is built. Keeps ~623/720 scenes planning,
+  # against ~351 for the runtime 0.08 m filter — which is why that stays off.
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08
+  hand_points_radius: 0.35
+
+  use_standoff: true
+  standoff_dist: 0.08
+
+  # PER-BIN: one grasp for every direction the scene can reach, each the goal-set
+  # grasp CLOSEST TO THAT BIN'S AXIS — which is the vector the policy is
+  # commanded with, so the demonstration is as close as the goal set allows to
+  # the instruction. Built by assign_direction_demos.py --mode per-bin, WITHOUT
+  # `--drop-bins`: under `grasp_offset` all six bins are populated, so dropping
+  # `-z` and `-x` (run 2's setting, correct there) would throw away a third of
+  # the data this run exists to use.
+  #
+  # Scenes carry 1 to 6 grasps, so `GraspPinTable.num_grasps` (a MIN) reads 1 and
+  # is the WRONG accessor; `max_grasps` (6) sizes arrays and `num_grasps_for`
+  # iterates. `episodes_per_iter` is divided by max_grasps to get the scene count.
+  grasp_pin_table: output/regrasp_pins_train_off.json
+  grasp_pin_match_tol: 0.02
+
+  # ── WHAT `d` IS DERIVED FROM. THE ONE CHANGE THIS RUN EXISTS FOR. ─────────
+  #
+  # `grasp_offset`: d = normalize(T_grasp @ [0,0,d_point_depth] - c), the
+  # direction from the anchor origin (the observed object centroid) to the
+  # midpoint between the fingertips. Independent of the grasp's ORIENTATION —
+  # which is what `approach_axis` (runs 1-9) reads and nothing else.
+  #
+  # THE TABLE IS AUTHORITATIVE AND THIS IS CROSS-CHECKED AGAINST IT. The bins
+  # were populated by whichever rule `build_direction_table.py` was given, so a
+  # config claiming the other one is refused at startup rather than producing an
+  # aggregate the miscaption filter silently empties.
+  d_rule: grasp_offset
+  # 0.1122 m = the fingertip end of the Panda pads (grasp_box.py, from
+  # meshes/collision/finger.obj). 0.1034 is the pad centre. 0.0 is the PALM
+  # ORIGIN — position-derived but answering the approach_axis question, and the
+  # conservative fallback if the fingertip rule proves too noisy. See the header.
+  d_point_depth: 0.1122
+  # Drop a grasp whose fingertip point lands within 2 cm of the centroid, where
+  # the direction is centroid noise rather than geometry. Measured: the fingertip
+  # sits a median 3.85 cm out and 14.4% of grasps are inside 2 cm. Applied at
+  # TABLE-BUILD time, so this value must match what built the table above.
+  d_min_offset: 0.02
+
+  # Scenes with no feasible bin at all. Subtracted from BOTH pools.
+  exclude_scenes: output/regrasp_pins_train_off_excluded.json
+
+  # The (scene, BIN) pairs base collection actually demonstrated. Written by
+  # audit_regrasp_demos.py --write-ok. `exclude_scenes` is scene-granular and
+  # cannot say "this scene is fine for +x and +z but OMG could not plan -y"; this
+  # can, and without it a per-bin planner failure trains on three directions and
+  # scores four. Applied by pruning the pin table, so the collection pool, the
+  # eval loop and `bin_of` cannot disagree about which pairs exist.
+  demo_ok_table: output/regrasp_demos_train_off_ok.json
+
+DAGGER:
+  # 25. Resumable, so a 24 h timeout costs only the queue wait: resubmit the
+  # identical command and completed iterations are skipped.
+  num_iters: 25
+  # A TARGET, not an exact count. `sample_pairs` draws m // max_grasps scenes and
+  # rolls out EVERY bin each can reach. Drawing a scene's directions TOGETHER is
+  # the point: rollouts differing only in the command are the only data that can
+  # teach the network the command matters, and independent draws would spread
+  # that contrast across the whole run.
+  #
+  # 600 = 100 SCENES x max_grasps 6. Under `d_rule: grasp_offset` all six bins
+  # are live — `-z` and `-x` stop being empty — so `max_grasps` is 6 rather than
+  # run 2's 4, and leaving this at 400 would draw 66 scenes instead of 100.
+  #
+  # THE REAL EPISODE COUNT IS NOT KNOWN UNTIL THE TABLE IS BUILT. Run 2 landed at
+  # ~259 from a mean 2.59 bins per scene. The equivalent mean under this rule
+  # comes out of step 1's histogram; set this to 100 x max_grasps once that is
+  # printed rather than trusting 600.
+  episodes_per_iter: 600
+  max_steps: 50
+  scene_sampling: random
+  seed: 0
+
+  # 1.0 -> 0.75 linearly over the 20 iterations. Iteration 1 is therefore PURE
+  # EXPERT (see the header): a data-augmentation round, with the distribution
+  # shift starting at iteration 2. Run 1 and Phase-4 run 16 both held 0.75
+  # constant, so the late iterations here match them and the early ones are
+  # gentler.
+  # 0.9 -> 0.75 linearly over the 25 iterations. NO pure-expert round: the
+  # distribution shift starts at iteration 1, and by the end a QUARTER of every
+  # trajectory is the learner's own actions.
+  #
+  # 0.75 is the floor Phase-4 run 16 (0.80, the best run in the project) and
+  # regrasp run 1 both held CONSTANT, so the late iterations here sit exactly
+  # where those runs sat and the early ones are gentler. That makes this schedule
+  # a strict interpolation between known-good settings rather than an
+  # extrapolation past them — which 0.5 would have been, at double run 16's
+  # on-policy fraction and beyond anything measured on this task.
+  beta_schedule: linear
+  beta_start: 0.9
+  beta_end: 0.75
+  beta_mid: 0.5          # unused by `linear`; kept so a switch to `piecewise`
+  beta_knee: 0.66        # needs no other edit
+  beta_p: 0.7
+
+  close_pos_thresh: 0.02
+  close_rot_thresh: 0.34
+  stop_on_close_label: true
+  stop_on_policy_close: false
+
+  ee_step: 0.04
+  # 5, not 10: the divergence profile between a scene's demonstrations was
+  # measured FLAT (0.89x) over the tail, so a longer commit buys no extra
+  # contrast and starves the free approach where obstacle avoidance is learned.
+  reach_tail: 5
+  min_free: 1
+  max_horizon: 40
+  first_horizon: null
+
+  reach_commit_dist: 0.05
+  reach_skip_eps: 0.01
+  expert_after_commit: true
+
+  # DART ON BOTH BANDS, at Phase-4 run 16's magnitudes verbatim. `dart_ratio`
+  # covers the FREE approach (with dart_max_dist: 10.0 the distance gate never
+  # bites, so it fires anywhere before the commit) and `dart_reach_ratio` the
+  # committed REACH TAIL, where the jolt is smaller (0.012 m) and clearance-tested
+  # because the gripper is already inside the object's neighbourhood. Not
+  # re-tuned: these were derived for this reach geometry and DART is not the
+  # variable under test.
+  dart_ratio: 0.3
+  dart_max_dist: 10.0
+  dart_pos_mag: 0.04
+  dart_rot_mag: 0.3
+  dart_reach_ratio: 0.3
+  dart_reach_pos_mag: 0.01202
+  dart_reach_rot_mag: 0.3
+  dart_reach_max_tries: 5
+  dart_reach_clearance: 0.01
+  dart_reach_path_steps: 4
+
+  # Collection outcomes on the evaluator's taxonomy, so `c_success_rate` is
+  # comparable with `success_rate` (mixture-driven, not policy-only) and the
+  # per-bin collection counters have a `success` column meaning the same thing.
+  outcome_check: true
+
+TRAIN:
+  # AUX HEAD ON — the one architecture change against run 1. See that file's
+  # header: under direction conditioning the head no longer predicts its own
+  # input, so `aux_pos_mm` separates "the features have it and the action head
+  # ignores it" from "the observation cannot support it".
+  train_cfg: examples/configs/bc_regrasp_run4.yaml
+  # Empty => PointNet++ initialised RANDOMLY. Iteration 0 only; every later
+  # iteration warm-starts the WHOLE network from the previous last.pt and never
+  # reads this.
+  pc_pretrained:
+  # `${REGRASP_DATA}` defaults to `output` and is set to $SCRATCH_ROOT/output
+  # by the sbatch scripts. Only the two HDF5 shards move: together they are
+  # ~1.1 GB against /home's HARD 30 GB quota, which fills SILENTLY and kills
+  # the job with exit code 6 and no traceback. The JSON tables above stay in
+  # the repo — a few MB, they are INPUTS rather than outputs, and /scratch is
+  # purged by age.
+  base_train_h5: ${REGRASP_DATA}/bc_dataset/train_regrasp_off.h5
+  val_h5: ${REGRASP_DATA}/bc_dataset/val_regrasp_off.h5
+  base_run: null
+  # 50. The measured val minimum on run 1's base fit was epoch 16 (val_total
+  # 0.1851, degrading to 0.239 by 99 with a 4.9x train/val gap), so 40 already
+  # cleared it; 50 is margin against a differently-seeded init bottoming later,
+  # and iteration 0 now has ~1.47x the data. Harmless either way — the epoch that
+  # matters is whichever `last.pt` ends on.
+  base_epochs: 50
+  # 15 epochs, and under `train_from_scratch: true` below this is a COMPLETE
+  # refit budget — the model starts from a random PointNet++ every iteration and
+  # has 15 epochs over the whole aggregate to get back.
+  #
+  # THE BUDGET IS TIGHT EARLY AND COMFORTABLE LATE, because epochs are over a
+  # GROWING D. In gradient steps (batch 64):
+  #     iteration 0   50 epochs x  86k steps  =  67k steps
+  #     iteration 1   15 epochs x  95k steps  =  22k steps   <- a third of it
+  #     iteration 25  15 epochs x ~530k steps = 125k steps   <- twice it
+  # So expect the early iterations to sit BELOW the base fit and recover as D
+  # grows. That dip is a property of this schedule, not a failure.
+  #
+  # 15 from random is known to be enough for a working policy: regrasp3_fast1's
+  # base fit was exactly that (15 epochs, empty pc_pretrained, 86k steps) and
+  # scored success 0.406 / bin_diag 0.406 at iteration 0.
+  iter_epochs: 15
+  # TRUE — paper-faithful Follow-The-Leader (Ross et al.): every iteration refits
+  # from the initialisation on the whole aggregate, discarding the previous
+  # iteration's weights. Phase-4 run 16, the best run in the project at 0.80,
+  # did this.
+  #
+  # WITH `pc_pretrained` EMPTY THAT MEANS A RANDOM PointNet++ EVERY ITERATION,
+  # not just at iteration 0. That is deliberate here — regrasp does not borrow
+  # the CVPR2023 encoder — but it is the thing to check first if the run
+  # underperforms: see the gradient-step table above, and compare
+  # `success_rate` at iterations 1-3 against iteration 0. A run that never gets
+  # back above its base fit is telling you 15 epochs from random is not enough
+  # on this aggregate, and the fix is `pc_pretrained` or more epochs, not more
+  # iterations.
+  #
+  # Costs nothing extra in wall clock: train_on_aggregate fits the whole D for
+  # `iter_epochs` either way, so warm start and from-scratch differ only in the
+  # starting weights.
+  train_from_scratch: true
+  # Inert while train_from_scratch is true (nothing is loaded from the previous
+  # iteration). Kept so flipping that flag back needs no other edit.
+  init_ckpt: best
+  # 8, not 2. These are DataLoader workers for the REFIT, and during the refit
+  # all 20 collection workers are idle — the node has 22 CPUs and two were
+  # feeding the loader. Each sample is a 1024x8 float array read from HDF5, so
+  # the loader is plausibly the bottleneck on an aggregate this size. Costs
+  # nothing and cannot change results.
+  num_workers: 8
+  device: cuda
+
+EVAL:
+  # IN THE LOOP. ~16 min an iteration at 100 scenes x 2.59 directions; that is
+  # 5.5 h on a ~20 h run, and it is what makes `ckpt`/`select_on` able to select
+  # at all — with the split job the metrics arrived after the next iteration had
+  # already started. Set to 2 if the queue makes the shorter job worth it.
+  every: 1
+  # 100 scenes -> ~259 episodes, ~65 per live bin. NOT randomly drawn: an
+  # np.linspace over the usable scene ids, so the SAME 100 scenes are scored
+  # every iteration and consecutive points are a paired comparison rather than
+  # two independent samples. That is what makes a trend readable at n=65/bin,
+  # where a single point's binomial standard error is ~0.05.
+  num_scenes: 100
+  # FALSE, as in run 1: the eval scenes are also collected on, so these are
+  # TRAIN-SET rates and optimistic. Kept false deliberately — the curves are a
+  # clean read of "is it learning what it is taught", and the held-out number
+  # comes from examples/eval_regrasp_testset.py on the s0 TEST split afterwards.
+  holdout: false
+  max_steps: 50
+  # LAST. Also picks the policy that collects the next iteration (train_regrasp
+  # hands this same string to the workers), so one set of weights per iteration.
+  # BEST. Selected on the lowest val loss of the fit; also picks the policy that
+  # collects the next iteration, so one set of weights per iteration either way.
+  #
+  # THE HONEST CAVEAT, MEASURED. The val set is collected ONCE at beta=1 from
+  # expert demonstrations and never changes, while D grows toward majority
+  # on-policy states (53% by iteration 8 of regrasp_fast1). So val loss measures
+  # the fit to a distribution that is a SHRINKING minority of the training data,
+  # and it rises monotonically while success rises: corr(val_loss, success) =
+  # +0.71 and +0.83 on the two fast runs, corr(on-policy share, val_loss) = +0.85
+  # and +0.96. Selecting on it is therefore selecting on a drifting target.
+  #
+  # WHY IT IS STILL DEFENSIBLE HERE: at these epoch budgets `best` and `last` are
+  # nearly the same checkpoint. Measured val gap between them is +0.000 to +0.001
+  # at iter_epochs 6 and +0.002 to +0.005 at 15 — far below anything that moves
+  # success. The choice is close to free in both directions.
+  #
+  # THE SELECTION THAT ACTUALLY MATTERS is `select_on: success_rate` below, which
+  # picks the best ITERATION on rollouts, where the differences (0.30 -> 0.48
+  # across a run) are much larger than the eval noise.
+  ckpt: best
+  success_mode: stable_grasp
+  hold_steps: 3
+  select_on: success_rate
+  verbose: false
+
+  box_check: true
+  box:
+    min_frac: 0.50
+    open_thresh: 0.8
+    half_x: 0.0088
+    z_lo: 0.0946
+    z_hi: 0.1122
+    inset: 0.002
+    grid_x: 7
+    grid_z: 7

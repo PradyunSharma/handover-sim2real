@@ -527,6 +527,38 @@ class CollectParams:
     dart_reach_clearance: float = 0.01   # metres
     dart_reach_path_steps: int = 4       # interpolation samples along the recovery
 
+    # ---- what the LEARNER is commanded during the rollout (SIM.command_deploy)
+    # [k, 3] axis set, or None for run 1's grasp-axis rule. The default is the
+    # STRING "BINS", resolved in __post_init__, because None is a MEANINGFUL
+    # value here and a None default would make "omitted" and "grasp_axis" the
+    # same request.
+    #
+    # THIS IS THE ROLLOUT COMMAND, NOT NECESSARILY THE TRAINING LABEL. Under
+    # DAgger an episode is both a rollout and a demonstration, and until run 9
+    # those two carried the same vector so the distinction never had to be made.
+    # It does now: the states visited must be the states DEPLOYMENT visits (that
+    # is the whole premise of DAgger), while the caption the learner is fit
+    # against comes from `DATA.d_source` in the learner config. `d_world` on the
+    # episode records what was commanded here; `d_grasp_world` records the axis
+    # the expert actually flew, and the dataset picks between them.
+    command_axes: object = "BINS"
+
+    # ---- what `d` is DERIVED FROM (`SIM.d_rule`) ----------------------------
+    # A `directions.DirectionRule`. Decides what `bin_realized` and
+    # `d_grasp_world` mean on every episode this collector writes, and it MUST
+    # match the rule the pin table was built under — the table's bins were
+    # populated by that rule, so measuring the realised bin by another one turns
+    # every episode into a miscaption. Defaults to `approach_axis`, which is
+    # runs 1-9.
+    d_rule: object = None
+
+    def __post_init__(self):
+        from handover_sim2real.regrasp import directions as _D
+        if isinstance(self.command_axes, str):
+            self.command_axes = _D.BINS.copy()
+        if self.d_rule is None:
+            self.d_rule = _D.DirectionRule()
+
 
 def _grasp_moved(prev, cur, tol: float = 1e-4) -> bool:
     """Did the planner re-select a different goal grasp between two plans?"""
@@ -775,6 +807,11 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     # DEFINITION can be changed later as a relabelling pass instead of a
     # collection campaign.
     anchor_R = anchor_mode = wrist = mano_side = None
+    # The anchor frame's ORIGIN, needed by `d_rule: grasp_offset` (the direction
+    # runs from here to the gripper point). Hoisted out of the step-0 block
+    # because the episode dict below has to see it: `approach_axis` never asked
+    # for it, so it used to be a local.
+    centroid_world = None
     bin_assigned = (pin_table.bin_of(int(scene_idx), int(grasp_idx))
                     if pin_table is not None else None)
     n_reach_steps = 0
@@ -901,12 +938,13 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
             mano_side = _rg_anchor.handedness(env)
             _c_ee = _rg_channels.object_centroid(pc5, fallback_to_all=False)
             if _c_ee is not None:
-                _c_w = _rg_anchor.centroid_to_world(
+                centroid_world = _rg_anchor.centroid_to_world(
                     _c_ee, obs, sim.panda_base_inv_tf,
                     sim.cfg.ENV.PANDA_BASE_POSITION,
                     sim.cfg.ENV.PANDA_BASE_ORIENTATION)
                 anchor_R, _ameta = _rg_anchor.anchor_rotation(
-                    _c_w, wrist, np.asarray(sim.cfg.ENV.PANDA_BASE_POSITION),
+                    centroid_world, wrist,
+                    np.asarray(sim.cfg.ENV.PANDA_BASE_POSITION),
                     _rg_anchor.AnchorState())
                 anchor_mode = _ameta["mode"]
         n_normal_fallback += int(_pcinfo.get("n_fallback", 0))
@@ -1037,14 +1075,18 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                     # command never referred to the pose. It makes the
                     # DEMONSTRATION wrong instead, which is why run 2 drops those
                     # (scene, bin) pairs outright rather than re-binning them.
-                    if anchor_R is not None and bin_assigned is not None \
-                            and int(bin_assigned) >= 0:
-                        d_world = _rg_directions.to_world(
-                            _rg_directions.BINS[int(bin_assigned)], anchor_R)
-                    elif grasp_pose is not None:
-                        # No anchor or no bin (a Phase-5-shaped table): fall back
-                        # to run 1's rule so an old pin table still collects.
-                        d_world = _rg_directions.approach_direction(grasp_pose)
+                    #
+                    # WHICH axis set is `params.command_axes`, and it is the SAME
+                    # `command_direction` call the evaluator makes. Sharing the
+                    # definition is the point: the trap this comment used to flag
+                    # was that base demonstrations come from
+                    # examples/collect_regrasp_demos.py and DAgger shards from
+                    # here, so changing one and not the other produced an
+                    # aggregate whose halves were captioned under different
+                    # rules — invisible in every rate.
+                    d_world = _rg_directions.command_direction(
+                        bin_assigned, anchor_R, grasp_pose=grasp_pose,
+                        axes=params.command_axes)
                     if d_world is not None:
                         runner.set_direction(d_world)
 
@@ -1447,6 +1489,14 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                       "n_dart_reach": int(n_dart_reach),
                       "n_dart_reject": int(n_dart_reject)}
 
+    # What the expert's grasp means UNDER THE RUN'S RULE, computed once here so
+    # `d_grasp_world`, `demo_off_deg` and `bin_realized` cannot disagree about
+    # it. None when the rule cannot be evaluated (no pose, or `grasp_offset`
+    # with no centroid / a degenerate offset) — and None is carried through as a
+    # zero vector plus `bin_realized: -1`, which the dataset drops rather than
+    # trains on.
+    d_grasp = params.d_rule.of(grasp_pose, centroid_world)
+
     episode = {
         "point_clouds": np.asarray(point_clouds, dtype=np.float32),
         "robot_states": np.asarray(robot_states, dtype=np.float32),
@@ -1465,20 +1515,21 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # provably constant however the hand moves).
         "d_world": (np.zeros(3, dtype=np.float32) if d_world is None
                     else np.asarray(d_world, dtype=np.float32)),
-        # ...and what the expert ACTUALLY flew, which is a different vector. The
+        # ...and what the expert ACTUALLY flew, UNDER THE RUN'S `d_rule`. The
         # demonstration is the goal-set grasp closest to the bin axis, so the two
         # differ by a MEASURED median 18.4 deg (p90 38.5, max 45 = the bin
         # half-width). That gap is the label noise the conditioning has to
         # tolerate: the policy is told a sector and shown one grasp inside it.
         # Recorded per episode so it can be measured on the collected data rather
-        # than assumed from the table, and so a run can filter on it.
-        "d_grasp_world": (np.zeros(3, dtype=np.float32) if grasp_pose is None
-                          else _rg_directions.approach_direction(
-                              grasp_pose).astype(np.float32)),
-        "demo_off_deg": (float("nan") if (grasp_pose is None or d_world is None)
+        # than assumed from the table, and so a run can filter on it. It is also
+        # what `DATA.d_source: d_grasp_world` trains on, which is why it must be
+        # computed under the same rule the table was built with rather than
+        # hard-wired to `-R[:,2]`.
+        "d_grasp_world": (np.zeros(3, dtype=np.float32) if d_grasp is None
+                          else np.asarray(d_grasp, dtype=np.float32)),
+        "demo_off_deg": (float("nan") if (d_grasp is None or d_world is None)
                          else float(_rg_directions.angle_between(
-                             d_world,
-                             _rg_directions.approach_direction(grasp_pose)))),
+                             d_world, d_grasp))),
         # ASSIGNED vs REALIZED. `bin_realized` is the bin the DEMONSTRATION lands
         # in, so the two disagree exactly when the pin missed and the expert flew
         # to a grasp in a different sector. Under run 2 that pair is dropped from
@@ -1487,13 +1538,18 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # and re-binning is not available because the scene already has a
         # demonstration for the bin it actually flew to.
         "bin_assigned": int(bin_assigned) if bin_assigned is not None else -1,
-        "bin_realized": (-1 if grasp_pose is None or anchor_R is None
+        "bin_realized": (-1 if d_grasp is None or anchor_R is None
                          else int(_rg_directions.bin_of(
-                             _rg_directions.from_world(
-                                 _rg_directions.approach_direction(grasp_pose),
-                                 anchor_R)))),
+                             _rg_directions.from_world(d_grasp, anchor_R)))),
         "anchor_R": (np.eye(3, dtype=np.float32) if anchor_R is None
                      else np.asarray(anchor_R, dtype=np.float32)),
+        # The anchor's ORIGIN. Stored for the same reason `wrist_world` is: with
+        # it, `d_rule` becomes a relabelling pass over an existing shard rather
+        # than a re-collection, because both rules are recomputable from the
+        # grasp pose plus this point. 12 bytes an episode.
+        "centroid_world": (np.full(3, np.nan, dtype=np.float32)
+                           if centroid_world is None
+                           else np.asarray(centroid_world, dtype=np.float32)),
         "anchor_mode": str(anchor_mode or "unset"),
         "wrist_world": (np.full(3, np.nan, dtype=np.float32) if wrist is None
                         else np.asarray(wrist, dtype=np.float32)),
@@ -1641,7 +1697,8 @@ class DaggerHDF5Writer:
         # rather than a re-collection.
         for _k in ("d_world", "d_grasp_world", "demo_off_deg",
                    "bin_assigned", "bin_realized", "anchor_R",
-                   "anchor_mode", "wrist_world", "mano_side", "pin_ok"):
+                   "anchor_mode", "wrist_world", "mano_side", "pin_ok",
+                   "centroid_world"):
             if _k in episode:
                 grp.attrs[_k] = episode[_k]
         for name in ("point_clouds", "robot_states", "expert_actions"):

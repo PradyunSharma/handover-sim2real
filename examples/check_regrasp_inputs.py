@@ -89,14 +89,59 @@ def main() -> int:
                 print(f"  ** MISSING **  {sec}.{key:<15}  {p}")
                 missing += 1
 
-        # The learner config is not a data path, but `d_noise_deg` is the one
-        # value that distinguishes runs sharing everything else, and reading it
-        # here is how you confirm you submitted the run you meant to.
+        # The learner config is not a data path, but `d_noise_deg` and
+        # `d_source` are the values that distinguish runs sharing everything
+        # else, and reading them here is how you confirm you submitted the run
+        # you meant to.
+        # ---- what `d` IS, cross-checked against the table that defined it ----
+        # The rule is decided in build_direction_table.py and rides in the pin
+        # table's `_meta`. A config that claims the other one is refused at
+        # startup, so catching it here saves a queue wait rather than a run.
+        sim = cfg.get("SIM") or {}
+        pin = sim.get("grasp_pin_table")
+        want_rule = sim.get("d_rule")
+        table_rule = None
+        if pin and os.path.exists(pin):
+            try:
+                table_rule = (json.load(open(pin)).get("_meta") or {}).get(
+                    "d_rule", "approach_axis")
+            except (OSError, ValueError):
+                table_rule = None
+        eff = want_rule or table_rule or "approach_axis"
+        line = f"       d_rule: {eff}"
+        if want_rule and table_rule and want_rule != table_rule:
+            line += (f"   ** MISMATCH — the table was built under "
+                     f"{table_rule!r}; rebuild it or fix SIM.d_rule **")
+            missing += 1
+        elif table_rule:
+            line += f"   (table: {table_rule})"
+        if eff == "grasp_offset":
+            line += (f", depth {float(sim.get('d_point_depth', 0.1122))*100:.2f} cm"
+                     f", min offset "
+                     f"{float(sim.get('d_min_offset', 0.0))*100:.1f} cm")
+        print(line)
+
         tc = (cfg.get("TRAIN") or {}).get("train_cfg")
+        deploy = sim.get("command_deploy", "bin_axis")
         if tc and os.path.exists(tc):
             d = yaml.safe_load(open(tc)) or {}
+            data = d.get("DATA") or {}
+            src = data.get("d_source", "d_world")
             print(f"  OK   TRAIN.train_cfg      {tc}")
-            print(f"       d_noise_deg={(d.get('DATA') or {}).get('d_noise_deg')}")
+            print(f"       d_noise_deg={data.get('d_noise_deg')}")
+            # The one combination train_regrasp.py refuses: the base shards were
+            # captioned `bin_axis` in `d_world`, so labelling from `d_world`
+            # under a different deploy rule makes the aggregate's halves
+            # disagree. Reported here rather than 20 hours into a queue.
+            bad = (src == "d_world" and deploy != "bin_axis")
+            print(f"       command: deploy={deploy}  label={src}"
+                  + ("   ** REFUSED by train_regrasp.py — set d_source: "
+                     "d_grasp_world or re-collect the base set **" if bad else
+                     ("   (SAME vector)" if src == "d_world" else
+                      "   (DIFFERENT vectors — train on the grasp axis, "
+                      "deploy on the bin's)")))
+            if bad:
+                missing += 1
         elif tc:
             print(f"  ** MISSING **  TRAIN.train_cfg      {tc}")
             missing += 1

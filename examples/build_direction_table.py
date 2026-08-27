@@ -96,6 +96,37 @@ def parse_args() -> argparse.Namespace:
                         "instead of another simulator pass. 5 covers the "
                         "3-per-bin setting with headroom at ~5x the pose "
                         "payload (a few MB).")
+    # ---- WHAT `d` IS DERIVED FROM. See directions.py for the measurement. ----
+    p.add_argument("--d-rule", default="approach_axis",
+                   choices=["approach_axis", "grasp_offset"],
+                   help="approach_axis (default, runs 1-9): d = -R_grasp[:,2], "
+                        "'which side the gripper comes from'. grasp_offset "
+                        "(run 10): d = centroid -> the point between the "
+                        "fingertips, 'which part of the object the fingers "
+                        "close on' — independent of the grasp's ORIENTATION. "
+                        "THEY ARE NOT THE SAME QUESTION: measured on s0/train, "
+                        "grasp_offset makes -z the third-largest bin (526 "
+                        "grasps over 235 scenes) where approach_axis has ZERO, "
+                        "because you cannot approach from beneath a held object "
+                        "but you can close on its underside. Rebuilds the whole "
+                        "assignment, so a table built under one rule cannot be "
+                        "used by a run configured for the other — the rule is "
+                        "written into `_meta` and checked downstream.")
+    p.add_argument("--d-point-depth", type=float, default=None,
+                   help="grasp_offset only: metres along the gripper's local +z "
+                        "to the point d is measured to. Default 0.1122 = the "
+                        "fingertip end of the Panda pads. 0.1034 is the pad "
+                        "centre; 0.0 is the PALM ORIGIN, which is 12.5 cm from "
+                        "the centroid (never degenerate) and a median 14.5 deg "
+                        "from -R[:,2] — i.e. position-derived but answering the "
+                        "approach_axis question. Use it if the fingertip rule "
+                        "proves too noisy.")
+    p.add_argument("--d-min-offset", type=float, default=0.02,
+                   help="grasp_offset only: drop a grasp whose point lands "
+                        "closer than this to the centroid, where the direction "
+                        "is centroid noise rather than geometry. Measured: the "
+                        "fingertip sits a median 3.85 cm out and 14.4%% of "
+                        "grasps are inside 2 cm. 0 disables.")
     p.add_argument("--egl", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
@@ -128,6 +159,17 @@ def main() -> None:
     lo = int(args.start)
     hi = min(n_total, lo + args.num_scenes) if args.num_scenes else n_total
 
+    # The rule, resolved ONCE and written into `_meta`. Every downstream stage
+    # compares against it rather than assuming, because a table built under one
+    # rule and consumed under the other is silently wrong: the bins are
+    # populated by different grasps and nothing about the file's shape says so.
+    rule = D.DirectionRule(
+        rule=str(args.d_rule),
+        depth=(D.FINGERTIP_DEPTH if args.d_point_depth is None
+               else float(args.d_point_depth)),
+        min_offset=(float(args.d_min_offset)
+                    if args.d_rule == "grasp_offset" else 0.0))
+
     table = {"_meta": {
         "phase": "regrasp", "schema": "direction-table-v1",
         "split": args.split, "setup": str(cfg.BENCHMARK.SETUP),
@@ -137,18 +179,20 @@ def main() -> None:
         "valid_grasp_dict_path": args.valid_grasp_dict,
         "centroid_source": "observed point cloud (ycb channel), EE frame -> world",
         "built": time.strftime("%Y-%m-%d %H:%M:%S"),
+        **rule.as_meta(),
     }}
 
     scenes_with = np.zeros(len(bins), dtype=np.int64)
     goal_hist = np.zeros(len(bins), dtype=np.int64)
     member_spread: list[float] = []
-    n_ok = n_no_plan = n_no_hand = n_fallback = n_no_object = 0
+    n_ok = n_no_plan = n_no_hand = n_fallback = n_no_object = n_short = 0
     modes, sides = Counter(), Counter()
     t0 = time.time()
 
     print("=" * 74)
     print(f"Regrasp direction table   split={args.split}  scenes {lo}..{hi - 1}")
     print(f"  k={args.k}  max_angle={args.max_angle} deg  -> {out}")
+    print(f"  d = {rule.describe()}")
     print("=" * 74)
 
     for idx in range(lo, hi):
@@ -192,11 +236,31 @@ def main() -> None:
             continue
 
         # EVERY goal-set member, not an FPS subsample -- this is the whole point.
-        d_world = np.stack([D.approach_direction(T) for T in poses])
+        #
+        # `d_rule` decides what `d` MEANS (directions.py): the approach axis
+        # `-R[:,2]`, or the direction from the object centroid to the point
+        # between the fingertips. THIS IS THE STAGE THAT DECIDES IT for the whole
+        # pipeline — every later stage reads `d_anchor` out of this file or
+        # recomputes it under the rule recorded in `_meta`, so the rule cannot be
+        # changed downstream without rebuilding here.
+        #
+        # `grasp_offset` can return None (the fingertip point lands closer to the
+        # centroid than `--d-min-offset`, where the direction is centroid noise
+        # rather than geometry). Those grasps are dropped from the assignment
+        # rather than binned, and counted.
+        d_list = [rule.of(T, c_world) for T in poses]
+        keepmask = np.array([d is not None for d in d_list])
+        n_short += int((~keepmask).sum())
+        if not keepmask.any():
+            n_no_plan += 1
+            table[str(idx)] = None
+            continue
+        d_world = np.stack([d if d is not None else np.zeros(3) for d in d_list])
         d_anchor = np.stack([D.from_world(d, R) for d in d_world])
         ang = D.angles_to_bins(d_anchor, bins)              # [n_grasps, k]
         assign = np.argmin(ang, axis=1)
         best_ang = ang[np.arange(len(ang)), assign]
+        best_ang = np.where(keepmask, best_ang, np.inf)     # drop the degenerate
 
         entries = []
         for b in range(len(bins)):
@@ -270,6 +334,9 @@ def main() -> None:
         "n_scenes": hi - lo, "n_ok": n_ok, "n_no_plan": n_no_plan,
         "n_no_object": n_no_object, "n_no_hand": n_no_hand,
         "n_anchor_fallback": n_fallback,
+        # grasp_offset only: goal-set members dropped because the point landed
+        # inside `--d-min-offset` of the centroid. Zero under approach_axis.
+        "n_short_offset": int(n_short),
         "scenes_with_bin": scenes_with.tolist(),
         "goal_set_bin_histogram": goal_hist.tolist(),
         "members_per_bin": int(args.members_per_bin),
@@ -282,6 +349,10 @@ def main() -> None:
     print(f"  planned            : {n_ok}/{hi - lo}   (no plan {n_no_plan}, "
           f"no object points {n_no_object})")
     print(f"  hand absent        : {n_no_hand}      anchor fallback: {n_fallback}")
+    if rule.needs_centroid():
+        print(f"  d = {rule.describe()}")
+        print(f"  dropped (offset < {rule.min_offset * 100:.1f} cm): {n_short} "
+              f"goal-set members — the direction there is centroid noise")
     print(f"  handedness         : {dict(sides)}")
     print(f"\n  {'bin':<18} {'goal-set grasps':>16} {'scenes reaching it':>20}")
     for b, nm in enumerate(names):

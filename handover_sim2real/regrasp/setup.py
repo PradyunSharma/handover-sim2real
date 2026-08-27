@@ -23,6 +23,7 @@ from typing import Any
 
 import numpy as np
 
+from handover_sim2real.regrasp import directions as _rg_directions
 from handover_sim2real.regrasp.env_setup import build_sim_cfg, build_sim_context
 from handover_sim2real.regrasp.evaluator import EvalParams
 from handover_sim2real.regrasp.grasp_box import build_box_params
@@ -72,6 +73,103 @@ def expand_config_paths(cfg):
     if isinstance(cfg, str) and "$" in cfg:
         return os.path.expandvars(cfg)
     return cfg
+
+
+# ── WHAT THE POLICY IS TOLD, AND WHERE THAT IS DECIDED ──────────────────────
+#
+# `SIM.command_deploy` names the rule that turns a bin into the unit vector the
+# policy is CONDITIONED ON whenever it acts — DAgger rollouts, in-loop eval, the
+# retry ladder, the test set, the rollout viewer. It is one key because those
+# five must agree; a run in which any two of them disagree reports nothing
+# unusual, it simply tells the policy one thing and scores it on another.
+#
+#   bin_axis      `BINS[b]`, the geometric axis. Runs 2-8, and the default, so a
+#                 config that omits the key behaves exactly as run 2 did.
+#   bin_centroid  the empirical mean of that bin's assigned `d_anchor` over the
+#                 PRUNED pin table. Same six-vector, deployment-computable
+#                 object; 8-17 deg closer to what the demonstrations show.
+#   grasp_axis    `-R_grasp[:,2]`. Run 1. NOT DEPLOYABLE — there is no grasp at
+#                 test time — so it is here for reproducing run 1 and for
+#                 diagnostics, never for a number that claims to be a deployment
+#                 rate.
+#
+# The TRAINING label is a separate key, `DATA.d_source` in the learner config,
+# because the two are genuinely independent: an episode is a rollout under one
+# rule and a demonstration captioned under another. Run 9 is the first run in
+# which they differ. `train_regrasp.py` refuses the one combination that is
+# always wrong — see its `d_source` guard.
+COMMAND_MODES = ("bin_axis", "bin_centroid", "grasp_axis")
+
+
+def resolve_command_axes(pin_table, mode: str = "bin_axis", *,
+                         verbose: bool = True):
+    """`SIM.command_deploy` -> the [k, 3] axis set, or None for `grasp_axis`.
+
+    None is the grasp-axis rule rather than an error: `directions.command_
+    direction` treats a missing axis set as "derive it from the pose", which is
+    the same fallback an old Phase-5-shaped pin table already takes.
+
+    MUST be called after `GraspPinTable.keep_only` — the centroid summarises the
+    training assignment, and the demo filter is what decides that.
+    """
+    mode = str(mode or "bin_axis")
+    if mode not in COMMAND_MODES:
+        raise SystemExit(f"[cfg] SIM.command_deploy must be one of "
+                         f"{list(COMMAND_MODES)}, got {mode!r}")
+    if mode == "grasp_axis":
+        return None
+    if mode == "bin_axis" or pin_table is None:
+        return _rg_directions.BINS.copy()
+    axes = pin_table.bin_centroids()
+    if verbose:
+        off = _rg_directions.angle_between(axes, _rg_directions.BINS)
+        print("[command] deploy on the BIN CENTROID, not the bin axis; "
+              "offset from each axis (deg): "
+              + "  ".join(f"{_rg_directions.BIN_SHORT[b]} {off[b]:.1f}"
+                          for b in _rg_directions.LIVE_BINS))
+    return axes
+
+
+def resolve_d_rule(pin_table, sim_cfg_d: dict, *, verbose: bool = True):
+    """`SIM.d_rule` -> a `DirectionRule`, CROSS-CHECKED against the pin table.
+
+    THE TABLE IS AUTHORITATIVE, and this function exists because of that. The
+    table's bins were populated by one rule: `assign_direction_demos.py` filed
+    each grasp under the bin nearest its `d_anchor`, and `d_anchor` came out of
+    `build_direction_table.py` under whatever `--d-rule` it was given. A run that
+    derives `bin_realized` under the OTHER rule disagrees with `bin_assigned` on
+    most episodes, the dataset's miscaption filter then drops most of the
+    aggregate, and the symptom is "the collection produced almost nothing" —
+    which names neither the config key nor the table.
+
+    So a config that states `SIM.d_rule` must agree with the table, and one that
+    omits it inherits the table's. A table with no recorded rule predates this
+    key and is `approach_axis` by construction.
+    """
+    meta = (getattr(pin_table, "meta", {}) or {}) if pin_table is not None else {}
+    from_table = _rg_directions.DirectionRule(
+        rule=str(meta.get("d_rule", "approach_axis")),
+        depth=float(meta.get("d_point_depth", _rg_directions.FINGERTIP_DEPTH)),
+        min_offset=float(meta.get("d_min_offset", 0.0)))
+    asked = sim_cfg_d.get("d_rule")
+    if asked is None:
+        if verbose and from_table.needs_centroid():
+            print(f"[d_rule] {from_table.describe()}  (from the pin table)")
+        return from_table
+    want = _rg_directions.DirectionRule.from_cfg(sim_cfg_d)
+    if pin_table is not None and want.rule != from_table.rule:
+        raise SystemExit(
+            f"[cfg] SIM.d_rule: {want.rule} but "
+            f"{getattr(pin_table, 'path', 'the pin table')} was built under "
+            f"{from_table.rule!r}. The table's bins were populated by that rule, "
+            f"so `bin_realized` computed under yours would disagree with "
+            f"`bin_assigned` on most episodes and the miscaption filter would "
+            f"discard the aggregate. Rebuild the table with "
+            f"`build_direction_table.py --d-rule {want.rule}` (and re-assign, "
+            f"re-collect, re-audit), or set SIM.d_rule: {from_table.rule}.")
+    if verbose:
+        print(f"[d_rule] {want.describe()}")
+    return want
 
 
 def scene_pools(num_scenes: int, ev: dict,
@@ -130,6 +228,16 @@ class RegraspContext:
     # GraspPinTable.keep_only — how many (scene, bin) pairs base collection
     # actually demonstrated, and which scenes it emptied.
     demo_ok: dict | None = None
+    # [k, 3] the axis set every command is built from, or None for the grasp-axis
+    # rule. Mirrored onto `eval_params` so a worker that only receives params
+    # still commands the same thing; kept here too because the collector's params
+    # are built by train_regrasp.py, not by this function.
+    command_axes: Any = None
+    command_mode: str = "bin_axis"
+    # `directions.DirectionRule` — what `d` is derived FROM. Distinct from
+    # `command_axes`, which is what a BIN turns into: the rule decides what a bin
+    # means, the axes decide which vector names it.
+    d_rule: Any = None
 
 
 def build_regrasp_context(cfg4: dict, *, seed: int = 0,
@@ -190,6 +298,12 @@ def build_regrasp_context(cfg4: dict, *, seed: int = 0,
             print(f"[exclude_scenes] {excl_path}: dropping {n_excluded} of "
                   f"{before} scenes whose expert demonstration failed")
 
+    # AFTER the demo filter, before anything that commands: the centroid rule
+    # summarises the assignment that survived `keep_only`.
+    command_mode = str(sim_cfg_d.get("command_deploy", "bin_axis"))
+    command_axes = resolve_command_axes(pin_table, command_mode, verbose=verbose)
+    d_rule = resolve_d_rule(pin_table, sim_cfg_d, verbose=verbose)
+
     pool, eval_scenes = scene_pools(sim.num_scenes, ev, usable=usable)
 
     # Thresholds come from the DAGGER block on purpose: `proximity` mode must
@@ -214,6 +328,14 @@ def build_regrasp_context(cfg4: dict, *, seed: int = 0,
         forward_steps=int(dag.get("forward_steps", 4)),
         standoff_dist=float(sim_cfg_d.get("standoff_dist", 0.08)),
         reach_tail=int(dag.get("reach_tail", 5)),
+        # What every commanded direction is built from. On the params rather than
+        # looked up per call site because the parallel evaluator SHIPS these to
+        # its workers — a worker that resolved its own would be one config edit
+        # away from scoring a different command than the manager collected under.
+        command_axes=command_axes,
+        # ...and what `d` MEANS, so `dir_err` and `bin_realized` are measured in
+        # the same terms the command is issued in.
+        d_rule=d_rule,
         verbose=bool(ev.get("verbose", False)))
 
     # Phase 5. `pool` and `eval_scenes` stay SCENE lists, not (scene, grasp)
@@ -243,4 +365,5 @@ def build_regrasp_context(cfg4: dict, *, seed: int = 0,
         eval_ckpt=str(ev.get("ckpt", "best")),
         select_on=str(ev.get("select_on", "success_rate")),
         n_excluded=n_excluded, usable=usable,
-        demo_ok=demo_ok_report)
+        demo_ok=demo_ok_report,
+        command_axes=command_axes, command_mode=command_mode, d_rule=d_rule)

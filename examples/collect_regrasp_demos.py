@@ -200,7 +200,7 @@ def _point_cloud(obs, point_listener, panda_base_inv_tf):
 
 def collect_episode(env, point_listener, cfg, scene_idx,
                     panda_base_inv_tf, steps_action_repeat, pin_table=None,
-                    grasp_idx=0):
+                    grasp_idx=0, command_axes="BINS", d_rule=None):
     """
     Run one episode and return a dict of arrays, or None if it could not be run.
 
@@ -261,10 +261,20 @@ def collect_episode(env, point_listener, cfg, scene_idx,
     mano_side = _rg_anchor.handedness(env)
     _ba = pin_table.bin_of(scene_idx, grasp_idx) if pin_table is not None else None
     _bin_assigned = None if _ba is None else int(_ba)
-    # What the expert actually flies, kept as a diagnostic. It is NOT the command
-    # any more — see the step-0 block below.
-    d_grasp_world = _rg_directions.approach_direction(grasp_pose)
-    d_world = d_grasp_world
+    # "BINS" rather than a bare default array: None is a MEANINGFUL value for
+    # `command_axes` (it selects run 1's grasp-axis rule), so "omitted" and
+    # "grasp_axis" must not be the same request.
+    if isinstance(command_axes, str):
+        command_axes = _rg_directions.BINS
+    d_rule = d_rule or _rg_directions.DirectionRule()
+    # What the expert actually flies, under the run's `d_rule`. It is NOT the
+    # command any more — see the step-0 block below — but it IS what
+    # `DATA.d_source: d_grasp_world` trains on. Under `grasp_offset` it needs the
+    # object centroid, which only exists once the step-0 cloud has arrived, so
+    # this is finalised inside the loop rather than here.
+    d_grasp_world = None
+    d_world = None
+    c_w = None
 
     for step in range(stop_step):
         pc5   = _point_cloud(obs, point_listener, panda_base_inv_tf)
@@ -279,28 +289,38 @@ def collect_episode(env, point_listener, cfg, scene_idx,
                     c_w, wrist, np.asarray(cfg.ENV.PANDA_BASE_POSITION),
                     _rg_anchor.AnchorState())
                 anchor_mode = _am["mode"]
-                # ---- THE COMMAND IS THE BIN AXIS, NOT THE GRASP -------------
+                # ---- THE COMMAND, WHICHEVER RULE `--command` NAMES -----------
                 # It has to be computed HERE and not above, because the anchor
                 # frame only exists once the step-0 cloud has given us the object
-                # centroid. `retry.next_direction` has no grasp to read at
-                # deployment and issues `to_world(BINS[b], anchor_R)`; training
-                # on `-R_grasp[:,2]` instead is a MEASURED median-18-degree
-                # train/deploy skew, which is the same order as the effect the
-                # conditioning is supposed to have. The demonstration is already
-                # chosen to be the goal-set grasp closest to this axis, so the
-                # residual is honest label noise (`demo_off_deg`), not a shift.
+                # centroid. The default is the bin axis: `retry.next_direction`
+                # has no grasp to read at deployment and issues
+                # `to_world(BINS[b], anchor_R)`, so labelling with `-R_grasp[:,2]`
+                # instead is a MEASURED median-18-degree train/deploy skew, the
+                # same order as the effect the conditioning is supposed to have.
                 #
-                # THE DAGGER COLLECTOR DOES THE SAME THING, and that is the
-                # trap this comment exists to flag: base demonstrations come
-                # from THIS file, DAgger shards from
-                # handover_sim2real/regrasp/collector.py. Changing one and not
-                # the other produces an aggregate whose halves are captioned
-                # under different rules — invisible in every rate, and caught
-                # only by `audit_regrasp_demos.py`'s `command vs bin axis` line.
-                if anchor_R is not None and _bin_assigned is not None \
-                        and _bin_assigned >= 0:
-                    d_world = _rg_directions.to_world(
-                        _rg_directions.BINS[_bin_assigned], anchor_R)
+                # THE DAGGER COLLECTOR MAKES THE SAME CALL, and that is the trap
+                # this comment exists to flag: base demonstrations come from THIS
+                # file, DAgger shards from handover_sim2real/regrasp/collector.py.
+                # Changing one and not the other produces an aggregate whose
+                # halves are captioned under different rules — invisible in every
+                # rate, and caught only by `audit_regrasp_demos.py`'s
+                # `command vs bin axis` line. Both now go through
+                # `directions.command_direction`, so there is one definition
+                # rather than two copies.
+                #
+                # NOTE the base shard's `d_world` is NOT what a run 9-style
+                # config trains on. This file replays an OMG plan, so nothing
+                # here is conditioned on anything — `d_world` is a caption, and
+                # `DATA.d_source: d_grasp_world` reads the other attr instead.
+                # That is why run 9 needs no re-collection.
+                d_grasp_world = d_rule.of(grasp_pose, c_w)
+                _d = _rg_directions.command_direction(
+                    _bin_assigned, anchor_R, grasp_pose=grasp_pose,
+                    axes=command_axes)
+                # Falls back to the rule's own direction when the command cannot
+                # be formed, so an episode always has SOME caption or none at
+                # all — never a zero vector standing in for one.
+                d_world = _d if _d is not None else d_grasp_world
         rs    = _robot_state(obs, prev_act6d)
         delta = env.convert_target_joint_position_to_action(expert_plan[step])  # [6]
         act   = np.concatenate([delta, [1.0]]).astype(np.float32)  # gripper open
@@ -342,26 +362,36 @@ def collect_episode(env, point_listener, cfg, scene_idx,
         "grasp_idx":      int(grasp_idx),
         "grasp_pose_world": grasp_pose,                                # [4, 4]
         # ---- Regrasp conditioning + provenance ----
-        "d_world":        np.asarray(d_world, dtype=np.float32),
-        # ...and what the expert actually flew, which is a different vector: the
-        # demonstration sits a median ~18 deg from its bin's axis (max 45, the
-        # bin half-width). That gap is the label noise the conditioning has to
-        # tolerate, recorded so it can be measured rather than assumed.
-        "d_grasp_world":  np.asarray(d_grasp_world, dtype=np.float32),
-        "demo_off_deg":   float(_rg_directions.angle_between(d_world,
-                                                             d_grasp_world)),
+        "d_world":        (np.zeros(3, dtype=np.float32) if d_world is None
+                           else np.asarray(d_world, dtype=np.float32)),
+        # ...and what the expert actually flew, under the run's `d_rule`, which
+        # is a different vector from the command: the demonstration sits a
+        # median ~18 deg from its bin's axis (max 45, the bin half-width). That
+        # gap is the label noise the conditioning has to tolerate, recorded so it
+        # can be measured rather than assumed — and it is what
+        # `DATA.d_source: d_grasp_world` trains on.
+        "d_grasp_world":  (np.zeros(3, dtype=np.float32) if d_grasp_world is None
+                           else np.asarray(d_grasp_world, dtype=np.float32)),
+        "demo_off_deg":   (float("nan")
+                           if (d_world is None or d_grasp_world is None)
+                           else float(_rg_directions.angle_between(
+                               d_world, d_grasp_world))),
         # `x or -1` would map bin 0 (+x, the MOST common bin) to -1, because 0
         # is falsy. Explicit None check, always.
         "bin_assigned":   _bin_assigned if _bin_assigned is not None else -1,
         # The bin the DEMONSTRATION lands in — derived from the grasp, not from
         # the command, so it still disagrees with `bin_assigned` exactly when the
         # pin missed. Deriving it from `d_world` would make it trivially equal.
-        "bin_realized":   (-1 if anchor_R is None else
+        "bin_realized":   (-1 if anchor_R is None or d_grasp_world is None else
                            int(_rg_directions.bin_of(
                                _rg_directions.from_world(d_grasp_world,
                                                          anchor_R)))),
         "anchor_R":       (np.eye(3, dtype=np.float32) if anchor_R is None
                            else np.asarray(anchor_R, dtype=np.float32)),
+        # The anchor's ORIGIN — see the DAgger collector. With it, switching
+        # `d_rule` is a relabelling pass rather than a re-collection.
+        "centroid_world": (np.full(3, np.nan, dtype=np.float32) if c_w is None
+                           else np.asarray(c_w, dtype=np.float32)),
         "anchor_mode":    str(anchor_mode or "unset"),
         "wrist_world":    (np.full(3, np.nan, dtype=np.float32) if wrist is None
                            else np.asarray(wrist, dtype=np.float32)),
@@ -404,6 +434,26 @@ def parse_args():
     p.add_argument("--grasps-per-scene", type=int, default=None,
                    help="cap on slots per scene (default: every slot the table "
                         "holds, i.e. K from build_direction_table.py)")
+    p.add_argument("--d-rule", default=None,
+                   choices=["approach_axis", "grasp_offset"],
+                   help="what `d` is derived from. DEFAULT: read from the pin "
+                        "table's `_meta`, which is what you want — the table's "
+                        "bins were populated under one rule and measuring the "
+                        "realised bin by another turns every episode into a "
+                        "miscaption. Pass it only to override a table with no "
+                        "recorded rule.")
+    p.add_argument("--d-point-depth", type=float, default=None,
+                   help="grasp_offset only; default: the table's, else 0.1122")
+    p.add_argument("--command", default="bin_axis",
+                   choices=["bin_axis", "bin_centroid", "grasp_axis"],
+                   help="which rule writes the `d_world` CAPTION on each episode. "
+                        "MUST match SIM.command_deploy in the run config that "
+                        "trains on this shard, or the aggregate's halves are "
+                        "captioned under different rules. bin_axis (default) is "
+                        "runs 2-8; grasp_axis is run 1. Note this is only a "
+                        "caption here — this script replays an OMG plan, so "
+                        "nothing is conditioned on it, and a run whose learner "
+                        "sets DATA.d_source: d_grasp_world ignores it entirely.")
     p.add_argument("--freeze-partial-pointcloud", action="store_true",
                    help="experimental: freeze the cloud to an early frame and hold "
                         "it for the whole episode, instead of the live cloud that "
@@ -498,6 +548,30 @@ def main():
                        "hand_collision_filter": False,
                        "split": args.split})   # scene indices are split-relative
 
+    # The caption rule, resolved once. No `keep_only` has run here — this script
+    # is what PRODUCES the shard the demo filter is later derived from — so a
+    # `bin_centroid` caption is over the full assignment rather than the pruned
+    # one. That is a ~1% difference and it is recorded in the shard's attrs
+    # below, but it is the reason `bin_centroid` belongs on the DEPLOYMENT side
+    # rather than here.
+    from handover_sim2real.regrasp.setup import resolve_command_axes
+    command_axes = resolve_command_axes(pin_table, args.command)
+
+    # THE `d` RULE COMES FROM THE TABLE unless overridden. The table's bins were
+    # populated under one rule; deriving `bin_realized` under another would
+    # disagree with `bin_assigned` on most episodes and the demo audit would
+    # discard the collection. Reading it from the file is what makes that
+    # impossible to get wrong from the command line.
+    _m = getattr(pin_table, "meta", {}) or {}
+    d_rule = _rg_directions.DirectionRule(
+        rule=str(args.d_rule or _m.get("d_rule", "approach_axis")),
+        depth=float(args.d_point_depth if args.d_point_depth is not None
+                    else _m.get("d_point_depth", _rg_directions.FINGERTIP_DEPTH)),
+        min_offset=float(_m.get("d_min_offset", 0.0)))
+    print(f"d rule: {d_rule.describe()}"
+          + ("  (from the pin table's _meta)" if args.d_rule is None else
+             "  (CLI OVERRIDE)"))
+
     # The work list: every (scene, slot) the table offers, scene-major, so a
     # partial run still covers whole scenes and `--num-episodes` stays readable.
     shard_i = shard_n = None
@@ -571,12 +645,21 @@ def main():
 
         f.attrs["phase"]            = 5
         f.attrs["grasps_per_scene"] = int(pin_table.num_grasps)
+        # Which rule wrote `d_world` on every episode in this file. Recorded so a
+        # shard cannot be trained on under a config that assumes a different one
+        # without the mismatch being answerable after the fact.
+        f.attrs["command_rule"] = str(args.command)
+        # ...and what `d` itself was derived from. A shard collected under one
+        # `d_rule` and trained under a config expecting the other is captioned
+        # by a different question entirely; recorded so it is answerable.
+        for _k, _v in d_rule.as_meta().items():
+            f.attrs[_k] = _v
 
         for job_i, (scene_idx, grasp_idx) in enumerate(jobs):
             episode = collect_episode(
                 env, point_listener, cfg, scene_idx,
                 panda_base_inv_tf, steps_action_repeat, pin_table=pin_table,
-                grasp_idx=grasp_idx,
+                grasp_idx=grasp_idx, command_axes=command_axes, d_rule=d_rule,
             )
 
             if episode is None:
@@ -600,7 +683,8 @@ def main():
             # re-derived under a different definition as a relabelling pass.
             for _k in ("d_world", "d_grasp_world", "demo_off_deg",
                        "bin_assigned", "bin_realized", "anchor_R",
-                       "anchor_mode", "wrist_world", "mano_side", "pin_ok"):
+                       "anchor_mode", "wrist_world", "mano_side", "pin_ok",
+                       "centroid_world"):
                 if _k in episode:
                     grp.attrs[_k] = episode[_k]
             grp.create_dataset("point_clouds",   data=episode["point_clouds"],   compression="gzip")
