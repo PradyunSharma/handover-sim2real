@@ -89,3 +89,4 @@ venv*/*
 *.bag
 *.mp4
 handover_sim2real/sim2real/checkpoint/**/*.pt
+output_home_shards/
