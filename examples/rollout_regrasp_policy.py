@@ -655,9 +655,26 @@ def parse_args():
                    help="also draw the full filtered OMG grasp candidate set "
                         "(faint grey); implies --show-goal-grasp.")
     p.add_argument("--grasp-idx", type=int, default=0,
-                   help="which pinned grasp to command (Phase 5). 0 is OMG's own "
-                        "pick and matches a Phase-4 rollout; rolling the same "
-                        "scene at 0 and 3 is the visual form of cond_track.")
+                   help="which pinned SLOT to command. 0 is OMG's own pick and "
+                        "matches a Phase-4 rollout; rolling the same scene at 0 "
+                        "and 3 is the visual form of cond_track. NOTE a slot is "
+                        "a position within the scene and is NOT the bin index — "
+                        "scenes reach different bins, and `keep_only` renumbers "
+                        "slots without renumbering bins. Use --bin to name a "
+                        "DIRECTION rather than a position.")
+    p.add_argument("--bin", type=int, default=None,
+                   help="command a BIN by index (0=+x 1=-x 2=+y 3=-y 4=+z "
+                        "5=-z). THE RIGHT SELECTOR FOR A ROLLOUT, because the "
+                        "command is built from the bin and the anchor alone — "
+                        "`to_world(axes[bin], anchor_R)`, the bin's axis or, "
+                        "under SIM.command_deploy: bin_centroid, its empirical "
+                        "centroid — so the bin fully determines what the policy "
+                        "is told. Also the only way to compare the SAME "
+                        "direction across scenes: slot 1 is `+y` on one scene "
+                        "and `-y` on another. Where a bin holds several grasps "
+                        "(--per-bin 3) the first is used for the goal overlay; "
+                        "the command is identical either way. Overrides "
+                        "--grasp-idx. Needs --grasp-pin-table.")
     p.add_argument("--all-grasps", action="store_true",
                    help="--benchmark only: sweep every pinned slot of every "
                         "scene, i.e. the conditional table retry@k comes from")
@@ -770,6 +787,49 @@ def main():
     from handover_sim2real.regrasp.setup import resolve_command_axes
     command_axes = resolve_command_axes(pin_table, args.command)
 
+    def slot_for(scene_idx: int) -> int:
+        """`--bin` -> a slot of this scene in that bin; `--grasp-idx` unchanged.
+
+        A SLOT IS A GRASP, A BIN IS A DIRECTION, and the map between them is
+        neither the identity nor one-to-one. Scenes reach different subsets of
+        the six bins, so slot 1 is `+y` on one scene and `-y` on another —
+        which makes `--grasp-idx 1` across two scenes a comparison of two
+        DIFFERENT commands. `keep_only` compounds it by renumbering slots and
+        not bins.
+
+        A BIN CAN HOLD SEVERAL GRASPS, AND FOR A ROLLOUT THAT DOES NOT MATTER.
+        Under `--per-bin 3` (run 3) scene 32's `+x` is slots 0, 4 and 8. The
+        COMMAND is unaffected: `command_direction` builds `d` from the bin and
+        the anchor alone — `to_world(axes[b], anchor_R)` — so all three slots
+        issue the identical vector. The slot only decides which grasp is drawn
+        by `--show-goal-grasp` and which pose `pin_table.apply` pins for
+        scoring. The FIRST match is taken, which the assignment orders as the
+        closest-to-axis grasp, i.e. the most canonical realisation of the
+        command. Name an exact grasp with `--grasp-idx` when that matters —
+        and for replaying a recorded demonstration, `--grasp-idx` is the only
+        selector that identifies one.
+        """
+        if args.bin is None:
+            return int(args.grasp_idx)
+        if pin_table is None:
+            raise SystemExit("--bin needs --grasp-pin-table: the bin -> slot "
+                             "mapping is per scene and lives in the table.")
+        n = pin_table.num_grasps_for(int(scene_idx))
+        have: dict[int, int] = {}
+        for gi in range(n):
+            b = pin_table.bin_of(int(scene_idx), gi)
+            if b is not None and int(b) >= 0 and int(b) not in have:
+                have[int(b)] = gi        # first match: closest to the bin axis
+        if int(args.bin) not in have:
+            names = ", ".join(f"{_dirs.BIN_SHORT[b]}(--bin {b})"
+                              for b in sorted(have)) or "none"
+            raise SystemExit(
+                f"scene {scene_idx} has no demonstration for bin "
+                f"{args.bin} ({_dirs.BIN_SHORT[int(args.bin)]}). This scene "
+                f"reaches: {names}. Bins are per scene — pick another bin or "
+                f"another scene.")
+        return have[int(args.bin)]
+
     def do_rollout(s, draw=render, g=None):
         return rollout(env, model, point_listener, s, args.device,
                        panda_base_inv_tf, steps_action_repeat, args.max_steps,
@@ -782,7 +842,7 @@ def main():
                        hold_steps=args.hold_steps,
                        dwell_steps=args.dwell_steps,
                        show_pred_grasp=(args.show_pred_grasp and draw),
-                       grasp_idx=(args.grasp_idx if g is None else g),
+                       grasp_idx=(slot_for(s) if g is None else g),
                        show_anchor_frame=(args.show_anchor_frame and draw),
                        show_bin_sphere=(args.show_bin_sphere and draw),
                        bin_sphere_radius=args.bin_sphere_radius,
@@ -800,8 +860,25 @@ def main():
         # conditional table `succ_g*` and `retry_at_k` are computed from. Without
         # it only --grasp-idx is rolled, so a Phase-5 benchmark reports one slot.
         n_slots = (pin_table.num_grasps if (args.all_grasps and pin_table) else 1)
-        jobs = ([(s, g) for s in ids for g in range(n_slots)] if n_slots > 1
-                else [(s, args.grasp_idx) for s in ids])
+        # `slot_for` rather than args.grasp_idx, so `--benchmark --bin 4` scores
+        # the SAME DIRECTION on every scene instead of the same slot position —
+        # which is a different bin on nearly every scene. Scenes that cannot
+        # reach the bin are skipped rather than fatal: over a benchmark sweep a
+        # missing bin is a property of the scene, not a mistake in the command.
+        if n_slots > 1:
+            jobs = [(s, g) for s in ids for g in range(n_slots)]
+        else:
+            jobs = []
+            for s in ids:
+                try:
+                    jobs.append((s, slot_for(s)))
+                except SystemExit as e:
+                    if args.bin is None:
+                        raise
+                    print(f"  [skip] {e}")
+            if args.bin is not None:
+                print(f"  --bin {args.bin}: {len(jobs)} of {len(ids)} scenes "
+                      f"have a demonstration for it")
         n = len(jobs)
         for s, g in jobs:
             success, reason, dist, grasped, close_step = do_rollout(s, draw=False, g=g)

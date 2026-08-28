@@ -47,6 +47,7 @@ from torch.utils.data import Dataset
 # so importing these in a DataLoader worker costs nothing beyond scipy.
 from handover_sim2real.regrasp import channels as _rg_channels
 from handover_sim2real.regrasp import directions as _rg_directions
+from handover_sim2real.regrasp import reach as _rg_reach
 
 
 GOAL_DIM = 8   # [quat_wxyz(4) ‖ trans(3) ‖ valid(1)] — the AUX HEAD's target.
@@ -221,15 +222,70 @@ class Normalizer:
         )
 
 
-def compute_normalization_stats(hdf5_paths) -> Normalizer:
+def episode_status(grp, *, direction_cond: bool = True,
+                   reach_filter: bool = True,
+                   reach_pos_thresh: float = _rg_reach.DEFAULT_POS_THRESH,
+                   reach_rot_thresh: float = _rg_reach.DEFAULT_ROT_THRESH) -> str:
+    """Should this episode be in D? One predicate, three callers.
+
+    Returns one of:
+        "ok"              keep
+        "miscaptioned"    DROP — `bin_realized != bin_assigned`, so the caption
+                          is the commanded bin but the trajectory is not
+        "no_reach"        DROP — the expert never got to the grasp it aimed at
+        "reach_unjudged"  KEEP — no `grasp_pose_world`, so reach is unknowable
+
+    `BCDataset`, `compute_normalization_stats` and anything else deciding what is
+    in the aggregate MUST route through this. They diverged once already: the
+    normalizer was fit over every episode in the shard while the dataset trained
+    on a filtered subset, so the head's output scale was defined by data the model
+    never saw. At 19 miscaptioned episodes that was noise; at 479 unreached ones
+    it is 30% of the shard, and the dropped episodes are systematically different
+    — truncated mid-approach, so their action labels skew toward large "keep
+    approaching" deltas and away from the small reach-phase ones.
+
+    Callers that DROP must treat "reach_unjudged" as a keep. It exists so a shard
+    predating `grasp_pose_world` degrades to the old behaviour loudly rather than
+    coming out empty.
+    """
+    a = grp.attrs
+    if direction_cond:
+        ba, br = a.get("bin_assigned"), a.get("bin_realized")
+        if (ba is not None and br is not None
+                and int(ba) >= 0 and int(br) >= 0 and int(ba) != int(br)):
+            return "miscaptioned"
+    if reach_filter:
+        G = a.get("grasp_pose_world")
+        if G is None:
+            return "reach_unjudged"
+        if not _rg_reach.reached(grp["robot_states"][-1], G,
+                                 reach_pos_thresh, reach_rot_thresh):
+            return "no_reach"
+    return "ok"
+
+
+DROP_STATUSES = ("miscaptioned", "no_reach")
+
+
+def compute_normalization_stats(
+        hdf5_paths, *, direction_cond: bool = True, reach_filter: bool = True,
+        reach_pos_thresh: float = _rg_reach.DEFAULT_POS_THRESH,
+        reach_rot_thresh: float = _rg_reach.DEFAULT_ROT_THRESH) -> Normalizer:
     """Single streaming pass over the train HDF5 file(s) → Normalizer.
 
     `hdf5_paths` may be one path or a list of paths (the DAgger aggregate);
     stats are pooled across all files. Uses Welford-style sums of x and x² to
     avoid loading the full dataset into memory. Only channels 0–5 of
     expert_actions contribute to action stats (channel 6 is binary).
+
+    FIT OVER EXACTLY THE EPISODES `BCDataset` KEEPS, via `episode_status`. The
+    normalizer defines the scale the policy head predicts in, so fitting it over
+    episodes that are not trained on makes the head's output units a property of
+    data the model never sees. Pass the same flags the dataset gets — which
+    `train_regrasp.py` does by deriving both from one config block.
     """
     paths = _as_path_list(hdf5_paths)
+    n_kept = n_dropped = 0
     sum_s    = np.zeros(32, dtype=np.float64)
     sum_s_sq = np.zeros(32, dtype=np.float64)
     sum_a    = np.zeros(6,  dtype=np.float64)
@@ -242,6 +298,14 @@ def compute_normalization_stats(hdf5_paths) -> Normalizer:
             if not ep_keys:
                 raise RuntimeError(f"No episodes found in {path}")
             for k in ep_keys:
+                if episode_status(
+                        f[k], direction_cond=direction_cond,
+                        reach_filter=reach_filter,
+                        reach_pos_thresh=reach_pos_thresh,
+                        reach_rot_thresh=reach_rot_thresh) in DROP_STATUSES:
+                    n_dropped += 1
+                    continue
+                n_kept += 1
                 rs  = f[k]["robot_states"][:].astype(np.float64)    # [T, 32]
                 act = f[k]["expert_actions"][:].astype(np.float64)  # [T, 7]
                 sum_s    += rs.sum(axis=0)
@@ -250,8 +314,13 @@ def compute_normalization_stats(hdf5_paths) -> Normalizer:
                 sum_a_sq += (act[:, :6] * act[:, :6]).sum(axis=0)
                 n += rs.shape[0]
 
+    if n_dropped:
+        print(f"[normalize] fit over {n_kept} episode(s); {n_dropped} dropped by "
+              f"the same filters the dataset applies (miscaptioned / no reach)")
     if n == 0:
-        raise RuntimeError(f"All episodes in {paths} were empty")
+        raise RuntimeError(
+            f"All episodes in {paths} were empty, or every one was dropped by "
+            f"the caption / reach filters ({n_dropped} dropped, {n_kept} kept)")
 
     state_mean  = sum_s / n
     state_var   = np.maximum(sum_s_sq / n - state_mean ** 2, 0.0)
@@ -287,7 +356,10 @@ class BCDataset(Dataset):
     def __init__(self, hdf5_paths, normalizer: Normalizer | None = None,
                  goal_table=None, reach_tail_weight: float = 1.0,
                  reach_tail: int = 5, direction_cond: bool = True,
-                 d_noise_deg: float = 0.0, d_source: str = "d_world"):
+                 d_noise_deg: float = 0.0, d_source: str = "d_world",
+                 reach_filter: bool = True,
+                 reach_pos_thresh: float = _rg_reach.DEFAULT_POS_THRESH,
+                 reach_rot_thresh: float = _rg_reach.DEFAULT_ROT_THRESH):
         self.hdf5_paths = _as_path_list(hdf5_paths)
         self.normalizer = normalizer
         # Oversampling weight for the last `reach_tail` steps of every episode —
@@ -367,6 +439,34 @@ class BCDataset(Dataset):
             raise ValueError(f"DATA.d_source must be 'd_world' or "
                              f"'d_grasp_world', got {d_source!r}")
         self.d_source = str(d_source)
+        # ---- DROP DEMONSTRATIONS THAT NEVER ARRIVED ---------------------------
+        # The caption filter below asks whether an episode's LABEL is honest. This
+        # asks whether the episode ACCOMPLISHED anything: did the expert end
+        # within the close thresholds of the grasp it was aiming at. Measured on
+        # the run-2 base set, caption validity passes 98.7% while this passes
+        # 69.9% — the two are nearly independent, and until this existed the 480
+        # episodes that stop a mean 108 mm short were 30% of D, teaching the
+        # policy to halt short of the grasp and keep commanding "approach".
+        #
+        # `SIM.reach_filter` prunes the pin table with the SAME criterion
+        # (regrasp/reach.py), which removes the pair from DAgger collection and
+        # from the in-loop eval. That is not enough on its own, for exactly the
+        # reason the caption filter needed a loader-side twin: the base shard on
+        # disk still holds the episode and this loader reads every episode in the
+        # file. Both halves or neither.
+        #
+        # Self-contained, like the caption check: the terminal robot_state and
+        # `grasp_pose_world` both ride on the episode, so no external ok-list is
+        # consulted and a shard cannot be filtered against the wrong run's.
+        #
+        # ON BY DEFAULT, and deliberately so — every run from here on gets it
+        # without touching a config. It changes what D is, so it also changes what
+        # val_loss means: numbers are comparable across runs that share this
+        # setting, not against runs 1-9. Set `DATA.reach_filter: false` to
+        # reproduce a pre-filter aggregate exactly.
+        self.reach_filter = bool(reach_filter)
+        self.reach_pos_thresh = float(reach_pos_thresh)
+        self.reach_rot_thresh = float(reach_rot_thresh)
         self.goal_table = goal_table
         self._goal_tables: list[dict[tuple[int, int], np.ndarray]] | None = None
         if goal_table is not None:
@@ -404,6 +504,7 @@ class BCDataset(Dataset):
         want_grasp = goal_table is not None
         n_from_attr = n_from_table = n_unresolved = 0
         n_dir = n_dir_missing = n_miscaptioned = n_dir_zero = 0
+        n_no_reach = n_reach_unjudged = 0
         widths: set[int] = set()
         # Per-item sampling weight, aligned with `index`. Built here because
         # step-from-end needs the episode length, which is only known while the
@@ -451,13 +552,26 @@ class BCDataset(Dataset):
                     # so the two differ in their captions and in nothing else.
                     # Recovering them would be a second change inside a
                     # one-change comparison.
-                    _ba = f[k].attrs.get("bin_assigned")
-                    _br = f[k].attrs.get("bin_realized")
-                    if (self.direction_cond and _ba is not None and _br is not None
-                            and int(_ba) >= 0 and int(_br) >= 0
-                            and int(_ba) != int(_br)):
+                    #
+                    # ---- AND DROP EPISODES THAT NEVER REACHED THE GRASP -------
+                    # See `self.reach_filter` above. Both decisions live in
+                    # `episode_status`, because `compute_normalization_stats`
+                    # has to make the identical one — a normalizer fit over
+                    # episodes the model never sees defines the head's output
+                    # scale from data that is not in D.
+                    _status = episode_status(
+                        f[k], direction_cond=self.direction_cond,
+                        reach_filter=self.reach_filter,
+                        reach_pos_thresh=self.reach_pos_thresh,
+                        reach_rot_thresh=self.reach_rot_thresh)
+                    if _status == "miscaptioned":
                         n_miscaptioned += 1
                         continue
+                    if _status == "no_reach":
+                        n_no_reach += 1
+                        continue
+                    if _status == "reach_unjudged":
+                        n_reach_unjudged += 1
                     T = int(f[k].attrs["num_steps"])
                     widths.add(int(f[k]["point_clouds"].shape[-1]))
                     if self.direction_cond:
@@ -528,6 +642,20 @@ class BCDataset(Dataset):
                 f"{self.stored_pc_channels}. Set DATA.pc_channels to "
                 f"{MODEL_PC_CHANNELS} in the MODEL and re-collect with "
                 f"examples/collect_regrasp_demos.py, which writes the normals.")
+        # LOUD, because this one is not ~1% — on the run-2 base set it removes
+        # 479 of 1596 episodes (30%). A run whose log does not say so is a run
+        # whose D nobody can reconstruct.
+        if self.reach_filter and (n_no_reach or n_reach_unjudged):
+            _kept = len({(fi, k) for fi, k, _ in index})
+            if n_no_reach:
+                print(f"[reach-filter] DROPPED {n_no_reach} episode(s) that never "
+                      f"reached their grasp (terminal pose further than "
+                      f"{self.reach_pos_thresh} m / {self.reach_rot_thresh} rad); "
+                      f"{_kept} episode(s) kept")
+            if n_reach_unjudged:
+                print(f"[reach-filter] KEPT {n_reach_unjudged} episode(s) with no "
+                      f"`grasp_pose_world` attr — they cannot be judged, so they "
+                      f"are not dropped. A pre-Regrasp shard is in the aggregate.")
         if self.direction_cond:
             # Reported, never silent: dropping ~1% of a 3.5-hour collection is a
             # thing the run's log should say out loud, and a SPIKE here means the

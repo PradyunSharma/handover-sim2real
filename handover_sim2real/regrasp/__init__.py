@@ -71,6 +71,8 @@ _LAZY = {
     "EvalParams": "evaluator", "evaluate_policy": "evaluator",
     "RegraspContext": "setup", "build_regrasp_context": "setup",
     "scene_pools": "setup",
+    "reach_ok_pairs": "reach", "reached": "reach",
+    "terminal_pose_error": "reach",
 }
 
 
@@ -127,8 +129,12 @@ __all__ = [
     "RegraspContext",
     "build_regrasp_context",
     "scene_pools",
+    "reach_ok_pairs",
+    "reached",
+    "terminal_pose_error",
     # ---- Regrasp geometry: pure numpy, no simulator, importable anywhere ----
     "directions",
+    "reach",
     "anchor",
     "normals",
     "channels",

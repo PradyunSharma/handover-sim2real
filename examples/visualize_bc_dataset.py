@@ -114,6 +114,85 @@ def count_episodes(dataset_path):
         return len([k for k in f.keys() if k.startswith("episode_")])
 
 
+def resolve_episode(dataset_path, scene=None, grasp_idx=None, bin_idx=None,
+                    episode=None):
+    """(scene, grasp_idx) -> the flat `--episode` index, or `episode` unchanged.
+
+    `--episode` is a POSITION IN THE FILE and says nothing about what the episode
+    is. What identifies a Regrasp demonstration is the `(scene_idx, grasp_idx)`
+    pair it was collected for, and translating between the two by hand is a
+    lookup nobody should have to do.
+
+    WHY `grasp_idx` AND NOT A BIN. A bin does not name a demonstration. Under a
+    `--per-bin 1` table (run 2) each bin holds one grasp and the two coincide;
+    under `--per-bin 3` (run 3) a bin holds three grasps with three different
+    poses and three different trajectories — on scene 32, `+x` is slots 0, 4 and
+    8. So the slot is the definitive selector for a REPLAY. `bin_idx` is offered
+    as a filter for the common "show me anything in this direction" case, and it
+    reports every match rather than silently taking one.
+
+    (For a ROLLOUT the opposite holds: `rollout_regrasp_policy.py --bin` is the
+    right selector there, because a rollout issues a command built from the bin
+    and the anchor alone and no grasp is being replayed.)
+
+    Returns an episode index. Raises SystemExit listing what the file does hold
+    when the request matches nothing — that message is the point, because the
+    usual cause is a shard that simply does not contain the scene.
+    """
+    if scene is None and grasp_idx is None and bin_idx is None:
+        return episode
+    if str(dataset_path).endswith(".npz"):
+        raise SystemExit("--scene / --grasp-idx / --bin need a per-episode HDF5; "
+                         "a flat RL demo pool has no such attrs.")
+    with h5py.File(dataset_path, "r") as f:
+        if "terminal" in f:
+            raise SystemExit("--scene / --grasp-idx / --bin need a per-episode "
+                             "HDF5; this is a flat RL demo pool.")
+        rows = []
+        for k in sorted(x for x in f if x.startswith("episode_")):
+            a = f[k].attrs
+            rows.append((int(k.split("_")[1]), int(a.get("scene_idx", -1)),
+                         int(a.get("grasp_idx", 0)),
+                         int(a.get("bin_assigned", -1)),
+                         int(a.get("num_steps", 0))))
+    hit = [r for r in rows
+           if (scene is None or r[1] == int(scene))
+           and (grasp_idx is None or r[2] == int(grasp_idx))
+           and (bin_idx is None or r[3] == int(bin_idx))]
+    short = ("+x", "-x", "+y", "-y", "+z", "-z")
+    if not hit:
+        scenes = sorted({r[1] for r in rows})
+        want = ", ".join(x for x in (
+            f"scene {scene}" if scene is not None else "",
+            f"grasp_idx {grasp_idx}" if grasp_idx is not None else "",
+            f"bin {bin_idx}" if bin_idx is not None else "") if x)
+        msg = [f"no episode matches {want} in {dataset_path}."]
+        if scene is not None and int(scene) not in scenes:
+            msg.append(f"  scene {scene} is not in this shard at all — it holds "
+                       f"{len(scenes)} scenes: {scenes[:15]}"
+                       + (" ..." if len(scenes) > 15 else ""))
+            msg.append("  (a DAgger shard holds only the ~100 scenes its "
+                       "iteration drew, not the whole split)")
+        else:
+            here = [r for r in rows if scene is None or r[1] == int(scene)]
+            msg.append(f"  scene {scene} holds: " + ", ".join(
+                f"grasp_idx {r[2]}"
+                + (f" (bin {r[3]} {short[r[3]]})" if 0 <= r[3] < 6 else "")
+                for r in here))
+        raise SystemExit("\n".join(msg))
+    if len(hit) > 1:
+        print(f"[select] {len(hit)} episodes match; taking the first. All of them:")
+        for r in hit:
+            print(f"    --episode {r[0]:5d}  scene {r[1]:4d}  grasp_idx {r[2]:2d}"
+                  + (f"  bin {r[3]} ({short[r[3]]})" if 0 <= r[3] < 6 else "")
+                  + f"  steps {r[4]:3d}")
+    r = hit[0]
+    print(f"[select] scene {r[1]} grasp_idx {r[2]}"
+          + (f" bin {r[3]} ({short[r[3]]})" if 0 <= r[3] < 6 else "")
+          + f" -> --episode {r[0]}")
+    return r[0]
+
+
 def load_episode(dataset_path, ep_idx=None):
     """Return (metadata_dict, arrays_dict, file_meta, ep_idx) for one episode.
     Accepts a BC per-episode HDF5, or an RL demo pool (flat npz OR streamed HDF5)
@@ -306,7 +385,13 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
 
     pin_table = None
     if grasp_pin_table:
-        from handover_sim2real.dagger import load_grasp_pin_table
+        # REGRASP's loader, not Phase 4's, and the difference matters here: a
+        # Regrasp table carries SEVERAL grasps per scene and its `apply` takes a
+        # `grasp_idx`, while Phase 4's has neither. A Phase-4 table still loads
+        # through it — `_normalize_entry` wraps a bare entry as a one-element
+        # list — so this is strictly wider, not a change of behaviour for the
+        # datasets that were already working.
+        from handover_sim2real.regrasp import load_grasp_pin_table
         pin_table = load_grasp_pin_table(grasp_pin_table)
 
     env = HandoverBenchmarkWrapper(gym.make(cfg.ENV.ID, cfg=cfg))
@@ -356,14 +441,27 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
         grasp overlay and fill `ep`. Returns the fresh obs."""
         meta, data, file_meta, idx = load_episode(dataset_path, idx)
         scene_idx    = int(meta["scene_idx"])
+        # WHICH GRASP this episode flew, not which bin. A Regrasp bin holds one
+        # grasp under `--per-bin 1` and three under `--per-bin 3`, so the bin
+        # does not identify an episode and the slot does. Absent on Phase-4 and
+        # RL-demo files, where a scene has exactly one target and 0 is right.
+        grasp_idx    = int(meta.get("grasp_idx", 0))
         saved_pc     = data["point_clouds"]      # [T, N, C]  EE-frame cloud per step
         robot_states = data["robot_states"]      # [T, 32]  joint_pos(9)+... per step
         expert_act   = data["expert_actions"]    # [T, 7]  OMG label at each visited state
         T = len(saved_pc)
 
         is_dagger = bool(file_meta.get("dagger", False))
+        # `grasp_idx` and the bin are both printed because they answer different
+        # questions and are easy to confuse: the slot says WHICH GRASP this
+        # episode is, the bin says which DIRECTION it was captioned under, and
+        # under a 3-per-bin table three slots share one bin.
+        _b = int(meta.get("bin_assigned", -1))
+        _bn = ("" if _b < 0 else
+               f"  bin={_b}({('+x','-x','+y','-y','+z','-z')[_b]})")
         print(f"Replaying episode {idx}/{n_episodes - 1}  scene_idx={scene_idx}  "
-              f"steps={T}  source={source}  (dagger={is_dagger})")
+              f"grasp_idx={grasp_idx}{_bn}  steps={T}  source={source}  "
+              f"(dagger={is_dagger})")
         if source == "omg" and is_dagger and not warned_omg_dagger[0]:
             print("  NOTE: --replay-source omg re-plans the OMG expert and steps THAT, "
                   "not the\n        policy's recorded states — for DAgger data the robot "
@@ -389,8 +487,16 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
             # under ol_alg='Proj') and the overlay can show a DIFFERENT grasp than
             # the episode actually aimed at — measured at up to 20.5 cm apart.
             # Replanning after the pin keeps `expert_plan` consistent too.
+            #
+            # THE EPISODE'S OWN SLOT, not slot 0. This used to call
+            # `apply(env, scene_idx)`, which defaults to slot 0 — correct under
+            # Phase 4, where a scene had ONE pinned grasp, and wrong for every
+            # Regrasp episode with `grasp_idx != 0`. It drew a confident green
+            # gripper at a grasp the episode never aimed at, which is the exact
+            # failure the comment above says this block exists to prevent. Under
+            # a `--per-bin 3` table three quarters of the episodes were affected.
             if expert_plan is not None and pin_table is not None:
-                if pin_table.apply(env, scene_idx):
+                if pin_table.apply(env, scene_idx, grasp_idx):
                     expert_plan, _ = env.run_omg_planner(cfg.RL_MAX_STEP, scene_idx,
                                                          reset_scene=False)
             if expert_plan is None:
@@ -639,6 +745,22 @@ def parse_args():
                         "episode aimed at: OMG re-selects its goal on every plan "
                         "(argmin over the goal set), and the demos-vs-replan target was "
                         "measured up to 20.5 cm apart on unpinned data.")
+    # ---- select an episode by WHAT IT IS, not by where it sits in the file ---
+    p.add_argument("--scene", type=int, default=None,
+                   help="pick the episode by scene index instead of --episode. "
+                        "Combine with --grasp-idx to name one exactly.")
+    p.add_argument("--grasp-idx", type=int, default=None,
+                   help="which GRASP of that scene — the episode's own "
+                        "`grasp_idx` attr, i.e. its slot in the pin table. THIS "
+                        "IS THE DEFINITIVE SELECTOR FOR A REPLAY: a bin holds "
+                        "one grasp under a --per-bin 1 table but three under "
+                        "--per-bin 3 (scene 32's `+x` is slots 0, 4 and 8), so "
+                        "the bin alone does not identify a demonstration.")
+    p.add_argument("--bin", type=int, default=None,
+                   help="filter by commanded bin (0=+x 1=-x 2=+y 3=-y 4=+z "
+                        "5=-z). A convenience for 'anything in this direction' "
+                        "— where several grasps share the bin it lists them all "
+                        "and takes the first. Use --grasp-idx to be exact.")
     p.add_argument("--seed",     type=int, default=None)
     return p.parse_args()
 
@@ -648,13 +770,19 @@ def main():
     if args.seed is not None:
         np.random.seed(args.seed)
 
+    # Resolved once, before either mode: both take a flat episode index, and
+    # this is the only place that knows how to get one from a (scene, grasp).
+    episode = resolve_episode(args.dataset, scene=args.scene,
+                              grasp_idx=args.grasp_idx, bin_idx=args.bin,
+                              episode=args.episode)
+
     if args.mode == "static":
-        visualize_static(args.dataset, args.episode)
+        visualize_static(args.dataset, episode)
     else:
         if args.cfg_file is None:
             print("Error: --cfg-file is required for --mode replay")
             sys.exit(1)
-        visualize_replay(args.dataset, args.episode, args.cfg_file, args.replay_source,
+        visualize_replay(args.dataset, episode, args.cfg_file, args.replay_source,
                          args.show_expert, args.arrow_scale, args.show_goal_grasp,
                          args.show_grasp_set, args.max_grasp_set, args.valid_grasp_dict,
                          args.grasp_pin_table)

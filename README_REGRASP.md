@@ -125,6 +125,143 @@ python examples/audit_regrasp_demos.py --demos output/bc_dataset/train_regrasp.h
 
 `--demos` `--write-ok`
 
+## 5b. Per-(scene, grasp) success table
+
+```bash
+python examples/build_demo_table.py --demos output/bc_dataset/train_regrasp.h5
+python examples/build_demo_table.py --demos output/bc_dataset/val_regrasp.h5
+```
+
+`--demos` (one or more shards) `--out` `--criterion {reach,close_label,caption,all}`
+`--by {grasp,bin}` `--pos-thresh` `--rot-thresh` `--no-detail`
+
+Writes `output/bc_dataset/tables/<stem>_demo_success.csv` — rows are scenes,
+columns are grasp indices, `1` where the demonstration succeeded and `0` where it
+did not. **Blank means the pair was never collected**, which is a different fact
+from a failure:
+
+```
+scene,0,1,2,3
+32,1,1,1,1
+52,1,1,0,1
+10,1,0,,
+```
+
+Columns are grasp indices rather than bins because a bin does not identify a
+demonstration — run 3's `--per-bin 3` gives each bin three grasps with three
+outcomes. `--by bin` gives the bin view, where a cell is the AND over that bin's
+grasps.
+
+**`--criterion reach` (the default) is not what `demo_ok_table` measures.** The
+audit asks whether the *caption* is valid (`bin_realized == bin_assigned`, pin
+landed) and passes **1575 of 1596**. This asks whether the expert actually
+reached the grasp it aimed at, and **1116 of 1596 (69.9%)** did — the other 480
+stop a median 89 mm short and run 14 steps against 21. Both are real filters for
+different jobs, and the gap between them is the 30% of the base set that is in
+`D` while demonstrating nothing.
+
+`--criterion close_label` uses the expert's own final CLOSE label instead of the
+geometry; the two agree on **99.6%** of episodes, which is why the number is
+believable rather than a threshold artifact.
+
+The companion `*_demo_success_detail.csv` carries one row per episode — scene,
+grasp index, bin (as an index and as an `axis` label: `+x`, `+y`, `-y`, …),
+terminal position and rotation error, step count and every criterion — so any `0`
+in the matrix can be traced.
+
+## 5c. Demos per direction
+
+```bash
+python examples/analyze_demo_bins.py
+python examples/analyze_demo_bins.py --by realized
+python examples/analyze_demo_bins.py output/bc_dataset/tables/*_detail.csv
+```
+
+Positional: one or more `*_detail.csv` (default: the train table; several are
+merged). `--criterion {reach,close_label,caption,all}` `--by {assigned,realized}`
+
+Per direction: demonstrations, distinct scenes, how many reached, and the rate.
+This is the question the success matrix **cannot** answer, because a column there
+is a SLOT and slots pack densely over whichever bins a scene reaches — `grasp_idx`
+1 is `+y` on one scene and `+z` on another, so counting columns counts something
+else. Reads the CSV from 5b rather than the shard, so it needs no h5py and runs on
+a login node.
+
+`--by realized` regroups on where each demo actually went instead of what it was
+commanded; the two differ exactly on the episodes where the pin was refused
+(19 of 1596 on run 2's base set).
+
+Bins with no demonstrations print at zero rather than being omitted — they are
+directions the policy will EXTRAPOLATE into if the feasibility mask ever admits
+them at test time. Under a `--drop-bins='-z_beneath,-x_over_fingers'` table that
+is `-x` and `-z`, and the trailing line reports the live count that caps
+`chained_retry_at_k`.
+
+## 5d. The reach filter (on by default)
+
+`demo_ok_table` asks whether a demonstration's **caption** is honest and passes
+**1576/1596**. It says nothing about whether the expert arrived. `SIM.reach_filter`
+asks that second question — terminal pose within `close_pos_thresh` /
+`close_rot_thresh` of the target grasp — and passes **1116/1596 (69.9%)**.
+
+```yaml
+SIM:
+  reach_filter: true        # default; false reproduces runs 1-9 exactly
+  reach_pos_thresh: 0.02    # m,   mirrors DAGGER.close_pos_thresh
+  reach_rot_thresh: 0.34    # rad, mirrors DAGGER.close_rot_thresh
+```
+
+**No config edit is needed** — it defaults on, so every run from here forward gets
+it. It applies in three places from one criterion
+([`handover_sim2real/regrasp/reach.py`](handover_sim2real/regrasp/reach.py)):
+
+| where | mechanism |
+|---|---|
+| DAgger collection | `pin_table.keep_only(reach_ok_pairs(base_train_h5))` in `train_regrasp.py` |
+| in-loop eval | same prune — `eval_jobs` reads slot counts from that table |
+| training data | `BCDataset`, per episode, via `dataset.episode_status` |
+| normalization | `compute_normalization_stats`, same predicate |
+| `D_episodes` / `D_steps` | `dataset_size(files, log_filt)`, same predicate |
+
+`episode_status` is the single predicate all four of the non-table consumers route
+through. They diverged once: the normalizer was fit over every episode in the
+shard while the dataset trained on a filtered subset, so the head's output scale
+was defined by data the model never saw. At 19 miscaptioned episodes that was
+noise; at 479 unreached ones it is 30% of the shard, and the dropped episodes are
+systematically different — truncated mid-approach, so their labels skew toward
+large "keep approaching" deltas and away from small reach-phase ones. Refitting
+moves `action_std` down 2–8% per axis and `state_std` on the EE pose up 3–7%.
+
+The table prune alone is **not** enough: the base shard on disk still holds the
+episode and the loader reads every episode in the file. That is the same leak the
+caption filter had before it grew a loader-side twin (`D_episodes` 1596, not
+1575). Both halves, or neither.
+
+Measured effect on `regrasp_pins_train.json`:
+
+```
+raw              617 scenes  1596 pairs
+after demo_ok    617 scenes  1576 pairs
+after reach      558 scenes  1097 pairs     <- 30% of the pairs, 59 whole scenes
+slots per scene  1:222  2:175  3:119  4:42
+
+D (train_regrasp.h5)   1596 ep / 30028 steps  ->  1098 ep / 23048 steps
+```
+
+A warm-started or resumed run **keeps its existing normalizer** (`train_regrasp.py`
+loads rather than recomputes), so turning this on mid-chain does not silently
+rescale a head. Only a fresh base fit refits.
+
+**Two consequences to plan around.** Unpaired scenes go from 127/617 (21%) to
+222/558 (40%), so a larger share of the data cannot break the conditioning
+confound — check `cond_delta` on the paired subset rather than assuming it holds.
+And mean pairs per scene falls 2.59 → 1.97, so `episodes_per_iter` (divided by
+`max_grasps`, still 4) yields fewer episodes per iteration than before; re-read
+the collection log's episode count before comparing wall clock with an earlier run.
+
+`val_loss` is comparable across runs that share this setting and **not** against
+runs 1-9, whose val set carried the unreached demonstrations.
+
 ## 6. Check a config's inputs
 
 ```bash
@@ -226,24 +363,54 @@ bash examples/watch_regrasp.sh -f slurm_logs/regrasp_<jobid>.out
 
 ## Rendering and replay (PyBullet GUI)
 
-### One iteration's policy on one scene
+### One iteration's policy, one scene, one bin
 
 ```bash
 python examples/rollout_regrasp_policy.py \
     --run-dir output/dagger_runs/regrasp_run2/iters/iter_13 \
     --cfg-file examples/pretrain_multicam_wr.yaml \
-    --scene 10 --show-goal-grasp
+    --grasp-pin-table output/regrasp_pins_train.json \
+    --scene 32 --bin 4 --show-goal-grasp
 ```
 
 `--run-dir` takes any iteration directory (`<run>/iters/iter_NN`) or `<run>/best`
 / `<run>/last`; there is no checkpoint flag — it loads `checkpoints/best.pt` and
 falls back to `last.pt`. GUI is on by default; `--no-render` disables it.
-`--grasp-idx` picks which commanded direction (bin slot) to roll out.
+
+**Use `--bin` for a rollout.** A rollout does not replay anything — it issues a
+command, and the command is built from the bin and the anchor alone:
+`to_world(axes[bin], anchor_R)`, where `axes` is the bin axes or, under
+`SIM.command_deploy: bin_centroid` (run 9), the bins' empirical centroids. So
+the bin *fully determines* what the policy is told, and `--bin` is the only way
+to issue the same command across scenes — slot 1 is `+y` on one scene and `−y`
+on another.
+
+Where a bin holds several grasps (a `--per-bin 3` table: scene 32's `+x` is
+slots 0, 4 and 8) the command is identical for all of them; the slot only
+decides which grasp `--show-goal-grasp` draws and which pose gets pinned for
+scoring. The first — the closest to the bin axis — is used. `--grasp-idx` still
+names an exact grasp when that matters, and it is the *only* selector that
+identifies a recorded demonstration (see the replay section below).
+
+`--bin` needs `--grasp-pin-table`, and errors with the scene's actual bin list
+when that scene has no demonstration for the bin.
+
+To see what a scene offers before rolling it:
+
+```bash
+python -c "
+import sys; sys.path.insert(0,'.')
+from handover_sim2real.regrasp.grasp_pin import GraspPinTable
+from handover_sim2real.regrasp import directions as D
+t=GraspPinTable('output/regrasp_pins_train.json'); s=32
+print(', '.join(f'--bin {t.bin_of(s,g)} ({D.BIN_SHORT[t.bin_of(s,g)]}) = slot {g}'
+                for g in range(t.num_grasps_for(s))))"
+```
 
 `--run-dir` `--cfg-file` `--scene` `--scenes 10,12,40` `--num-scenes`
 `--scenes-from-run` `--max-steps` `--hold-steps` `--dwell-steps` `--device`
 `--no-render` `--benchmark` `--show-goal-grasp` `--show-grasp-set`
-`--grasp-idx N` `--all-grasps` `--show-pred-grasp` `--grasp-pin-table`
+`--bin N` `--grasp-idx N` `--all-grasps` `--show-pred-grasp` `--grasp-pin-table`
 `--command {bin_axis,bin_centroid,grasp_axis}` `--show-anchor-frame`
 `--show-bin-sphere` `--bin-sphere-radius` `--bin-sphere-points`
 `--freeze-partial-pointcloud` `--freeze-at-step` `--egl`
@@ -269,7 +436,110 @@ wrist, z world up); `--show-bin-sphere` draws a point shell coloured by bin with
 a labelled ray down each bin axis, colours matching `plot_regrasp_run.py`. Both
 read `anchor_R` / `centroid_world` from the pin table's `scene_meta`.
 
-Scenes with all four live bins: **32, 52, 91, 92, 94** (`0=+x 1=+y 2=−y 3=+z`).
+Scenes with all four live bins under the run-2 table: **32, 52, 91, 92, 94**
+(slots `0=+x 1=+y 2=−y 3=+z`; under a `--per-bin 3` table the same four bins
+occupy 12 slots, `0–3`, `4–7`, `8–11`).
+
+### Replay recorded demonstrations — base shard or a run's DAgger buffer
+
+Same tool for both. The base shard `output/bc_dataset/train_regrasp.h5` holds the
+expert demonstrations; every DAgger iteration writes `<run>/data/dagger_iter_NN.h5`
+holding the episodes that iteration collected. Replaying drives the robot through
+the *recorded* rollout and overlays the saved point cloud, so it shows what
+actually happened, not a fresh rollout.
+
+```bash
+# base demonstrations — scene 32, its 4th grasp
+python examples/visualize_bc_dataset.py \
+    --dataset output/bc_dataset/train_regrasp.h5 \
+    --mode replay --cfg-file examples/pretrain_multicam_wr.yaml \
+    --grasp-pin-table output/regrasp_pins_train.json \
+    --scene 32 --grasp-idx 3 --show-goal-grasp --show-expert-arrows
+
+# one iteration's DAgger buffer — same selectors
+python examples/visualize_bc_dataset.py \
+    --dataset output/dagger_runs/regrasp_run2/data/dagger_iter_13.h5 \
+    --mode replay --cfg-file examples/pretrain_multicam_wr.yaml \
+    --grasp-pin-table output/regrasp_pins_train.json \
+    --scene 52 --grasp-idx 3 --show-goal-grasp --show-expert-arrows
+```
+
+`--scene` + `--grasp-idx` resolve to the flat `--episode` index and print what
+they picked:
+
+```
+[select] scene 32 grasp_idx 3 bin 4 (+z) -> --episode 56
+```
+
+When nothing matches, the error says what the shard *does* hold — for the scene
+if it's present, and the scene list if it isn't (a DAgger shard carries only the
+~100 scenes its iteration drew, not the whole split).
+
+`--bin` is available as a filter for "anything in this direction", but where
+several grasps share the bin it lists them all and takes the first:
+
+```
+[select] 3 episodes match; taking the first. All of them:
+    --episode     0  scene    0  grasp_idx  0  bin 0 (+x)  steps  14
+    --episode     1  scene    0  grasp_idx  1  bin 0 (+x)  steps  21
+    --episode     2  scene    0  grasp_idx  2  bin 0 (+x)  steps  21
+```
+
+> **Select a replay by GRASP INDEX, never by bin.** A bin does not identify a
+> demonstration. Run 2's table gives each bin one grasp, but run 3's `--per-bin 3`
+> gives it three — on scene 32, `+x` is slots 0, 4 *and* 8, three different grasp
+> poses with three different trajectories. The episode's `grasp_idx` attr is the
+> slot it flew, and that is the definitive selector; `bin_assigned` is context.
+> (For a *rollout* the opposite holds — see the previous section: there the bin
+> is what determines the command, and no grasp is being replayed at all.)
+
+`--grasp-pin-table` makes `--show-goal-grasp` draw **this episode's** grasp: the
+replay pins the episode's own `grasp_idx` before reading the pose back from OMG.
+Without the table, OMG re-selects its goal by `argmin` over the goal set and the
+overlay can land on a different grasp than the episode aimed at — measured at up
+to 20.5 cm away. Each loaded episode prints its `scene_idx`, `grasp_idx` and
+`bin`, so the overlay can be checked against the caption.
+
+`--replay-source states` (the default) follows the stored `robot_states`, which
+is the **policy's** path for DAgger data and the only mode where the cloud lines
+up. `--replay-source omg` re-plans the expert instead and matches the *offline*
+set only — on DAgger data it shows a different trajectory than the one recorded.
+
+Keys in the window: `R` replay, `N` / `P` next / previous episode (reloads that
+episode's scene and grasp overlay), `Q` quit.
+
+`--dataset` `--scene N` `--grasp-idx N` `--bin N` `--episode N`
+`--mode {static,replay}` `--cfg-file` `--replay-source {states,omg}`
+`--show-expert-arrows` / `--no-expert-arrows` `--arrow-scale` `--show-goal-grasp`
+`--show-grasp-set` `--max-grasp-set` `--valid-grasp-dict` `--grasp-pin-table`
+`--seed`
+
+`--mode static` needs no simulator — it plots the clouds and trajectory with
+matplotlib, which is the fast way to check a shard is intact.
+
+**`--episode` is a position in the file** and says nothing about what the
+episode is — `--scene` / `--grasp-idx` above exist so you never have to translate
+by hand. To browse what a shard contains before picking one:
+
+```bash
+python -c "
+import h5py, collections, sys; sys.path.insert(0,'.')
+from handover_sim2real.regrasp import directions as D
+f=h5py.File('output/dagger_runs/regrasp_run2/data/dagger_iter_13.h5','r')
+ks=[k for k in f if k.startswith('episode_')]
+n=collections.Counter(int(f[k].attrs.get('bin_assigned',-1)) for k in ks)
+g=collections.Counter(int(f[k].attrs['grasp_idx']) for k in ks)
+print(len(ks),'episodes over',
+      len({int(f[k].attrs['scene_idx']) for k in ks}),'scenes')
+print('  by bin  :', {D.BIN_SHORT[b]: c for b,c in sorted(n.items()) if b>=0})
+print('  by slot :', dict(sorted(g.items())))"
+```
+
+```
+268 episodes over 100 scenes
+  by bin  : {'+x': 82, '+y': 65, '-y': 54, '+z': 67}
+  by slot : {0: 100, 1: 86, 2: 58, 3: 24}
+```
 
 ### One scene through the retry ladder
 

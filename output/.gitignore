@@ -36,6 +36,16 @@
 !regrasp_pins_*.json
 !regrasp_demos_*_ok.json
 
+# Per-(scene, grasp) demonstration outcomes (examples/build_demo_table.py).
+# Tracked for the same reason as the tables above and one more: this is the only
+# record of WHICH demonstrations actually reached their grasp, and the .h5 it is
+# derived from lives on /scratch and is never committed. Losing the shard loses
+# the ability to recompute it. 7 KB for the matrix, ~100 KB for the per-episode
+# detail; a directory rule is needed because `*` on line 5 ignores the folder
+# itself before any file pattern inside it can match.
+!bc_dataset/tables/
+!bc_dataset/tables/*.csv
+
 # Track lightweight per-run metadata under rl_runs/ (training logs, plots, and
 # configs) so runs can be committed/pushed for record-keeping. The parent dirs
 # must be re-included first, then the specific files. The large checkpoints/

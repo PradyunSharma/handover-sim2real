@@ -146,6 +146,17 @@ def main() -> int:
             print(f"  ** MISSING **  TRAIN.train_cfg      {tc}")
             missing += 1
 
+        # The reach filter changes what D is and is ON BY DEFAULT, so a config
+        # that never mentions it still gets it. Reported unconditionally — an
+        # unstated default that removes 30% of the demonstrations is exactly the
+        # kind of thing a pre-flight check exists to make visible.
+        rf = sim.get("reach_filter", True)
+        print(f"       reach_filter={'ON' if rf else 'OFF'}"
+              + (f"  ({sim.get('reach_pos_thresh', 0.02)} m / "
+                 f"{sim.get('reach_rot_thresh', 0.34)} rad)  -- pairs whose "
+                 f"demonstration never reached are dropped from D, collection "
+                 f"and eval" if rf else "  (default is ON; this run opts out)"))
+
         trn = cfg.get("TRAIN") or {}
         dag = cfg.get("DAGGER") or {}
         print(f"       -> beta {dag.get('beta_start')} -> {dag.get('beta_end')}, "

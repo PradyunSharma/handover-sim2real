@@ -196,6 +196,22 @@ SIM:
   # eval loop and `bin_of` cannot disagree about which pairs exist.
   demo_ok_table: output/regrasp_demos_train_off_ok.json
 
+  # DROP (scene, bin) PAIRS WHOSE DEMONSTRATION NEVER ARRIVED. `demo_ok_table`
+  # above asks whether the CAPTION is honest and passes ~99%; this asks whether
+  # the expert reached the grasp, and on the run-2 shard only 69.9% did. The
+  # other 30% stop a mean 108 mm short, run 14 steps against 21, and end still
+  # commanding "keep approaching" — they were in D, and their pairs were
+  # re-collected and re-scored every iteration.
+  #
+  # Derived at train time from TRAIN.base_train_h5, so there is nothing to
+  # rebuild; it prunes the pin table (collection + eval) and BCDataset,
+  # compute_normalization_stats and the D_* log columns all apply the same
+  # predicate. Default is true — stated explicitly here because it changes what
+  # D is, and a run's config should record that rather than inherit it.
+  reach_filter: true
+  reach_pos_thresh: 0.02        # m,   = DAGGER.close_pos_thresh
+  reach_rot_thresh: 0.34        # rad, = DAGGER.close_rot_thresh
+
 DAGGER:
   # 25. Resumable, so a 24 h timeout costs only the queue wait: resubmit the
   # identical command and completed iterations are skipped.

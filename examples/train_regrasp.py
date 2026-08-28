@@ -78,6 +78,9 @@ from handover_sim2real.regrasp_bc import (
     Normalizer,
     compute_normalization_stats,
 )
+from handover_sim2real.regrasp_bc.dataset import (                # noqa: E402
+    DROP_STATUSES, episode_status,
+)
 from handover_sim2real.regrasp import (
     build_box_params,
     CollectParams,
@@ -96,6 +99,7 @@ from handover_sim2real.regrasp import (
     policy_kind,
 )
 from handover_sim2real.regrasp.directions import BINS as _rg_dirs_BINS  # noqa: E402
+from handover_sim2real.regrasp import reach as _rg_reach          # noqa: E402
 from handover_sim2real.regrasp.evaluator import (               # noqa: E402
     aggregate_eval_rows, eval_jobs, eval_num_grasps,
 )
@@ -312,6 +316,29 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
 
     set_seed(seed)
 
+    # RESOLVED BEFORE THE NORMALIZER, because the normalizer must be fit over
+    # exactly the episodes the dataset keeps. `direction_cond` is a MODEL key and
+    # `reach_*` are DATA keys injected by main() from the SIM block, so both are
+    # available here and neither is re-derived further down.
+    kind = policy_kind(cfg)
+    direction_cond = bool(cfg["MODEL"].get("direction_cond", True))
+    # Drop demonstrations that never reached their grasp. Defaults ON and matches
+    # the pin-table prune in main() — the two filters MUST use one criterion or D
+    # holds episodes for pairs the loop no longer collects on.
+    reach_kw = {
+        "reach_filter": bool(cfg["DATA"].get("reach_filter", True)),
+        "reach_pos_thresh": float(cfg["DATA"].get(
+            "reach_pos_thresh", _rg_reach.DEFAULT_POS_THRESH)),
+        "reach_rot_thresh": float(cfg["DATA"].get(
+            "reach_rot_thresh", _rg_reach.DEFAULT_ROT_THRESH)),
+    }
+    # The ACT learner's BCSequenceDataset applies neither filter, so normalizing
+    # under them would fit the scale to a subset it does not train on — the exact
+    # inconsistency this change removes for the BC path. Off for ACT until that
+    # dataset grows the same filtering.
+    filt_kw = ({"direction_cond": direction_cond, **reach_kw} if kind == "bc"
+               else {"direction_cond": False, "reach_filter": False})
+
     resume_ckpt = run_dir / "checkpoints" / "last.pt"
     resume = resume_ckpt.exists()
     norm_path = run_dir / "normalization.npz"
@@ -324,10 +351,9 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
         print(f"[train] warm start from {init_from} (reusing its normalizer)")
     else:
         print(f"[train] computing normalization over {len(train_files)} file(s) ...")
-        normalizer = compute_normalization_stats(cfg["DATA"]["train_h5"])
+        normalizer = compute_normalization_stats(cfg["DATA"]["train_h5"], **filt_kw)
     normalizer.save(norm_path)
 
-    kind = policy_kind(cfg)
     if kind == "bc":
         # Auxiliary goal-grasp target (run 13), only when the head exists and the
         # weight is nonzero. "auto" resolves each shard's pin table from its own
@@ -337,10 +363,12 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
         if bool(cfg["MODEL"].get("aux_head", False)) and \
                 float(cfg.get("LOSS", {}).get("aux_weight", 0.0)) > 0.0:
             goal_table = cfg["DATA"].get("grasp_pin_table") or "auto"
-        # REGRASP conditioning. No table needed: every episode carries its own
-        # `d_world` attr, so the dataset reads its own command and a rebuilt pin
-        # table cannot retarget an existing collection.
-        direction_cond = bool(cfg["MODEL"].get("direction_cond", True))
+        # REGRASP conditioning (`direction_cond`) and the reach filter
+        # (`reach_kw`) are both resolved above the normalizer — see there. No
+        # table is needed for either: every episode carries its own `d_world` and
+        # `grasp_pose_world` attrs, so the dataset reads its own command and a
+        # rebuilt pin table cannot retarget an existing collection.
+        #
         # Perturb the command by this much, TRAIN ONLY. Weighting or perturbing
         # val would change what val_loss means across epochs.
         d_noise = float(cfg["DATA"].get("d_noise_deg", 0.0))
@@ -361,10 +389,16 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
                              d_source=d_source,
                              reach_tail_weight=float(cfg["DATA"].get(
                                  "reach_tail_weight", 1.0)),
-                             reach_tail=int(cfg["DATA"].get("reach_tail", 5)))
+                             reach_tail=int(cfg["DATA"].get("reach_tail", 5)),
+                             **reach_kw)
+        # APPLIED TO VAL TOO. A val set holding demonstrations the expert never
+        # completed measures how well the policy imitates stopping short, which is
+        # not the quantity `best.pt` should be selected on. It does mean val_loss
+        # is comparable across runs that share this setting and NOT against runs
+        # 1-9, whose val set carried them.
         val_ds = (BCDataset(val_h5, normalizer=normalizer, goal_table=goal_table,
                             direction_cond=direction_cond, d_noise_deg=0.0,
-                            d_source=d_source)
+                            d_source=d_source, **reach_kw)
                   if val_h5 and os.path.exists(val_h5) else None)
     else:
         T = int(cfg["MODEL"]["history_len"])
@@ -835,8 +869,15 @@ def collect_columns(c: dict) -> dict:
     }
 
 
-def dataset_size(files: list[str]) -> tuple[int, int]:
-    """(episodes, steps) across the HDF5 files the refit will train on."""
+def dataset_size(files: list[str], filt: dict | None = None) -> tuple[int, int]:
+    """(episodes, steps) across the HDF5 files the refit will train on.
+
+    `filt` is the same kwargs `BCDataset` and `compute_normalization_stats` get.
+    Passing it is what keeps `D_episodes`/`D_steps` in dagger_log.csv equal to
+    what the fit actually saw — without it the columns count episodes the loader
+    drops, which under the reach filter is ~30% of the base shard and would make
+    the logged aggregate a number that describes no artifact in the run.
+    """
     n_ep = n_steps = 0
     for path in files:
         if not path or not os.path.exists(path):
@@ -845,6 +886,8 @@ def dataset_size(files: list[str]) -> tuple[int, int]:
             for name in f:
                 grp = f[name]
                 if isinstance(grp, h5py.Group) and "num_steps" in grp.attrs:
+                    if filt and episode_status(grp, **filt) in DROP_STATUSES:
+                        continue
                     n_ep += 1
                     n_steps += int(grp.attrs["num_steps"])
     return n_ep, n_steps
@@ -994,6 +1037,48 @@ def main() -> None:
             raw_ok = json.load(f)
         pin_table.keep_only(raw_ok.get("ok", raw_ok))
 
+    # THE SECOND PRUNE: PAIRS WHOSE DEMONSTRATION NEVER ARRIVED.
+    #
+    # `demo_ok_table` asks whether the caption is honest and passes 98.7%. This
+    # asks whether the expert reached the grasp, and passes 69.9% — the two are
+    # nearly independent, so the caption filter left ~30% of the pairs in the
+    # collection pool and the eval set with nothing behind them. A pair whose
+    # base demonstration stops 108 mm short is one DAgger re-collects every
+    # iteration and the evaluator scores every iteration, against a target the
+    # expert itself could not hit.
+    #
+    # DERIVED FROM THE BASE SHARD, not from a file on disk. The alternative — a
+    # second ok-list next to `demo_ok_table` — is a third artifact to rebuild
+    # whenever the shard changes, and a third opportunity for the loader's filter
+    # and the table's to disagree. Reading it here costs one attrs pass over the
+    # shard (no point clouds) and guarantees the table prune and
+    # `BCDataset.reach_filter` apply the same criterion to the same data.
+    #
+    # ON BY DEFAULT, so every run from here on gets it without a config edit.
+    # `SIM.reach_filter: false` reproduces the runs 1-9 behaviour exactly.
+    reach_pos = float(sim_cfg_d.get("reach_pos_thresh",
+                                    _rg_reach.DEFAULT_POS_THRESH))
+    reach_rot = float(sim_cfg_d.get("reach_rot_thresh",
+                                    _rg_reach.DEFAULT_ROT_THRESH))
+    reach_filter = bool(sim_cfg_d.get("reach_filter", True))
+    if reach_filter and pin_table is not None:
+        base_h5 = trn.get("base_train_h5")
+        if not base_h5 or not os.path.exists(base_h5):
+            raise SystemExit(
+                f"[reach-filter] SIM.reach_filter is on but TRAIN.base_train_h5 "
+                f"({base_h5!r}) does not exist. The filter is derived from the "
+                f"base demonstrations, so it cannot be applied without them. "
+                f"Set SIM.reach_filter: false to run without it.")
+        ok_pairs, rstats = _rg_reach.reach_ok_pairs(base_h5, reach_pos, reach_rot)
+        print(f"[reach-filter] {base_h5}: {rstats['reached']}/"
+              f"{rstats['episodes']} episodes reached their grasp "
+              f"({reach_pos} m / {reach_rot} rad)"
+              + (f", {rstats['unjudgeable']} unjudgeable (kept)"
+                 if rstats["unjudgeable"] else "")
+              + (f", {rstats['unnamed']} with no bin (skipped)"
+                 if rstats["unnamed"] else ""))
+        pin_table.keep_only(ok_pairs)
+
     # WHAT THE POLICY IS COMMANDED WHENEVER IT ACTS. Resolved here, AFTER the
     # demo filter (the centroid summarises the assignment that survived it), and
     # handed to both the collection params and the eval params so the manager,
@@ -1054,6 +1139,25 @@ def main() -> None:
     pool, eval_scenes = scene_pools(sim.num_scenes, ev, usable=usable)
 
     train_cfg = load_yaml(trn["train_cfg"])
+    # ONE SOURCE OF TRUTH FOR THE REACH FILTER. The table prune above and the
+    # loader-side drop must agree, or D holds episodes for pairs the loop no
+    # longer collects on. Injecting SIM's values into DATA here means the run
+    # config decides once and `train_on_aggregate` cannot be handed a different
+    # threshold; the written-out `config.yaml` then records what was actually
+    # applied.
+    train_cfg.setdefault("DATA", {}).update(
+        {"reach_filter": reach_filter,
+         "reach_pos_thresh": reach_pos, "reach_rot_thresh": reach_rot})
+    # The same predicate again, for `D_episodes`/`D_steps` in dagger_log.csv —
+    # those columns are read as "what the fit saw", so they must not count the
+    # episodes the loader drops. `direction_cond` comes from the train config
+    # because that is where the model's flag lives.
+    log_filt = {
+        "direction_cond": bool(train_cfg.get("MODEL", {}).get(
+            "direction_cond", True)),
+        "reach_filter": reach_filter,
+        "reach_pos_thresh": reach_pos, "reach_rot_thresh": reach_rot,
+    }
     # TRAIN.pc_pretrained overrides MODEL.pc_pretrained in the train config. Same
     # mechanism examples/train_bc.py exposes as `--pc-pretrained none`: an empty
     # value means initialise the PointNet++ encoder RANDOMLY instead of from the
@@ -1367,7 +1471,7 @@ def main() -> None:
         export_run_dir(base_dir, run_root / "last", ckpt=eval_ckpt,
                        note="DAgger iteration 0 (base policy)")
         save_state(run_root / "state.json", state)
-        d_ep, d_steps = dataset_size(base_files(trn))
+        d_ep, d_steps = dataset_size(base_files(trn), log_filt)
         row0 = {
             "iter": 0, "beta": 1.0, "m": 0, "episodes": 0, "steps": 0,
             "skipped": 0, "aggregate_files": 1,
@@ -1596,8 +1700,8 @@ def main() -> None:
         # D as the refit actually saw it: demonstrations + every D_j so far.
         # `D_dagger_frac` is the axis that separates "DAgger helps" from "more
         # data helps" — success against |D| with the on-policy share alongside.
-        d_ep, d_steps = dataset_size(base_files(trn) + dagger_files)
-        _, dag_steps = dataset_size(dagger_files)
+        d_ep, d_steps = dataset_size(base_files(trn) + dagger_files, log_filt)
+        _, dag_steps = dataset_size(dagger_files, log_filt)
 
         row = {
             "iter": i, "beta": round(beta, 4), "m": len(pairs),
