@@ -491,12 +491,33 @@ offset with a warning when it falls below `d_min_offset` — that is the case wh
 ```bash
 # run 10's demos, with the full conditioning overlay
 python examples/visualize_bc_dataset.py \
-    --dataset $RUNS/output/bc_dataset/train_regrasp_off.h5 \
+    --dataset output/bc_dataset/train_regrasp_off.h5 \
     --mode replay --cfg-file examples/pretrain_multicam_wr.yaml \
     --grasp-pin-table output/regrasp_pins_train_off.json \
-    --scene 32 --grasp-idx 0 \
+    --scene 387 --grasp-idx 0 \
     --show-goal-grasp --show-anchor-frame --show-bin-sphere --show-d
 ```
+
+Scene 387 is the useful one to start on, because its five slots show three
+different things side by side. Step through them with `--grasp-idx`:
+
+| slot | bin | what it shows |
+|---|---|---|
+| 0 | `+x` | **a truncated demo** — the gripper stops 2.07 cm short of the green grasp and the last label is still "approach". `reach_filter` drops it |
+| 1 | `−x` | **a failed pin** (`pin_ok=0`) — the episode flew to OMG's own grasp, 17.9 cm and 157° from the table's. The load line says so |
+| 2 | `+y` | **the OMG dive** — the wrist drops 37 cm toward the table, clips the object and the episode ends early |
+| 3, 4 | `−y`, `−z` | healthy: terminal pose 0.45 cm from the grasp, CLOSE emitted |
+
+The load line prints the terminal pose error against **this episode's own** grasp,
+so a gap between the green gripper and the robot is named rather than guessed at:
+
+```
+terminal EE vs this episode's grasp: 2.07 cm / 0.0 deg   (-2.07 cm along the approach axis)
+   ** the demo did NOT reach it — truncated **
+```
+
+Prefix the dataset path with `$RUNS/` on the cluster, where the shards live under
+`$REGRASP_DATA`; locally they are under `output/`.
 
 The same overlays are available on `rollout_regrasp_policy.py`; both scripts draw
 them from `handover_sim2real/regrasp/viz.py`, so a bin is the same colour in both

@@ -564,15 +564,24 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
             return
         aR = np.asarray(aR, dtype=np.float64)
 
-        c_ee = _rg_chan.object_centroid(np.asarray(saved_pc[0]),
-                                        fallback_to_all=False)
-        if c_ee is None:
-            print("  [overlay] step 0 has no object points — cannot place the "
-                  "anchor origin.")
-            return
-        c_world = _rg_anchor.centroid_to_world(
-            c_ee, obs, panda_base_inv_tf,
-            cfg.ENV.PANDA_BASE_POSITION, cfg.ENV.PANDA_BASE_ORIENTATION)
+        # THE STORED ORIGIN WINS WHERE IT EXISTS. DAgger shards carry
+        # `centroid_world` — the exact value the labels were computed against —
+        # so recomputing it would only introduce a difference. Base shards
+        # predate the attr, and there the step-0 cloud is rebuilt the way the
+        # collector built it.
+        c_world = meta.get("centroid_world")
+        if c_world is not None:
+            c_world = np.asarray(c_world, dtype=np.float64)
+        else:
+            c_ee = _rg_chan.object_centroid(np.asarray(saved_pc[0]),
+                                            fallback_to_all=False)
+            if c_ee is None:
+                print("  [overlay] step 0 has no object points — cannot place "
+                      "the anchor origin.")
+                return
+            c_world = _rg_anchor.centroid_to_world(
+                c_ee, obs, panda_base_inv_tf,
+                cfg.ENV.PANDA_BASE_POSITION, cfg.ENV.PANDA_BASE_ORIENTATION)
 
         if show_bin_sphere:
             _rg_viz.draw_bin_sphere(aR, c_world, goal_ids,
@@ -583,14 +592,24 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
 
         if not show_d:
             return
-        # THREE VECTORS, AND THEY ARE NOT THE SAME THING. Drawing only one of them
-        # is how you convince yourself the conditioning is fine when it is not.
+        # THREE VECTORS, AND THEY ANSWER THREE DIFFERENT QUESTIONS. Drawing only
+        # one is how you convince yourself the conditioning is fine when it is
+        # not; mislabelling them is how you convince yourself it is broken when
+        # it is not.
+        #
         #   white   what this episode was COMMANDED (`d_world`) — the vector the
-        #           network actually read, whatever rule produced it
-        #   yellow  this shard's rule applied to the grasp the episode FLEW; for a
-        #           run-10 table that is `grasp_offset`, centroid -> fingertips
-        #   grey    `-R_grasp[:,2]`, the approach axis, as stored in
-        #           `d_grasp_world` — runs 1-9's definition, for contrast
+        #           network actually read
+        #   yellow  THIS SHARD'S RULE applied to the grasp the episode flew,
+        #           read from its own `d_grasp_world` attr
+        #   grey    THE OTHER RULE, drawn for contrast
+        #
+        # The grey one earns its place. `approach_axis` is a property of the
+        # gripper's ORIENTATION and `grasp_offset` of its POSITION, and on a
+        # grasp that reaches down to close on an object's underside they are
+        # nearly perpendicular — measured 88.6 deg on run 9's scene 52 slot 0,
+        # where the fingertips sit 12.0 cm below the centroid while the approach
+        # axis is horizontal. Seeing only one of them, the other looks like a
+        # bug. Seeing both is the whole argument for run 10.
         gp = meta.get("grasp_pose_world")
         gp = None if gp is None else np.asarray(gp, dtype=np.float64)
 
@@ -599,34 +618,37 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
             _rg_viz.draw_direction(dw, c_world, goal_ids, colour=(1.0, 1.0, 1.0),
                                    label="d commanded")
 
-        d_rule_vec = d_rule_obj.of(gp, c_world) if gp is not None else None
-        if d_rule_vec is not None:
-            _rg_viz.draw_direction(d_rule_vec, c_world, goal_ids,
-                                   colour=(1.0, 0.85, 0.1),
-                                   label=f"d {d_rule_obj.rule}", length=0.26)
-            if d_rule_obj.needs_centroid():
-                off = _rg_viz.draw_grasp_point(gp, c_world, goal_ids,
-                                               depth=d_rule_obj.depth)
-                print(f"  [d] offset centroid -> fingertips: {off * 100:.1f} cm"
-                      + ("   ** below d_min_offset "
-                         f"{d_rule_obj.min_offset * 100:.0f} cm — `d` here is "
-                         f"centroid noise **"
-                         if off < d_rule_obj.min_offset else ""))
-        elif gp is not None and d_rule_obj.needs_centroid():
-            print(f"  [d] {d_rule_obj.rule} is undefined for this episode — the "
-                  f"offset is below d_min_offset {d_rule_obj.min_offset} m.")
-
+        # The shard's own label, not a recomputation — that is what training reads.
         dg = meta.get("d_grasp_world")
-        if dg is not None:
-            _rg_viz.draw_direction(dg, c_world, goal_ids, colour=(0.6, 0.6, 0.6),
-                                   label="d approach_axis", length=0.18, width=3.0)
+        if dg is not None and np.linalg.norm(np.asarray(dg, float)) > 0.5:
+            _rg_viz.draw_direction(dg, c_world, goal_ids, colour=(1.0, 0.85, 0.1),
+                                   label=f"d flown ({d_rule_obj.rule})",
+                                   length=0.26)
+        if d_rule_obj.needs_centroid() and gp is not None:
+            off = _rg_viz.draw_grasp_point(gp, c_world, goal_ids,
+                                           depth=d_rule_obj.depth)
+            print(f"  [d] offset centroid -> fingertips: {off * 100:.1f} cm"
+                  + ("   ** below d_min_offset "
+                     f"{d_rule_obj.min_offset * 100:.0f} cm — `d` here is "
+                     f"centroid noise **" if off < d_rule_obj.min_offset else ""))
 
-        if dw is not None and d_rule_vec is not None:
-            print(f"  [d] commanded vs {d_rule_obj.rule}: "
-                  f"{float(_rg_dirs.angle_between(dw, d_rule_vec)):.1f} deg")
+        other = ("grasp_offset" if d_rule_obj.rule == "approach_axis"
+                 else "approach_axis")
+        d_other = (_rg_dirs.DirectionRule(rule=other, depth=d_rule_obj.depth)
+                   .of(gp, c_world) if gp is not None else None)
+        if d_other is not None:
+            _rg_viz.draw_direction(d_other, c_world, goal_ids,
+                                   colour=(0.6, 0.6, 0.6),
+                                   label=f"d {other} (not used)",
+                                   length=0.18, width=3.0)
+
         if dw is not None and dg is not None:
-            print(f"  [d] commanded vs approach_axis: "
+            print(f"  [d] commanded vs flown ({d_rule_obj.rule}): "
                   f"{float(_rg_dirs.angle_between(dw, dg)):.1f} deg")
+        if dg is not None and d_other is not None:
+            print(f"  [d] {d_rule_obj.rule} vs {other}: "
+                  f"{float(_rg_dirs.angle_between(dg, d_other)):.1f} deg"
+                  f"   (orientation vs position — they are different questions)")
 
     def _draw_goal_overlay(meta=None, robot_states=None):
         if not (show_goal_grasp or show_grasp_set):

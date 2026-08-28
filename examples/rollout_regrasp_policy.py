@@ -720,6 +720,50 @@ def main():
     from handover_sim2real.regrasp.setup import resolve_command_axes
     command_axes = resolve_command_axes(pin_table, args.command)
 
+    def print_bin_legend(scene_idx=None) -> None:
+        """`--bin N` -> which direction, and what this scene actually offers.
+
+        The index is the ONLY thing the flag takes and the least memorable thing
+        in the system: `BINS` is ordered +x, -x, +y, -y, +z, -z, so `--bin 3` is
+        `-y` and not `+z`, and an off-by-one there issues a command 90 deg from
+        the intended one and looks like a policy failure. Printed every run, next
+        to the vector each index resolves to under `--command`, because under
+        `bin_centroid` the axis and the issued vector are NOT the same thing.
+        """
+        axes = (_dirs.BINS if command_axes is None
+                else np.asarray(command_axes, dtype=np.float64))
+        have = {}
+        if pin_table is not None and scene_idx is not None:
+            for gi in range(pin_table.num_grasps_for(int(scene_idx))):
+                b = pin_table.bin_of(int(scene_idx), gi)
+                if b is not None and int(b) >= 0:
+                    have.setdefault(int(b), gi)
+        print(f"\nbins ({args.command})"
+              + (f"   scene {scene_idx}" if scene_idx is not None else ""))
+        for b in range(len(_dirs.BINS)):
+            v = axes[b] if b < len(axes) else _dirs.BINS[b]
+            off = float(_dirs.angle_between(v, _dirs.BINS[b]))
+            mark = (f"slot {have[b]}" if b in have else
+                    ("--" if scene_idx is not None else ""))
+            print(f"  --bin {b}  {_dirs.BIN_SHORT[b]:<3} "
+                  f"{_dirs.BIN_NAMES[b]:<17} "
+                  f"[{v[0]:+.3f} {v[1]:+.3f} {v[2]:+.3f}]"
+                  + (f"  {off:5.1f} deg off the axis" if off > 1e-6
+                     else "  (the axis itself)")
+                  + (f"   {mark}" if mark else ""))
+        if scene_idx is not None and pin_table is not None:
+            missing = [b for b in range(len(_dirs.BINS)) if b not in have]
+            print(f"  this scene reaches "
+                  f"{', '.join(_dirs.BIN_SHORT[b] for b in sorted(have)) or 'nothing'}"
+                  + (f"; no demonstration for "
+                     f"{', '.join(_dirs.BIN_SHORT[b] for b in missing)}"
+                     if missing else ""))
+        print("  the vectors above are in the ANCHOR frame; what the policy is "
+              "issued is\n  to_world(vector, anchor_R), which moves with the "
+              "giver's wrist.\n")
+
+    print_bin_legend(scene if pin_table is not None else None)
+
     def slot_for(scene_idx: int) -> int:
         """`--bin` -> a slot of this scene in that bin; `--grasp-idx` unchanged.
 
