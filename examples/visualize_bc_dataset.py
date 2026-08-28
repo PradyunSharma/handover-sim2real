@@ -60,6 +60,7 @@ Same static / replay modes:
 import argparse
 import h5py
 import numpy as np
+import os
 import sys
 
 
@@ -342,7 +343,10 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
                      show_expert=False, arrow_scale=3.0, show_goal_grasp=False,
                      show_grasp_set=False, max_grasp_set=40,
                      valid_grasp_dict="examples/valid_grasp_dict_005.pkl",
-                     grasp_pin_table=None):
+                     grasp_pin_table=None, show_anchor_frame=False,
+                     show_bin_sphere=False, bin_sphere_radius=0.10,
+                     bin_sphere_points=2400, show_d=False, d_rule=None,
+                     d_point_depth=None, d_min_offset=None):
     import gym
     import pybullet
     import time
@@ -353,6 +357,10 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
     from handover.benchmark_wrapper import HandoverBenchmarkWrapper
     from handover_sim2real.config import get_cfg
     from handover_sim2real.utils import add_sys_path_from_env, resolve_valid_grasp_dict_path
+    from handover_sim2real.regrasp import anchor as _rg_anchor
+    from handover_sim2real.regrasp import channels as _rg_chan
+    from handover_sim2real.regrasp import directions as _rg_dirs
+    from handover_sim2real.regrasp import viz as _rg_viz
 
     add_sys_path_from_env("GADDPG_DIR")
     from experiments.config import cfg_from_file
@@ -393,6 +401,27 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
         # datasets that were already working.
         from handover_sim2real.regrasp import load_grasp_pin_table
         pin_table = load_grasp_pin_table(grasp_pin_table)
+
+    # WHICH `d` THIS SHARD WAS LABELLED UNDER. The rule is a property of the DATA,
+    # not of this viewer, and it lives in the pin table's `_meta` (put there by
+    # build_direction_table.py and carried forward by assign_direction_demos.py).
+    # Defaulting to it means `--show-d` draws run 10's `grasp_offset` vector for a
+    # run-10 table and runs 1-9's `approach_axis` for theirs, with no flag — and
+    # drawing the wrong rule is not a cosmetic error, the two differ by a median
+    # 14.5 deg and disagree about which bin a grasp is in.
+    _rule_meta = dict(getattr(pin_table, "meta", None) or {}) if pin_table else {}
+    _rule_block = {
+        "d_rule": d_rule or _rule_meta.get("d_rule", "approach_axis"),
+        "d_point_depth": (d_point_depth if d_point_depth is not None
+                          else _rule_meta.get("d_point_depth",
+                                              _rg_dirs.FINGERTIP_DEPTH)),
+        "d_min_offset": (d_min_offset if d_min_offset is not None
+                         else _rule_meta.get("d_min_offset", 0.0)),
+    }
+    d_rule_obj = _rg_dirs.DirectionRule.from_cfg(_rule_block)
+    if show_d or show_anchor_frame or show_bin_sphere:
+        print(f"[d_rule] {d_rule_obj.describe()}"
+              + ("" if d_rule else f"   (from {grasp_pin_table or 'the default'})"))
 
     env = HandoverBenchmarkWrapper(gym.make(cfg.ENV.ID, cfg=cfg))
 
@@ -511,14 +540,147 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
                   act=expert_act, T=T, expert_plan=expert_plan,
                   stop_step=(len(expert_plan) if expert_plan is not None else 0)
                             if source == "omg" else T)
-        _draw_goal_overlay()
+        _draw_goal_overlay(meta, robot_states)
+        _draw_conditioning_overlay(meta, saved_pc, obs)
         return obs
 
-    def _draw_goal_overlay():
+    def _draw_conditioning_overlay(meta, saved_pc, obs):
+        """Anchor frame, bin sphere and `d`, at the anchor's own origin.
+
+        THE ORIGIN IS RECOMPUTED, NOT STORED. Episodes carry `anchor_R` but not
+        the centroid it is pinned at, so it is rebuilt here exactly as the
+        collector built it: the observed-cloud centroid of the STEP-0 frame, in
+        the EE frame, mapped to world. Using the object's pose instead would
+        offset the drawing by a few cm from the frame the labels were actually
+        computed in — the conditioning channels use the visible-surface centroid,
+        so that is what has to be drawn.
+        """
+        if not (show_anchor_frame or show_bin_sphere or show_d):
+            return
+        aR = meta.get("anchor_R")
+        if aR is None:
+            print("  [overlay] this episode has no `anchor_R` attr (pre-Regrasp "
+                  "shard) — nothing to draw.")
+            return
+        aR = np.asarray(aR, dtype=np.float64)
+
+        c_ee = _rg_chan.object_centroid(np.asarray(saved_pc[0]),
+                                        fallback_to_all=False)
+        if c_ee is None:
+            print("  [overlay] step 0 has no object points — cannot place the "
+                  "anchor origin.")
+            return
+        c_world = _rg_anchor.centroid_to_world(
+            c_ee, obs, panda_base_inv_tf,
+            cfg.ENV.PANDA_BASE_POSITION, cfg.ENV.PANDA_BASE_ORIENTATION)
+
+        if show_bin_sphere:
+            _rg_viz.draw_bin_sphere(aR, c_world, goal_ids,
+                                    radius=bin_sphere_radius,
+                                    n_points=bin_sphere_points)
+        if show_anchor_frame:
+            _rg_viz.draw_anchor_frame(aR, c_world, goal_ids)
+
+        if not show_d:
+            return
+        # THREE VECTORS, AND THEY ARE NOT THE SAME THING. Drawing only one of them
+        # is how you convince yourself the conditioning is fine when it is not.
+        #   white   what this episode was COMMANDED (`d_world`) — the vector the
+        #           network actually read, whatever rule produced it
+        #   yellow  this shard's rule applied to the grasp the episode FLEW; for a
+        #           run-10 table that is `grasp_offset`, centroid -> fingertips
+        #   grey    `-R_grasp[:,2]`, the approach axis, as stored in
+        #           `d_grasp_world` — runs 1-9's definition, for contrast
+        gp = meta.get("grasp_pose_world")
+        gp = None if gp is None else np.asarray(gp, dtype=np.float64)
+
+        dw = meta.get("d_world")
+        if dw is not None:
+            _rg_viz.draw_direction(dw, c_world, goal_ids, colour=(1.0, 1.0, 1.0),
+                                   label="d commanded")
+
+        d_rule_vec = d_rule_obj.of(gp, c_world) if gp is not None else None
+        if d_rule_vec is not None:
+            _rg_viz.draw_direction(d_rule_vec, c_world, goal_ids,
+                                   colour=(1.0, 0.85, 0.1),
+                                   label=f"d {d_rule_obj.rule}", length=0.26)
+            if d_rule_obj.needs_centroid():
+                off = _rg_viz.draw_grasp_point(gp, c_world, goal_ids,
+                                               depth=d_rule_obj.depth)
+                print(f"  [d] offset centroid -> fingertips: {off * 100:.1f} cm"
+                      + ("   ** below d_min_offset "
+                         f"{d_rule_obj.min_offset * 100:.0f} cm — `d` here is "
+                         f"centroid noise **"
+                         if off < d_rule_obj.min_offset else ""))
+        elif gp is not None and d_rule_obj.needs_centroid():
+            print(f"  [d] {d_rule_obj.rule} is undefined for this episode — the "
+                  f"offset is below d_min_offset {d_rule_obj.min_offset} m.")
+
+        dg = meta.get("d_grasp_world")
+        if dg is not None:
+            _rg_viz.draw_direction(dg, c_world, goal_ids, colour=(0.6, 0.6, 0.6),
+                                   label="d approach_axis", length=0.18, width=3.0)
+
+        if dw is not None and d_rule_vec is not None:
+            print(f"  [d] commanded vs {d_rule_obj.rule}: "
+                  f"{float(_rg_dirs.angle_between(dw, d_rule_vec)):.1f} deg")
+        if dw is not None and dg is not None:
+            print(f"  [d] commanded vs approach_axis: "
+                  f"{float(_rg_dirs.angle_between(dw, dg)):.1f} deg")
+
+    def _draw_goal_overlay(meta=None, robot_states=None):
         if not (show_goal_grasp or show_grasp_set):
             return
-        goal_mat     = env.get_omg_goal_grasp_pose()   # traj[-1], the grasp pose
-        standoff_mat = env.get_omg_standoff_pose()     # traj[-5], the pre-grasp pose
+        # THE EPISODE'S OWN GRASP, NOT A RE-PLANNED ONE. `get_omg_goal_grasp_pose`
+        # is what OMG picked when THIS VIEWER replanned, which is not necessarily
+        # what the episode flew, and the gap is visible:
+        #
+        #   * the pin matches by position within `match_tol` (2 cm) and only then
+        #     disambiguates by rotation, so even a SUCCESSFUL re-pin can land on a
+        #     candidate up to 2 cm from the recorded one;
+        #   * where the episode's `pin_ok` is 0 the collector stored the grasp OMG
+        #     actually flew to, while the viewer's re-pin may now succeed — so the
+        #     overlay drew a completely different pose (11 of 1418 episodes on
+        #     run 10's shard, and the symptom is "the gripper lands at a totally
+        #     different orientation than the green gripper").
+        #
+        # `grasp_pose_world` is read back from the planner AFTER pinning at
+        # collection time, so it is true by construction for this episode — and it
+        # is the pose `--show-d` builds `d` from, so drawing anything else here
+        # makes the two overlays disagree with each other.
+        goal_mat = standoff_mat = None
+        if meta is not None and meta.get("grasp_pose_world") is not None:
+            goal_mat = np.asarray(meta["grasp_pose_world"], dtype=np.float64)
+            # Analytic, from the grasp: OMG appends the standoff ramp in Cartesian
+            # space without re-optimising it, so traj[-reach_tail] IS the grasp
+            # backed off along its own -z (matched to 5.6e-7 m — see
+            # regrasp/collector.py:derived_standoff_pose).
+            standoff_mat = goal_mat @ np.array(
+                [[1., 0., 0., 0.], [0., 1., 0., 0.],
+                 [0., 0., 1., -0.064], [0., 0., 0., 1.]], dtype=np.float64)
+            if robot_states is not None:
+                # How far the demonstration ACTUALLY got, printed next to the
+                # overlay so a gap between the green gripper and the robot is
+                # named rather than left to be squinted at.
+                from handover_sim2real.regrasp import reach as _rg_reach
+                p_err, r_err = _rg_reach.terminal_pose_error(
+                    robot_states[-1], goal_mat)
+                depth = float((np.asarray(robot_states[-1][18:21])
+                               - goal_mat[:3, 3]) @ goal_mat[:3, 2])
+                print(f"  terminal EE vs this episode's grasp: {p_err*100:.2f} cm"
+                      f" / {np.degrees(r_err):.1f} deg"
+                      f"   ({depth*100:+.2f} cm along the approach axis)"
+                      + ("   ** the demo did NOT reach it — truncated **"
+                         if not _rg_reach.reached(robot_states[-1], goal_mat)
+                         else ""))
+                if not int(meta.get("pin_ok", 1)):
+                    print("  NOTE pin_ok=0: the pin failed at COLLECTION, so this "
+                          "episode flew to OMG's own choice, not the table's. The "
+                          "green gripper is the flown grasp; the pin table names a "
+                          "different one.")
+        else:
+            goal_mat     = env.get_omg_goal_grasp_pose()   # traj[-1]
+            standoff_mat = env.get_omg_standoff_pose()     # traj[-5]
 
         # Full candidate set first (thin grey) so the highlighted goal draws on top:
         # every grasp OMG could pick from for this scene — the valid_grasp_dict-
@@ -761,6 +923,30 @@ def parse_args():
                         "5=-z). A convenience for 'anything in this direction' "
                         "— where several grasps share the bin it lists them all "
                         "and takes the first. Use --grasp-idx to be exact.")
+    # ---- Regrasp conditioning overlays (replay mode) ------------------------
+    p.add_argument("--show-anchor-frame", action="store_true",
+                   help="draw the anchor frame (x away from the hand, z world "
+                        "up) at the observed object centroid — the frame every "
+                        "`d` is expressed in")
+    p.add_argument("--show-bin-sphere", action="store_true",
+                   help="draw a see-through sphere around the object painted by "
+                        "BIN, with a labelled ray down each bin axis")
+    p.add_argument("--bin-sphere-radius", type=float, default=0.10)
+    p.add_argument("--bin-sphere-points", type=int, default=2400)
+    p.add_argument("--show-d", action="store_true",
+                   help="draw the conditioning vector: white = what the episode "
+                        "was COMMANDED (`d_world`), yellow = this shard's d_rule "
+                        "applied to the grasp it flew (run 10: grasp_offset, "
+                        "centroid -> fingertip midpoint), grey = `-R_grasp[:,2]`")
+    p.add_argument("--d-rule", default=None, choices=["approach_axis", "grasp_offset"],
+                   help="override the rule for --show-d. Default reads "
+                        "`_meta.d_rule` from --grasp-pin-table, which is what the "
+                        "shard was actually labelled under")
+    p.add_argument("--d-point-depth", type=float, default=None,
+                   help="metres along the gripper's +z for grasp_offset "
+                        "(default 0.1122, the fingertip end of the Panda pads)")
+    p.add_argument("--d-min-offset", type=float, default=None,
+                   help="reject grasp_offset shorter than this (run 10: 0.02)")
     p.add_argument("--seed",     type=int, default=None)
     return p.parse_args()
 
@@ -769,6 +955,19 @@ def main():
     args = parse_args()
     if args.seed is not None:
         np.random.seed(args.seed)
+
+    # An UNSET ${RUNS} (or ${REGRASP_DATA}) expands to nothing in the shell, so a
+    # copy-pasted cluster command turns into an absolute `/output/...` path and
+    # h5py reports it as a bare FileNotFoundError several frames deep. Say which
+    # of the two it is, here, before the simulator is built.
+    if not os.path.exists(args.dataset):
+        hint = ("\n  The path starts at `/`, which is what an UNSET ${RUNS} or "
+                "${REGRASP_DATA} looks like\n  after the shell expands it. Either "
+                "export it, or use a repo-relative path."
+                if args.dataset.startswith("/output") else "")
+        raise SystemExit(f"--dataset not found: {args.dataset}{hint}")
+    if args.grasp_pin_table and not os.path.exists(args.grasp_pin_table):
+        raise SystemExit(f"--grasp-pin-table not found: {args.grasp_pin_table}")
 
     # Resolved once, before either mode: both take a flat episode index, and
     # this is the only place that knows how to get one from a (scene, grasp).
@@ -785,7 +984,14 @@ def main():
         visualize_replay(args.dataset, episode, args.cfg_file, args.replay_source,
                          args.show_expert, args.arrow_scale, args.show_goal_grasp,
                          args.show_grasp_set, args.max_grasp_set, args.valid_grasp_dict,
-                         args.grasp_pin_table)
+                         args.grasp_pin_table,
+                         show_anchor_frame=args.show_anchor_frame,
+                         show_bin_sphere=args.show_bin_sphere,
+                         bin_sphere_radius=args.bin_sphere_radius,
+                         bin_sphere_points=args.bin_sphere_points,
+                         show_d=args.show_d, d_rule=args.d_rule,
+                         d_point_depth=args.d_point_depth,
+                         d_min_offset=args.d_min_offset)
 
 
 if __name__ == "__main__":

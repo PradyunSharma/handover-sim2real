@@ -464,6 +464,44 @@ python examples/visualize_bc_dataset.py \
     --scene 52 --grasp-idx 3 --show-goal-grasp --show-expert-arrows
 ```
 
+#### The conditioning overlay — anchor frame, bin sphere, and `d`
+
+Add `--show-anchor-frame --show-bin-sphere --show-d` to any replay. All three are
+drawn at the **observed object centroid**, recomputed from the episode's own
+step-0 cloud exactly as the collector built it — episodes store `anchor_R` but not
+the origin it is pinned at, and the object's pose would sit a few cm from the
+visible-surface centroid the conditioning channels actually use.
+
+`--show-d` draws three vectors, because they are not the same thing and drawing
+only one is how you convince yourself the conditioning is fine when it is not:
+
+| colour | vector |
+|---|---|
+| white | what the episode was **commanded** (`d_world`) — what the network read |
+| yellow | this shard's `d_rule` applied to the grasp it **flew**; under run 10 that is `grasp_offset`, centroid → fingertip midpoint, with the offset segment and endpoint drawn |
+| grey | `−R_grasp[:,2]` (`d_grasp_world`), runs 1–9's `approach_axis`, for contrast |
+
+The rule is read from `_meta.d_rule` in `--grasp-pin-table`, so a run-10 table
+draws `grasp_offset` and a run-2 table draws `approach_axis` with no flag.
+Override with `--d-rule / --d-point-depth / --d-min-offset`. The angles between
+the vectors are printed, and under `grasp_offset` so is the centroid → fingertip
+offset with a warning when it falls below `d_min_offset` — that is the case where
+`d` is centroid noise rather than geometry.
+
+```bash
+# run 10's demos, with the full conditioning overlay
+python examples/visualize_bc_dataset.py \
+    --dataset $RUNS/output/bc_dataset/train_regrasp_off.h5 \
+    --mode replay --cfg-file examples/pretrain_multicam_wr.yaml \
+    --grasp-pin-table output/regrasp_pins_train_off.json \
+    --scene 32 --grasp-idx 0 \
+    --show-goal-grasp --show-anchor-frame --show-bin-sphere --show-d
+```
+
+The same overlays are available on `rollout_regrasp_policy.py`; both scripts draw
+them from `handover_sim2real/regrasp/viz.py`, so a bin is the same colour in both
+views and in every figure.
+
 `--scene` + `--grasp-idx` resolve to the flat `--episode` index and print what
 they picked:
 

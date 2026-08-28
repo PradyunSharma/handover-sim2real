@@ -419,6 +419,7 @@ with different `init`. Phase-4 run 16, for reference, was 100 / 25 from scratch.
 | **regrasp_run7** | `regrasp_run7.yaml` | wrist+right | **17 of 25** (running) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.5** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | **12** (`success 0.555`) | it17 `success 0.496`, `dir_track 0.704`, `bin_diag 0.903` | = run 2 with **the same two changes run 4 made to run 3** (`bc_regrasp_run4.yaml`, `d_noise_deg` 12 → 0, **and** `beta_end` 0.75 → 0.5). Shares run 2's pin tables and shards. **The noise transformed the BASE FIT and nothing after it**: iteration 0 went `success 0.143 → 0.370` against run 2, and by iteration 7 the two runs are indistinguishable. Shows the FTL dip textbook-clean (0.370 → 0.244 at it 1, back above base by it 5). See below. |
 | **regrasp_run8** | `regrasp_run8.yaml` | wrist+right | **19 of 25** (running) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | **0° (OFF)** | **warm-start (best.pt)**, PointNet++ from scratch at iter 0 only | 50 / 15 | **linear 0.9→0.5** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | **14** (`success 0.487`) | it19 `success 0.475`, `dir_track 0.704`, `bin_diag 0.908` | = run 7 with `train_from_scratch` **false**. ONE change — the clean warm-start ablation at one demo per bin. **The warm start removes the FTL dip and buys nothing**: no early trough, `train_loss` half run 7's (0.14 vs 0.235), and success/`dir_track`/`bin_diag` all at or below run 7's from iteration 7 on. Its iteration 0 is configured identically to run 7's and scored 0.282 against 0.370 — **that 0.088 gap is the run-to-run noise floor** for this setup and the yardstick for everything else here. See below. |
 | **regrasp_run9** | `regrasp_run9.yaml` | wrist+right | 25 (planned) | 400 → ~259 | **1–4 (one per bin)** | **train: grasp axis `−R[:,2]` / deploy: BIN CENTROID** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | **The first run whose training label and deployment command are different vectors.** = run 2 + `SIM.command_deploy: bin_centroid` + `bc_regrasp_run9.yaml` (`d_noise_deg` 12 → 0, `DATA.d_source` `d_world` → `d_grasp_world`). Trains on the grasp's own approach axis — no quantisation, no perturbation — and deploys on the unit mean of each bin's assigned `d_anchor`, which needs no grasp and so is producible on the robot. Reuses run 2's tables and shards **verbatim**: both vectors have always been written per episode, so this is a relabelling. Read it as **run 1 done properly**, not as a run-2 variant. See below. |
+| **regrasp_run11** | `regrasp_run11.yaml` | wrist+right | 25 (planned) | 600 → TBD | **1–6 (one per bin, ALL SIX LIVE)** | **grasp's own `d`** (continuous), deploy on the **bin centroid** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | **Run 10 with the LABEL de-quantised.** = run 10 + `DATA.d_source: d_grasp_world` + `SIM.command_deploy: bin_centroid` (two keys; the second is forced by the first — training on the true direction while deploying the axis would just move the gap to test time). Runs 2/4/10 caption every episode with one of six fixed axes, but the flown grasp is only the *closest member* of that bin: measured on `train_regrasp_off.h5`, the caption sits a **median 24.5° / p90 41.5°** from the grasp's own `d`, with 36% beyond 30°. Run 11 labels with the flown direction instead — a pure **relabelling**, no new data or tables, since `d_grasp_world` already rides on every episode. Completes the 2×2 over {`d_rule`} × {label scheme}: run 2 / run 9 / run 10 / **run 11**. One change from run 10; one from run 9 (`d_rule`), though that edge is weaker since run 9 predates the reach filter. Read `dir_err` first — `bin_diag_rate` scores against a bin the label no longer is. See below. |
 | **regrasp_run10** | `regrasp_run10.yaml` | wrist+right | 25 (planned) | 600 → TBD | **1–6 (one per bin, ALL SIX LIVE)** | bin axis, but **`d` = centroid → fingertip** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | **The first run to change what `d` MEANS.** = run 2 + `SIM.d_rule: grasp_offset` + `bc_regrasp_run4.yaml` (noise off). `d` is no longer `−R_grasp[:,2]` but the direction from the object centroid to the midpoint between the fingertips — a function of the grasp's **position**, not its orientation. **This unlocks the two dead bins**: `−z` goes from 0 scenes to 235 and `−x` from 12 to 191, because you cannot *approach* from beneath a held object but you can close your fingers on its underside. Retry ladder gains two rungs; chance level moves 1/4 → 1/6. **Needs the whole upstream chain rebuilt** — table, assignment, base collection, audit. **Also the first run under `SIM.reach_filter`**: (scene, bin) pairs whose demonstration never reached its grasp are dropped from D, from collection and from eval (on the run-2 shard that was 30% of pairs). Deliberately NOT a single-change test against run 2. See below. |
 
 ### Result: DAgger did not move success; the conditioning is read but not obeyed
@@ -787,6 +788,73 @@ argument survives. Run 8 ahead to the end means FTL loses more to the 15-epoch
 budget than it gains, and every future regrasp run should warm-start. Run 8 ahead
 early and **behind** late is the inherited-mistake failure FTL exists to prevent,
 arriving as the aggregate turns majority on-policy.
+
+---
+
+### regrasp_run11 — run 10's `d`, trained on the continuous vector, configured, not yet run
+
+`examples/configs/regrasp_run11.yaml`. **Run 10 with the label de-quantised.**
+Runs 1–10 argued about which *rule* produces `d`; this one keeps run 10's rule and
+changes what the network is actually shown.
+
+Runs 2/4/10 caption every episode with `to_world(BINS[bin_assigned], anchor_R)` —
+one of six fixed octahedral axes. But the grasp an episode flies to is only the
+*closest member* of that bin, never a grasp on the axis. Measured over the 1402
+episodes of `train_regrasp_off.h5` with a resolvable grasp vector:
+
+| label (bin axis) vs the flown grasp's continuous `d` | |
+|---|---|
+| median | **24.5°** |
+| p90 | 41.5° |
+| max | 133.9° |
+| within 10° | 14% |
+| beyond 30° | **36%** |
+
+So run 10's policy is told "come from `+y`" and shown a demonstration a median
+24.5° off that axis, and is asked to produce one action for grasps up to 90° apart.
+It can only average them, and the average is a grasp of neither.
+
+**Two keys, and the second is forced by the first.**
+`DATA.d_source: d_grasp_world` labels each episode with the direction the expert
+actually flew, under this run's own `d_rule`. `SIM.command_deploy: bin_centroid`
+then issues, at test time, the unit mean of every `d_anchor` a bin was assigned —
+taken over the pin table *after* `demo_ok_table` and the reach filter prune it, so
+it is the centre of the label distribution the policy was really trained on.
+Training on the true direction while deploying the bin *axis* would simply move
+the 24.5° gap from training to test time and measure nothing;
+`train_regrasp.py` refuses the mirror-image combination for the same reason. This
+is run 9's pairing, applied to run 10's rule. The resolved centroids sit 1.7–10.8°
+off their axes (`+x` 10.8, `−y` 7.9, `+z` 7.3, `−z` 4.9, `+y` 4.8, `−x` 1.7) and
+are written to `<run>/command_axes.json` — copy that file with the checkpoint.
+
+**No new data.** `d_grasp_world` already rides on every Regrasp episode, so this
+is a relabelling, not a re-collection: same `_off` tables, same shards, same reach
+filter, same 966 episodes / 20285 steps. `bc_regrasp_run9.yaml` is reused rather
+than copied — it is `bc_regrasp_run4.yaml` plus that one key, verified identical
+in every other field.
+
+**The 2×2 this completes:**
+
+| | label = bin axis, deploy = bin axis | label = grasp's own `d`, deploy = bin centroid |
+|---|---|---|
+| `approach_axis` | run 2 | run 9 |
+| `grasp_offset` | run 10 | **run 11** |
+
+One change from run 10, one from run 9. Prefer the run 10 ↔ run 11 edge: run 9
+predates `SIM.reach_filter` and so trains on a different `D`.
+
+**What would falsify it.** If the caption error is a real cost, `dir_err` falls and
+`near_rate` rises against run 10. The failure that matters is `dir_err`
+**unchanged** with `bin_diag_rate` **down** — that would mean the continuous label
+is harder to learn without being more useful, because the policy never sees the
+same direction twice and cannot form a per-direction prior. The response then is
+run 9's own fallback: keep the continuous label but widen the deployment centroid,
+or go back to axes. Note `bin_diag_rate` is scored against the bin, which the label
+no longer is, so it is a coarser diagnostic here than in run 10 — read `dir_err`
+first.
+
+**To run it:** `docs/runbook_run10_train.md` applies verbatim with the config name
+swapped; the §2 gate has already passed on this shard and does not need repeating.
 
 ---
 
@@ -1519,6 +1587,7 @@ Configs without a numbered run file were shared across several runs.
 | `regrasp_run9.yaml` | regrasp_run9 — = run 2 + train on the grasp axis, deploy on the bin centroid |
 | `bc_regrasp_run9.yaml` | run 9 `TRAIN.train_cfg` — = `bc_regrasp_run4.yaml` + `DATA.d_source: d_grasp_world` |
 | `regrasp_run10.yaml` | regrasp_run10 — = run 2 + `d` from the grasp's position (`SIM.d_rule: grasp_offset`), noise off |
+| `regrasp_run11.yaml` | regrasp_run11 — = run 10 + the continuous label (`DATA.d_source: d_grasp_world`, `SIM.command_deploy: bin_centroid`) |
 | `regrasp_smoke.yaml` | Regrasp shakedown — 2 iters, m=8, 3 eval scenes |
 | `bc_regrasp.yaml` | regrasp_run1 `TRAIN.train_cfg` — `direction_cond`, aux head **off**, head `[256,256]` |
 | `bc_regrasp_run2.yaml` | regrasp_run2, regrasp_run3, regrasp_run5 and both fast runs `TRAIN.train_cfg` — = `bc_regrasp.yaml` + aux head **on** (`aux_weight: 1.0`) |

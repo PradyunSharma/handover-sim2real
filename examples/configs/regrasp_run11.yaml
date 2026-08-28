@@ -1,0 +1,219 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRASP RUN 11 — RUN 10's `d`, TRAINED ON THE CONTINUOUS VECTOR.
+#
+# Run 10 with the LABEL changed from the bin's axis to the grasp's own direction.
+# Structurally identical otherwise: the same `_off` tables and shards, the same
+# `d_rule: grasp_offset`, six live bins, `train_from_scratch: true`,
+# `EVAL.every: 1`, 25 iterations, beta 0.9 → 0.75, the aux head, DART on both
+# bands, the reach filter on.
+#
+#   TRAIN.train_cfg     bc_regrasp_run4.yaml -> bc_regrasp_run9.yaml
+#                       (`DATA.d_source` d_world -> d_grasp_world; that file is
+#                        byte-identical to run 4's apart from the one key)
+#   SIM.command_deploy  (new key)  bin_axis -> bin_centroid
+#
+# ── WHAT THE LABEL CHANGE ACTUALLY IS ────────────────────────────────────────
+#
+# Runs 2/4/10 caption every episode with `to_world(BINS[bin_assigned], anchor_R)`
+# — one of six fixed octahedral axes. The grasp the episode flies to is only the
+# CLOSEST MEMBER of that bin, never a grasp on the axis, so the caption is a
+# quantisation of the truth. Measured on `train_regrasp_off.h5`, over the 1402
+# episodes with a resolvable grasp vector:
+#
+#     label (bin axis) vs the flown grasp's continuous d
+#         median 24.5 deg   p90 41.5   max 133.9
+#         within 10 deg: 14%      beyond 30 deg: 36%
+#
+# So run 10's policy is told "come from +y" and shown a demonstration a median
+# 24.5 deg off that axis. Under `grasp_offset` the label bound is the same 45 deg
+# Voronoi half-angle it always was, but the vector being quantised is now a
+# POSITION-derived one whose magnitude is small (median 3.90 cm centroid ->
+# fingertips), so the same angular slack corresponds to a much smaller physical
+# displacement on the object — the quantisation is coarser relative to what it
+# is naming. That is the argument for spending a run on removing it.
+#
+# `d_source: d_grasp_world` labels each episode with the direction the expert
+# ACTUALLY flew, under this run's own `d_rule`. It is a RELABELLING, not a
+# re-collection: `d_grasp_world` already rides on every episode of the existing
+# `_off` shard, so run 11 needs no new data and no new tables.
+#
+# ── WHY `command_deploy` MOVES TOO, AND WHY THAT IS NOT A SECOND VARIABLE ────
+#
+# At deployment there is no grasp to derive a vector from — the retry ladder
+# issues a direction and the policy has to act on it. Training on the true
+# direction while deploying the bin AXIS would reintroduce the same 24.5 deg gap
+# this run exists to close, just moved from training to test time, and the run
+# would measure nothing. `bin_centroid` issues the unit mean of every `d_anchor`
+# the bin was assigned, taken over the pin table AFTER `demo_ok_table` and the
+# reach filter prune it — i.e. the centre of the label distribution the policy
+# was actually trained on for that bin. Train and deploy are then as close as a
+# grasp-free command can get.
+#
+# This is run 9's pairing exactly. `train_regrasp.py` REFUSES `d_source:
+# d_world` with a non-`bin_axis` deploy for the mirror-image reason; the
+# combination here is the sanctioned one.
+#
+# ── THE 2x2 THIS COMPLETES ───────────────────────────────────────────────────
+#
+#                    label = bin axis          label = grasp's own d
+#                    deploy = bin axis         deploy = bin centroid
+#   approach_axis    run 2                     run 9
+#   grasp_offset     run 10                    RUN 11
+#
+# Run 11 is one change from run 10 (the label scheme) and one change from run 9
+# (`d_rule`), so the two main effects and their interaction are all readable.
+# Note run 9 and run 10 differ in the reach filter as well — run 9 predates it —
+# so the run 9 ↔ run 11 edge is the weaker of the two; prefer run 10 ↔ run 11.
+#
+# ── WHAT WOULD FALSIFY IT ────────────────────────────────────────────────────
+#
+# The premise is that the 24.5 deg caption error is a real cost: the network is
+# being shown the same command for grasps up to 90 deg apart, so it must average
+# them, and the averaged action is a grasp of neither. If that is right,
+# `dir_err` falls and `near_rate` rises against run 10.
+#
+# `dir_err` UNCHANGED with `bin_diag_rate` DOWN is the failure that matters: it
+# would mean the continuous label is harder to learn without being more useful,
+# because the policy never sees the same direction twice and cannot build a
+# per-direction prior. The response is then run 9's own fallback — keep the
+# continuous label but widen the deployment centroid, or go back to axes.
+#
+# `bin_diag_rate` is scored against the BIN, which the label no longer is, so it
+# becomes a coarser diagnostic here than in run 10 — read `dir_err` first.
+#
+# THE DATA IS ALREADY BUILT. Same tables and shards as run 10; nothing upstream
+# to rebuild. See docs/runbook_run10_train.md — every step applies with the
+# config name swapped.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SIM:
+  cfg_file: examples/pretrain_multicam_wr.yaml   # wrist + right
+  split: train
+  egl: false
+
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08
+  hand_points_radius: 0.35
+
+  use_standoff: true
+  standoff_dist: 0.08
+
+  # Run 10's tables, unchanged. `_meta.d_rule` must read `grasp_offset` or
+  # `build_regrasp_context` refuses the run.
+  grasp_pin_table: output/regrasp_pins_train_off.json
+  grasp_pin_match_tol: 0.02
+
+  d_rule: grasp_offset
+  d_point_depth: 0.1122
+  d_min_offset: 0.02
+
+  exclude_scenes: output/regrasp_pins_train_off_excluded.json
+  demo_ok_table: output/regrasp_demos_train_off_ok.json
+
+  # ── CHANGE 2 OF 2: WHAT THE POLICY IS COMMANDED WHENEVER IT ACTS ───────────
+  #
+  # The unit mean of every `d_anchor` a bin was assigned, taken over the table
+  # AFTER `demo_ok_table` and `reach_filter` prune it — so the six vectors
+  # summarise the demonstrations this run is actually trained on, not the ones
+  # that were hoped for. Six vectors, no grasp needed, computable on the robot
+  # exactly as `BINS` is. The resolved values are written to
+  # `<run>/command_axes.json`; copy that file with the checkpoint.
+  #
+  # NOTE this is NOT the same six vectors run 9 resolved: run 9's table was
+  # pruned by `demo_ok_table` alone and built under `approach_axis`. Comparing
+  # the two files is the cheapest way to see how much the rule moved the bins.
+  command_deploy: bin_centroid
+
+  # Unchanged from run 10. Drops (scene, bin) pairs whose base demonstration
+  # never reached its grasp — 443 of 1418 (31.2%) on this shard, leaving 966
+  # episodes / 20285 steps. Per-bin reach rates were +x 75.8, -x 58.7, +y 72.7,
+  # -y 59.7, +z 65.7, -z 76.3.
+  reach_filter: true
+  reach_pos_thresh: 0.02        # m,   = DAGGER.close_pos_thresh
+  reach_rot_thresh: 0.34        # rad, = DAGGER.close_rot_thresh
+
+DAGGER:
+  num_iters: 25
+  # 600 = 100 SCENES x max_grasps 6. The reach filter can leave a scene with
+  # fewer live bins, so this is a TARGET: `sample_pairs` draws m // max_grasps
+  # scenes and expands each to its own count. Read the startup line's collectable
+  # pair count rather than assuming 600.
+  episodes_per_iter: 600
+  max_steps: 50
+  scene_sampling: random
+  seed: 0
+
+  beta_schedule: linear
+  beta_start: 0.9
+  beta_end: 0.75
+  beta_mid: 0.5          # unused by `linear`; kept so a switch to `piecewise`
+  beta_knee: 0.66        # needs no other edit
+  beta_p: 0.7
+
+  close_pos_thresh: 0.02
+  close_rot_thresh: 0.34
+  stop_on_close_label: true
+  stop_on_policy_close: false
+
+  ee_step: 0.04
+  reach_tail: 5
+  min_free: 1
+  max_horizon: 40
+  first_horizon: null
+
+  reach_commit_dist: 0.05
+  reach_skip_eps: 0.01
+  expert_after_commit: true
+
+  dart_ratio: 0.3
+  dart_max_dist: 10.0
+  dart_pos_mag: 0.04
+  dart_rot_mag: 0.3
+  dart_reach_ratio: 0.3
+  dart_reach_pos_mag: 0.01202
+  dart_reach_rot_mag: 0.3
+  dart_reach_max_tries: 5
+  dart_reach_clearance: 0.01
+  dart_reach_path_steps: 4
+
+  outcome_check: true
+
+TRAIN:
+  # ── CHANGE 1 OF 2: WHAT THE EPISODE IS LABELLED WITH ──────────────────────
+  # `bc_regrasp_run9.yaml` is `bc_regrasp_run4.yaml` plus `d_source:
+  # d_grasp_world` — verified identical in every other key, so reusing it keeps
+  # this a one-key change rather than a new file that could drift.
+  train_cfg: examples/configs/bc_regrasp_run9.yaml
+  pc_pretrained:
+  base_train_h5: ${REGRASP_DATA}/bc_dataset/train_regrasp_off.h5
+  val_h5: ${REGRASP_DATA}/bc_dataset/val_regrasp_off.h5
+  base_run: null
+  base_epochs: 50
+  iter_epochs: 15
+  train_from_scratch: true
+  init_ckpt: best
+  num_workers: 8
+  device: cuda
+
+EVAL:
+  every: 1
+  num_scenes: 100
+  holdout: false
+  max_steps: 50
+  ckpt: best
+  success_mode: stable_grasp
+  hold_steps: 3
+  select_on: success_rate
+  verbose: false
+
+  box_check: true
+  box:
+    min_frac: 0.50
+    open_thresh: 0.8
+    half_x: 0.0088
+    z_lo: 0.0946
+    z_hi: 0.1122
+    inset: 0.002
+    grid_x: 7
+    grid_z: 7
