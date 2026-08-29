@@ -1387,6 +1387,16 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                     target_jp = action_to_target_joint(
                         np.concatenate([exec_delta, [1.0]]).astype(np.float32), obs)
                     n_dart_noise += 1
+                    # `dart_reach` means "a perturbation was applied inside the
+                    # committed reach" in BOTH modes. Before this it was only
+                    # incremented on the jolt path, so a dart_noise run logged
+                    # dart_reach = 0 while reach noise was firing every iteration
+                    # (run 12: 0 for all 25, with dart_reject at 126/iter proving
+                    # the path ran). The column named for the reach tail read zero
+                    # for the runs that most needed to confirm it was on.
+                    # Free-phase perturbations are then n_dart_noise - n_dart_reach.
+                    if committed_reach is not None:
+                        n_dart_reach += 1
             else:
                 target_jp = expert_target_jp
                 exec_delta = expert_delta
