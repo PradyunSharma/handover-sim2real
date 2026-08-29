@@ -1796,8 +1796,22 @@ def collect_iteration(sim, runner, pairs, out_path, *, rng,
            # which can shift for `+x` and not for `+z`. Six entries always, even
            # the two this dataset cannot reach, so the CSV header does not depend
            # on what a run happened to draw.
+           # `outcomes` mirrors the pooled one below, split the same way: keyed
+           # on the EVALUATOR's taxonomy and counted over KEPT episodes, so it
+           # stacks to that bin's `episodes` and reads as a fraction. This is
+           # what lets the collection side be drawn with the same stacked-area
+           # panel as eval — WHY a direction's collection episodes came away with
+           # nothing, which `success` alone cannot say. Requires
+           # params.outcome_check; empty otherwise, exactly like the pooled dict.
+           # `min_pos` / `min_rot` mirror the pooled lists: the CLOSEST the EE
+           # came to the target on each episode, split by direction. Closest
+           # rather than terminal so an episode that never closed still
+           # contributes — in a run where the perturbation is stopping the reach
+           # those ARE the episodes, and a terminal-only statistic would drop
+           # exactly them. Averaged into `c_min_pos_b{b}` by the driver.
            "per_bin": {b: {"episodes": 0, "reached_standoff": 0,
-                           "reached_grasp": 0, "policy_closed": 0, "success": 0}
+                           "reached_grasp": 0, "policy_closed": 0, "success": 0,
+                           "outcomes": {}, "min_pos": [], "min_rot": []}
                        for b in range(len(_rg_directions.BINS))},
            # params.target == "pregrasp" + outcome_check only: where the blind
            # push landed relative to the grasp. Empty otherwise, so `_mean`
@@ -1907,6 +1921,13 @@ def collect_iteration(sim, runner, pairs, out_path, *, rng,
                     pb["reached_grasp"] += st["reached_grasp"]
                     pb["policy_closed"] += st["policy_closed"]
                     pb["success"] += int(st.get("success", 0))
+                    if st.get("outcome"):
+                        pb["outcomes"][st["outcome"]] = (
+                            pb["outcomes"].get(st["outcome"], 0) + 1)
+                    if np.isfinite(st["min_pos"]):
+                        pb["min_pos"].append(st["min_pos"])
+                    if np.isfinite(st["min_rot"]):
+                        pb["min_rot"].append(st["min_rot"])
                 agg["n_reach_steps"] += st["n_reach_steps"]
                 agg["n_settle_steps"] += st.get("n_settle_steps", 0)
                 agg["policy_closed"] += st["policy_closed"]

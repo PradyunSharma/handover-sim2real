@@ -73,6 +73,7 @@ _LAZY = {
     "scene_pools": "setup",
     "reach_ok_pairs": "reach", "reached": "reach",
     "terminal_pose_error": "reach",
+    "RunSpec": "runspec", "resolve_run": "runspec", "relocate": "runspec",
 }
 
 
@@ -132,9 +133,14 @@ __all__ = [
     "reach_ok_pairs",
     "reached",
     "terminal_pose_error",
+    # ---- derive a run's paths and rules from its name alone ----
+    "RunSpec",
+    "resolve_run",
+    "relocate",
     # ---- Regrasp geometry: pure numpy, no simulator, importable anywhere ----
     "directions",
     "reach",
+    "runspec",
     "anchor",
     "normals",
     "channels",

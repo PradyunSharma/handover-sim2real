@@ -708,6 +708,11 @@ BIN_EVAL_KEYS = (
 )
 BIN_COLLECT_KEYS = ("episodes", "reached_standoff", "reached_grasp",
                     "policy_closed", "success")
+# Per-bin collection MEANS rather than counts, so they are floats and blank when
+# the bin collected nothing. `min_pos`/`min_rot` are the closest the EE came to
+# the target on each episode — the collection twin of `eval_min_pos`, and the
+# only per-bin view of how near the DAgger data actually gets to the grasp.
+BIN_COLLECT_MEANS = ("min_pos", "min_rot")
 
 
 def bin_eval_fields() -> list[str]:
@@ -723,8 +728,21 @@ def bin_eval_fields() -> list[str]:
 
 def bin_collect_fields() -> list[str]:
     """Every per-bin COLLECTION column — the learner's own rollouts, split by the
-    direction they were driven under."""
-    return [f"c_{k}_b{b}" for b in range(N_BINS) for k in BIN_COLLECT_KEYS]
+    direction they were driven under.
+
+    The `co_*_b{b}` block is the OUTCOME taxonomy per direction, the collection
+    twin of `f_*_b{b}`. It exists so the two sides can be drawn with the same
+    stacked-area panel and read against each other: `f_*` says how the POLICY
+    fails at eval (beta 0, no DART), `co_*` says how the beta-mixture fails
+    during collection, and those are different failures. RAW COUNTS, like every
+    other per-bin collection column, with `c_episodes_b{b}` as the denominator.
+    Added after run 12, so earlier logs do not carry it and the plotter must
+    tolerate its absence.
+    """
+    out = [f"c_{k}_b{b}" for b in range(N_BINS) for k in BIN_COLLECT_KEYS]
+    out += [f"{c}_b{b}" for b in range(N_BINS) for c in COLLECT_OUTCOMES.values()]
+    out += [f"c_{k}_b{b}" for b in range(N_BINS) for k in BIN_COLLECT_MEANS]
+    return out
 
 
 # Deferred to here because the helpers above have to exist first (see the note
@@ -749,6 +767,13 @@ def reason_columns(reasons: dict, mapping: dict, denom: int | None = None) -> di
     if denom:
         out = {k: round(v / denom, 4) for k, v in out.items()}
     return out
+
+
+def _mean_or_none(values):
+    """Mean of a list, or None for an empty/missing one so `_r` blanks the cell."""
+    if not values:
+        return None
+    return sum(values) / len(values)
 
 
 def _r(value, nd: int = 4):
@@ -866,6 +891,27 @@ def collect_columns(c: dict) -> dict:
         # direction that genuinely collected nothing.
         **{f"c_{k}_b{b}": int((c.get("per_bin", {}).get(b) or {}).get(k, -1))
            for b in range(N_BINS) for k in BIN_COLLECT_KEYS},
+        # The outcome taxonomy per direction — counts, denominator
+        # `c_episodes_b{b}`. `denom=None` keeps them counts for the same reason
+        # the block above is counts: `m` varies and the plotter divides.
+        #
+        # A bin that collected NOTHING gets blanks rather than the zeros
+        # `reason_columns` would return, matching the eval side: a stacked area
+        # reading 0.0 across every category says "nothing failed", which is the
+        # opposite of "nothing was measured".
+        **{k: v for b in range(N_BINS)
+           for k, v in (
+               reason_columns(
+                   (c.get("per_bin", {}).get(b) or {}).get("outcomes"),
+                   {r: f"{col}_b{b}" for r, col in COLLECT_OUTCOMES.items()})
+               if ((c.get("per_bin", {}).get(b) or {}).get("episodes"))
+               else {f"{col}_b{b}": "" for col in COLLECT_OUTCOMES.values()}
+           ).items()},
+        # Per-bin means — blank rather than 0.0 for a bin that collected nothing,
+        # since 0.0 here would read as "the gripper reached the grasp exactly".
+        **{f"c_{k}_b{b}": _r(_mean_or_none(
+               (c.get("per_bin", {}).get(b) or {}).get(k)))
+           for b in range(N_BINS) for k in BIN_COLLECT_MEANS},
     }
 
 

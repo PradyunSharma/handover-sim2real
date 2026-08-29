@@ -11,8 +11,8 @@ figures look the same either way.
 
 Five figures, and the split between them is by QUESTION, not by convenience.
 
-TRAINING CURVE (<run>/training_curve.png) — 4x3, "did it learn, and for which
-direction". One ROW per commanded bin, three columns:
+TRAINING CURVE (<run>/training_curve.png) — 4x5, "did it learn, and for which
+direction". One ROW per commanded bin, five columns:
 
   • success stages   close -> near -> grasp -> success. Nested (close >= near,
                      close >= grasp >= success), so the VERTICAL GAPS are the
@@ -29,6 +29,27 @@ direction". One ROW per commanded bin, three columns:
                      the close (dashed), position on the left axis and rotation
                      on the right. Phase-3 experience is that ROTATION binds
                      first.
+  • COLLECTION       how the DAgger episodes of this direction ended.
+    outcomes
+  • EVAL outcomes    how the evaluation episodes of this direction ended, same
+                     taxonomy and colours.
+
+  THE LAST TWO ARE DIFFERENT POPULATIONS AND ARE ADJACENT ON PURPOSE. Collection
+  runs the beta mixture (0.9->0.75, so most steps are the OMG expert's) with DART
+  injected and `expert_after_commit` forcing the reach; eval runs the policy
+  alone at beta=0, no expert, no DART, on its own 100-scene draw that is never
+  written to a shard. So column 4 is how the LOOP fails and column 5 is how the
+  POLICY fails, and they move independently — run 12's eval stack barely shifted
+  while `co_timeout` took over its collection stack. Two asymmetries stop them
+  being comparable as LEVELS: a collection episode is only ever scored if a close
+  fires, so everything that timed out or was killed lands in column 4's grey and
+  brown rather than in any grasp category; and with `stop_on_policy_close: false`
+  the close that fires in collection is the EXPERT's geometric trigger, not the
+  learner's decision.
+
+  Column 4 needs DAGGER.outcome_check and the per-bin `co_*_b{b}` columns, which
+  postdate run 12. It cannot be backfilled: the taxonomy comes from pushing and
+  holding in the simulator, and a shard records no outcome.
 
 WHY PER BIN, AND WHY THIS IS THE MAIN FIGURE. A pooled `success_rate` averages
 four physically different commands. A policy that solves `+x` and ignores `+z`
@@ -60,17 +81,33 @@ DIAGNOSTIC (<run>/curves_diag.png) — 2x4, "is the machinery healthy":
                  during collection vs at eval, against the horizon.
   • cost       — wall-clock split by phase, so the expensive part is visible.
 
-DEBUG DAGGER (<run>/debug_dagger.png) — 3x4, "is the LOOP working":
+DEBUG DAGGER (<run>/debug_dagger.png) — 3x4, "is the LOOP working". The per-bin
+outcome stacks moved to training_curve.png, next to the success rate they
+explain; what stays here is about the DAgger DATA rather than the policy.
   • row 1      — collection, per commanded direction: how far the learner's own
                  rollouts got. This is DAgger's state distribution shifting, and
                  it moves BEFORE eval success does — and it can move for one
                  direction and not another, which pooling hides.
-  • row 2      — per direction, of the episodes that came away with NOTHING,
-                 what went wrong. Conditioned on failure, so the categories
-                 stack to 1.0 and the PROFILE is readable independently of how
-                 often that bin fails at all. Two bins failing at 0.8 for
-                 different reasons are indistinguishable in `f_*` and obvious
-                 here.
+  • row 2      — HOW CLOSE the collection episodes actually got, per direction:
+                 the mean over each iteration of the CLOSEST the EE came to the
+                 grasp, position and rotation, against their close thresholds.
+                 The training figure asks this of the eval episodes; this asks
+                 it of the data that decides what D contains, and the two can
+                 disagree completely. Run 12 held `eval_min_pos` near 0.105 m
+                 while its collection stalled at 0.131 m against run 11's
+                 0.049 m — invisible on the eval figure, because eval carries no
+                 DART. A flat line here means D has stopped gaining states near
+                 the grasp and no further iteration will help.
+
+                 `c_min_pos_b{b}` / `c_min_rot_b{b}` postdate run 12, but unlike
+                 the outcome stacks they ARE recoverable: the shards hold
+                 `robot_states` and `grasp_pose_world`, so
+                 examples/backfill_collect_err.py recomputes them into
+                 <run>/collect_err.csv, which is spliced in here. That
+                 recomputation reads ~2-3 mm high (see the script) because the
+                 collector minimises over steps a shard does not keep; the level
+                 shifts slightly, no trend does.
+
   • row 3      — the pooled outcome stack, the pin-consistency check
                  (`grasp_mismatch` must stay 0 — a nonzero bar means D holds
                  contradictory labels for one scene), |D| growth with the
@@ -151,7 +188,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from handover_sim2real.regrasp import directions as _D          # noqa: E402
 
 
-def _load(log_path: Path, eval_log: Path | None = None):
+def _load(log_path: Path, eval_log: Path | None = None,
+          extra_logs: tuple[Path, ...] = ()):
     cols: dict[str, list] = {}
     with log_path.open() as f:
         for row in csv.DictReader(f):
@@ -160,27 +198,39 @@ def _load(log_path: Path, eval_log: Path | None = None):
 
     n_rows = len(cols.get("iter", []))
 
-    # With EVAL.every: 0 the loop leaves every eval column blank and the metrics
-    # live in eval_log.csv instead (examples/eval_dagger_run.py, a separate job).
-    # Splice them in by iteration so the plots look the same either way. Only
-    # BLANK cells are filled — an in-loop number always wins, so a run that did
-    # both never has its own numbers overwritten by a re-scored pool.
-    if eval_log is not None and eval_log.exists():
-        with eval_log.open() as f:
+    def splice(path: Path) -> None:
+        """Fill BLANK cells from a sidecar CSV keyed on `iter`.
+
+        Two sidecars use this. `eval_log.csv` carries the eval columns when
+        EVAL.every: 0 put scoring in a separate job; `collect_err.csv` carries
+        per-bin collection error recomputed from the shards for a run that
+        predates those columns (examples/backfill_collect_err.py).
+
+        Only blanks are filled, so an in-loop number always wins and a run that
+        logged its own values is never overwritten by a recomputation.
+        """
+        with path.open() as f:
             by_iter = {r["iter"]: r for r in csv.DictReader(f) if r.get("iter")}
-        if by_iter:
-            keys = set().union(*(set(r) for r in by_iter.values())) - {"iter", "run_dir"}
-            filled = 0
-            for k in keys:
-                col = cols.setdefault(k, [""] * n_rows)
-                for i, it in enumerate(cols.get("iter", [])):
-                    if i < len(col) and not str(col[i]).strip():
-                        v = by_iter.get(str(it), {}).get(k, "")
-                        if str(v).strip():
-                            col[i] = v
-                            filled += 1
-            print(f"[plot] merged {len(by_iter)} rows / {filled} cells from "
-                  f"{eval_log.name}")
+        if not by_iter:
+            return
+        keys = set().union(*(set(r) for r in by_iter.values())) - {"iter", "run_dir"}
+        filled = 0
+        for k in keys:
+            col = cols.setdefault(k, [""] * n_rows)
+            for i, it in enumerate(cols.get("iter", [])):
+                if i < len(col) and not str(col[i]).strip():
+                    v = by_iter.get(str(it), {}).get(k, "")
+                    if str(v).strip():
+                        col[i] = v
+                        filled += 1
+        print(f"[plot] merged {len(by_iter)} rows / {filled} cells from "
+              f"{path.name}")
+
+    if eval_log is not None and eval_log.exists():
+        splice(eval_log)
+    for extra in extra_logs:
+        if extra is not None and extra.exists():
+            splice(extra)
 
     def num(key):
         """Column as floats. Absent column (an older log) or blank cell -> NaN,
@@ -540,6 +590,18 @@ _FAILURES = (("ff_grasp_miss", "closed, not secured", "tab:olive"),
              ("ff_drop", "drop", "tab:red"),
              ("ff_human_contact", "human contact", "tab:purple"),
              ("ff_timeout", "never closed / timed out", "tab:gray"))
+# The COLLECTION twin of `_OUTCOMES`, same taxonomy and same colours so the two
+# rows can be read against each other at a glance. Two differences that matter:
+# these are RAW COUNTS over `c_episodes_b{b}` rather than fractions, and the
+# taxonomy has one extra category — BENCH_TIMEOUT, which eval cannot produce
+# because it stops at EVAL.max_steps well inside the benchmark's own limit.
+_COLLECT_OUTCOMES = (("co_grasp_ok", "secured", "tab:green"),
+                     ("co_grasp_miss", "closed, not secured", "tab:olive"),
+                     ("co_no_release", "no release", "tab:orange"),
+                     ("co_drop", "drop", "tab:red"),
+                     ("co_human_contact", "human contact", "tab:purple"),
+                     ("co_bench_timeout", "benchmark timeout", "tab:brown"),
+                     ("co_timeout", "never closed", "tab:gray"))
 
 
 def _panel_outcomes(a, c: _Ctx, sfx="", title=None, failures_only=False,
@@ -557,6 +619,98 @@ def _panel_outcomes(a, c: _Ctx, sfx="", title=None, failures_only=False,
     # a row pass legend=False on all but the first.
     if legend:
         _legend(a, loc="lower left", ncol=2)
+
+
+def _panel_collect_outcomes(a, c: _Ctx, b=None, title=None, legend=True):
+    """How the COLLECTION episodes ended, per direction — the twin of
+    `_panel_outcomes`, on the DAgger data rather than the eval set.
+
+    The two rows answer different questions and neither substitutes for the
+    other. Eval is beta=0 with no DART, so `f_*` is how the POLICY fails.
+    Collection is the beta mixture (0.9->0.75, so mostly the expert) with DART
+    injected and `expert_after_commit` forcing the reach, so `co_*` is how the
+    LOOP fails — and a loop that stops producing arrivals starves D of exactly
+    the states the policy needs, without eval showing anything for an iteration
+    or two. Run 12 is the case: its eval stack barely moved while `co_timeout`
+    took over the collection stack.
+
+    Counts, not fractions (see bin_collect_fields), so divide by
+    `c_episodes_b{b}` here. Requires DAGGER.outcome_check and postdates run 12;
+    an older log has neither the pooled nor the per-bin columns and gets a note.
+    """
+    denom = c.get(f"c_episodes_b{b}" if b is not None else "episodes")
+    series = []
+    for key, _, _ in _COLLECT_OUTCOMES:
+        ys = c.get(key + (f"_b{b}" if b is not None else ""))
+        # -1 marks "this bin collected nothing", which is a gap, not a zero.
+        series.append([(y / d if (d and d > 0 and y == y and y >= 0)
+                        else float("nan")) for y, d in zip(ys, denom)])
+    if _stack(a, c.it, series, [lb for _, lb, _ in _COLLECT_OUTCOMES],
+              [col for _, _, col in _COLLECT_OUTCOMES]):
+        a.set_ylim(0, 1)
+    _note_empty(a, "per-bin collection outcomes not in this run's log\n"
+                   "(needs DAGGER.outcome_check; added after run 12)")
+    _grid(a, title or "collection outcomes", ylabel="fraction")
+    if legend:
+        _legend(a, loc="lower left", ncol=2)
+
+
+def _panel_collect_error(a, c: _Ctx, b=None, title=None, legend=True):
+    """How close the COLLECTION episodes got, per direction — the DAgger-data
+    twin of `_panel_approach`.
+
+    `mean_min_pos` / `mean_min_rot` are the CLOSEST the EE came to the target
+    over each episode, averaged over that bin's episodes. Closest rather than
+    terminal, and so defined even for an episode that never closed — which is
+    most of them in a bad run, and exactly the ones a terminal-only statistic
+    would silently exclude.
+
+    This is the row that reads a DART regression at a glance. Run 12's
+    `eval_min_pos` sat at 0.105 m all run while its collection stalled at
+    0.131 m against run 11's 0.049 m: the eval figure could not show it, because
+    eval carries no DART. A flat line here means D has stopped gaining states
+    near the grasp, and nothing downstream will improve.
+
+    Position on the left axis, rotation on the right, both against their close
+    thresholds — the same layout as the eval panel so the two are comparable by
+    eye. Per-bin columns postdate run 12; `backfill_collect_err.py` recomputes
+    them from an existing run's shards.
+    """
+    args = c.args
+    sfx = f"_b{b}" if b is not None else ""
+    mp = c.get(f"c_min_pos{sfx}") if b is not None else c.get("mean_min_pos")
+    mr = c.get(f"c_min_rot{sfx}") if b is not None else c.get("mean_min_rot")
+    if _finite(mp):
+        _plot(a, c.it, mp, "-o", ms=3, color="tab:blue",
+              label="closest EE->target (m)")
+    a.axhline(args.pos_thresh, color="tab:blue", ls=":", lw=1,
+              label=f"close thresh {args.pos_thresh} m")
+    a.set_ylim(bottom=0)
+    a.set_ylabel("position error (m)", fontsize=8, color="tab:blue")
+    a.tick_params(axis="y", labelcolor="tab:blue", labelsize=7)
+    a2 = a.twinx()
+    if _finite(mr):
+        _plot(a2, c.it, mr, "--s", ms=3, color="tab:red",
+              label="closest rotation (rad)")
+    a2.axhline(args.rot_thresh, color="tab:red", ls=":", lw=1,
+               label=f"close thresh {args.rot_thresh} rad")
+    a2.set_ylim(bottom=0)
+    a2.set_ylabel("rotation error (rad)", fontsize=8, color="tab:red")
+    a2.tick_params(axis="y", labelcolor="tab:red", labelsize=7)
+    if not (_finite(mp) or _finite(mr)):
+        # Two threshold lines are always drawn, so the generic empty-axis test
+        # cannot fire — ask the data.
+        a.text(0.5, 0.5, "per-bin collection error not in this run's log\n"
+                         "(run examples/backfill_collect_err.py <run>)",
+               transform=a.transAxes, ha="center", va="center", fontsize=8,
+               color="0.55", style="italic")
+    _grid(a, title or "collection: closest EE -> target")
+    if legend:
+        h1, l1 = a.get_legend_handles_labels()
+        h2, l2 = a2.get_legend_handles_labels()
+        if h1 or h2:
+            a.legend(h1 + h2, l1 + l2, fontsize=6, loc="lower left", ncol=2,
+                     framealpha=0.85)
 
 
 def _panel_collection(a, c: _Ctx, b=None, title=None, lean=False, legend=True):
@@ -617,7 +771,8 @@ def main() -> None:
     if not log_path.exists():
         raise SystemExit(f"no log at {log_path}")
 
-    num, n = _load(log_path, eval_log=run / "eval_log.csv")
+    num, n = _load(log_path, eval_log=run / "eval_log.csv",
+                   extra_logs=(run / "collect_err.csv",))
     if n == 0:
         raise SystemExit(f"{log_path} has no rows yet")
     it = num("iter")
@@ -658,8 +813,14 @@ def main() -> None:
     # debug_dagger.png. None of them are results; all of them need the diagnostic
     # figure's context to mean anything, and here they competed for attention
     # with the four rows that ARE the result.
+    # COLUMNS 4 AND 5 ARE THE FAILURE MODES, and they belong here rather than on
+    # the diagnostic figure: "it failed" and "how it failed" are the same
+    # question asked at two resolutions, and splitting them across two files
+    # meant reading a success rate on one and the reason for it on another.
+    # Column 4 is the COLLECTION episodes and column 5 the EVAL ones — different
+    # populations (see _panel_collect_outcomes), adjacent so the pair is legible.
     nrow = max(len(bins), 1)
-    fig, ax = plt.subplots(nrow, 3, figsize=(17, 3.7 * nrow), squeeze=False)
+    fig, ax = plt.subplots(nrow, 5, figsize=(28, 3.7 * nrow), squeeze=False)
     for r, b in enumerate(bins):
         sfx = f"_b{b}"
         name = _bin_title(b)
@@ -668,6 +829,11 @@ def main() -> None:
                            title=f"{name} — chance vs conversion")
         _panel_approach(ax[r][2], ctx, sfx,
                         title=f"{name} — approach error to the {ctx.TGT}")
+        _panel_collect_outcomes(
+            ax[r][3], ctx, b=b, legend=(r == 0),
+            title=f"{name} — COLLECTION outcomes (beta mix + DART)")
+        _panel_outcomes(ax[r][4], ctx, sfx=sfx, legend=(r == 0),
+                        title=f"{name} — EVAL outcomes (policy alone, beta=0)")
 
     _fix_x(fig, it)
     fig.suptitle(f"Regrasp — {run.name}   [eval, by commanded direction]"
@@ -871,27 +1037,29 @@ def main() -> None:
         else:
             a.axis("off")
 
-    # Row 2 — the FULL outcome split per direction: what fraction succeeded, and
-    # what the rest failed of. `f_*` (fractions of all that bin's episodes,
-    # stacking to 1.0 with `f_grasp_ok` in green) rather than `ff_*` (fractions
-    # of the failures alone), because the success share is what makes the panel
-    # readable on its own — under `ff_*` a bin that fails 20% of the time and one
-    # that fails 80% draw identical stacks, and the reader has to cross-reference
-    # a different panel to tell them apart. The failure-conditional view is still
-    # the sharper one for COMPARING two bins' failure profiles at equal height,
-    # and it remains one keyword away (`failures_only=True`).
+    # Row 2 — HOW CLOSE THE COLLECTION EPISODES ACTUALLY GOT, per direction. The
+    # training figure's third column asks this of the EVAL episodes; this asks it
+    # of the DAgger data, which is the population that decides what D contains.
+    #
+    # It is the panel that reads run 12 at a glance. `eval_min_pos` stayed near
+    # 0.105 m there while collection stalled at 0.131 m against run 11's 0.049 m,
+    # and the eval figure cannot show that because eval never had DART in it. If
+    # this row flattens, D has stopped gaining states near the grasp and no
+    # amount of further iteration will help.
     for j in range(4):
         a = dx[1][j]
         if j < len(bins):
             b = bins[j]
-            _panel_outcomes(a, ctx, sfx=f"_b{b}", legend=(j == 0),
-                            title=f"{_D.BIN_SHORT[b]} — outcomes: secured vs "
-                                  f"how it failed")
+            _panel_collect_error(
+                a, ctx, b=b, legend=(j == 0),
+                title=f"{_D.BIN_SHORT[b]} — COLLECTION: closest EE -> "
+                      f"{ctx.TGT}")
         else:
             a.axis("off")
 
     # Row 3 — the pooled outcome stack, then the three run-machinery panels that
-    # used to sit on the main grid.
+    # used to sit on the main grid. The per-bin outcome rows moved to
+    # training_curve.png, where the success rate they explain lives.
     _panel_outcomes(dx[2][0], ctx, title="eval outcomes (all bins, fraction of "
                                          "the eval set)")
 

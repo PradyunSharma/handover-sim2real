@@ -419,6 +419,16 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
                          else _rule_meta.get("d_min_offset", 0.0)),
     }
     d_rule_obj = _rg_dirs.DirectionRule.from_cfg(_rule_block)
+    # The rule can be named in two independent places — the run's SIM block and
+    # the pin table's `_meta` — and they are built by different scripts. If they
+    # ever disagree, one of them is describing data that was labelled the other
+    # way, and every `d` drawn from here on is wrong by a median 14.5 deg. Say so
+    # rather than picking a winner silently.
+    _table_rule = _rule_meta.get("d_rule")
+    if _table_rule and _table_rule != _rule_block["d_rule"]:
+        print(f"[d_rule] WARNING: rule mismatch — using {_rule_block['d_rule']!r} "
+              f"but {grasp_pin_table} says {_table_rule!r}. One of them does not "
+              f"describe this shard; check the run's SIM.d_rule.")
     if show_d or show_anchor_frame or show_bin_sphere:
         print(f"[d_rule] {d_rule_obj.describe()}"
               + ("" if d_rule else f"   (from {grasp_pin_table or 'the default'})"))
@@ -881,12 +891,34 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
 
 def parse_args():
     p = argparse.ArgumentParser(description="Visualise a BC dataset episode.")
-    p.add_argument("--dataset",  required=True,
-                   help="BC HDF5 dataset, or an RL demo pool (.h5/.npz) from collect_rl_demos.py")
+    # ---- name a RUN and let everything else follow --------------------------
+    # A shard does not carry the pin table its `grasp_idx` indexes or the
+    # d_rule its `d_world` was labelled under, and using the wrong one is
+    # SILENT: `approach_axis` on a `grasp_offset` shard draws a vector a median
+    # 14.5 deg off, in a different bin. `<run_dir>/config.yaml` records both, so
+    # `--run` + `--iter` derives --dataset, --cfg-file, --grasp-pin-table,
+    # --d-rule, --d-point-depth and --d-min-offset. Any of those passed
+    # explicitly still wins.
+    p.add_argument("--run", default=None,
+                   help="Regrasp run NAME (regrasp_run12) or run directory. "
+                        "Derives the dataset, benchmark config, pin table and "
+                        "direction rule from the run's own config.yaml — use "
+                        "with --iter. Replaces --dataset.")
+    p.add_argument("--iter", dest="iteration", default=None,
+                   help="which DAgger iteration of --run to open: an integer, "
+                        "0 or 'base' for the base demonstration set, or 'last'.")
+    p.add_argument("--run-root", default=None,
+                   help="where <run>/ lives, if not $REGRASP_DATA/dagger_runs, "
+                        "$RUNS/output/dagger_runs or ./output/dagger_runs.")
+    p.add_argument("--dataset",  default=None,
+                   help="BC HDF5 dataset, or an RL demo pool (.h5/.npz) from "
+                        "collect_rl_demos.py. Alternative to --run/--iter.")
     p.add_argument("--episode",  type=int, default=None,
                    help="episode index (default: random)")
-    p.add_argument("--mode",     default="static", choices=["static", "replay"],
-                   help="static=matplotlib plots, replay=PyBullet simulator")
+    p.add_argument("--mode",     default=None, choices=["static", "replay"],
+                   help="static=matplotlib plots, replay=PyBullet simulator. "
+                        "Defaults to static, or to replay when --run is given "
+                        "(the derived config and pin table are only used there).")
     p.add_argument("--cfg-file", default=None,
                    help="config yaml (required for --mode replay)")
     p.add_argument("--replay-source", default="states", choices=["states", "omg"],
@@ -977,6 +1009,37 @@ def main():
     args = parse_args()
     if args.seed is not None:
         np.random.seed(args.seed)
+
+    # ---- --run: derive the four things a shard cannot tell you itself -------
+    # Explicit flags always win, so `--run regrasp_run12 --d-rule approach_axis`
+    # is still how you look at the same episode under the other rule.
+    if args.run:
+        if args.dataset:
+            raise SystemExit("pass either --run/--iter or --dataset, not both.")
+        if args.iteration is None:
+            raise SystemExit(
+                "--run needs --iter: an integer, 0/'base' for the base "
+                "demonstration set, or 'last'.")
+        from handover_sim2real.regrasp.runspec import resolve_run
+        spec = resolve_run(args.run, run_root=args.run_root)
+        args.dataset = spec.dataset_for(args.iteration)
+        if args.cfg_file is None:
+            args.cfg_file = spec.cfg_file
+        if args.grasp_pin_table is None:
+            args.grasp_pin_table = spec.pin_table
+        if args.d_rule is None:
+            args.d_rule = spec.d_rule
+        if args.d_point_depth is None:
+            args.d_point_depth = spec.d_point_depth
+        if args.d_min_offset is None:
+            args.d_min_offset = spec.d_min_offset
+        if args.mode is None:
+            args.mode = "replay"
+        print(spec.describe(args.iteration))
+    elif not args.dataset:
+        raise SystemExit("one of --run (with --iter) or --dataset is required.")
+    if args.mode is None:
+        args.mode = "static"
 
     # An UNSET ${RUNS} (or ${REGRASP_DATA}) expands to nothing in the shell, so a
     # copy-pasted cluster command turns into an absolute `/output/...` path and

@@ -547,8 +547,30 @@ def rollout(env, model, point_listener, scene_idx, device,
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--run-dir",  required=True, help="output/bc_runs/<name>")
-    p.add_argument("--cfg-file", required=True, help="simulator config (e.g. examples/pretrain.yaml)")
+    # A run's checkpoint does not carry the pin table it was trained against,
+    # the direction rule that labelled it, or the deploy rule it was scored
+    # under — and all three fail SILENTLY when wrong (`--command bin_axis` on a
+    # run 9-13 policy is a different experiment; the wrong pin table draws the
+    # green goal at OMG's free pick, which differs on 63% of train scenes).
+    # `<run_dir>/config.yaml` records all three, so --run derives them.
+    p.add_argument("--run", default=None,
+                   help="Regrasp run NAME (regrasp_run12) or run directory. "
+                        "Derives --run-dir, --cfg-file, --grasp-pin-table and "
+                        "--command from the run's own config.yaml. Replaces "
+                        "--run-dir.")
+    p.add_argument("--ckpt", default="best",
+                   help="which checkpoint --run picks: 'best' (default), 'last', "
+                        "or an iteration number for <run>/iters/iter_NN.")
+    p.add_argument("--iter", dest="iteration", default=None,
+                   help="shorthand for --ckpt <N>: roll out the policy as it was "
+                        "at DAgger iteration N rather than at its best.")
+    p.add_argument("--run-root", default=None,
+                   help="where <run>/ lives, if not $REGRASP_DATA/dagger_runs, "
+                        "$RUNS/output/dagger_runs or ./output/dagger_runs.")
+    p.add_argument("--run-dir",  default=None, help="output/bc_runs/<name>")
+    p.add_argument("--cfg-file", default=None,
+                   help="simulator config (e.g. examples/pretrain.yaml). Derived "
+                        "from the run's config.yaml when --run is given.")
     p.add_argument("--scene",    type=int, default=0, help="scene index to roll out")
     p.add_argument("--max-steps", type=int, default=30, help="max policy steps")
     p.add_argument("--hold-steps", type=int, default=3,
@@ -638,7 +660,7 @@ def parse_args():
                    help="--show-bin-sphere radius in metres (default 0.10)")
     p.add_argument("--bin-sphere-points", type=int, default=2400,
                    help="--show-bin-sphere point count (default 2400)")
-    p.add_argument("--command", default="bin_axis",
+    p.add_argument("--command", default=None,
                    choices=["bin_axis", "bin_centroid", "grasp_axis"],
                    help="which rule builds the commanded direction. MUST match "
                         "SIM.command_deploy in the run's config.yaml, or you are "
@@ -669,6 +691,33 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # ---- --run: derive run-dir, cfg-file, pin table and command ------------
+    # Explicit flags always win, so overriding one to compare (say, the same
+    # checkpoint under --command bin_axis) still works.
+    if args.run:
+        if args.run_dir:
+            raise SystemExit("pass either --run or --run-dir, not both.")
+        from handover_sim2real.regrasp.runspec import resolve_run
+        spec = resolve_run(args.run, run_root=args.run_root)
+        args.run_dir = str(spec.ckpt_dir(
+            args.iteration if args.iteration is not None else args.ckpt))
+        if args.cfg_file is None:
+            args.cfg_file = spec.cfg_file
+        if args.grasp_pin_table is None:
+            args.grasp_pin_table = spec.pin_table
+        if args.command is None:
+            args.command = spec.command_deploy
+        print(spec.describe())
+        print(f"      ckpt        {args.run_dir}")
+    elif not args.run_dir:
+        raise SystemExit("one of --run or --run-dir is required.")
+    if args.cfg_file is None:
+        raise SystemExit("--cfg-file is required (or use --run to derive it).")
+    if args.command is None:
+        # Matches the collector's own default, i.e. what runs 2-8 were scored on.
+        args.command = "bin_axis"
+
     run_dir = Path(args.run_dir)
 
     cfg = get_cfg()

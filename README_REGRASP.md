@@ -333,6 +333,64 @@ python examples/plot_regrasp_run.py output/dagger_runs/regrasp_run2
 Writes `training_curve.png`, `curves_regrasp.png`, `debug_dagger.png`,
 `curves_diag.png`, `media_curves.png`. `--show` opens them.
 
+**`training_curve.png` columns 4 and 5 are the failure modes, and they are
+different populations.** Column 4 is the outcome of the **collection** episodes —
+the β mixture (0.9→0.75, so most steps are the OMG expert's) with DART injected
+and `expert_after_commit` forcing the reach. Column 5 is the outcome of the
+**evaluation** episodes — the policy alone at β=0, no expert, no DART, a separate
+set of 100 scenes rolled out after each refit and never written to
+`dagger_iter_NN.h5`. So column 4 says how the *loop* fails and column 5 says how
+the *policy* fails, and they move independently: run 12's eval stack barely
+shifted while `co_timeout` took over its collection stack.
+
+Two asymmetries make them non-comparable as levels. A collection episode is only
+ever scored if a close fires, so everything that timed out or was killed lands in
+column 4's grey and brown rather than in any grasp category — column 4 is bounded
+above by the close-label rate and column 5 is not. And with
+`stop_on_policy_close: false` the close that fires during collection is the
+*expert's* geometric trigger, not the learner's decision (`c_policy_close` is 0
+across all 25 iterations of runs 9, 11 and 12).
+
+Column 4 needs `DAGGER.outcome_check: true` and the per-bin `co_*_b{b}` columns,
+which postdate run 12 — older logs draw a note saying so. It **cannot** be
+backfilled: the taxonomy comes from pushing and holding in the simulator, and a
+shard records no outcome.
+
+**`debug_dagger.png` row 2 is how close the DAgger data actually gets.** The mean
+per iteration of the *closest* the EE came to the grasp, position and rotation,
+per commanded direction, against the close thresholds. Closest rather than
+terminal, so an episode that never closed still counts — in a run where the
+perturbation is stopping the reach those *are* the episodes.
+
+The training figure's third column asks the same question of the eval episodes,
+and the two can disagree completely, because eval carries no DART:
+
+| mean closest EE→grasp, iterations 15–25 | +x | −x | +y | −y | +z | −z |
+|---|---|---|---|---|---|---|
+| run 11 (jolt) | 0.047 | 0.069 | 0.048 | 0.055 | 0.068 | 0.031 |
+| run 12 (`dart_noise` @ ratio 1.0) | **0.113** | **0.147** | **0.135** | **0.134** | **0.126** | **0.095** |
+
+Every bin ~2.4× worse, uniformly, while `eval_min_pos` sat at 0.105 m in both. A
+flat line in this row means D has stopped gaining states near the grasp and no
+further iteration will help.
+
+`c_min_pos_b{b}` / `c_min_rot_b{b}` also postdate run 12, but unlike the outcome
+stacks they *are* recoverable — the shards hold `robot_states` and
+`grasp_pose_world`:
+
+```bash
+python examples/backfill_collect_err.py output/dagger_runs/regrasp_run12 --check
+```
+
+Writes `<run>/collect_err.csv`, which the plotter splices in by iteration, filling
+only blank cells so a run that logged its own numbers is never overwritten.
+`--check` recomputes the pooled `mean_min_pos` and diffs it against the logged
+column: the backfill reads **~2–3 mm high** (max 4.9 mm on values near 120 mm)
+because the collector minimises over simulator steps a shard does not keep. A
+one-directional bias on every iteration, so it shifts the level slightly and
+changes no trend — but don't mix a backfilled series with a natively-logged one
+in the same comparison.
+
 ```bash
 python examples/plot_regrasp_fits.py output/dagger_runs/regrasp_run2
 ```
@@ -367,15 +425,21 @@ bash examples/watch_regrasp.sh -f slurm_logs/regrasp_<jobid>.out
 
 ```bash
 python examples/rollout_regrasp_policy.py \
-    --run-dir output/dagger_runs/regrasp_run2/iters/iter_13 \
-    --cfg-file examples/pretrain_multicam_wr.yaml \
-    --grasp-pin-table output/regrasp_pins_train.json \
-    --scene 32 --bin 4 --show-goal-grasp
+    --run regrasp_run2 --iter 13 --scene 32 --bin 4 --show-goal-grasp
 ```
 
-`--run-dir` takes any iteration directory (`<run>/iters/iter_NN`) or `<run>/best`
-/ `<run>/last`; there is no checkpoint flag — it loads `checkpoints/best.pt` and
-falls back to `last.pt`. GUI is on by default; `--no-render` disables it.
+`--run` derives `--run-dir`, `--cfg-file`, `--grasp-pin-table` **and `--command`**
+from the run's own `config.yaml`, the same way the replay viewer does, and prints
+what it chose. `--command` matters most: it defaults to `bin_axis`, which is right
+for runs 2–8 and **wrong for every run since 9** (`bin_centroid`) — and getting it
+wrong means watching a different experiment than the one that was scored, with no
+error to say so.
+
+`--iter N` selects `<run>/iters/iter_NN`; `--ckpt best` (the default) or
+`--ckpt last` select the run-level checkpoints. Either way it loads
+`checkpoints/best.pt` and falls back to `last.pt`. `--run-dir` still takes a raw
+path for anything that is not a Regrasp run. GUI is on by default; `--no-render`
+disables it.
 
 **Use `--bin` for a rollout.** A rollout does not replay anything — it issues a
 command, and the command is built from the bin and the anchor alone:
@@ -424,10 +488,7 @@ Conditioning overlays (both need `--grasp-pin-table`):
 
 ```bash
 python examples/rollout_regrasp_policy.py \
-    --run-dir output/dagger_runs/regrasp_run2/iters/iter_13 \
-    --cfg-file examples/pretrain_multicam_wr.yaml \
-    --grasp-pin-table output/regrasp_pins_train.json \
-    --scene 32 --grasp-idx 1 \
+    --run regrasp_run2 --iter 13 --scene 32 --grasp-idx 1 \
     --show-anchor-frame --show-bin-sphere --show-goal-grasp
 ```
 
@@ -448,20 +509,61 @@ holding the episodes that iteration collected. Replaying drives the robot throug
 the *recorded* rollout and overlays the saved point cloud, so it shows what
 actually happened, not a fresh rollout.
 
+**Name the run and the iteration; everything else is derived.** A shard does not
+carry the pin table its `grasp_idx` indexes, the benchmark config it was collected
+under, or the `d_rule` its `d_world` was labelled with — and every one of those
+fails *silently* when wrong. Hand a `grasp_offset` shard the `approach_axis` table
+and `--show-d` draws a vector a median 14.5° off, in a different bin, with no
+error. All of it is recorded in `<run>/config.yaml`, which `train_regrasp.py`
+writes when the run starts, so `--run` + `--iter` fills in `--dataset`,
+`--cfg-file`, `--grasp-pin-table`, `--d-rule`, `--d-point-depth` and
+`--d-min-offset`, prints what it chose, and defaults `--mode` to `replay`:
+
 ```bash
-# base demonstrations — scene 32, its 4th grasp
+# run 12, iteration 13, scene 33's first grasp — no paths, no rules
+python examples/visualize_bc_dataset.py \
+    --run regrasp_run12 --iter 13 --scene 33 --grasp-idx 0 \
+    --show-goal-grasp --show-expert-arrows
+
+# --iter 0 (or 'base') opens that run's base demonstration set; 'last' its final
+# iteration. Both resolve through the run's own config, so run 9 gets
+# train_regrasp.h5 and run 12 gets train_regrasp_off.h5.
+python examples/visualize_bc_dataset.py \
+    --run regrasp_run9 --iter base --scene 32 --grasp-idx 3 \
+    --show-goal-grasp --show-expert-arrows
+```
+
+It prints the derivation before opening anything, so a wrong run name is obvious
+at a glance rather than three overlays later:
+
+```
+[run] regrasp_run12  (output/dagger_runs/regrasp_run12)
+      config      output/dagger_runs/regrasp_run12/config.yaml
+      dataset     output/dagger_runs/regrasp_run12/data/dagger_iter_13.h5
+      cfg_file    examples/pretrain_multicam_wr.yaml
+      pin table   output/regrasp_pins_train_off.json
+      d_rule      grasp_offset  (depth 0.1122, min_offset 0.02)
+      command     bin_centroid
+```
+
+The run directory is looked for under `$REGRASP_DATA/dagger_runs`,
+`$RUNS/output/dagger_runs` and `./output/dagger_runs`, in that order — so the same
+command works on the cluster and on a laptop that rsync'd a run down. Paths
+*inside* the snapshot are re-rooted the same way, which is what makes
+`TRAIN.base_train_h5` (recorded as an absolute `/home/pradyunsharma/...`) resolve
+locally. Runs 7 and 8 predate the snapshot and fall back to
+`examples/configs/<run>.yaml`, which is said so in the `config` line.
+
+Any flag passed explicitly still wins, so `--run regrasp_run12 --d-rule
+approach_axis` is how you look at the same episode under the other rule.
+`--dataset` also still works on its own for a shard that belongs to no run:
+
+```bash
 python examples/visualize_bc_dataset.py \
     --dataset output/bc_dataset/train_regrasp.h5 \
     --mode replay --cfg-file examples/pretrain_multicam_wr.yaml \
     --grasp-pin-table output/regrasp_pins_train.json \
     --scene 32 --grasp-idx 3 --show-goal-grasp --show-expert-arrows
-
-# one iteration's DAgger buffer — same selectors
-python examples/visualize_bc_dataset.py \
-    --dataset output/dagger_runs/regrasp_run2/data/dagger_iter_13.h5 \
-    --mode replay --cfg-file examples/pretrain_multicam_wr.yaml \
-    --grasp-pin-table output/regrasp_pins_train.json \
-    --scene 52 --grasp-idx 3 --show-goal-grasp --show-expert-arrows
 ```
 
 #### The conditioning overlay — anchor frame, bin sphere, and `d`
@@ -481,9 +583,12 @@ only one is how you convince yourself the conditioning is fine when it is not:
 | yellow | this shard's `d_rule` applied to the grasp it **flew**; under run 10 that is `grasp_offset`, centroid → fingertip midpoint, with the offset segment and endpoint drawn |
 | grey | `−R_grasp[:,2]` (`d_grasp_world`), runs 1–9's `approach_axis`, for contrast |
 
-The rule is read from `_meta.d_rule` in `--grasp-pin-table`, so a run-10 table
-draws `grasp_offset` and a run-2 table draws `approach_axis` with no flag.
-Override with `--d-rule / --d-point-depth / --d-min-offset`. The angles between
+Under `--run` the rule comes from that run's `SIM.d_rule`; otherwise it is read
+from `_meta.d_rule` in `--grasp-pin-table`, so a run-10 table draws `grasp_offset`
+and a run-2 table draws `approach_axis` with no flag. If the two ever disagree the
+viewer says so and names both, because one of them is then describing data that
+was labelled the other way. Override with `--d-rule / --d-point-depth /
+--d-min-offset`. The angles between
 the vectors are printed, and under `grasp_offset` so is the centroid → fingertip
 offset with a warning when it falls below `d_min_offset` — that is the case where
 `d` is centroid noise rather than geometry.
@@ -491,10 +596,7 @@ offset with a warning when it falls below `d_min_offset` — that is the case wh
 ```bash
 # run 10's demos, with the full conditioning overlay
 python examples/visualize_bc_dataset.py \
-    --dataset output/bc_dataset/train_regrasp_off.h5 \
-    --mode replay --cfg-file examples/pretrain_multicam_wr.yaml \
-    --grasp-pin-table output/regrasp_pins_train_off.json \
-    --scene 387 --grasp-idx 0 \
+    --run regrasp_run10 --iter base --scene 387 --grasp-idx 0 \
     --show-goal-grasp --show-anchor-frame --show-bin-sphere --show-d
 ```
 
