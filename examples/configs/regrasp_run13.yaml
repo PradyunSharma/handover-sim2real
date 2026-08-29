@@ -7,8 +7,8 @@
 # d_grasp_world`, 25 iterations, beta 0.9 -> 0.75, `train_from_scratch: true`.
 #
 #   DAGGER.dart_mode        (new key)  jolt -> dart_noise
-#   DAGGER.dart_alpha_*     (new)      1.0 -> 0.25
-#   DAGGER.dart_noise_ratio (new)      1.0
+#   DAGGER.dart_alpha_*     (new)      0.35 -> 0.18   (post-run-12 recalibration)
+#   DAGGER.dart_noise_ratio (new)      0.3            (post-run-12; run 12 used 1.0)
 #   DAGGER.dart_reach_*_scale (new)    0.3005 / 1.0
 #   DAGGER.dart_pos_mag     0.04 -> 0.026    (iteration-1 bootstrap only)
 #   DAGGER.dart_rot_mag     0.3  -> 0.121    (iteration-1 bootstrap only)
@@ -81,18 +81,31 @@
 #   `c_env_done` should fall below ~34% (run 9: 75-107 of ~250 every iteration)
 #   `c_close_label` should rise above ~135 (run 9: drifting down, 143 -> 114)
 #
-# If neither moves, the perturbation was not what was killing the episodes. The
-# next suspect is the OMG dive — 20% of base episodes drop the wrist more than
-# 5 cm below both endpoints mid-trajectory, clipping the object on the way in —
-# and that is a planner problem no noise model reaches.
+# BUT CHECK THE GUARD COLUMNS FIRST, at iteration 1, BEFORE reading either of
+# those. Run 12 improved `c_env_done` and still collapsed, because the noise
+# stopped the reach from ever committing:
+#
+#   `c_max_steps`      must stay near run 9's ~35/250.  Run 12: 21 -> 92.
+#   `reached_standoff` must stay near run 9's ~155/250. Run 12: 129 -> 59.
+#   `mean_min_pos`     must stay near run 9's ~0.06 m.  Run 12: 0.049 -> 0.131.
+#
+# If those three move, the noise is keeping the EE outside `reach_commit_dist`
+# and nothing downstream is interpretable. Halve `dart_noise_ratio` again before
+# touching anything else.
+#
+# If the guards hold and the two headline columns still do not move, the
+# perturbation was not what was killing the episodes. The next suspect is the
+# OMG dive — 20% of base episodes drop the wrist more than 5 cm below both
+# endpoints mid-trajectory, clipping the object on the way in — and that is a
+# planner problem no noise model reaches.
 #
 # `eval_min_pos` continuing past iteration 8 is the payoff, but it is downstream
 # of those two columns and moves an iteration later.
 #
-# The opposite failure is live: `dart_noise_ratio: 1.0` perturbs EVERY supervisor
-# step against the jolt's 30%. If `c_env_done` RISES, lower the ratio to 0.3
-# before touching alpha — that keeps the measured shape and magnitude while
-# restoring the jolt's firing rate.
+# `dart_noise_ratio` and `dart_alpha_scale` both already carry run 12's
+# correction; if this run still degrades, the ratio is the knob to move, not
+# alpha — run 12 showed magnitude is the secondary term (its iteration 1 ran
+# BELOW the jolt in both channels and still halved the close labels).
 #
 # THE DATA IS ALREADY BUILT — run 9's tables and shards, unchanged.
 # docs/runbook_run10_train.md applies with the config name and paths swapped.
@@ -172,11 +185,33 @@ DAGGER:
   # At 3.0 the z axis executes 1.8x the jolt's sd. At 1.0 the noise sits in the
   # 1-2 cm band with the same ~2.5x cut in rotation. Identical to run 12's
   # setting, so the two runs test one intervention on two substrates.
-  dart_alpha_scale: 1.0    # alpha at iteration 1  (the paper uses 3.0)
-  dart_alpha_end:   0.25   # alpha at iteration 25
-  # 1.0 = the paper: noise on EVERY supervisor step, against the jolt's 30%.
-  # The SECOND parameter to move if `c_env_done` rises rather than falls.
-  dart_noise_ratio: 1.0
+  # RECALIBRATED AGAINST THIS STACK'S OWN ANCHOR AFTER RUN 12 — see below.
+  # alpha multiplies tr(Sigma_hat_1), which run 9 measures at 0.0287, NOT the
+  # phase-4 0.0161 the table above was computed from. alpha 1.0 would therefore
+  # execute ~[2.3, 2.5, 3.0] cm, ABOVE the jolt it replaces. 0.35 -> 0.18 puts
+  # the applied trace where run 12's final iterations actually measured
+  # ([1.36, 1.48, 1.82] cm / [0.066, 0.054, 0.046] rad), i.e. in the 1-2 cm band.
+  dart_alpha_scale: 0.35   # alpha at iteration 1   (was 1.0; paper uses 3.0)
+  dart_alpha_end:   0.18   # alpha at iteration 25  (was 0.25)
+  #
+  # ── 0.3, NOT 1.0, AND THIS IS THE LESSON OF RUN 12 ────────────────────────
+  #
+  # Run 12 ran this at 1.0 and perturbed 90% of all steps against the jolt's
+  # 26%, because dart_noise fires only on EXPERT steps and beta starts at 0.9.
+  # It did not fail the way the header predicts: `c_env_done` went DOWN 52 -> 46
+  # (the object was knocked out LESS), but `c_max_steps` went 21 -> 92 and
+  # `reached_standoff` halved, 129 -> 59.
+  #
+  # THE REACH NEVER COMMITTED. `reach_commit_dist` is 5 cm, and converging into
+  # a 5 cm ball needs steps that are NOT perturbed. At ratio 1.0 there are none:
+  # every expert action carries an eps with E||eps_pos|| ~ 2.9 cm, so the arm
+  # hovers outside the radius and times out 13 cm from the grasp — 5 cm short of
+  # the standoff, exactly where `mean_min_pos` landed (0.131 vs run 11's 0.049).
+  # Close labels fell to 26% of episodes against run 11's 58%.
+  #
+  # 0.3 restores the jolt's duty cycle. dart_noise fires on ~90% of steps at
+  # beta 0.9, so 0.3 x 0.90 = 27% of all steps — the jolt's 26%, matched.
+  dart_noise_ratio: 0.3
   # Sigma is pooled over the whole episode, but the reach cannot take the free
   # phase's magnitude: 5 cm from the object a free-phase displacement knocks it
   # out of the hand. These reproduce the ratio the jolt already encoded

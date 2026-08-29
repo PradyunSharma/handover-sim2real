@@ -418,10 +418,11 @@ with different `init`. Phase-4 run 16, for reference, was 100 / 25 from scratch.
 | **regrasp_run6** | `regrasp_run6.yaml` | wrist+right | 25 (planned) | **7404 → ~4578 (ALL 617 scenes)** | **1–4 bins × 3 grasps** (~7.4 slots) | **bin axis** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.5** | 0.3 | 0.3 | replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 4 with `episodes_per_iter` 1200 → **7404** = every scene, every iteration. Maximum on-policy coverage: \|D\| passes half DAgger data after ONE iteration instead of thirteen. **~223 h ≈ 9.3 days of GPU and ~47 GB of scratch** — the refit is quadratic in the iteration count, so `num_iters: 8` costs ~30 h and gets most of it. Shares run 3/4's tables and shards. See below. |
 | **regrasp_run7** | `regrasp_run7.yaml` | wrist+right | **17 of 25** (running) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.5** | 0.3 | 0.3 | replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | **12** (`success 0.555`) | it17 `success 0.496`, `dir_track 0.704`, `bin_diag 0.903` | = run 2 with **the same two changes run 4 made to run 3** (`bc_regrasp_run4.yaml`, `d_noise_deg` 12 → 0, **and** `beta_end` 0.75 → 0.5). Shares run 2's pin tables and shards. **The noise transformed the BASE FIT and nothing after it**: iteration 0 went `success 0.143 → 0.370` against run 2, and by iteration 7 the two runs are indistinguishable. Shows the FTL dip textbook-clean (0.370 → 0.244 at it 1, back above base by it 5). See below. |
 | **regrasp_run8** | `regrasp_run8.yaml` | wrist+right | **19 of 25** (running) | 400 → ~259 | **1–4 (one per bin)** | **bin axis** | **0° (OFF)** | **warm-start (best.pt)**, PointNet++ from scratch at iter 0 only | 50 / 15 | **linear 0.9→0.5** | 0.3 | 0.3 | replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | **14** (`success 0.487`) | it19 `success 0.475`, `dir_track 0.704`, `bin_diag 0.908` | = run 7 with `train_from_scratch` **false**. ONE change — the clean warm-start ablation at one demo per bin. **The warm start removes the FTL dip and buys nothing**: no early trough, `train_loss` half run 7's (0.14 vs 0.235), and success/`dir_track`/`bin_diag` all at or below run 7's from iteration 7 on. Its iteration 0 is configured identically to run 7's and scored 0.282 against 0.370 — **that 0.088 gap is the run-to-run noise floor** for this setup and the yardstick for everything else here. See below. |
-| **regrasp_run9** | `regrasp_run9.yaml` | wrist+right | 25 (planned) | 400 → ~259 | **1–4 (one per bin)** | **train: grasp axis `−R[:,2]` / deploy: BIN CENTROID** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | **The first run whose training label and deployment command are different vectors.** = run 2 + `SIM.command_deploy: bin_centroid` + `bc_regrasp_run9.yaml` (`d_noise_deg` 12 → 0, `DATA.d_source` `d_world` → `d_grasp_world`). Trains on the grasp's own approach axis — no quantisation, no perturbation — and deploys on the unit mean of each bin's assigned `d_anchor`, which needs no grasp and so is producible on the robot. Reuses run 2's tables and shards **verbatim**: both vectors have always been written per episode, so this is a relabelling. Read it as **run 1 done properly**, not as a run-2 variant. See below. |
-| **regrasp_run12** | `regrasp_run12.yaml` | wrist+right | 25 (planned) | 600 → TBD | **1–6 (one per bin, ALL SIX LIVE)** | **grasp's own `d`** (continuous), deploy on the **bin centroid** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | **add noise (α 1.0→0.25)** | **1.5→0.7–2.4 cm / 0.07 rad → 0.45→0.2–0.7 / 0.07** | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | **DART as the paper writes it, on run 11.** = run 11 + `DAGGER.dart_mode: dart_noise` (one key; five parameters ride with it). Runs 1–11 REPLACE the expert action with a uniform box draw on 30% of steps; this ADDS `eps ~ N(0, Σ)` with Σ estimated each iteration from `(π_θ − π*)` outer products and trace-rescaled. **Motivated by run 9's collection log**: `c_env_done` — the benchmark killing the episode on contact / drop / timeout — sits at **~34% of collection episodes at every one of 25 iterations** with no trend, while `c_close_label` drifts *down* 143→114. So D stops gaining near-grasp states around iteration 5, which is exactly where `eval_min_pos` flattens in every bin. The jolt's rotation noise is **~2.5× the learner's measured error** (uniform sd 0.1732 rad vs 0.0836/0.0590/0.0676) and isotropic where the real error is not. Read `c_env_done` and `c_close_label` from iteration 3 — they move a full iteration before `eval_min_pos` and say whether the mechanism engaged at all. Same tables and shards as runs 10/11; nothing to rebuild. See below. |
-| **regrasp_run11** | `regrasp_run11.yaml` | wrist+right | 25 (planned) | 600 → TBD | **1–6 (one per bin, ALL SIX LIVE)** | **grasp's own `d`** (continuous), deploy on the **bin centroid** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | **Run 10 with the LABEL de-quantised.** = run 10 + `DATA.d_source: d_grasp_world` + `SIM.command_deploy: bin_centroid` (two keys; the second is forced by the first — training on the true direction while deploying the axis would just move the gap to test time). Runs 2/4/10 caption every episode with one of six fixed axes, but the flown grasp is only the *closest member* of that bin: measured on `train_regrasp_off.h5`, the caption sits a **median 24.5° / p90 41.5°** from the grasp's own `d`, with 36% beyond 30°. Run 11 labels with the flown direction instead — a pure **relabelling**, no new data or tables, since `d_grasp_world` already rides on every episode. Completes the 2×2 over {`d_rule`} × {label scheme}: run 2 / run 9 / run 10 / **run 11**. One change from run 10; one from run 9 (`d_rule`), though that edge is weaker since run 9 predates the reach filter. Read `dir_err` first — `bin_diag_rate` scores against a bin the label no longer is. See below. |
-| **regrasp_run10** | `regrasp_run10.yaml` | wrist+right | 25 (planned) | 600 → TBD | **1–6 (one per bin, ALL SIX LIVE)** | bin axis, but **`d` = centroid → fingertip** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | **The first run to change what `d` MEANS.** = run 2 + `SIM.d_rule: grasp_offset` + `bc_regrasp_run4.yaml` (noise off). `d` is no longer `−R_grasp[:,2]` but the direction from the object centroid to the midpoint between the fingertips — a function of the grasp's **position**, not its orientation. **This unlocks the two dead bins**: `−z` goes from 0 scenes to 235 and `−x` from 12 to 191, because you cannot *approach* from beneath a held object but you can close your fingers on its underside. Retry ladder gains two rungs; chance level moves 1/4 → 1/6. **Needs the whole upstream chain rebuilt** — table, assignment, base collection, audit. **Also the first run under `SIM.reach_filter`**: (scene, bin) pairs whose demonstration never reached its grasp are dropped from D, from collection and from eval (on the run-2 shard that was 30% of pairs). Deliberately NOT a single-change test against run 2. See below. |
+| **regrasp_run9** | `regrasp_run9.yaml` | wrist+right | **25 of 25** | 400 → ~259 | **1–4 (one per bin)** | **train: grasp axis `−R[:,2]` / deploy: BIN CENTROID** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | **23** (`success 0.592`) | it25 `success 0.496`, `eval_min_pos 0.0712`, D = 7968 eps | **The first run whose training label and deployment command are different vectors.** = run 2 + `SIM.command_deploy: bin_centroid` + `bc_regrasp_run9.yaml` (`d_noise_deg` 12 → 0, `DATA.d_source` `d_world` → `d_grasp_world`). Trains on the grasp's own approach axis — no quantisation, no perturbation — and deploys on the unit mean of each bin's assigned `d_anchor`, which needs no grasp and so is producible on the robot. Reuses run 2's tables and shards **verbatim**: both vectors have always been written per episode, so this is a relabelling. Read it as **run 1 done properly**, not as a run-2 variant. See below. |
+| **regrasp_run13** | `regrasp_run13.yaml` | wrist+right | 25 (planned) | 400 → ~259 | **1–4 (one per bin)** | train: grasp axis `−R[:,2]` / deploy: BIN CENTROID | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | **add noise (α 1.0→0.25)** | **~1.4–1.8 cm / 0.05–0.07 rad → reach 0.4–0.5 / same** at it 1, ×0.72 by it 25 (α **0.35→0.18**, recalibrated to run 9's own anchor 0.0287 after run 12). Fires on **27%** of steps (`dart_noise_ratio` **0.3**), matched to the jolt's 26%. | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | **The same DART change, on run 9 instead of run 11.** = run 9 + `dart_mode: dart_noise` (α 1.0→0.25) + `SIM.reach_filter: false`. The DART block is **byte-identical to run 12's**, so the two are a replication of one intervention on two substrates — run 12 on `grasp_offset` + reach-filtered, run 13 on `approach_axis` + unfiltered. **Run 13 is the readable one now**: its baseline (run 9) is complete on disk, while run 12's (run 11) has not been run. `reach_filter: false` is deliberate and is the point — the flag defaults ON and postdates run 9, so a plain copy would differ from the baseline in *two* ways. This is the only Regrasp config that should set it false. Compare directly against run 9's `c_env_done` (75–107 of ~250 at every iteration, no trend) and `c_close_label` (143→114). See below. |
+| **regrasp_run12** | `regrasp_run12.yaml` | wrist+right | **25 of 25** | 600 → ~187 | **1–6 (one per bin, ALL SIX LIVE)** | **grasp's own `d`** (continuous), deploy on the **bin centroid** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | **add noise (α 1.0→0.25)** | **MEASURED, and larger than intended**: it 2 **2.7–3.6 cm / 0.09–0.13 rad** → reach 0.8–1.1 cm / same; it 25 **1.4–1.8 cm / 0.05–0.07 rad** → reach 0.4–0.5 / same. The α table was anchored to phase 4's tr(Σ̂)=0.0161; this stack measures **0.0408**, so σ ran **1.59×** the design and above the jolt for the first half. Fired on **90%** of all steps vs the jolt's 26%. | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | **22** (`success 0.562`) | it25 `success 0.490`, `eval_min_pos 0.1117`, D = **2147** eps (run 11: 3660) | **DART as the paper writes it, on run 11.** = run 11 + `DAGGER.dart_mode: dart_noise` (one key; five parameters ride with it). Runs 1–11 REPLACE the expert action with a uniform box draw on 30% of steps; this ADDS `eps ~ N(0, Σ)` with Σ estimated each iteration from `(π_θ − π*)` outer products and trace-rescaled. **Motivated by run 9's collection log**: `c_env_done` — the benchmark killing the episode on contact / drop / timeout — sits at **~34% of collection episodes at every one of 25 iterations** with no trend, while `c_close_label` drifts *down* 143→114. So D stops gaining near-grasp states around iteration 5, which is exactly where `eval_min_pos` flattens in every bin. The jolt's rotation noise is **~2.5× the learner's measured error** (uniform sd 0.1732 rad vs 0.0836/0.0590/0.0676) and isotropic where the real error is not. Read `c_env_done` and `c_close_label` from iteration 3 — they move a full iteration before `eval_min_pos` and say whether the mechanism engaged at all. Same tables and shards as runs 10/11; nothing to rebuild. See below. |
+| **regrasp_run11** | `regrasp_run11.yaml` | wrist+right | **25 of 25** | 600 → ~187 | **1–6 (one per bin, ALL SIX LIVE)** | **grasp's own `d`** (continuous), deploy on the **bin centroid** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | **22** (`success 0.619`) | it25 `success 0.572`, `eval_min_pos 0.1022`, D = 3660 eps | **Run 10 with the LABEL de-quantised.** = run 10 + `DATA.d_source: d_grasp_world` + `SIM.command_deploy: bin_centroid` (two keys; the second is forced by the first — training on the true direction while deploying the axis would just move the gap to test time). Runs 2/4/10 caption every episode with one of six fixed axes, but the flown grasp is only the *closest member* of that bin: measured on `train_regrasp_off.h5`, the caption sits a **median 24.5° / p90 41.5°** from the grasp's own `d`, with 36% beyond 30°. Run 11 labels with the flown direction instead — a pure **relabelling**, no new data or tables, since `d_grasp_world` already rides on every episode. Completes the 2×2 over {`d_rule`} × {label scheme}: run 2 / run 9 / run 10 / **run 11**. One change from run 10; one from run 9 (`d_rule`), though that edge is weaker since run 9 predates the reach filter. Read `dir_err` first — `bin_diag_rate` scores against a bin the label no longer is. See below. |
+| **regrasp_run10** | `regrasp_run10.yaml` | wrist+right | **25 of 25** | 600 → ~187 | **1–6 (one per bin, ALL SIX LIVE)** | bin axis, but **`d` = centroid → fingertip** | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | **25** (`success 0.608`) | it25 `success 0.608`, `eval_min_pos 0.1060`, D = 3635 eps | **The first run to change what `d` MEANS.** = run 2 + `SIM.d_rule: grasp_offset` + `bc_regrasp_run4.yaml` (noise off). `d` is no longer `−R_grasp[:,2]` but the direction from the object centroid to the midpoint between the fingertips — a function of the grasp's **position**, not its orientation. **This unlocks the two dead bins**: `−z` goes from 0 scenes to 235 and `−x` from 12 to 191, because you cannot *approach* from beneath a held object but you can close your fingers on its underside. Retry ladder gains two rungs; chance level moves 1/4 → 1/6. **Needs the whole upstream chain rebuilt** — table, assignment, base collection, audit. **Also the first run under `SIM.reach_filter`**: (scene, bin) pairs whose demonstration never reached its grasp are dropped from D, from collection and from eval (on the run-2 shard that was 30% of pairs). Deliberately NOT a single-change test against run 2. See below. |
 
 ### Result: DAgger did not move success; the conditioning is read but not obeyed
 
@@ -792,11 +793,168 @@ arriving as the aggregate turns majority on-policy.
 
 ---
 
-### regrasp_run12 — DART as the paper writes it, configured, not yet run
+### regrasp_run13 — the same DART change on run 9, dose corrected after run 12, not yet run
+
+`examples/configs/regrasp_run13.yaml`. **Run 9 with the perturbation added rather
+than substituted** — and, since run 12 finished, with the *dose corrected*.
+
+|  | run 12 (ran, regressed) | run 13 |
+|---|---|---|
+| baseline | run 11 — 0.619 @it22 | run 9 — 0.592 @it23 |
+| `d_rule` | `grasp_offset` | `approach_axis` |
+| tables / shards | `_off` | run 9's |
+| `reach_filter` | on | **off** (see below) |
+| `dart_noise_ratio` | 1.0 → **90% of steps** | **0.3** → 27% of steps |
+| α schedule | 1.0 → 0.25, anchored to phase 4 | **0.35 → 0.18**, anchored to run 9's own 0.0287 |
+| reach scales | 0.3005 / 1.0 | *identical* |
+
+**The DART block is no longer byte-identical to run 12's, and that is the point.**
+Run 12 ran the block as originally written and regressed — 0.562 against run 11's
+0.619, with `D` finishing 41% smaller. The cause was not the magnitude the config
+argued about: `dart_noise` fires only on *expert* steps and so covers 90% of them
+at β = 0.9, against the jolt's 26% of all steps. With no clean steps left, the EE
+never converged inside `reach_commit_dist: 0.05`, the reach never committed, and
+episodes timed out 13 cm from the grasp (`c_max_steps` 21 → 92,
+`reached_standoff` 129 → 59, `mean_min_pos` 0.049 → 0.131). See the run 12 section
+for the full reading. Run 13 carries both corrections.
+
+**Run 13 is still the readable one.** Run 12 answered a different question than it
+asked, so this is now the first clean test of the intervention, and against a
+baseline that is complete on disk. If run 13 improves, a corrected rerun of run 12
+(α 0.25 → 0.12, ratio 0.3) separates the perturbation from the substrate.
+
+**`SIM.reach_filter: false` is deliberate and is the point of the run.** The flag
+defaults to *true* and did not exist when run 9 ran, so a plain copy of run 9's
+config would silently acquire it and run 13 would differ from its baseline in two
+ways — the perturbation *and* a 31% smaller `D`. This is the **only** Regrasp
+config that should set it false; every future run wants the filter. The preflight
+prints `reach_filter=OFF (default is ON; this run opts out)` so the exception is
+never silent.
+
+**The hypothesis was measured on this run's own baseline.** Run 9's collection
+columns:
+
+| iter | episodes | `c_env_done` | `c_close_label` | `eval_min_pos` |
+|---|---|---|---|---|
+| 1 | 261 | 96 | 143 | 0.0982 |
+| 5 | 254 | 91 | 137 | 0.0719 |
+| 11 | 253 | 107 | 114 | 0.0695 |
+| 18 | 247 | 75 | 133 | 0.0689 |
+| 25 | 256 | 99 | 114 | 0.0712 |
+
+`c_env_done` — the benchmark killing the episode on contact, a dropped object, or
+timeout — sits at ~34% of collection episodes at *every* one of 25 iterations with
+no downward trend, while `c_close_label` drifts *down* 143 → 114. `D` stops
+gaining near-grasp states around iteration 5, which is exactly where
+`eval_min_pos` flattens in every bin.
+
+**Read the guard columns first, at iteration 1**, before either headline column.
+Run 12 *improved* `c_env_done` (52 → 46) and still collapsed, because the noise
+stopped the reach from committing at all. Against run 9's baseline:
+
+| guard | run 9 | run 12's failure |
+|---|---|---|
+| `c_max_steps` | ~35 / 250 | 21 → **92** |
+| `reached_standoff` | ~155 / 250 | 129 → **59** |
+| `mean_min_pos` | ~0.06 m | 0.049 → **0.131** |
+
+If those move, the noise is holding the EE outside `reach_commit_dist` and
+nothing downstream is interpretable — halve `dart_noise_ratio` again before
+touching anything else.
+
+**What would falsify it**, once the guards hold, checkable from iteration 3
+against the table above: `c_env_done` should fall below ~34% and `c_close_label`
+should rise above ~135. If neither moves, the perturbation was not what was
+killing the episodes and the next suspect is the OMG dive — 20% of base episodes
+drop the wrist more than 5 cm below both endpoints mid-trajectory, a planner
+problem no noise model reaches.
+
+Run 9's tables and shards, unchanged. `docs/runbook_run10_train.md` applies with
+the config name and paths swapped.
+
+---
+
+### regrasp_run12 — DART as the paper writes it; 25 of 25, **the intervention was mis-dosed and the run regressed**
 
 `examples/configs/regrasp_run12.yaml`. **Run 11 with the perturbation changed
 from replacing the expert's action to adding noise to it.** One key,
 `DAGGER.dart_mode: jolt → dart_noise`, plus the five parameters that ride with it.
+
+**Outcome: 0.562 @it22 against run 11's 0.619 @it22**, and `D` finished at 2147
+episodes where run 11 reached 3660 — 41% less data collected from the same
+scene budget. The hypothesis was not tested, because the implementation delivered
+something other than what the config described. Two faults, and only the second
+is about magnitude.
+
+**Fault 1 — the noise fired on 90% of steps, not 30%. This is the one that
+broke the run.** The jolt pre-empts the β coin, so it fires on 30% of *all*
+steps. `dart_noise` fires only on *expert* steps, so at β = 0.9 it covers 90% of
+them, decaying only to 77% as β anneals.
+
+| | run 11 (jolt) | run 12 (`dart_noise`) |
+|---|---|---|
+| perturbed steps / all steps | **26%** | **90%** → 77% |
+| `reached_standoff` per iter | 129 / 190 | **59** / 190 |
+| `c_close_label` / episodes | **58%** | **26%** |
+| `c_max_steps` | 21 | **92** |
+| `c_env_done` | 52 | **46** |
+| `mean_min_pos` | 0.049 m | **0.131 m** |
+| mean episode length | 34.7 | 38.9 (cap 40 / 50) |
+
+Read `c_env_done` first, because it is the column the run was designed around: it
+went **down**, 52 → 46. The object was knocked out of the hand *less* often, so
+the smaller per-kick magnitude and the clearance-rejected reach did their job.
+
+What killed the run is `c_max_steps`, which quadrupled — the episodes were not
+dying, they were **running out of horizon** — together with `reached_standoff`
+halving, which places the failure in the free approach, before the reach tail
+ever runs.
+
+The mechanism is `reach_commit_dist: 0.05`. The reach only commits, and the
+frozen standoff→grasp waypoints only start playing, once the EE is within 5 cm of
+the standoff. Converging into a 5 cm ball requires steps that are *not*
+perturbed. Under the jolt, 74% of steps were clean and the arm got two or three
+untouched expert steps after each kick to pull straight back in. Under
+`dart_noise_ratio: 1.0` there is **never** a clean step: every expert action
+carries an ε with `E‖ε_pos‖ ≈ 2.9 cm` against a 5 cm radius, so the arm hovers
+outside it, never commits, and times out 13 cm from the grasp — 5 cm short of the
+standoff, exactly where `mean_min_pos` landed.
+
+**Fault 2 — α was anchored to the wrong measurement.** The α table in the config
+header was computed from the phase-4 discrepancy, `tr(Σ̂) = 1.61e-2`. This stack
+measures **4.08e-2** (run 10: 0.0411, run 11: 0.0399, run 12: 0.0408 — a property
+of the stack, not of the noise), so executed σ ran **1.59×** the design:
+
+| | designed | actually executed | jolt |
+|---|---|---|---|
+| it 2 (α ≈ 0.97) | 1.41 / 1.61 / 2.41 cm | **2.67 / 2.91 / 3.57 cm** | 2.31 cm |
+| it 25 (α 0.25) | 0.72 / 0.82 / 1.23 cm | 1.36 / 1.48 / 1.82 cm | 2.31 cm |
+
+For the first half of the run the noise ran *larger* than the jolt it replaced —
+the opposite of the intent. But this is the secondary fault: **iteration 1 used
+the bootstrap** (1.50 cm / 0.070 rad, unambiguously below the jolt's 2.31 cm /
+0.173 rad) **and already collapsed** to 27.4% close labels against run 11's
+57.9%. Smaller noise applied to every step still broke it. The ratio dominates.
+
+**Eq. 4's safeguard worked.** Run 12's raw `dart_sigma_trace` spiked to 0.183 at
+iteration 2 and 0.099 at iteration 4 as the learner degraded on data it could not
+handle, and none of it fed back into more noise — the applied magnitude stayed
+pinned at `α ×` the frozen anchor. Only the *shape* tracked the spikes.
+
+**Corrections carried into run 13**, in priority order: `dart_noise_ratio`
+1.0 → **0.3** (0.3 × 0.90 = 27% of all steps, matching the jolt's 26%), and α
+recalibrated to each stack's own anchor rather than phase 4's — 1.0 → 0.25 for
+this stack, 1.0 → 0.35 for run 9's (anchor 0.0287). A corrected rerun of run 12
+itself would use α **0.25 → 0.12** with the same ratio.
+
+**Guard columns for any future `dart_noise` run**, to be read at iteration 1
+*before* `c_env_done` or `c_close_label`: `c_max_steps`, `reached_standoff`, and
+`mean_min_pos`. If those move, the noise is holding the EE outside
+`reach_commit_dist` and nothing downstream is interpretable.
+
+---
+
+#### The original rationale, kept for the record
 
 **The observation that motivates it.** `eval_min_pos` flattens after 5–8
 iterations in run 9 and never improves again, in *every* bin. The collection
@@ -850,12 +1008,17 @@ is a planner problem no noise model reaches. The opposite failure is live too:
 so if `c_env_done` **rises**, lower the ratio to 0.3 before touching α — that
 keeps the measured shape and magnitude while restoring the jolt's firing rate.
 
+That last sentence is the one the run turned on, and it was filed in the wrong
+place: the ratio was listed as the *second* knob to move, conditional on
+`c_env_done` rising. `c_env_done` fell, and the ratio was the fault anyway. It
+should have been the first knob, unconditionally.
+
 Same tables and shards as runs 10 and 11; nothing upstream to rebuild.
 `docs/runbook_run10_train.md` applies with the config name swapped.
 
 ---
 
-### regrasp_run11 — run 10's `d`, trained on the continuous vector, configured, not yet run
+### regrasp_run11 — run 10's `d`, trained on the continuous vector; 25 of 25, best 0.619 @it22
 
 `examples/configs/regrasp_run11.yaml`. **Run 10 with the label de-quantised.**
 Runs 1–10 argued about which *rule* produces `d`; this one keeps run 10's rule and
@@ -922,7 +1085,7 @@ swapped; the §2 gate has already passed on this shard and does not need repeati
 
 ---
 
-### regrasp_run10 — `d` from the grasp's position, not its orientation, configured, not yet run
+### regrasp_run10 — `d` from the grasp's position, not its orientation; 25 of 25, best 0.608 @it25
 
 `examples/configs/regrasp_run10.yaml`. **The first run in the phase to change
 what `d` means.** Runs 1–9 argued about which *vector* to hand the policy; this
@@ -1652,7 +1815,8 @@ Configs without a numbered run file were shared across several runs.
 | `bc_regrasp_run9.yaml` | run 9 `TRAIN.train_cfg` — = `bc_regrasp_run4.yaml` + `DATA.d_source: d_grasp_world` |
 | `regrasp_run10.yaml` | regrasp_run10 — = run 2 + `d` from the grasp's position (`SIM.d_rule: grasp_offset`), noise off |
 | `regrasp_run11.yaml` | regrasp_run11 — = run 10 + the continuous label (`DATA.d_source: d_grasp_world`, `SIM.command_deploy: bin_centroid`) |
-| `regrasp_run12.yaml` | regrasp_run12 — = run 11 + DART as the paper writes it (`DAGGER.dart_mode: dart_noise`) |
+| `regrasp_run12.yaml` | regrasp_run12 — = run 11 + DART as the paper writes it (`DAGGER.dart_mode: dart_noise`). **Ran and regressed** (0.562 vs run 11's 0.619): `dart_noise_ratio: 1.0` perturbed 90% of steps and the reach never committed. Do not copy its DART block. |
+| `regrasp_run13.yaml` | regrasp_run13 — = run 9 + the same DART change with the **dose corrected after run 12** (ratio 0.3, α 0.35→0.18), `reach_filter: false` to stay comparable |
 | `regrasp_smoke.yaml` | Regrasp shakedown — 2 iters, m=8, 3 eval scenes |
 | `bc_regrasp.yaml` | regrasp_run1 `TRAIN.train_cfg` — `direction_cond`, aux head **off**, head `[256,256]` |
 | `bc_regrasp_run2.yaml` | regrasp_run2, regrasp_run3, regrasp_run5 and both fast runs `TRAIN.train_cfg` — = `bc_regrasp.yaml` + aux head **on** (`aux_weight: 1.0`) |

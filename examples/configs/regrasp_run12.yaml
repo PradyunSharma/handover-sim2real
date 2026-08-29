@@ -1,6 +1,36 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # REGRASP RUN 12 — DART AS THE PAPER WRITES IT: NOISE ADDED, NOT ACTION REPLACED.
 #
+# ###########################################################################
+# # RAN, AND REGRESSED. DO NOT COPY THIS DART BLOCK. Kept as written so the #
+# # log is reproducible; run 13 carries the corrected version.              #
+# #                                                                          #
+# # 0.562 @it22 against run 11's 0.619, D finishing at 2147 episodes against #
+# # 3660 — 41% less data from the same scene budget.                         #
+# #                                                                          #
+# # THE FAULT WAS THE FIRING RATE, NOT THE MAGNITUDE. `dart_noise` fires     #
+# # only on EXPERT steps, so `dart_noise_ratio: 1.0` at beta 0.9 perturbed   #
+# # 90% of all steps against the jolt's 26%. Converging inside               #
+# # `reach_commit_dist: 0.05` needs steps that are NOT perturbed; there were #
+# # none, so the reach never committed and episodes timed out 13 cm from the #
+# # grasp. `c_max_steps` 21 -> 92, `reached_standoff` 129 -> 59,             #
+# # `mean_min_pos` 0.049 -> 0.131, `c_close_label` 58% -> 26% of episodes.   #
+# #                                                                          #
+# # `c_env_done` actually IMPROVED, 52 -> 46 — the object was knocked out    #
+# # LESS. The prediction below was right about the mechanism it named and    #
+# # blind to the one that mattered.                                          #
+# #                                                                          #
+# # Secondary fault: the alpha table below is anchored to phase 4's          #
+# # tr(Sigma_hat) = 0.0161. THIS STACK MEASURES 0.0408, so sigma executed    #
+# # 1.59x the design — [2.67, 2.91, 3.57] cm at iteration 2, ABOVE the       #
+# # 2.31 cm jolt it replaced. Secondary because iteration 1 ran the          #
+# # bootstrap (1.50 cm / 0.070 rad, below the jolt in both channels) and     #
+# # already halved the close labels.                                         #
+# #                                                                          #
+# # A CORRECTED RERUN of this config wants `dart_noise_ratio: 0.3` and       #
+# # `dart_alpha_scale: 0.25` / `dart_alpha_end: 0.12`. See run 13.           #
+# ###########################################################################
+#
 # Run 11 with one key changed. Same `_off` tables and shards, the same
 # `d_rule: grasp_offset`, the same continuous label (`d_source: d_grasp_world`)
 # and `command_deploy: bin_centroid`, the same reach filter, 25 iterations,
