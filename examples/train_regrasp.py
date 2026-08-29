@@ -569,11 +569,18 @@ LOG_FIELDS = [
     "reached_standoff", "reached_grasp", "reach_steps", "settle_steps",
     "omg_fail", "goal_switch", "expert_steps", "policy_closed",
     "policy_close_cmds", "dropped_tail", "dart", "dart_env_done",
+    # `dart_reach` = perturbations applied INSIDE the committed reach, in either
+    # mode; `dart_reject` = draws the clearance check refused there. Under
+    # dart_noise the reach share is `dart_reach` and the free share is
+    # `dart_noise_steps - dart_reach`. Both nonzero is the confirmation that
+    # reach-tail DART is live — runs before this fix logged `dart_reach` = 0 under
+    # dart_noise even while it was firing (run 12).
     "dart_reach", "dart_reject",
     # DART-paper noise (DAGGER.dart_mode: dart_noise). `dart_sigma_trace` is
     # tr(Sigma_hat), the measured learner-supervisor error, and is logged in BOTH
     # modes — in a jolt run it is the counterfactual "what the noise would have
-    # been". `dart_noise_steps` is how many expert steps were actually perturbed.
+    # been". `dart_noise_steps` is how many expert steps were actually perturbed,
+    # free phase and reach tail together.
     "dart_sigma_trace", "dart_noise_steps", "dart_alpha",
     "mean_min_pos", "mean_min_rot", "mean_policy_close_step",
     "c_close_label", "c_policy_close", "c_max_steps", "c_env_done", "c_no_labels",
