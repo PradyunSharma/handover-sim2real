@@ -1,0 +1,300 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRASP RUN 14 — RUN 13 WITH A WARM-STARTED CHAIN INSTEAD OF REFITTING.
+#
+# Run 13 with three keys changed, all in TRAIN. Everything else is run 13's,
+# byte for byte: `approach_axis`, run 9's tables and shards, the corrected DART
+# block (`dart_noise` at ratio 0.3, alpha 0.35 -> 0.18), `reach_filter: false`,
+# `episodes_per_iter: 400`, 25 iterations, beta 0.9 -> 0.75, `bin_centroid`.
+#
+#   TRAIN.train_from_scratch  true -> FALSE   each iteration starts from the last
+#   TRAIN.init_ckpt           best -> last    ...specifically from its last.pt
+#   TRAIN.iter_epochs         15   -> 20
+#
+# ── WHAT THE CHAIN ACTUALLY DOES ─────────────────────────────────────────────
+#
+# Iteration 0 fits the base demonstrations for `base_epochs` from a random init,
+# as before. From iteration 1 on, `train_on_aggregate` is handed the previous
+# iteration's run dir and loads `checkpoints/last.pt` out of it. So:
+#
+#   iter 0 (base fit, random init) -> iter 1 -> iter 2 -> ... -> iter 25
+#
+# Each link still trains on the FULL aggregate D = base u D_1 u ... u D_i for
+# `iter_epochs`. Warm start does not shrink the training set; it only changes
+# where the optimiser starts.
+#
+# THE NORMALIZER IS CARRIED WITH THE WEIGHTS AND NEVER RECOMPUTED. On a warm
+# start `train_on_aggregate` loads `normalization.npz` from the run it is seeded
+# from rather than recomputing stats over the aggregate, because the network's
+# output scale is DEFINED by the normalizer — warm-starting under freshly
+# computed stats would silently reinterpret the head. The chain therefore pins
+# iteration 0's statistics, computed over the base demonstrations alone, for all
+# 25 iterations. Under FTL every iteration recomputes them over the growing D.
+# This is a real difference between the two runs and it is not in the three keys
+# above; it is worth remembering before attributing any gap to the warm start
+# itself.
+#
+# ── THE EVIDENCE SAYS THIS PROBABLY WILL NOT HELP, AND IT IS STILL WORTH RUNNING
+#
+# Regrasp already ran this ablation cleanly. Run 8 = run 7 + `train_from_scratch:
+# false`, one key, same tables and shards:
+#
+#   run 7 (scratch)      best 0.555 @it12    it17 0.496, dir_track 0.704
+#   run 8 (warm start)   best 0.487 @it14    it19 0.475, dir_track 0.704
+#
+# The warm start removed the FTL dip — no early trough, `train_loss` roughly half
+# run 7's (0.14 vs 0.235) — and bought nothing: success, `dir_track` and
+# `bin_diag` all sat at or below run 7's from iteration 7 on. The 0.068 gap is
+# INSIDE that setup's measured noise floor of 0.088, so run 8 is evidence of "no
+# effect", not of "worse".
+#
+# Two things make it worth asking again here rather than treating run 8 as
+# settled. Run 8 chained on `best.pt`; this chains on `last.pt`, which is the
+# more converged fit and the variant phase-4 run 20 used. And run 8 sat on the
+# jolt, whereas this sits on `dart_noise` at the corrected dose, where D grows
+# differently — the FTL dip that the warm start removes is a real cost when every
+# refit throws away a working policy, and it may matter more or less depending on
+# what the collection is actually contributing.
+#
+# ── REACH-TAIL DART IS ON, AND HERE IS HOW TO CONFIRM IT ────────────────────
+#
+# Under `dart_noise` the reach tail is perturbed by the SAME gate as the free
+# phase — `dart_noise_ratio` (0.3 here), not `dart_reach_ratio`, which is
+# jolt-only. Inside the committed reach the collector scales Sigma by
+# diag(0.3005, 0.3005, 0.3005, 1, 1, 1) and clearance-rejects every draw against
+# the observed cloud, up to `dart_reach_max_tries`; a step whose every draw is
+# refused falls back to the clean expert action. `expert_after_commit: true`
+# forces the expert through the reach, so the branch is always reachable, and
+# `not at_grasp` excludes the final step so noise can never fire the close.
+#
+# CHECK IT AT ITERATION 1 — `dart_reach` AND `dart_reject` MUST BOTH BE NONZERO:
+#
+#     dart_reach   perturbations applied INSIDE the committed reach
+#     dart_reject  reach draws the clearance check refused
+#     free-phase share = dart_noise_steps - dart_reach
+#
+# Runs before this config logged `dart_reach` = 0 under dart_noise even though
+# reach noise was firing every iteration — the counter was only incremented on
+# the jolt path (run 12: 0 for all 25 iterations, with dart_reject at 126/iter as
+# the only evidence the path ran at all). Fixed in regrasp/collector.py, so from
+# run 14 on the column named for the reach tail actually reports it.
+#
+# ── WHAT TO READ ─────────────────────────────────────────────────────────────
+#
+# Against run 13 iteration for iteration, on three things:
+#
+#   THE DIP. Run 13 should trough at iteration 1-2 and climb back above its base
+#   by iteration 5 (run 7 did: 0.370 -> 0.244 -> above base by 5). Run 14 should
+#   not dip at all. That is the warm start working as advertised and is NOT by
+#   itself a reason to prefer it.
+#
+#   THE CEILING. What matters is iterations 10-25. Run 8's warning is that the
+#   chain plateaus lower. If run 14 is below run 13 by more than ~0.09 there,
+#   that exceeds the noise floor and the warm start is actively costing.
+#
+#   `train_loss` AND `val_loss` TOGETHER. A warm-started chain that memorises
+#   drives train_loss down while val_loss flattens or rises. Under FTL that
+#   divergence cannot happen the same way, which is what makes the pair the
+#   diagnostic here rather than train_loss alone.
+#
+# COST. `iter_epochs` 15 -> 20 is +33% on the refit, which is ~85% of this run's
+# wall clock. Run 13 is estimated at ~13.8 h; budget run 14 at ~17-18 h and
+# request 22:00:00.
+#
+# THE DATA IS ALREADY BUILT — run 9's tables and shards, unchanged.
+# docs/runbook_run10_train.md applies with the config name and paths swapped.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SIM:
+  cfg_file: examples/pretrain_multicam_wr.yaml   # wrist + right
+  split: train
+  egl: false
+
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08
+  hand_points_radius: 0.35
+
+  use_standoff: true
+  standoff_dist: 0.08
+
+  # Run 9's tables. `approach_axis` — `_meta.d_rule` is absent, which resolves to
+  # the default, and `build_regrasp_context` checks that against SIM.
+  grasp_pin_table: output/regrasp_pins_train.json
+  grasp_pin_match_tol: 0.02
+
+  exclude_scenes: output/regrasp_pins_train_excluded.json
+  demo_ok_table: output/regrasp_demos_train_ok.json
+
+  command_deploy: bin_centroid
+
+  # OFF, and this is the only Regrasp config that should say so — see the header.
+  # Run 9 predates the filter; matching it is what makes this a one-change test.
+  reach_filter: false
+
+DAGGER:
+  num_iters: 25
+  episodes_per_iter: 400
+  max_steps: 50
+  scene_sampling: random
+  seed: 0
+
+  beta_schedule: linear
+  beta_start: 0.9
+  beta_end: 0.75
+  beta_mid: 0.5          # unused by `linear`; kept so a switch to `piecewise`
+  beta_knee: 0.66        # needs no other edit
+  beta_p: 0.7
+
+  close_pos_thresh: 0.02
+  close_rot_thresh: 0.34
+  stop_on_close_label: true
+  stop_on_policy_close: false
+
+  ee_step: 0.04
+  reach_tail: 5
+  min_free: 1
+  max_horizon: 40
+  first_horizon: null
+
+  reach_commit_dist: 0.05
+  reach_skip_eps: 0.01
+  expert_after_commit: true
+
+  # ── THE CHANGE: ADD NOISE, DO NOT REPLACE THE ACTION ──────────────────────
+  dart_mode: dart_noise
+  #
+  # ALPHA IS 1.0, NOT THE PAPER'S 3.0. The premise is that the perturbation is
+  # knocking the object out of the hand, so it must execute SMALLER than the jolt
+  # it replaces. At the paper's alpha it does the opposite: the trace anchor is
+  # the measured error and sd = sqrt(alpha) x measured, so the largest axis of an
+  # anisotropic covariance runs away first.
+  #
+  #                              free pos sd (cm)        free rot sd (rad)
+  #   jolt (uniform, replaces)   2.31 2.31 2.31          0.173 0.173 0.173
+  #   alpha 3.0  (the paper)     2.43 2.79 4.17          0.142 0.100 0.115
+  #   alpha 1.0  (HERE, iter 2)  1.41 1.61 2.41          0.082 0.058 0.067
+  #   alpha 0.25 (HERE, iter 25) 0.72 0.82 1.23          0.042 0.030 0.034
+  #
+  # At 3.0 the z axis executes 1.8x the jolt's sd. At 1.0 the noise sits in the
+  # 1-2 cm band with the same ~2.5x cut in rotation. Identical to run 12's
+  # setting, so the two runs test one intervention on two substrates.
+  # RECALIBRATED AGAINST THIS STACK'S OWN ANCHOR AFTER RUN 12 — see below.
+  # alpha multiplies tr(Sigma_hat_1), which run 9 measures at 0.0287, NOT the
+  # phase-4 0.0161 the table above was computed from. alpha 1.0 would therefore
+  # execute ~[2.3, 2.5, 3.0] cm, ABOVE the jolt it replaces. 0.35 -> 0.18 puts
+  # the applied trace where run 12's final iterations actually measured
+  # ([1.36, 1.48, 1.82] cm / [0.066, 0.054, 0.046] rad), i.e. in the 1-2 cm band.
+  dart_alpha_scale: 0.35   # alpha at iteration 1   (was 1.0; paper uses 3.0)
+  dart_alpha_end:   0.18   # alpha at iteration 25  (was 0.25)
+  #
+  # ── 0.3, NOT 1.0, AND THIS IS THE LESSON OF RUN 12 ────────────────────────
+  #
+  # Run 12 ran this at 1.0 and perturbed 90% of all steps against the jolt's
+  # 26%, because dart_noise fires only on EXPERT steps and beta starts at 0.9.
+  # It did not fail the way the header predicts: `c_env_done` went DOWN 52 -> 46
+  # (the object was knocked out LESS), but `c_max_steps` went 21 -> 92 and
+  # `reached_standoff` halved, 129 -> 59.
+  #
+  # THE REACH NEVER COMMITTED. `reach_commit_dist` is 5 cm, and converging into
+  # a 5 cm ball needs steps that are NOT perturbed. At ratio 1.0 there are none:
+  # every expert action carries an eps with E||eps_pos|| ~ 2.9 cm, so the arm
+  # hovers outside the radius and times out 13 cm from the grasp — 5 cm short of
+  # the standoff, exactly where `mean_min_pos` landed (0.131 vs run 11's 0.049).
+  # Close labels fell to 26% of episodes against run 11's 58%.
+  #
+  # 0.3 restores the jolt's duty cycle. dart_noise fires on ~90% of steps at
+  # beta 0.9, so 0.3 x 0.90 = 27% of all steps — the jolt's 26%, matched.
+  dart_noise_ratio: 0.3
+  # Sigma is pooled over the whole episode, but the reach cannot take the free
+  # phase's magnitude: 5 cm from the object a free-phase displacement knocks it
+  # out of the hand. These reproduce the ratio the jolt already encoded
+  # (0.01202/0.04 = 0.3005 for position; the reach jolt never scaled rotation
+  # down). Applied as D Sigma D, so it scales sd and preserves PSD and the
+  # correlation structure.
+  #
+  # THE REACH DRAWS ARE ALSO CLEARANCE-REJECTED, which is run 18's protected
+  # reach and is already wired for this mode (regrasp/collector.py): each
+  # candidate is swept from the perturbed pose to the next reach waypoint and
+  # refused if any of the six gripper control points comes within
+  # `dart_reach_clearance` of a hand- or object-flagged cloud point. A step whose
+  # every draw is refused falls back to the clean expert action.
+  dart_reach_pos_scale: 0.3005
+  dart_reach_rot_scale: 1.0
+
+  # Inert under dart_noise EXCEPT as the iteration-1 bootstrap: alpha is not
+  # applied to it (there is no measurement to anchor yet), so these two numbers
+  # alone set iteration 1's noise — and iteration 1 is where DART is most
+  # dangerous, with a barely-trained learner. Lowered from run 9's 0.04 / 0.3 so
+  # iteration 1 matches where alpha 1.0 puts iterations 2+: 0.026 -> sd 1.50 cm,
+  # 0.121 -> sd 0.070 rad.
+  dart_ratio: 0.3
+  dart_max_dist: 10.0
+  dart_pos_mag: 0.026      # run 9: 0.04  -> bootstrap sd 1.50 cm
+  dart_rot_mag: 0.121      # run 9: 0.3   -> bootstrap sd 0.070 rad
+  dart_reach_ratio: 0.3
+  dart_reach_pos_mag: 0.01202
+  dart_reach_rot_mag: 0.3
+  dart_reach_max_tries: 5
+  dart_reach_clearance: 0.01
+  dart_reach_path_steps: 4
+
+  outcome_check: true
+
+TRAIN:
+  train_cfg: examples/configs/bc_regrasp_run9.yaml
+  pc_pretrained:
+  base_train_h5: ${REGRASP_DATA}/bc_dataset/train_regrasp.h5
+  val_h5: ${REGRASP_DATA}/bc_dataset/val_regrasp.h5
+  base_run: null
+  base_epochs: 50
+  # 20, NOT run 13's 15, AND IT MEANS SOMETHING DIFFERENT HERE. Under
+  # `train_from_scratch: true` this is a COMPLETE fit on the aggregate; under
+  # warm start it is 20 MORE epochs on top of everything the chain already
+  # learned, so the model sees the early shards for 20 x 25 = 500 epochs by the
+  # end while the newest shard gets 20. That asymmetry is the reason to watch
+  # `train_loss` here: under FTL a rising train loss means D is becoming
+  # self-inconsistent, but under warm start a FALLING one can equally mean the
+  # chain is memorising the old shards.
+  iter_epochs: 20
+
+  # ── THE CHANGE ────────────────────────────────────────────────────────────
+  # false = each iteration initialises from the PREVIOUS iteration's weights
+  # instead of refitting the aggregate from a random init. The chain is
+  # iteration 0 -> 1 -> 2 -> ... -> 25, seeded at each step from the run dir the
+  # last iteration wrote.
+  train_from_scratch: false
+
+  # `last`, not run 8's `best`. This is the checkpoint at the end of the cosine
+  # schedule — the most converged fit on the aggregate — and it is what the user
+  # asked for and what phase-4 run 20 used.
+  #
+  # BE AWARE OF WHAT IT COSTS: `EVAL.ckpt` is `best`, so evaluation and the next
+  # collection both run on best.pt while the WEIGHTS CARRIED FORWARD are last.pt.
+  # The chain and the data therefore come from two slightly different policies.
+  # Run 8 chose `best` precisely to keep them the same; if that turns out to
+  # matter here, this is the key to flip, and it is a one-word change.
+  init_ckpt: last
+  num_workers: 8
+  device: cuda
+
+EVAL:
+  every: 1
+  num_scenes: 100
+  holdout: false
+  max_steps: 50
+  ckpt: best
+  success_mode: stable_grasp
+  hold_steps: 3
+  select_on: success_rate
+  verbose: false
+
+  box_check: true
+  box:
+    min_frac: 0.50
+    open_thresh: 0.8
+    half_x: 0.0088
+    z_lo: 0.0946
+    z_hi: 0.1122
+    inset: 0.002
+    grid_x: 7
+    grid_z: 7
