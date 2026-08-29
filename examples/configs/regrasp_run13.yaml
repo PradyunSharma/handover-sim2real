@@ -1,0 +1,248 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRASP RUN 13 — RUN 9 WITH DART ADDED RATHER THAN SUBSTITUTED.
+#
+# The same DART change run 12 makes to run 11, made instead to run 9. Everything
+# else is run 9's: `approach_axis`, the un-`_off` tables and shards,
+# `episodes_per_iter: 400`, `command_deploy: bin_centroid`, `d_source:
+# d_grasp_world`, 25 iterations, beta 0.9 -> 0.75, `train_from_scratch: true`.
+#
+#   DAGGER.dart_mode        (new key)  jolt -> dart_noise
+#   DAGGER.dart_alpha_*     (new)      1.0 -> 0.25
+#   DAGGER.dart_noise_ratio (new)      1.0
+#   DAGGER.dart_reach_*_scale (new)    0.3005 / 1.0
+#   DAGGER.dart_pos_mag     0.04 -> 0.026    (iteration-1 bootstrap only)
+#   DAGGER.dart_rot_mag     0.3  -> 0.121    (iteration-1 bootstrap only)
+#   SIM.reach_filter        (new key)  EXPLICITLY FALSE — see below
+#
+# ── WHY THIS RUN AND NOT JUST RUN 12 ─────────────────────────────────────────
+#
+# Run 12 tests the same intervention, but its baseline — run 11 — HAS NOT BEEN
+# RUN. Run 9 has: 25 iterations, complete, on disk. So run 13 is the only version
+# of this experiment that can be read the day it finishes, against a curve that
+# already exists.
+#
+# The two together are also a replication rather than a duplication: run 12 puts
+# `dart_noise` on the `grasp_offset` / reach-filtered stack, run 13 on the
+# `approach_axis` / unfiltered one. An effect that shows up in both is a property
+# of the perturbation; one that shows up in neither kills the hypothesis; one
+# that shows up in only one says the perturbation interacts with the substrate,
+# which is itself worth knowing.
+#
+# ── THE HYPOTHESIS, AND IT WAS MEASURED ON THIS RUN'S OWN BASELINE ───────────
+#
+# `eval_min_pos` flattens after 5-8 iterations in run 9 and never improves again,
+# in every bin. Run 9's collection columns say why:
+#
+#     iter   episodes   c_env_done   c_close_label   eval_min_pos
+#        1        261           96             143         0.0982
+#        5        254           91             137         0.0719
+#       11        253          107             114         0.0695
+#       18        247           75             133         0.0689
+#       25        256           99             114         0.0712
+#
+# `c_env_done` — the benchmark terminating the episode on human contact, a
+# dropped object, or timeout — is ~34% of collection episodes at EVERY one of 25
+# iterations, with no downward trend. `c_close_label` does not rise either; it
+# drifts DOWN, 143 -> 114. So D stops gaining states near the grasp around
+# iteration 5, and `eval_min_pos` flattens there because there is nothing closer
+# in the aggregate to learn from.
+#
+# THE JOLT IS THE SUSPECT: it REPLACES the expert action with a uniform box draw
+# on 30% of steps, so the arm stops tracking the plan entirely for that step, and
+# its rotation magnitude is ~2.5x the error it is meant to rehearse (measured
+# learner discrepancy sd rot [0.0836, 0.0590, 0.0676] rad against the jolt's
+# uniform sd 0.1732). Position is about right in magnitude (0.0143/0.0164/0.0245
+# vs 0.0231) but ISOTROPIC where the truth is not — pos z carries 1.7x the spread
+# of pos x, so a box draw spends most of its noise in directions the learner is
+# not wrong in.
+#
+# `dart_noise` ADDS `eps ~ N(0, Sigma)` to `pi*(s)` instead, with Sigma estimated
+# each iteration from `(pi_theta - pi*)` outer products and trace-rescaled. The
+# LABEL is the clean `pi*(s)` in both modes — that asymmetry is the mechanism.
+#
+# ── `reach_filter: false` IS DELIBERATE AND IS THE POINT OF THE RUN ──────────
+#
+# `SIM.reach_filter` defaults to TRUE and did not exist when run 9 ran. A copy of
+# run 9's config would therefore silently pick it up, and run 13 would differ
+# from run 9 in TWO ways — the perturbation AND a 31% smaller D. That destroys
+# the one thing this run is for: a single-variable comparison against a completed
+# baseline. So it is turned off explicitly.
+#
+# THIS IS THE ONLY REGRASP RUN THAT SHOULD SET IT FALSE. Every future run wants
+# the filter; this one wants comparability with a run that predates it. If you
+# find yourself copying this line into another config, you almost certainly want
+# to delete it instead.
+#
+# ── WHAT WOULD FALSIFY IT ────────────────────────────────────────────────────
+#
+# Checkable from iteration 3, in the COLLECTION columns rather than the eval
+# ones, and directly against run 9's numbers above:
+#
+#   `c_env_done` should fall below ~34% (run 9: 75-107 of ~250 every iteration)
+#   `c_close_label` should rise above ~135 (run 9: drifting down, 143 -> 114)
+#
+# If neither moves, the perturbation was not what was killing the episodes. The
+# next suspect is the OMG dive — 20% of base episodes drop the wrist more than
+# 5 cm below both endpoints mid-trajectory, clipping the object on the way in —
+# and that is a planner problem no noise model reaches.
+#
+# `eval_min_pos` continuing past iteration 8 is the payoff, but it is downstream
+# of those two columns and moves an iteration later.
+#
+# The opposite failure is live: `dart_noise_ratio: 1.0` perturbs EVERY supervisor
+# step against the jolt's 30%. If `c_env_done` RISES, lower the ratio to 0.3
+# before touching alpha — that keeps the measured shape and magnitude while
+# restoring the jolt's firing rate.
+#
+# THE DATA IS ALREADY BUILT — run 9's tables and shards, unchanged.
+# docs/runbook_run10_train.md applies with the config name and paths swapped.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SIM:
+  cfg_file: examples/pretrain_multicam_wr.yaml   # wrist + right
+  split: train
+  egl: false
+
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08
+  hand_points_radius: 0.35
+
+  use_standoff: true
+  standoff_dist: 0.08
+
+  # Run 9's tables. `approach_axis` — `_meta.d_rule` is absent, which resolves to
+  # the default, and `build_regrasp_context` checks that against SIM.
+  grasp_pin_table: output/regrasp_pins_train.json
+  grasp_pin_match_tol: 0.02
+
+  exclude_scenes: output/regrasp_pins_train_excluded.json
+  demo_ok_table: output/regrasp_demos_train_ok.json
+
+  command_deploy: bin_centroid
+
+  # OFF, and this is the only Regrasp config that should say so — see the header.
+  # Run 9 predates the filter; matching it is what makes this a one-change test.
+  reach_filter: false
+
+DAGGER:
+  num_iters: 25
+  episodes_per_iter: 400
+  max_steps: 50
+  scene_sampling: random
+  seed: 0
+
+  beta_schedule: linear
+  beta_start: 0.9
+  beta_end: 0.75
+  beta_mid: 0.5          # unused by `linear`; kept so a switch to `piecewise`
+  beta_knee: 0.66        # needs no other edit
+  beta_p: 0.7
+
+  close_pos_thresh: 0.02
+  close_rot_thresh: 0.34
+  stop_on_close_label: true
+  stop_on_policy_close: false
+
+  ee_step: 0.04
+  reach_tail: 5
+  min_free: 1
+  max_horizon: 40
+  first_horizon: null
+
+  reach_commit_dist: 0.05
+  reach_skip_eps: 0.01
+  expert_after_commit: true
+
+  # ── THE CHANGE: ADD NOISE, DO NOT REPLACE THE ACTION ──────────────────────
+  dart_mode: dart_noise
+  #
+  # ALPHA IS 1.0, NOT THE PAPER'S 3.0. The premise is that the perturbation is
+  # knocking the object out of the hand, so it must execute SMALLER than the jolt
+  # it replaces. At the paper's alpha it does the opposite: the trace anchor is
+  # the measured error and sd = sqrt(alpha) x measured, so the largest axis of an
+  # anisotropic covariance runs away first.
+  #
+  #                              free pos sd (cm)        free rot sd (rad)
+  #   jolt (uniform, replaces)   2.31 2.31 2.31          0.173 0.173 0.173
+  #   alpha 3.0  (the paper)     2.43 2.79 4.17          0.142 0.100 0.115
+  #   alpha 1.0  (HERE, iter 2)  1.41 1.61 2.41          0.082 0.058 0.067
+  #   alpha 0.25 (HERE, iter 25) 0.72 0.82 1.23          0.042 0.030 0.034
+  #
+  # At 3.0 the z axis executes 1.8x the jolt's sd. At 1.0 the noise sits in the
+  # 1-2 cm band with the same ~2.5x cut in rotation. Identical to run 12's
+  # setting, so the two runs test one intervention on two substrates.
+  dart_alpha_scale: 1.0    # alpha at iteration 1  (the paper uses 3.0)
+  dart_alpha_end:   0.25   # alpha at iteration 25
+  # 1.0 = the paper: noise on EVERY supervisor step, against the jolt's 30%.
+  # The SECOND parameter to move if `c_env_done` rises rather than falls.
+  dart_noise_ratio: 1.0
+  # Sigma is pooled over the whole episode, but the reach cannot take the free
+  # phase's magnitude: 5 cm from the object a free-phase displacement knocks it
+  # out of the hand. These reproduce the ratio the jolt already encoded
+  # (0.01202/0.04 = 0.3005 for position; the reach jolt never scaled rotation
+  # down). Applied as D Sigma D, so it scales sd and preserves PSD and the
+  # correlation structure.
+  #
+  # THE REACH DRAWS ARE ALSO CLEARANCE-REJECTED, which is run 18's protected
+  # reach and is already wired for this mode (regrasp/collector.py): each
+  # candidate is swept from the perturbed pose to the next reach waypoint and
+  # refused if any of the six gripper control points comes within
+  # `dart_reach_clearance` of a hand- or object-flagged cloud point. A step whose
+  # every draw is refused falls back to the clean expert action.
+  dart_reach_pos_scale: 0.3005
+  dart_reach_rot_scale: 1.0
+
+  # Inert under dart_noise EXCEPT as the iteration-1 bootstrap: alpha is not
+  # applied to it (there is no measurement to anchor yet), so these two numbers
+  # alone set iteration 1's noise — and iteration 1 is where DART is most
+  # dangerous, with a barely-trained learner. Lowered from run 9's 0.04 / 0.3 so
+  # iteration 1 matches where alpha 1.0 puts iterations 2+: 0.026 -> sd 1.50 cm,
+  # 0.121 -> sd 0.070 rad.
+  dart_ratio: 0.3
+  dart_max_dist: 10.0
+  dart_pos_mag: 0.026      # run 9: 0.04  -> bootstrap sd 1.50 cm
+  dart_rot_mag: 0.121      # run 9: 0.3   -> bootstrap sd 0.070 rad
+  dart_reach_ratio: 0.3
+  dart_reach_pos_mag: 0.01202
+  dart_reach_rot_mag: 0.3
+  dart_reach_max_tries: 5
+  dart_reach_clearance: 0.01
+  dart_reach_path_steps: 4
+
+  outcome_check: true
+
+TRAIN:
+  train_cfg: examples/configs/bc_regrasp_run9.yaml
+  pc_pretrained:
+  base_train_h5: ${REGRASP_DATA}/bc_dataset/train_regrasp.h5
+  val_h5: ${REGRASP_DATA}/bc_dataset/val_regrasp.h5
+  base_run: null
+  base_epochs: 50
+  iter_epochs: 15
+  train_from_scratch: true
+  init_ckpt: best
+  num_workers: 8
+  device: cuda
+
+EVAL:
+  every: 1
+  num_scenes: 100
+  holdout: false
+  max_steps: 50
+  ckpt: best
+  success_mode: stable_grasp
+  hold_steps: 3
+  select_on: success_rate
+  verbose: false
+
+  box_check: true
+  box:
+    min_frac: 0.50
+    open_thresh: 0.8
+    half_x: 0.0088
+    z_lo: 0.0946
+    z_hi: 0.1122
+    inset: 0.002
+    grid_x: 7
+    grid_z: 7
