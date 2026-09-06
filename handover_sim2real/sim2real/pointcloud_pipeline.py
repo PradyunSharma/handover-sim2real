@@ -115,6 +115,8 @@ def reject_arm_clusters(
     voxel_m: float,
     min_offset_m: float = 0.07,
     max_lateral_m: float = 0.12,
+    max_below_m: float = 0.10,
+    up_axis: Optional[np.ndarray] = None,
     grasp_mask: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Drop the object-class blobs that are arm rather than held object.
@@ -227,6 +229,32 @@ def reject_arm_clusters(
     point_offsets = rel @ axis
     lateral = np.linalg.norm(rel - point_offsets[:, None] * axis, axis=1)
     arm_like = (point_offsets < -min_offset_m) | (lateral > max_lateral_m)
+
+    # Points hanging well BELOW the hand are forearm, whatever else they score.
+    #
+    # This exists because position relative to the robot axis cannot settle the
+    # case on its own, and it took hardware to show it. The kept region without
+    # this term is a CYLINDER about the hand-to-robot axis: long along it, thin
+    # across it. So the same object gets 0.26 m of room when held along that axis
+    # and is cut at `max_lateral_m` when held across it, and which case you are
+    # in is decided by how the person happens to be holding their forearm.
+    # Reported exactly so — fine with the forearm parallel to the ground, object
+    # gone once it tilted toward vertical — and reproduced in the sweep below at
+    # 100% kept along the axis falling to 68% across it, before the whole-blob
+    # rule takes the remainder.
+    #
+    # Widening the cylinder alone cannot fix it: near the hand, a vertical
+    # forearm and an object held across the axis occupy the SAME REGION, so no
+    # threshold on position relative to the robot separates them. Gravity does. A
+    # forearm leaves the hand and descends toward the elbow; an object being
+    # offered does not hang below the hand holding it. That is a real assumption
+    # and worth stating plainly: it holds for a standing person offering an
+    # object to a table-mounted robot, and would fail for one reaching up from
+    # below. It is what lets `max_lateral_m` be widened enough to keep an object
+    # held across the axis.
+    if up_axis is not None:
+        below = -(rel @ np.asarray(up_axis, dtype=np.float64))
+        arm_like |= below > max_below_m
 
     # THE GRASP REGION OVERRIDES EVERYTHING. A point between the fingers is the
     # object by definition, so it is never arm however it scores, and a blob
@@ -445,6 +473,7 @@ def extract_hand_object_clouds(
     depth_m: np.ndarray,
     hand_mask: np.ndarray,
     cam,
+    object_mask: Optional[np.ndarray] = None,
     last_hand_xyz: Optional[np.ndarray] = None,
     last_object_xyz: Optional[np.ndarray] = None,
     crop_radius_m: float = 0.12,
@@ -469,6 +498,15 @@ def extract_hand_object_clouds(
         colors_rgb: optional Nx3
         pixel_indices: Nx2 as (v, u)
 
+    `object_mask`, when given, is a POSITIVE claim about which pixels are the
+    object, and it short-circuits steps 2-5 below. Those steps are the negative
+    derivation — crop a sphere around the hand, subtract the dilated hand mask,
+    keep what is 3D-connected to the hand — and every one of them exists solely
+    because "object" had to mean "not hand, near the hand". Run against a real
+    object mask they cannot add information; they can only remove correct
+    points, and the connectivity test in particular would delete an object the
+    moment depth noise opened a 1 cm gap between it and the fingers holding it.
+
     Returns:
     - hand_xyz: hand points in camera frame
     - object_xyz: object points in camera frame
@@ -476,6 +514,8 @@ def extract_hand_object_clouds(
     - debug: counts and fallback info
     """
     hand_mask = _ensure_uint8_mask(hand_mask)
+    if object_mask is not None:
+        object_mask = _ensure_uint8_mask(object_mask)
 
     debug: dict[str, Any] = {
         "used_last_hand": False,
@@ -488,6 +528,12 @@ def extract_hand_object_clouds(
         "cluster_dropped": 0,
         "cluster_fallback": None,
         "margin_band_points": 0,
+        # Which definition of "object" produced this result. Recorded rather
+        # than inferred from the flags, because the two paths keep different
+        # subsets of the counters above and reading "cluster_dropped: 0" as
+        # "connectivity kept everything" when connectivity never ran is exactly
+        # the kind of quiet misreading that costs an afternoon.
+        "object_from_mask": object_mask is not None,
     }
 
     # 1) Hand cloud directly from the 2D hand mask.
@@ -518,6 +564,53 @@ def extract_hand_object_clouds(
 
     if hand_center is not None:
         debug["hand_center"] = hand_center.copy()
+
+    # 1b) THE POSITIVE PATH. Everything below this block is the negative
+    #     derivation and is skipped: the object was measured, not inferred.
+    if object_mask is not None:
+        object_xyz, _, _ = cam.depth_to_pointcloud(
+            depth_m=depth_m,
+            color_bgr=color_bgr,
+            mask=object_mask,
+            stride=full_cloud_stride,
+            min_depth=min_depth_m,
+            max_depth=max_depth_m,
+        )
+        object_xyz = object_xyz.astype(np.float32, copy=False)
+        debug["crop_object_points"] = int(len(object_xyz))
+
+        # The radius survives, as a workspace bound and nothing else. It is not
+        # segmenting here — it is the one cheap guard against a tracker that has
+        # latched onto something across the room, which is the failure mode a
+        # promptable segmenter has and a per-frame one does not. Skipped when the
+        # hand is unknown: a bound measured from a guessed centre is worse than
+        # no bound.
+        if len(object_xyz) > 0 and hand_center is not None:
+            obj_dist = np.linalg.norm(object_xyz - hand_center[None, :], axis=1)
+            object_xyz = object_xyz[obj_dist < object_max_radius_m]
+
+        # THE TWO CLASSES ARE NOW INDEPENDENT, which is new. Under the negative
+        # derivation the object was defined relative to `hand_center`, so losing
+        # the hand lost the object as well — the stale-object fallback existed
+        # largely to paper over that coupling. Here a hand dropout costs only the
+        # hand class. Both fallbacks are kept anyway: they are about momentary
+        # dropouts, and a tracker drops frames too.
+        hand_xyz = hand_points_xyz
+        if (len(hand_xyz) < min_hand_points
+                and last_hand_xyz is not None and len(last_hand_xyz) > 0):
+            hand_xyz = last_hand_xyz.astype(np.float32, copy=False)
+            debug["used_last_hand"] = True
+        if (len(object_xyz) < min_object_points
+                and last_object_xyz is not None and len(last_object_xyz) > 0):
+            object_xyz = last_object_xyz.astype(np.float32, copy=False)
+            debug["used_last_object"] = True
+
+        return CloudExtractionResult(
+            hand_xyz=hand_xyz.astype(np.float32, copy=False),
+            object_xyz=object_xyz.astype(np.float32, copy=False),
+            hand_center=hand_center,
+            debug=debug,
+        )
 
     # 2) Full cloud for local crop around the hand.
     full_points_xyz, _, pixel_indices = cam.depth_to_pointcloud(

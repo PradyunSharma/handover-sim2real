@@ -82,6 +82,54 @@ rl_runs/*/checkpoints/
 # stay ignored (one level deeper, not re-included).
 !dagger_runs/*/iters/
 !dagger_runs/*/iters/*/
-!dagger_runs/*/iters/*/*.csv
-!dagger_runs/*/iters/*/*.yaml
-!dagger_runs/*/iters/*/*.npz
+#
+# NOTHING INSIDE iters/ IS TRACKED ANY MORE — the directories stay re-included
+# only so a future rule can reach into them without re-deriving the chain.
+#
+# THE normalization.npz ARGUMENT WAS INVERTED, AND MEASURING IT SETTLED IT. The
+# case for keeping them was "the checkpoint payload does not carry the Normalizer
+# and the .h5 lives on /scratch, so this is the only record of how to denormalize
+# a policy's output". True in general — but `iters/*/checkpoints/*.pt` is NOT
+# tracked and never has been (21 MB each), so these 389 files are normalizers for
+# checkpoints that do not exist in the repo. They cannot denormalize anything.
+#
+# Worse, the one that CAN was never tracked: `best/normalization.npz` and
+# `last/normalization.npz` sit one level down from the `!dagger_runs/*/` rule,
+# which only re-includes files directly in the run dir, so the normalizer for the
+# checkpoint a run actually publishes was excluded while 389 useless ones were
+# kept.
+#
+# THE PATTERN THAT ALREADY WORKS is the one to rely on: when a run is deployed,
+# its normalizer is copied to `handover_sim2real/sim2real/checkpoint/<run>/` and
+# tracked THERE, next to the config and source.txt that say which run it came
+# from (run12, run16, run19, cp2, cp3 today). That is a deliberate, curated
+# handful rather than one per iteration of every run, and it is the copy the
+# robot loads. `best/` is deliberately NOT re-included here: doing so would add
+# ~30 runs x 2 dirs of files to `git status` to preserve a capability
+# sim2real/checkpoint/ already covers.
+#
+# PER-ITER log.csv AND config.yaml ARE NO LONGER TRACKED. They were, and at 658
+# files each they are most of what a `git add output/` stages — 164 yaml and 170
+# csv in one recent staging, which buries the handful of files a commit is
+# actually about.
+#
+# What each one cost, and what replaces it:
+#
+#   iters/*/config.yaml  2.6 MB / 658 files. The learner config for that
+#                        iteration's fit. NOT a copy of the run config (129-150
+#                        lines differ) but it is `TRAIN.train_cfg` resolved, and
+#                        that file IS tracked under examples/configs/ alongside
+#                        the run config naming it. Reconstructible.
+#   iters/*/log.csv      9.3 MB / 658 files. The PER-EPOCH curve of one
+#                        iteration's fit. `dagger_log.csv` (tracked) carries one
+#                        row per iteration, so what is lost is epoch-level
+#                        resolution WITHIN an iteration — enough to see that a
+#                        fit converged, not enough to see how.
+#
+# normalization.npz STAYS. It is ~1.3 KB, the checkpoint payload does not carry
+# the Normalizer, and the .h5 it was fitted on lives on /scratch and is never
+# committed — so it is the only surviving record of how to denormalize a
+# policy's output. Primary, not derived; the same argument that keeps it at the
+# run level keeps it here.
+#
+# Re-include either line if epoch-level history turns out to matter.

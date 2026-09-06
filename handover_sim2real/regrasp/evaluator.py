@@ -76,6 +76,7 @@ from handover_sim2real.rl.rollout_worker import (  # noqa: E402
     _status_name, grasp_held_after_hold,
 )
 from handover_sim2real.regrasp import directions as _rg_dirs  # noqa: E402
+from handover_sim2real.regrasp import anchor as _rg_anchor  # noqa: E402
 from handover_sim2real.regrasp.grasp_box import (  # noqa: E402
     BoxParams, grasp_opportunity,
 )
@@ -136,6 +137,25 @@ class EvalParams:
     # `grasp_offset` command against an `approach_axis` achievement compares two
     # different questions and reports the difference as policy error.
     d_rule: object = None
+    # ---- when the anchor frame is built (`SIM.anchor_update`) ---------------
+    # `latched` = once at step 0 and held, which is what every run through 15
+    # did. `live` = rebuilt from the observed cloud every step, and the command
+    # re-issued with it. The camera is eye-in-hand, so the object's OBSERVED
+    # centroid moves as the gripper approaches even though the object does not;
+    # `latched` conditions on a frame derived from the worst view of the episode
+    # and a real rig has no way to reproduce it.
+    anchor_update: str = "latched"
+    # `SIM.anchor_hand_ref`: the MANO wrist JOINT, or the segmented hand CLOUD's
+    # centroid, which is what the real rig measures from.
+    anchor_hand_ref: str = "wrist"
+    # ---- whether a short `grasp_offset` chord is DROPPED from the metrics ----
+    # `d_min_offset` exists to stop a near-centroid fingertip from turning
+    # centroid noise into a confident direction. Applying it to the MEASUREMENT
+    # as well silently removes those episodes from `dir_err` and the confusion
+    # matrix, so a policy that consistently stops on top of the centroid is
+    # scored on the subset where it did not. False measures every episode that
+    # arrived at all, at `min_offset` 0.
+    dir_drop_short: bool = True
     verbose: bool = False
 
     def __post_init__(self):
@@ -143,6 +163,14 @@ class EvalParams:
             self.command_axes = _rg_dirs.BINS.copy()
         if self.d_rule is None:
             self.d_rule = _rg_dirs.DirectionRule()
+        if str(self.anchor_update) not in _rg_anchor.ANCHOR_UPDATES:
+            raise ValueError(
+                f"anchor_update must be one of {_rg_anchor.ANCHOR_UPDATES}, "
+                f"got {self.anchor_update!r}")
+        if str(self.anchor_hand_ref) not in _rg_anchor.ANCHOR_HAND_REFS:
+            raise ValueError(
+                f"anchor_hand_ref must be one of "
+                f"{_rg_anchor.ANCHOR_HAND_REFS}, got {self.anchor_hand_ref!r}")
         if self.success_mode not in SUCCESS_MODES:
             raise ValueError(f"success_mode must be one of {SUCCESS_MODES}, "
                              f"got {self.success_mode!r}")
@@ -192,7 +220,8 @@ def _resolve_grasp_pose(sim, scene_idx: int, pin_table, grasp_idx: int = 0):
 
 
 def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
-                  grasp_pose=None, target_pose=None, d_world=None) -> dict:
+                  grasp_pose=None, target_pose=None, d_world=None,
+                  bin_idx=None, anchor_R=None) -> dict:
     """`grasp_pose` is what the gripper must end up on; `target_pose` is what the
     POLICY is steering to. They are the same pose in grasp mode and 6.4 cm apart
     in pre-grasp mode, where the difference is covered by the blind push."""
@@ -257,10 +286,38 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
     # mean of four demonstrations" — and the second is the failure mode that
     # makes the whole regrasping premise inert.
     ee_final = None
+    # THE FRAME THE EPISODE ENDED IN, which under `live` is not the one it
+    # started in. `_dir_block` scores `bin_realized` against these, so a live run
+    # is measured in the frame a deployment would have had at the close rather
+    # than in the step-0 frame it has already left.
+    live = str(params.anchor_update) == "live"
+    anchor_state = _rg_anchor.AnchorState() if live else None
+    anchor_final = None if anchor_R is None else np.asarray(anchor_R)
+    centroid_final = None
+    n_anchor_blind = 0
 
     for step in range(params.max_steps):
         pc = _point_cloud(obs, sim.point_listener, sim.panda_base_inv_tf)
         rs = _robot_state(obs, prev_act6d)
+        # REBUILD THE FRAME AND RE-ISSUE THE COMMAND, before the policy acts on
+        # this cloud, so the direction it is told matches the observation it is
+        # told it about. On a step whose cloud has no object points the previous
+        # frame is kept: conditioning on nothing would zero both channels, which
+        # reads to the network as a valid command rather than a missing one.
+        if live:
+            aR, cw, ameta = _rg_anchor.anchor_from_cloud(
+                pc, obs, env, sim.panda_base_inv_tf, sim.cfg, anchor_state,
+                hand_ref=params.anchor_hand_ref)
+            if aR is None:
+                n_anchor_blind += 1
+            else:
+                anchor_final, centroid_final = aR, cw
+                d_live = _rg_dirs.command_direction(
+                    bin_idx, aR, grasp_pose=grasp_pose,
+                    axes=params.command_axes)
+                if d_live is not None:
+                    d_world = d_live
+                    runner.set_direction(d_world)
         # World-frame EE pose, straight out of the state the policy just saw
         # (rs[18:21] xyz, rs[21:25] wxyz). Overwritten every step, so whatever
         # the episode ends on is what cond_track measures.
@@ -354,6 +411,15 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
     return {
         "scene_idx": int(scene_idx),
         "ee_final": ee_final,
+        # The frame and origin the episode ENDED in, and the command that was
+        # standing at that moment. Under `latched` these are the step-0 values
+        # handed in; under `live` they are what the last cloud with object points
+        # produced. `eval_one` writes them onto the row so `_dir_block` scores in
+        # the frame the policy was actually being commanded in.
+        "anchor_R_final": anchor_final,
+        "centroid_world_final": centroid_final,
+        "d_world_final": d_world,
+        "n_anchor_blind": int(n_anchor_blind),
         "success": int(success),
         "grasped": int(grasped),
         "closed": int(close_step >= 0),
@@ -388,7 +454,7 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
 
 
 def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
-                    pin_table=None) -> dict:
+                    pin_table=None, pairs=None) -> dict:
     """Roll the policy over `scenes` and aggregate. Returns rates in [0, 1].
 
     `success_rate` is the Phase-3 criterion selected by `params.success_mode`.
@@ -409,7 +475,7 @@ def evaluate_policy(sim, runner, scenes, *, params: EvalParams,
     opportunities they are. `box_taken_rate` is the conversion of the latter.
     """
     num_grasps = eval_num_grasps(pin_table)
-    jobs = eval_jobs(scenes, pin_table, num_grasps)
+    jobs = eval_jobs(scenes, pin_table, num_grasps, pairs=pairs)
     rows = []
     for n, (scene, gi) in enumerate(jobs):
         row = eval_one(sim, runner, scene, gi, params=params, pin_table=pin_table)
@@ -430,14 +496,131 @@ def eval_num_grasps(pin_table) -> int:
                getattr(pin_table, "num_grasps", 1) or 1)
 
 
-def eval_jobs(scenes, pin_table, num_grasps=None):
+def off_table_slot(bin_idx: int) -> int:
+    """A slot index meaning "command this BIN on a scene that has no demo for it".
+
+    NEGATIVE, AND THAT IS DELIBERATE. The job protocol between the manager and
+    the worker pool is a flat `(scene, slot)` pair — `parallel._fan_out` packs
+    exactly two fields — so carrying a third would change the wire format of
+    every job for a case that only needs one extra integer. Slots are
+    non-negative by construction, so `-(bin + 1)` is unambiguous, survives the
+    existing protocol untouched, and decodes in one place (`eval_one`).
+
+    An off-table episode has NO pinned grasp: the scene demonstrates no grasp in
+    that direction, which is the entire point of scoring it. `stable_grasp` does
+    not need one — it scores release-and-hold — so these rows carry real success,
+    grasp and direction numbers, with the pose diagnostics NaN.
+    """
+    return -(int(bin_idx) + 1)
+
+
+def slot_bin(gi: int):
+    """`(slot, bin)` for a job index: `(gi, None)` on-table, `(None, b)` off."""
+    gi = int(gi)
+    return (None, -gi - 1) if gi < 0 else (gi, None)
+
+
+def stratified_pairs(pin_table, scenes, frac: float, *, verbose: bool = True,
+                     full_bins: bool = False):
+    """`[(scene, gi)]` — `frac` of EACH BIN's pairs, spread evenly, deterministic.
+
+    THE DEFAULT EVAL IS A SCENE SAMPLE, AND THAT MAKES THE BINS WHATEVER THEY
+    FALL OUT AS. `scene_pools` takes an np.linspace over usable scene ids and
+    `eval_jobs` then expands each into ALL of its slots, so the per-bin counts
+    are a by-product of which scenes were drawn. On run 11 that gives
+    `+x 54, -x 33, +y 37, -y 25, +z 19, -z 26` — a 2.8x spread, with `+z` on 19
+    episodes where one episode is 5.3 percentage points and the binomial standard
+    error is +-11. Half the visible movement in the per-bin curves is that.
+
+    This selects at the PAIR level instead: group every (scene, slot) pair by its
+    bin, then take `ceil(frac * n_b)` from each. The per-bin proportions then
+    match the population's by construction, the small bins are no longer starved
+    relative to their own size, and `n_bin_*` becomes a stated fraction of a
+    known denominator rather than an accident.
+
+    EVENLY SPREAD, NOT RANDOMLY DRAWN — an np.linspace over each bin's sorted
+    pair list, the same device `scene_pools` uses on scenes. No seed is consumed,
+    so the same config always scores the same pairs and two runs are comparable
+    episode by episode; a seeded draw would be reproducible only as long as
+    nothing upstream of it changed its RNG consumption.
+
+    NOTE THIS DOES NOT EQUALISE THE BINS. 20% of 19 is still 4. It makes the
+    sample proportional and stable, which is a different (and honest) thing:
+    equalising would require oversampling `+z` scenes that do not exist.
+    """
+    if pin_table is None:
+        raise SystemExit(
+            "EVAL.scene_select: per_bin_frac needs SIM.grasp_pin_table — the "
+            "bin of every slot lives in the table, so without it there is "
+            "nothing to stratify on.")
+    frac = float(frac)
+    if not 0.0 < frac <= 1.0:
+        raise SystemExit(f"EVAL.bin_frac must be in (0, 1], got {frac}")
+
+    by_bin: dict[int, list] = {}
+    for scene in sorted(int(s) for s in scenes):
+        for gi in range(pin_table.num_grasps_for(scene)):
+            b = pin_table.bin_of(scene, gi)
+            if b is None or int(b) < 0:
+                continue
+            by_bin.setdefault(int(b), []).append((scene, gi))
+
+    out = []
+    for b in sorted(by_bin):
+        pool = by_bin[b]
+        n = min(len(pool), max(1, int(np.ceil(frac * len(pool)))))
+        idx = (np.linspace(0, len(pool) - 1, n).astype(int).tolist()
+               if n > 1 else [len(pool) // 2])
+        take = [pool[i] for i in sorted(set(idx))]
+        out += take
+        if verbose:
+            print(f"[eval] bin {_rg_dirs.BIN_SHORT[b]}: {len(take)} of "
+                  f"{len(pool)} pairs ({100.0 * len(take) / len(pool):.0f}%)")
+    out.sort()
+    scenes_used = sorted({s for s, _ in out})
+    if verbose:
+        print(f"[eval] per-bin {frac:.0%} sample: {len(out)} episodes over "
+              f"{len(scenes_used)} scenes")
+
+    # ---- FULL BIN COVERAGE --------------------------------------------------
+    # `succ_bin_b` answers "when the policy is told `+z` ON A SCENE THAT
+    # DEMONSTRATES `+z`, how often does it succeed". That is the right question
+    # for "did it learn the training distribution", and the wrong one for "can I
+    # deploy this" — at deployment the retry ladder commands a direction because
+    # the previous one failed, not because a demonstration exists. Nothing in the
+    # runs so far has ever measured a bin on a scene that did not demonstrate it.
+    #
+    # So every selected scene is additionally scored under EVERY bin it does not
+    # already carry. Those rows get `in_table = 0`; the metric block reports
+    # `succ_bin_b` over the in-table rows only (unchanged, comparable with runs
+    # 1-15) and `succ_bin_all_b` over both. ONE eval pass, two populations.
+    if full_bins:
+        have = {(s, pin_table.bin_of(s, g)) for s, g in out}
+        extra = [(s, off_table_slot(b))
+                 for s in scenes_used for b in range(len(_rg_dirs.BINS))
+                 if (s, b) not in have]
+        out = sorted(out + extra)
+        if verbose:
+            print(f"[eval] full bin coverage: +{len(extra)} off-table episodes "
+                  f"-> {len(out)} total ({len(scenes_used)} scenes x "
+                  f"{len(_rg_dirs.BINS)} bins)")
+    return out
+
+
+def eval_jobs(scenes, pin_table, num_grasps=None, pairs=None):
     """[(scene, gi)] — every (scene, direction) pair scored, in order.
+
+    `pairs`, when given, IS the job list: a pre-selected set of (scene, slot)
+    pairs from `stratified_pairs`, passed through unchanged so the serial loop,
+    the parallel pool and the resume path all enumerate the identical work.
 
     Split out so the serial loop and the parallel pool enumerate the SAME work
     in the SAME order. Results are reassembled by job index, which is what makes
     the parallel path bit-identical to the serial one rather than merely
     equivalent in distribution.
     """
+    if pairs is not None:
+        return [(int(s), int(g)) for s, g in pairs]
     num_grasps = eval_num_grasps(pin_table) if num_grasps is None else num_grasps
     out = []
     for scene in scenes:
@@ -456,11 +639,23 @@ def eval_one(sim, runner, scene, gi, *, params: EvalParams, pin_table=None) -> d
     """
     pregrasp = str(params.target) == "pregrasp"
     scene = int(scene)
+    # A NEGATIVE SLOT IS A BIN WITH NO DEMONSTRATION on this scene — see
+    # `off_table_slot`. There is no pinned grasp to resolve, and asking for one
+    # would fall through to OMG's free pick, which is a different grasp in a
+    # different direction and would silently caption the row wrong.
+    slot, off_bin = slot_bin(gi)
+    off_table = slot is None
+    if off_table and params.success_mode == "proximity":
+        raise SystemExit(
+            "EVAL.success_mode: proximity scores distance to a pinned grasp, and "
+            "an off-table bin has none. Use stable_grasp with full bin coverage, "
+            "or turn EVAL.full_bin_coverage off.")
     # proximity needs a grasp pose; stable_grasp only wants one if a pin table
     # makes it free (a diagnostic there, not the score).
     grasp_pose = None
-    if params.success_mode == "proximity" or pin_table is not None:
-        grasp_pose = _resolve_grasp_pose(sim, scene, pin_table, gi)
+    if not off_table and (params.success_mode == "proximity"
+                          or pin_table is not None):
+        grasp_pose = _resolve_grasp_pose(sim, scene, pin_table, slot)
         if grasp_pose is None and params.success_mode == "proximity":
             print(f"    [eval] scene {scene} g{gi}: no grasp pose (OMG failed "
                   f"and no pin entry) — proximity cannot score it; counted as "
@@ -484,20 +679,41 @@ def eval_one(sim, runner, scene, gi, *, params: EvalParams, pin_table=None) -> d
     # eval scored the policy on a command no deployment could give it.
     meta = (pin_table.scene_meta.get(scene, {}) if pin_table is not None else {})
     anchor_R = meta.get("anchor_R")
-    b = pin_table.bin_of(scene, gi) if pin_table is not None else None
+    b = (off_bin if off_table
+         else (pin_table.bin_of(scene, slot) if pin_table is not None else None))
     d_world = _rg_dirs.command_direction(
         b, None if anchor_R is None else np.asarray(anchor_R),
         grasp_pose=grasp_pose, axes=params.command_axes)
 
     row = _eval_episode(sim, runner, scene, params=params,
                         grasp_pose=grasp_pose, target_pose=target_pose,
-                        d_world=d_world)
-    row["grasp_idx"] = gi
+                        d_world=d_world, bin_idx=b,
+                        anchor_R=None if anchor_R is None else np.asarray(anchor_R))
+    row["grasp_idx"] = int(gi)
     row["grasp_pose"] = grasp_pose
-    row["d_world"] = d_world
-    row["anchor_R"] = np.asarray(anchor_R) if anchor_R is not None else None
-    row["centroid_world"] = meta.get("centroid_world")
     row["bin_idx"] = -1 if b is None else int(b)
+    # 1 = this (scene, bin) pair HAS a demonstration and is what runs 1-15
+    # scored; 0 = the bin was commanded on a scene that never demonstrates it.
+    # The metric block splits `succ_bin_*` on this.
+    row["in_table"] = int(not off_table)
+    # THE STEP-0 VALUES, kept under their historical names so a `latched` run's
+    # rows are byte-identical to what they always were.
+    row["d_world_0"] = d_world
+    row["anchor_R_0"] = np.asarray(anchor_R) if anchor_R is not None else None
+    row["centroid_world_0"] = meta.get("centroid_world")
+    # WHAT THE METRICS ARE MEASURED AGAINST. Under `latched` the episode hands
+    # back exactly what it was given, so these three collapse onto the step-0
+    # values; under `live` they are the frame and command standing at the close.
+    # EXPLICIT None CHECK, never `or`: these are ndarrays, and `arr or x`
+    # evaluates the array's truth value, which raises.
+    _dw = row.pop("d_world_final", None)
+    row["d_world"] = d_world if _dw is None else _dw
+    _aR = row.pop("anchor_R_final", None)
+    row["anchor_R"] = (np.asarray(_aR) if _aR is not None
+                       else (np.asarray(anchor_R) if anchor_R is not None else None))
+    _cw = row.pop("centroid_world_final", None)
+    row["centroid_world"] = (_cw if _cw is not None
+                             else meta.get("centroid_world"))
     return row
 
 
@@ -516,7 +732,9 @@ def aggregate_eval_rows(rows, params, num_grasps) -> dict:
     """rows -> the metric dict. Shared by the serial and parallel eval paths."""
     out = _rate_block(rows, params)
     out["rows"] = rows
-    out.update(_regrasp_metrics(rows, num_grasps, getattr(params, "d_rule", None)))
+    out.update(_regrasp_metrics(
+        rows, num_grasps, getattr(params, "d_rule", None),
+        drop_short=bool(getattr(params, "dir_drop_short", True))))
     # ---- THE SAME BLOCK AGAIN, ONE BIN AT A TIME ---------------------------
     # Pooled rates hide the thing the phase is about: `success_rate` averages
     # four physically different commands, and a policy that solves `+x` and
@@ -655,7 +873,8 @@ def _rate_block(rows, params) -> dict:
     }
 
 
-def _regrasp_metrics(rows, num_grasps: int, d_rule=None) -> dict:
+def _regrasp_metrics(rows, num_grasps: int, d_rule=None,
+                     drop_short: bool = True) -> dict:
     """The three things Phase 5 exists to measure, all from one eval pass.
 
     **Per-slot rates** (`succ_g0..`, `near_g0..`). Slot 0 is OMG's own pick, so
@@ -689,10 +908,30 @@ def _regrasp_metrics(rows, num_grasps: int, d_rule=None) -> dict:
     # therefore the column to read, and the one that shows whether -x and -z are
     # learnable at all (on this dataset they are not: 11 and 0 demonstrations).
     for b in range(len(_D.BINS)):
-        rs = [r for r in rows if int(r.get("bin_idx", -1)) == b]
+        allb = [r for r in rows if int(r.get("bin_idx", -1)) == b]
+        # TWO POPULATIONS, ONE EVAL PASS.
+        #
+        #   succ_bin_b      the scenes that DEMONSTRATE b. "Did it learn what it
+        #                   was taught" — and the column runs 1-15 reported, so
+        #                   this stays the comparable one.
+        #   succ_bin_all_b  EVERY evaluated scene, commanded b whether or not a
+        #                   demonstration for it exists. "What happens if I
+        #                   deploy and the ladder asks for b" — which is the
+        #                   situation the retry machine creates on purpose,
+        #                   since it commands a direction BECAUSE the previous
+        #                   one failed, not because a demo exists.
+        #
+        # Rows carry `in_table`, so both come out of the same rollouts and the
+        # gap between them is the generalisation-to-unseen-direction number this
+        # phase has never measured. Older rows have no `in_table`; they default
+        # to 1, so a re-scored run 1-15 log gives succ_bin_all == succ_bin.
+        rs = [r for r in allb if int(r.get("in_table", 1)) == 1]
         out[f"succ_bin_{b}"] = (sum(r["success"] for r in rs) / len(rs)
                                 if rs else float("nan"))
         out[f"n_bin_{b}"] = len(rs)
+        out[f"succ_bin_all_{b}"] = (sum(r["success"] for r in allb) / len(allb)
+                                    if allb else float("nan"))
+        out[f"n_bin_all_{b}"] = len(allb)
     # Kept for continuity with the Phase-5 column set, but slot-indexed and so
     # only meaningful within a scene.
     for g in range(num_grasps):
@@ -701,33 +940,63 @@ def _regrasp_metrics(rows, num_grasps: int, d_rule=None) -> dict:
         out[f"succ_g{g}"] = sum(r["success"] for r in rs) / m
 
     # ---- retry@k -----------------------------------------------------------
+    # KEYED BY BIN, WALKED IN LADDER ORDER (`directions.RETRY_LADDER`:
+    # +x, +z, +y, -y, -z, -x, ordered by measured per-bin success). Runs 1-15
+    # keyed by SLOT and walked ascending, which is ascending BIN INDEX and
+    # therefore arbitrary with respect to which direction is worth trying first:
+    # `-x`, the worst bin at 0.333, sat at index 1 and was tried second.
+    #
+    # IN-TABLE ROWS ONLY, so `retry_at_k` keeps the population it has always had
+    # and stays comparable with runs 1-15 despite the reordering. The off-table
+    # rows exist for `succ_bin_all_*`; folding them in here would change both the
+    # order and the population in one step.
     by_scene: dict[int, dict[int, dict]] = {}
     for r in rows:
-        by_scene.setdefault(int(r["scene_idx"]), {})[int(r.get("grasp_idx", 0))] = r
+        if int(r.get("in_table", 1)) != 1:
+            continue
+        b = int(r.get("bin_idx", -1))
+        if b >= 0:
+            by_scene.setdefault(int(r["scene_idx"]), {})[b] = r
     n_scenes = max(len(by_scene), 1)
-    for k in range(1, num_grasps + 1):
+    for k in range(1, len(_D.RETRY_LADDER) + 1):
+        rungs = _D.RETRY_LADDER[:k]
         hits = sum(1 for per in by_scene.values()
-                   if any(per[g]["success"] for g in range(k) if g in per))
+                   if any(per[b]["success"] for b in rungs if b in per))
         out[f"retry_at_{k}"] = hits / n_scenes
+        # ---- THE DENOMINATOR, AND WHY IT HAS TO BE REPORTED -----------------
+        # `retry_at_k` is over EVERY scene, including those with fewer than k
+        # slots — for them the k-th attempt does not exist and the rate is just
+        # their retry_at_(their slot count). `succ_bin_b`, by contrast, is over
+        # the scenes that HAVE bin b. Different populations, so the two are not
+        # comparable and `retry_at_4 >= max_b succ_bin_b` is NOT guaranteed:
+        # measured on run 11 it 22, retry_at_4 = 0.75 over 100 scenes while
+        # succ_bin_+x = 0.778 over the 54 scenes that have a `+x` demo, and the
+        # 46 scenes without one are in the first denominator but not the second.
+        #
+        # Restricted to scenes that actually offer k attempts, the ladder IS
+        # monotone and IS above any single bin measured on the same scenes,
+        # because adding an attempt can only add a success. That is the number
+        # to read as "what does retrying buy", and it is what these two columns
+        # make available.
+        deep = [per for per in by_scene.values()
+                if sum(1 for b in rungs if b in per) == k]
+        out[f"retry_n_{k}"] = len(deep)
+        out[f"retry_at_{k}_deep"] = (
+            sum(1 for per in deep
+                if any(per[b]["success"] for b in rungs if b in per))
+            / len(deep) if deep else float("nan"))
+        # The ladder is FIXED now, so rung k is a definite direction rather than
+        # a per-scene mixture. Kept as columns so the figures need no special
+        # case, but `retry_bin_frac_k` is 1.0 by construction from here on.
+        out[f"retry_bin_{k}"] = int(_D.RETRY_LADDER[k - 1])
+        out[f"retry_bin_frac_{k}"] = 1.0
 
-        # WHICH DIRECTION THE k-TH RUNG ACTUALLY WAS. The ladder walks a scene's
-        # pin slots in table order, and `assign_direction_demos --mode per-bin`
-        # emits them in ASCENDING BIN INDEX — so slot 0 is `+x` for a scene that
-        # can reach `+x` and `+y` for one that cannot. A rung is therefore a
-        # MIXTURE of directions across scenes, not one direction, and a legend
-        # naming a single bin would be wrong for every scene in the minority.
-        # Log the modal bin and its share so the figure can say "+x (79%)" and
-        # remain true. `retry_bin_frac` well below 1.0 is the signal that the
-        # ladder is not a fixed direction order and should not be read as one.
-        slot = [r for r in rows if int(r.get("grasp_idx", 0)) == k - 1]
-        if slot:
-            counts: dict[int, int] = {}
-            for r in slot:
-                b = int(r.get("bin_idx", -1))
-                counts[b] = counts.get(b, 0) + 1
-            top = max(counts.items(), key=lambda kv: (kv[1], -kv[0]))
-            out[f"retry_bin_{k}"] = top[0]
-            out[f"retry_bin_frac_{k}"] = top[1] / len(slot)
+        # (The modal-bin computation that stood here is gone: it existed because
+        # the ladder walked pin SLOTS, so rung k was a mixture of directions
+        # across scenes and a legend naming one bin would have been wrong for the
+        # minority. `RETRY_LADDER` fixes the order, so rung k is now one definite
+        # direction and it is set above. It also ran AFTER the new assignment and
+        # would have overwritten it.)
 
     # ---- DID IT GO WHERE IT WAS TOLD ---------------------------------------
     # This replaces `near_rate`, which measured distance to a pinned POSE the
@@ -744,7 +1013,7 @@ def _regrasp_metrics(rows, num_grasps: int, d_rule=None) -> dict:
     #                 30 rather than the 45-deg Voronoi half-angle, for margin.
     #   dir_track     1 - mean(dir_err)/90, so it reads like cond_track did:
     #                 1 = follows the command, 0 = ignores it.
-    dir_all, conf_all = _dir_block(rows, d_rule)
+    dir_all, conf_all = _dir_block(rows, d_rule, drop_short=drop_short)
     out.update(dir_all)
     out["bin_confusion"] = conf_all.tolist()
     # ...and the same four numbers restricted to each commanded bin. `dir_track`
@@ -754,7 +1023,7 @@ def _regrasp_metrics(rows, num_grasps: int, d_rule=None) -> dict:
     # being read at all.
     for b in range(len(_D.BINS)):
         rs = [r for r in rows if int(r.get("bin_idx", -1)) == b]
-        blk, _ = _dir_block(rs, d_rule)
+        blk, _ = _dir_block(rs, d_rule, drop_short=drop_short)
         for k, v in blk.items():
             out[f"{k}_b{b}"] = v
 
@@ -780,7 +1049,7 @@ def _regrasp_metrics(rows, num_grasps: int, d_rule=None) -> dict:
     return out
 
 
-def _dir_block(rows, d_rule=None):
+def _dir_block(rows, d_rule=None, drop_short: bool = True):
     """Did the gripper go where it was told, over one set of eval episodes.
 
     Returns `(metrics, confusion)`. Factored out for the same reason as
@@ -810,8 +1079,21 @@ def _dir_block(rows, d_rule=None):
     # compares two different questions and reports the difference as policy
     # error. Defaults to `approach_axis`, which is what runs 1-9 measured.
     d_rule = d_rule or _D.DirectionRule()
+    # MEASURE EVERY EPISODE THAT ARRIVED, or only those whose chord cleared
+    # `d_min_offset`. The threshold is a COLLECTION guard — it stops a fingertip
+    # that ends on top of the centroid from minting a confident direction out of
+    # centroid noise — and reusing it here quietly changes the denominator:
+    # exactly the episodes that stopped short vanish from `dir_err` and from the
+    # confusion matrix, so a policy whose failure mode IS stopping on the
+    # centroid is scored on the subset where it did not do that. With
+    # `drop_short=False` the same rule is applied at `min_offset` 0, so the
+    # direction is noisy but present and the episode is counted.
+    if not drop_short and d_rule.needs_centroid() and d_rule.min_offset:
+        d_rule = _D.DirectionRule(rule=d_rule.rule, depth=d_rule.depth,
+                                  min_offset=0.0)
 
     dir_errs, sector_errs = [], []
+    n_short = 0
     confusion = np.zeros((len(_D.BINS), len(_D.BINS)), dtype=np.int64)
     for r in rows:
         d_cmd = r.get("d_world")
@@ -823,6 +1105,7 @@ def _dir_block(rows, d_rule=None):
         c = r.get("centroid_world")
         achieved = d_rule.of(np.asarray(ee), None if c is None else np.asarray(c))
         if achieved is None:
+            n_short += 1
             continue
         dir_errs.append(float(_D.angle_between(d_cmd, achieved)))
         if c is not None:
@@ -847,4 +1130,10 @@ def _dir_block(rows, d_rule=None):
         "sector_err": float(se.mean()) if se.size else nan,
         "bin_hit_rate": float((se < _D.BIN_HIT_DEG).mean()) if se.size else nan,
         "bin_diag_rate": float(np.trace(confusion) / tot) if tot else nan,
+        # HOW MANY EPISODES THE DIRECTION METRICS ABOVE DO NOT COVER. Non-zero
+        # only under `grasp_offset` with `drop_short`, and it is the number that
+        # says whether `dir_err` is over the whole eval set or over a filtered
+        # subset of it.
+        "dir_n": int(de.size),
+        "dir_n_short": int(n_short),
     }, confusion

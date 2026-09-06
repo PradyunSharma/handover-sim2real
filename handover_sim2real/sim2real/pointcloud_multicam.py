@@ -68,6 +68,7 @@ longer the neutral choice.
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -83,6 +84,8 @@ from pointcloud_pipeline import (  # noqa: E402
     _sample_or_pad_points,
     extract_hand_object_clouds,
     reject_arm_clusters,
+    _BLOB_ARM_FRAC,
+    _BLOB_COHERENT_FRAC,
 )
 from transforms import invert_transform, transform_points  # noqa: E402
 
@@ -207,6 +210,122 @@ class RobotExclusionBox:
 
 
 ROBOT_EXCLUSION = RobotExclusionBox()
+
+
+@dataclass(frozen=True)
+class FingerExclusion:
+    """The two finger bodies, in the panda_hand frame. Their contents are dropped.
+
+    `RobotExclusionBox` deliberately stops at z = +0.02 so it cannot eat a
+    grasped object, which leaves the fingers themselves — z = 0.059..0.112 —
+    entirely unfiltered. A side camera sees them plainly, they are not hand and
+    not background, so they arrive in the object class. That is harmless while
+    the object is far away and wrong exactly when it is not: as the gripper
+    closes, finger points and object points merge into one blob a few centimetres
+    across, and the policy is fed a target whose centroid is pulled toward the
+    gripper it is already holding still.
+
+    MEASURED, NOT ASSUMED. From panda_gripper_hand_camera.urdf and
+    meshes/collision/finger.obj (visual agrees to 0.05 mm):
+
+      * both finger joints originate at z = 0.0584 with no rotation, and travel
+        along +y (left) and -y (right) to an upper limit of 0.04;
+      * the finger mesh spans x -0.01048..0.01049, y -0.00013..0.02640,
+        z 0.00013..0.05385 in its own link frame;
+      * panda_rightfinger's mesh carries rpy = (0, 0, pi), which maps
+        (x, y, z) -> (-x, -y, z) and makes the pair exactly symmetric in y.
+
+    So with the joints at `q` metres each, a finger occupies |x| <= 0.0105,
+    z in 0.0585..0.1123, and |y| in q..q+0.0264. The inner face is at |y| = q,
+    which is also the plane the object rests against.
+
+    THE INNER FACE IS THE ONE BOUND THAT DOES NOT GET THE MARGIN. Every other
+    bound is padded by `margin_m` to absorb calibration and depth error, and
+    padding those costs nothing — outboard of a finger there is only more
+    gripper. Padding the inner bound is different: it would carve that many
+    metres off both sides of the object at the one moment the object matters
+    most, which is the failure `GraspRegion` exists to prevent. A sliver of
+    finger surviving at the jaw edge is much cheaper than a bite out of the
+    object. The faces a side camera actually sees are the outer and side ones
+    anyway; the inner face is only visible looking straight down the jaw axis.
+
+    So `inner_y` is measured, not padded: the mesh's inner face sits 0.13 mm
+    INBOARD of the joint origin, and the bound is rounded out to 0.6 mm so a
+    point lying exactly on that face is caught rather than landing on a strict
+    inequality. It costs 0.6 mm of object surface, which is below the depth
+    noise it is measured in.
+
+    One consequence of a negative `inner_y` worth naming: at q = 0 the two
+    boxes meet and cover the whole jaw volume. That is geometrically right —
+    a closed gripper has no gap — but it means this filter would delete a
+    grasped object. It never runs in that state, because the episode ends at
+    the close.
+
+    SPAN MODE (`span_gap=True`) drops the inner bound at every jaw width, so
+    the two boxes become one running outer face to outer face THROUGH the gap.
+    It exists because the split boxes have one real weakness: the jaw axis is
+    the direction calibration error is least forgiving in, and a finger seen
+    6-10 mm out of place lands in the gap, where nothing is looking for it.
+    Span mode cannot miss a finger point for that reason.
+
+    It pays for that by deleting the object at contact, which is not a corner
+    case — it is the last few steps of every episode. Precisely: the box is a
+    37 mm wide column in x, so an object narrower than that goes entirely and a
+    wider one loses the 37 mm band between the jaws and keeps its ends. Either
+    way the part nearest the grasp is the part that goes.
+    That is precisely the failure `GraspRegion` was written to prevent, so
+    reaching for span mode means preferring a policy that loses sight of the
+    object at the jaws over one that sees a few finger points. Use it to find
+    out whether stray finger points are what is hurting you; the split boxes
+    are the ones to run once you know.
+    """
+    half_x: float = 0.0105        # mesh |x| max
+    z_lo: float = 0.0585          # 0.0584 + 0.00013
+    z_hi: float = 0.1123          # 0.0584 + 0.05385, the fingertip
+    inner_y: float = -0.0006      # inner face wrt the joint origin (mesh: -0.00013)
+    depth_y: float = 0.0264       # mesh y extent, inner face to outer
+    margin_m: float = 0.008       # every bound except the inner one
+    span_gap: bool = False        # one box through the gap; see the docstring
+
+    def keep_mask(self, points_hand: np.ndarray,
+                  finger_q_m: float = 0.04) -> np.ndarray:
+        """True for points to KEEP, i.e. outside both fingers.
+
+        `finger_q_m` is one joint's travel (0 closed, 0.04 open), so it is
+        `read_gripper_norm() * 0.04`. It has to be live rather than assumed:
+        the boxes ride outward with the jaws, and holding them at the open
+        position while the gripper closes would leave them straddling nothing.
+        """
+        if len(points_hand) == 0:
+            return np.zeros(0, dtype=bool)
+        q = float(np.clip(finger_q_m, 0.0, 0.04))
+        m = self.margin_m
+        ay = np.abs(points_hand[:, 1])
+        inside = (
+            (np.abs(points_hand[:, 0]) < self.half_x + m)
+            & (points_hand[:, 2] > self.z_lo - m)
+            & (points_hand[:, 2] < self.z_hi + m)
+            & (ay < q + self.depth_y + m)
+        )
+        if not self.span_gap:
+            inside &= ay > q + self.inner_y
+        return ~inside
+
+    @property
+    def label(self) -> str:
+        return "span" if self.span_gap else "split"
+
+
+# The default. `FingerExclusion(span_gap=True)` is the other one — see the
+# class docstring for which to reach for and why the default is this one.
+FINGER_EXCLUSION_MODES = {
+    "split": FingerExclusion(),
+    "span": FingerExclusion(span_gap=True),
+    "off": None,
+}
+
+
+FINGER_EXCLUSION = FINGER_EXCLUSION_MODES["split"]
 
 
 @dataclass(frozen=True)
@@ -411,7 +530,42 @@ class CameraRig:
         self._last_object_xyz = None
 
 
-# ── hand segmentation ────────────────────────────────────────────────────────
+# ── segmentation ─────────────────────────────────────────────────────────────
+
+@dataclass
+class SegmentationResult:
+    """What one segmentation backend says about one image.
+
+    `object is None` IS THE LOAD-BEARING PART, not a missing value. It means the
+    backend has no opinion about the object, so the object class must be derived
+    the way it always has been — negatively, as the non-hand points near the hand
+    (`pointcloud_pipeline.extract_hand_object_clouds`). `HandSegModel` segments
+    hands and nothing else, so that is the only thing it can honestly say.
+
+    A backend that returns an object mask is making a much stronger claim, and
+    downstream that claim REPLACES the crop sphere, the margin band and the
+    connectivity test rather than being filtered by them. All three of those
+    exist only because the object was a subtraction; run against a real object
+    mask they can only delete correct points.
+    """
+    hand: np.ndarray                       # uint8 HxW {0,1}, native resolution
+    object: Optional[np.ndarray] = None    # uint8 HxW {0,1}, or None
+    debug: dict = field(default_factory=dict)
+
+
+def as_segmentation(result: Any) -> SegmentationResult:
+    """Accept either a bare hand mask or a SegmentationResult.
+
+    A bare array is a legal return and means what it always meant: this is the
+    hand, derive the object. Kept because "returns a mask" is the whole contract
+    a stub segmenter needs in order to exercise the fusion geometry, and forcing
+    every such stub to wrap a dataclass buys uniformity at the cost of the
+    cheapest test in the file.
+    """
+    if isinstance(result, SegmentationResult):
+        return result
+    return SegmentationResult(hand=result)
+
 
 def largest_component(mask: np.ndarray) -> np.ndarray:
     """Keep only the biggest connected blob.
@@ -433,6 +587,67 @@ def largest_component(mask: np.ndarray) -> np.ndarray:
     return (labels == largest_idx).astype(np.uint8)
 
 
+def select_hand_component(mask, depth_m, cam, T_base_cam, *,
+                          min_pixels: int = 40,
+                          min_depth: float = 0.2, max_depth: float = 2.0):
+    """Keep the mask blob nearest the ROBOT BASE, not the biggest one.
+
+    `largest_component` picks by area, which is right for the wrist camera —
+    there the hand fills the frame and nothing else skin-coloured competes with
+    it — and wrong for a camera watching a whole person. The segmenter fires on
+    any skin, so from a tripod at 1 m the operator's FACE is comparable in area
+    to their hand, and area alone picks whichever won that frame.
+
+    That is not a cosmetic wobble. `hand_center` is the origin of the object
+    crop, of the connectivity seed, and of the arm-rejection capsule, so when it
+    jumps to the face the actual hand and the object it holds land 20-40 cm
+    off-axis and are rejected as arm. Observed on hardware exactly so: the mask
+    alternating between face and hand, `hand=` swinging 451 to 810 between
+    frames, and the object class collapsing to 10-20 points — under the 30-point
+    floor, which is why the overlay alternated between a prediction and "no
+    observation".
+
+    Distance to the robot BASE is the discriminator because a hand offering an
+    object is reaching toward the robot and a face is not. The base rather than
+    the end effector for the same reason arm rejection uses it: the EE is where
+    the policy is being driven, so scoring against it closes a loop in which one
+    bad frame pulls the EE toward the error and makes the error score better next
+    frame. The base cannot be moved by a perception mistake.
+
+    Falls back to the largest component whenever the geometry cannot be
+    established — no depth on a blob, or a mask with nothing in it — so this can
+    only ever do better than area, never fail closed.
+    """
+    import cv2
+
+    mask = (np.asarray(mask) > 0).astype(np.uint8)
+    if not mask.any():
+        return mask
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    if n_labels <= 2:                       # background plus at most one blob
+        return mask
+
+    best, best_d = None, np.inf
+    base_in_cam = invert_transform(np.asarray(T_base_cam, dtype=np.float64))[:3, 3]
+    for i in range(1, n_labels):
+        if stats[i, cv2.CC_STAT_AREA] < min_pixels:
+            continue
+        blob = (labels == i).astype(np.uint8)
+        xyz, _, _ = cam.depth_to_pointcloud(depth_m, mask=blob, stride=4,
+                                            min_depth=min_depth,
+                                            max_depth=max_depth)
+        if len(xyz) < 3:
+            continue
+        # Median, not mean: a blob straddling a depth edge picks up a few points
+        # metres behind it, and a mean would follow them off the person.
+        d = float(np.linalg.norm(np.median(xyz, axis=0) - base_in_cam))
+        if d < best_d:
+            best, best_d = blob, d
+    if best is None:
+        return largest_component(mask)
+    return best
+
+
 def normalize_mask(mask: np.ndarray) -> np.ndarray:
     """Binarize, keep the largest blob, then open/close to fill speckle.
 
@@ -451,17 +666,21 @@ def normalize_mask(mask: np.ndarray) -> np.ndarray:
 
 
 def overlay_mask(color_bgr: np.ndarray, mask: np.ndarray,
-                 alpha: float = 0.45) -> np.ndarray:
-    """Tint the segmented hand green over the colour image.
+                 alpha: float = 0.45,
+                 colour: tuple = (0, 255, 0)) -> np.ndarray:
+    """Tint a segmented class over the colour image. Green is the hand.
 
     Shared by the runner and test_perception_viz so both draw the mask
     identically — a debugging view that renders differently from the thing being
-    debugged is worse than none.
+    debugged is worse than none. `colour` is BGR and exists so a backend that
+    also segments the OBJECT can draw it in a second colour over the same frame;
+    two classes drawn in one colour hides the failure worth seeing, which is the
+    two of them claiming the same pixels.
     """
     overlay = color_bgr.copy()
-    hand_color = np.zeros_like(color_bgr)
-    hand_color[:, :, 1] = 255
-    blended = (alpha * hand_color + (1.0 - alpha) * overlay).astype(np.uint8)
+    tint = np.zeros_like(color_bgr)
+    tint[:, :] = colour
+    blended = (alpha * tint + (1.0 - alpha) * overlay).astype(np.uint8)
     return np.where(mask[..., None] > 0, blended, overlay)
 
 
@@ -516,8 +735,20 @@ class HandSegmenter:
             self._preprocess[px] = make_seg_preprocess(px)
         return self._preprocess[px]
 
+    def reset(self) -> None:
+        """No per-episode state. Present so the perception layer can call
+        `reset()` on any backend without asking which one it has."""
+
     def __call__(self, images_rgb: Sequence[np.ndarray],
-                 sizes: Optional[Sequence[int]] = None) -> list[np.ndarray]:
+                 sizes: Optional[Sequence[int]] = None,
+                 depths: Optional[Sequence[np.ndarray]] = None,
+                 T_base_hand: Optional[np.ndarray] = None
+                 ) -> list[SegmentationResult]:
+        # `depths` and `T_base_hand` are part of the contract and unused here.
+        # A backend that has to CHOOSE which of several detections is the hand
+        # needs metric geometry to do it — the same "nearest the robot base"
+        # test `select_hand_component` applies to blobs. This network segments
+        # every hand pixel it sees and chooses nothing, so it needs neither.
         import cv2
         import torch
 
@@ -533,7 +764,7 @@ class HandSegmenter:
         for i, px in enumerate(sizes):
             groups.setdefault(int(px), []).append(i)
 
-        out: list[Optional[np.ndarray]] = [None] * len(images_rgb)
+        out: list[Optional[SegmentationResult]] = [None] * len(images_rgb)
         for px, indices in groups.items():
             transform = self._transform(px)
             batch = torch.stack([transform(images_rgb[i]) for i in indices])
@@ -544,7 +775,11 @@ class HandSegmenter:
                 img = images_rgb[i]
                 m = cv2.resize(pred[slot], (img.shape[1], img.shape[0]),
                                interpolation=cv2.INTER_NEAREST)
-                out[i] = normalize_mask(m)
+                # object=None: this network segments hands. Saying anything
+                # about the object here would be inventing a claim it cannot
+                # make, and downstream that claim would REPLACE the geometry
+                # that currently derives the object correctly.
+                out[i] = SegmentationResult(hand=normalize_mask(m))
         return out  # type: ignore[return-value]
 
 
@@ -611,7 +846,39 @@ class FusedObservation:
                          + (f"!veto{self.grasp_vetoed}" if self.grasp_vetoed else ""))
         if self.arm_fallback not in (None, "disabled"):
             parts.append(f"[arm:{self.arm_fallback}]")
+        if self.arm_clusters:
+            parts.append(self.blob_detail())
         return "  ".join(parts)
+
+    def blob_detail(self, limit: int = 3) -> str:
+        """Per-blob `size@offset/lateral=armfrac` with the decision each got.
+
+        These numbers were computed on every frame and never shown, which made
+        the object class disappearing indistinguishable from the ground truth
+        being empty. They separate the two mechanisms that can empty it, and the
+        distinction decides the fix:
+
+          one blob at a high arm fraction   The object and the forearm merged —
+            the hand touches both, so connectivity cannot part them — and the
+            whole blob was dropped for the forearm's sake, taking the object
+            with it. Marked `DROP`. This is a knife edge at 0.60, so it flickers
+            frame to frame, which is what "sometimes it appears" looks like.
+          every blob genuinely arm-like     Nothing in view scores as a held
+            object. Then the object really is absent, or the capsule is aimed
+            wrong, and no blob rule will fix it.
+        """
+        out = []
+        for (size, offset, lateral, frac) in self.arm_clusters[:limit]:
+            if frac <= _BLOB_COHERENT_FRAC:
+                verdict = "keep"
+            elif frac >= _BLOB_ARM_FRAC:
+                verdict = "DROP"
+            else:
+                verdict = "split"
+            out.append(f"{size}@{offset*100:+.0f}/lat{lateral*100:.0f}"
+                       f"={frac:.2f}{verdict}")
+        more = len(self.arm_clusters) - len(out)
+        return "blobs[" + " ".join(out) + (f" +{more}" if more > 0 else "") + "]"
 
 
 class MultiCameraPerception:
@@ -630,7 +897,9 @@ class MultiCameraPerception:
                  arm_rejection: bool = True,
                  arm_voxel_m: float = 0.012,
                  arm_offset_m: float = 0.07,
-                 arm_lateral_m: float = 0.12):
+                 arm_lateral_m: float = 0.18,
+                 arm_below_m: float = 0.10,
+                 finger_exclusion: Optional[FingerExclusion] = FINGER_EXCLUSION):
         if not rigs:
             raise ValueError("need at least one camera rig")
         self._rigs = list(rigs)
@@ -645,11 +914,20 @@ class MultiCameraPerception:
         self._arm_voxel_m = arm_voxel_m
         self._arm_offset_m = arm_offset_m
         self._arm_lateral_m = arm_lateral_m
+        self._arm_below_m = arm_below_m
+        # None disables the finger cut without touching the housing box — the
+        # two answer different questions and are worth being able to turn off
+        # independently.
+        self._finger_exclusion = finger_exclusion
         # Last (colour, hand mask) and last depth per camera, kept so a viewer
         # can draw exactly the frames this observation was computed from rather
         # than grabbing its own — which would be a different instant.
         self.last_frames: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.last_depths: dict[str, np.ndarray] = {}
+        # None for a backend that does not segment the object, which is also
+        # what "the object class was derived, not measured" looks like to a
+        # viewer deciding whether to draw a second mask.
+        self.last_object_masks: dict[str, Optional[np.ndarray]] = {}
 
     @property
     def rigs(self) -> list[CameraRig]:
@@ -658,8 +936,16 @@ class MultiCameraPerception:
     def reset(self) -> None:
         for rig in self._rigs:
             rig.reset()
+        # The episode boundary a promptable tracker needs. Its memory bank is
+        # about one scene and one object; carried into the next episode it is
+        # not stale the way a point cloud is stale, it is confidently wrong —
+        # it would keep tracking the object from the last handover.
+        seg_reset = getattr(self._segment, "reset", None)
+        if callable(seg_reset):
+            seg_reset()
 
-    def observe(self, T_base_hand: np.ndarray) -> FusedObservation:
+    def observe(self, T_base_hand: np.ndarray,
+                finger_q_m: float = 0.04) -> FusedObservation:
         import cv2
 
         # 1. Grab every camera first, THEN segment. Interleaving grab/segment
@@ -671,24 +957,48 @@ class MultiCameraPerception:
             colors.append(color_bgr)
             depths.append(depth_m)
 
-        masks = self._segment(
+        segs = [as_segmentation(s) for s in self._segment(
             [cv2.cvtColor(c, cv2.COLOR_BGR2RGB) for c in colors],
-            sizes=[rig.params.seg_input_px for rig in self._rigs])
+            sizes=[rig.params.seg_input_px for rig in self._rigs],
+            depths=depths, T_base_hand=T_base_hand)]
+        masks = [s.hand for s in segs]
+        object_masks = [s.object for s in segs]
+
+        # Re-pick which blob is "the hand" for cameras that can see a whole
+        # person. Only for those: the wrist camera keeps area selection so cp2's
+        # input is bit-for-bit what it was trained against, and from the wrist
+        # there is nothing for a face to compete with anyway.
+        #
+        # Skipped entirely for a backend that returns an object mask. A promptable
+        # tracker was already pointed at ONE hand when it was seeded, so its mask
+        # is not a set of candidate skin blobs to choose between — re-picking
+        # could only split a correct mask, and picking by area or distance would
+        # discard the disambiguation the prompt already did.
+        masks = [
+            (select_hand_component(mask, depth, rig.camera, rig.T_base_cam,
+                                   min_depth=rig.params.min_depth_m,
+                                   max_depth=rig.params.max_depth_m)
+             if (rig.T_base_cam is not None and obj_mask is None) else mask)
+            for rig, mask, depth, obj_mask in zip(self._rigs, masks, depths,
+                                                  object_masks)
+        ]
 
         object_parts, hand_parts = [], []
         object_src, hand_src = [], []
         per_camera: dict[str, dict[str, Any]] = {}
 
-        for rig_i, (rig, color_bgr, depth_m, hand_mask) in enumerate(
-                zip(self._rigs, colors, depths, masks)):
+        for rig_i, (rig, color_bgr, depth_m, hand_mask, object_mask) in enumerate(
+                zip(self._rigs, colors, depths, masks, object_masks)):
             self.last_frames[rig.name] = (color_bgr, hand_mask)
             self.last_depths[rig.name] = depth_m
+            self.last_object_masks[rig.name] = object_mask
 
             p = rig.params
             result = extract_hand_object_clouds(
                 color_bgr=color_bgr,
                 depth_m=depth_m,
                 hand_mask=hand_mask,
+                object_mask=object_mask,
                 cam=rig.camera,
                 last_hand_xyz=rig._last_hand_xyz,
                 last_object_xyz=rig._last_object_xyz,
@@ -716,11 +1026,23 @@ class MultiCameraPerception:
             hand_hand = transform_points(T_hand_cam, result.hand_xyz)
 
             n_before = len(obj_hand)
+            n_finger = 0
             if rig.exclude_robot:
                 # Object class only. The human hand is never inside the gripper,
                 # and masking it there would just hide a calibration error we
                 # would rather see.
                 obj_hand = obj_hand[ROBOT_EXCLUSION.keep_mask(obj_hand)]
+                # The fingers are a second, separate cut, and it has to be here
+                # rather than with the fused-cloud filters below: this is the
+                # last point at which the two are distinguishable. Downstream,
+                # GRASP_REGION covers the whole finger volume and protects
+                # everything in it — correctly, for the object — so a finger
+                # test run after it could never fire.
+                if self._finger_exclusion is not None:
+                    n_mid = len(obj_hand)
+                    obj_hand = obj_hand[
+                        self._finger_exclusion.keep_mask(obj_hand, finger_q_m)]
+                    n_finger = n_mid - len(obj_hand)
 
             if self._per_camera_cap is not None:
                 obj_hand = _cap(obj_hand, self._per_camera_cap)
@@ -737,6 +1059,11 @@ class MultiCameraPerception:
                 "object": int(len(obj_hand)),
                 "hand": int(len(hand_hand)),
                 "robot_pts_removed": int(n_before - len(obj_hand)) if rig.exclude_robot else 0,
+                # Broken out from robot_pts_removed rather than folded into it.
+                # The housing cut fires constantly and means nothing; the finger
+                # cut firing means the object has reached the jaws, which is the
+                # one moment of the episode worth being able to see in a log.
+                "finger_pts_removed": int(n_finger),
                 "used_last_hand": bool(result.debug["used_last_hand"]),
                 "used_last_object": bool(result.debug["used_last_object"]),
                 # How much table and background connectivity threw away, and why
@@ -746,6 +1073,14 @@ class MultiCameraPerception:
                 "cluster_dropped": int(result.debug["cluster_dropped"]),
                 "cluster_fallback": result.debug["cluster_fallback"],
                 "margin_band": int(result.debug["margin_band_points"]),
+                # Where the object class came from, and what the segmenter
+                # thought of its own answer. A tracker that is being re-seeded
+                # every frame produces perfectly plausible point counts, so the
+                # counts alone cannot show it — this can.
+                "object_from_mask": bool(result.debug["object_from_mask"]),
+                "seg_reseeded": bool(segs[rig_i].debug.get("reseeded", False)),
+                "seg_reseeds": int(segs[rig_i].debug.get("reseeds", 0)),
+                "seg_reason": segs[rig_i].debug.get("reason"),
             }
 
         # 3. Raw per-class union across cameras — see the module docstring on why
@@ -763,13 +1098,24 @@ class MultiCameraPerception:
         arm_debug: dict[str, Any] = {"dropped": 0, "fallback": "disabled",
                                      "clusters": [], "grasp_points": 0,
                                      "grasp_vetoed": 0}
-        if self._arm_rejection:
+        # A positive object mask makes this obsolete AND harmful. Arm rejection
+        # exists because the forearm falls into the object class when "object"
+        # means "not hand" — it is a guess about which blob is anatomy, made
+        # from geometry, because there was nothing better. A segmenter that was
+        # asked for the object and answered has already excluded the forearm, so
+        # the only thing left for this to do is delete a correct object whose
+        # blob happens to sit behind the hand.
+        if self._arm_rejection and all(m is None for m in object_masks):
             # The base origin, in the hand frame the cloud already lives in.
             robot_origin = invert_transform(T_base_hand)[:3, 3]
             keep, arm_debug = reject_arm_clusters(
                 object_xyz, hand_xyz, robot_origin,
                 voxel_m=self._arm_voxel_m, min_offset_m=self._arm_offset_m,
                 max_lateral_m=self._arm_lateral_m,
+                max_below_m=self._arm_below_m,
+                # Base +z (up) expressed in the panda_hand frame the cloud lives
+                # in. R_hand_base @ [0,0,1] is the third ROW of R_base_hand.
+                up_axis=np.asarray(T_base_hand[2, :3], dtype=np.float64),
                 # Both are in the panda_hand frame already, so the grasp volume
                 # is a fixed box here — no pose needed, and it is the one thing
                 # in this function the robot knows exactly.
@@ -843,6 +1189,7 @@ def build_rigs(
     wrist_seg_px: Optional[int] = None,
     fixed_seg_px: Optional[int] = None,
     hand_margin_px: Optional[int] = None,
+    camera_model: Optional[str] = None,
 ) -> list[CameraRig]:
     """Build rigs for the requested camera names, resolving serials and extrinsics.
 
@@ -874,6 +1221,13 @@ def build_rigs(
         serial = serials.get(name)
         camera = RealSenseCamera(color_size=color_size, depth_size=depth_size,
                                  fps=fps, serial=serial)
+        if camera_model is not None:
+            # An override is for the case the driver's name is unhelpful, or a
+            # body is being stood in for. It is applied before start(), so
+            # start() will overwrite it with what it detects unless the detection
+            # comes back empty — see apply_camera_model below, which the runner
+            # calls after starting and which is where the override really wins.
+            camera.model_key = camera_model
         if name == "wrist":
             rigs.append(CameraRig(
                 name=name, kind="eye_in_hand", camera=camera,
@@ -890,3 +1244,74 @@ def build_rigs(
                 T_base_cam=load_fixed_extrinsics(fixed_session),
                 exclude_robot=exclude_robot, serial=serial))
     return rigs
+
+
+def check_session_camera(session: str, rig: CameraRig) -> Optional[str]:
+    """Warn if this session was calibrated with a different camera. None if fine.
+
+    THE FAILURE THIS CATCHES HAS NO OTHER SYMPTOM. A calibration is a statement
+    about one physical camera in one place; nothing downstream re-derives it, so
+    mounting a different body — or the same body somewhere else — and loading
+    the old session produces a cloud that is confidently, uniformly wrong. The
+    object appears, the counts look healthy, the policy acts on it. The only
+    evidence is that the arm reaches to one side of everything.
+
+    Sessions captured before camera.json existed return None rather than
+    complaining. Absence of the file is not evidence of a mismatch, and turning
+    old sessions into warnings would train the warning away.
+    """
+    path = CALIB_DIR / "sessions" / session / "camera.json"
+    if not path.exists():
+        return None
+    try:
+        rec = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+    live_serial = str(rig.serial) if rig.serial is not None else None
+    was_serial = rec.get("serial")
+    if was_serial and live_serial and str(was_serial) != live_serial:
+        return (f"session {session!r} was calibrated with serial {was_serial} "
+                f"({rec.get('device_name', 'unknown model')}) but {rig.name} is "
+                f"serial {live_serial} ({rig.camera.device_name}). The extrinsics "
+                "describe a camera that is not the one streaming. RECALIBRATE — "
+                "this cannot be corrected with an offset.")
+
+    was_model = rec.get("model")
+    if was_model and rig.camera.model_key and was_model != rig.camera.model_key:
+        return (f"session {session!r} was calibrated on a {was_model.upper()} "
+                f"but {rig.name} is a {rig.camera.model_key.upper()}. Recalibrate.")
+    return None
+
+
+def apply_camera_model(rig: CameraRig, override: Optional[str] = None) -> str:
+    """Pin one rig's depth window to the body actually attached. Call AFTER start().
+
+    Returns a one-line description for the startup log.
+
+    ONLY THE NEAR LIMIT IS RAISED, NEVER LOWERED. `min_depth_m` in the params is
+    a scene choice — how close to the camera we are willing to believe a point
+    is — and the body's min_z is a hardware floor below which the imagers do not
+    overlap and the driver returns whatever it likes. The binding constraint is
+    the larger of the two, so a D455 on the tripod moves 0.25 m up to 0.40 while
+    a D435 leaves it alone. Doing this the other way round would let a hardware
+    limit loosen a deliberate scene bound.
+
+    The far limit is left entirely alone. The D455 can range to 6 m, but the
+    2.50 m in FIXED_PARAMS is there to keep the far wall out of the object
+    class, not because the D435 gives up past it — extending it because a better
+    body arrived would import the room into the cloud.
+    """
+    from camera import CAMERA_MODELS      # deferred: needs pyrealsense2
+
+    model = CAMERA_MODELS[override] if override else rig.camera.model
+    was = rig.params.min_depth_m
+    floor = max(was, model.min_z_m)
+    if floor > was:
+        rig.params = replace(rig.params, min_depth_m=floor)
+    detected = rig.camera.device_name or "unknown device"
+    note = f" (forced; device reports {detected})" if override else ""
+    return (f"{rig.name}: {model.name}{note}, baseline "
+            f"{model.baseline_m * 1000:.0f} mm, RGB {model.rgb_hfov_deg:.0f} deg, "
+            f"min depth {floor:.2f} m"
+            + (f" (raised from {was:.2f} for this body)" if floor > was else ""))

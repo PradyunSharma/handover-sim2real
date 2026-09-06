@@ -100,8 +100,9 @@ from handover_sim2real.regrasp import (
 )
 from handover_sim2real.regrasp.directions import BINS as _rg_dirs_BINS  # noqa: E402
 from handover_sim2real.regrasp import reach as _rg_reach          # noqa: E402
+from handover_sim2real.regrasp import anchor as _rg_anchor       # noqa: E402
 from handover_sim2real.regrasp.evaluator import (               # noqa: E402
-    aggregate_eval_rows, eval_jobs, eval_num_grasps,
+    aggregate_eval_rows, eval_jobs, eval_num_grasps, stratified_pairs,
 )
 from handover_sim2real.regrasp.pregrasp import forward_dist_default
 from handover_sim2real.regrasp.setup import (                     # noqa: E402
@@ -124,10 +125,28 @@ def load_yaml(path) -> dict:
 
 
 def set_seed(seed: int) -> None:
+    """Seed every stream this run draws from, and pin cuDNN.
+
+    THE FOUR `seed` CALLS WERE NEVER THE WHOLE STORY. cuDNN picks convolution
+    algorithms by BENCHMARKING them at the first call of each shape, and several
+    of the algorithms it can pick are themselves non-deterministic (atomics in
+    the backward pass). So two runs with identical seeds and identical data
+    diverge in the third decimal of the first gradient and compound from there —
+    which on a 25-iteration FTL chain is a different policy, not a rounding
+    difference. `deterministic=True` restricts the search to reproducible
+    algorithms and `benchmark=False` stops the autotune, at a few percent of
+    throughput.
+
+    NOT `torch.use_deterministic_algorithms(True)`: PointNet++'s CUDA ops have no
+    deterministic implementation registered, so it would raise rather than fall
+    back. cuDNN is the part that is actually reachable here.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def beta_at(i: int, d: dict, num_iters: int) -> float:
@@ -240,7 +259,7 @@ def base_files(trn: dict) -> list[str]:
 # ── per-iteration training (a fresh fit on the whole aggregate) ──────────────
 
 def run_eval(pool, sim, run_dir, ckpt, device, eval_scenes, eval_params,
-             pin_table, iteration=0):
+             pin_table, iteration=0, eval_pairs=None):
     """Evaluate one checkpoint, on the worker pool when there is one.
 
     THE POOL IS THE SAME ONE COLLECTION USES, and it is otherwise IDLE here:
@@ -263,12 +282,12 @@ def run_eval(pool, sim, run_dir, ckpt, device, eval_scenes, eval_params,
     if pool is None:
         runner, _ = load_policy_runner(Path(run_dir), device, ckpt=ckpt)
         out = evaluate_policy(sim, runner, eval_scenes, params=eval_params,
-                              pin_table=pin_table)
+                              pin_table=pin_table, pairs=eval_pairs)
         del runner
         if device != "cpu":
             torch.cuda.empty_cache()
         return out
-    jobs = eval_jobs(eval_scenes, pin_table)
+    jobs = eval_jobs(eval_scenes, pin_table, pairs=eval_pairs)
     rows = pool.evaluate(str(run_dir), str(ckpt), jobs, eval_params,
                          iteration=iteration)
     return aggregate_eval_rows(rows, eval_params, eval_num_grasps(pin_table))
@@ -645,7 +664,22 @@ LOG_FIELDS = [
     # the policy goes the same way whatever it is told.
     "dir_err", "dir_err_median", "dir_track", "sector_err",
     "bin_hit_rate", "bin_diag_rate", "cond_sep",
+    # HOW MANY EPISODES THE DIRECTION METRICS ABOVE ARE OVER. Under
+    # `grasp_offset` with `EVAL.dir_drop_short: true` a short chord leaves the
+    # confusion matrix entirely, so `bin_diag_rate` can move because its
+    # DENOMINATOR moved. These two make that visible instead of inferable.
+    "dir_n", "dir_n_short",
     "retry_at_1", "retry_at_2", "retry_at_3", "retry_at_4",
+    "retry_at_5", "retry_at_6",
+    # THE DENOMINATOR EACH RUNG IS OVER, and the same rate restricted to scenes
+    # that actually offer k attempts. `retry_at_k` counts EVERY scene, so one
+    # with 2 slots sits in the retry_at_4 denominator having had 2 tries — which
+    # is why `retry_at_4` can fall BELOW the best single bin's rate with nothing
+    # wrong. `retry_at_k_deep` is the honest "what does retrying buy".
+    "retry_n_1", "retry_n_2", "retry_n_3", "retry_n_4",
+    "retry_n_5", "retry_n_6",
+    "retry_at_1_deep", "retry_at_2_deep", "retry_at_3_deep", "retry_at_4_deep",
+    "retry_at_5_deep", "retry_at_6_deep",
     # WHICH DIRECTION EACH RUNG OF THE LADDER WAS. The ladder walks pin slots in
     # ascending bin order, so rung k is a MIXTURE across scenes rather than one
     # direction — `retry_bin_k` is the modal bin and `retry_bin_frac_k` its
@@ -656,6 +690,15 @@ LOG_FIELDS = [
     "succ_bin_0", "succ_bin_1", "succ_bin_2",
     "succ_bin_3", "succ_bin_4", "succ_bin_5",
     "n_bin_0", "n_bin_1", "n_bin_2", "n_bin_3", "n_bin_4", "n_bin_5",
+    # THE SAME BIN COMMANDED ON EVERY EVALUATED SCENE, not only the ones that
+    # demonstrate it (`EVAL.full_bin_coverage`). `succ_bin_*` is "did it learn
+    # what it was taught"; `succ_bin_all_*` is "what happens when the ladder asks
+    # for a direction this scene never showed it" — which is what retry does by
+    # construction. Same rollouts, split on the row's `in_table` flag.
+    "succ_bin_all_0", "succ_bin_all_1", "succ_bin_all_2",
+    "succ_bin_all_3", "succ_bin_all_4", "succ_bin_all_5",
+    "n_bin_all_0", "n_bin_all_1", "n_bin_all_2",
+    "n_bin_all_3", "n_bin_all_4", "n_bin_all_5",
     "succ_g0", "succ_g1",
     # -- (2) eval outcome breakdown, fractions of the eval set
     "f_grasp_ok", "f_grasp_miss", "f_no_release", "f_drop", "f_timeout",
@@ -810,10 +853,14 @@ def eval_columns(m: dict | None) -> dict:
         "dir_err", "dir_err_median", "dir_track", "sector_err",
         "bin_hit_rate", "bin_diag_rate", "cond_sep",
         "retry_at_1", "retry_at_2", "retry_at_3", "retry_at_4",
+        "retry_at_1_deep", "retry_at_2_deep", "retry_at_3_deep",
+        "retry_at_4_deep",
         "retry_bin_frac_1", "retry_bin_frac_2", "retry_bin_frac_3",
         "retry_bin_frac_4",
         "succ_bin_0", "succ_bin_1", "succ_bin_2",
         "succ_bin_3", "succ_bin_4", "succ_bin_5",
+        "succ_bin_all_0", "succ_bin_all_1", "succ_bin_all_2",
+        "succ_bin_all_3", "succ_bin_all_4", "succ_bin_all_5",
         "n_bin_0", "n_bin_1", "n_bin_2", "n_bin_3", "n_bin_4", "n_bin_5",
         "succ_g0", "succ_g1")}
     # The modal bin of each rung is an INDEX, not a rate — blank when the rung
@@ -1144,6 +1191,22 @@ def main() -> None:
     # rule decides what a bin MEANS, the axes decide which vector names it.
     # Cross-checked against the table, which is what actually populated the bins.
     d_rule = resolve_d_rule(pin_table, sim_cfg_d)
+    # WHEN the frame that turns a bin into a vector is built. `latched` (runs
+    # 1-15) builds it once from the step-0 cloud; `live` rebuilds it from every
+    # step's cloud, because the camera is eye-in-hand and the object's OBSERVED
+    # centroid moves with the gripper even when the object does not.
+    anchor_update = str(sim_cfg_d.get("anchor_update", "latched"))
+    if anchor_update not in _rg_anchor.ANCHOR_UPDATES:
+        raise SystemExit(f"[cfg] SIM.anchor_update must be one of "
+                         f"{_rg_anchor.ANCHOR_UPDATES}, got {anchor_update!r}")
+    # WHICH POINT ON THE GIVER the azimuth is measured from. `wrist` is the MANO
+    # joint and exists only in simulation; `hand_centroid` is the segmented hand
+    # cloud's centroid, which is what the real rig has.
+    anchor_hand_ref = str(sim_cfg_d.get("anchor_hand_ref", "wrist"))
+    if anchor_hand_ref not in _rg_anchor.ANCHOR_HAND_REFS:
+        raise SystemExit(f"[cfg] SIM.anchor_hand_ref must be one of "
+                         f"{_rg_anchor.ANCHOR_HAND_REFS}, "
+                         f"got {anchor_hand_ref!r}")
     # Written out because under `bin_centroid` the six vectors are a function of
     # the pin table AND the demo filter, and both are files that get rebuilt.
     # Reproducing a run's command a year later should not require re-deriving
@@ -1154,6 +1217,8 @@ def main() -> None:
                    "axes": (None if command_axes is None
                             else np.asarray(command_axes).tolist()),
                    "bins": _rg_dirs_BINS.tolist(),
+                   "anchor_update": anchor_update,
+                   "anchor_hand_ref": anchor_hand_ref,
                    **d_rule.as_meta()}, f, indent=2)
 
     usable = set(pin_table.entries) if pin_table is not None else None
@@ -1190,6 +1255,29 @@ def main() -> None:
         n_excluded = 0
 
     pool, eval_scenes = scene_pools(sim.num_scenes, ev, usable=usable)
+    # ---- WHICH (scene, bin) PAIRS EVAL SCORES ------------------------------
+    # `linspace` (the default, runs 1-15): draw `EVAL.num_scenes` scenes evenly
+    # over the usable ids and score EVERY slot of each. The per-bin counts are
+    # then whatever those scenes happen to carry — on run 11, +x 54 against
+    # +z 19, a 2.8x spread, so one +z episode is 5.3 points and its curve swings
+    # +-11 points on binomial noise alone.
+    #
+    # `per_bin_frac`: take `EVAL.bin_frac` of EACH bin's pairs over the whole
+    # usable table. Proportional by construction, and every bin is a stated
+    # fraction of a denominator that is printed rather than a by-product.
+    eval_select = str(ev.get("scene_select", "linspace"))
+    eval_pairs = None
+    if eval_select == "per_bin_frac":
+        # OVER THE FULL USABLE SET, not over `eval_scenes`: stratifying inside a
+        # scene sample would inherit exactly the imbalance it exists to remove.
+        eval_pairs = stratified_pairs(
+            pin_table, sorted(usable) if usable else range(sim.num_scenes),
+            float(ev.get("bin_frac", 0.2)),
+            full_bins=bool(ev.get("full_bin_coverage", False)))
+        eval_scenes = sorted({s for s, _ in eval_pairs})
+    elif eval_select != "linspace":
+        raise SystemExit(f"[cfg] EVAL.scene_select must be 'linspace' or "
+                         f"'per_bin_frac', got {eval_select!r}")
 
     train_cfg = load_yaml(trn["train_cfg"])
     # ONE SOURCE OF TRUTH FOR THE REACH FILTER. The table prune above and the
@@ -1357,6 +1445,12 @@ def main() -> None:
         # ...and what `d` MEANS, so `d_grasp_world` and `bin_realized` on every
         # DAgger episode are computed the way the pin table's bins were.
         d_rule=d_rule,
+        # WHEN the anchor frame is built. `live` rebuilds it from every step's
+        # observed cloud and re-issues the command; the eval params below take
+        # this from here rather than re-reading the config, so collection and
+        # scoring cannot end up under different command laws.
+        anchor_update=anchor_update,
+        anchor_hand_ref=anchor_hand_ref,
     )
     # (pin_table is loaded above, before the scene pools, because its key set
     # defines which scenes the expert can plan for.)
@@ -1415,6 +1509,15 @@ def main() -> None:
         # in sync.
         command_axes=collect_params.command_axes,
         d_rule=collect_params.d_rule,
+        anchor_update=collect_params.anchor_update,
+        anchor_hand_ref=collect_params.anchor_hand_ref,
+        # Whether a short `grasp_offset` chord is dropped from `dir_err` and the
+        # confusion matrix or measured anyway. Eval-only: `d_min_offset` still
+        # guards COLLECTION, where inventing a direction out of centroid noise
+        # would put a wrong label in the aggregate. Dropping at MEASUREMENT time
+        # is different — it removes exactly the episodes that stopped short, so
+        # the metric is computed on the subset that did not exhibit the failure.
+        dir_drop_short=bool(ev.get("dir_drop_short", True)),
         verbose=bool(ev.get("verbose", False)))
     eval_every = int(ev.get("every", 1))
     eval_ckpt = str(ev.get("ckpt", "best"))
@@ -1508,7 +1611,8 @@ def main() -> None:
         print(f"[iter 00] evaluating the base policy on {len(eval_scenes)} scenes "
               f"= {_n_eval_ep} episodes (per-scene direction counts) ...")
         base_metrics = run_eval(collector_pool, sim, base_dir, eval_ckpt, device,
-                                eval_scenes, eval_params, pin_table, iteration=0)
+                                eval_scenes, eval_params, pin_table, iteration=0,
+                                eval_pairs=eval_pairs)
         base_metrics.pop("rows")
         print(f"[iter 00] success={base_metrics['success_rate']:.3f} "
               f"grasp={base_metrics['grasp_rate']:.3f} "
@@ -1715,7 +1819,8 @@ def main() -> None:
                   + (f" on {collector_pool.num_workers} workers ..."
                      if collector_pool is not None else " (serial) ..."))
             emetrics = run_eval(collector_pool, sim, iter_dir, eval_ckpt, device,
-                                eval_scenes, eval_params, pin_table, iteration=i)
+                                eval_scenes, eval_params, pin_table, iteration=i,
+                                eval_pairs=eval_pairs)
             emetrics.pop("rows")
             print(f"  [eval] success={emetrics['success_rate']:.3f} "
                   f"grasp={emetrics['grasp_rate']:.3f} "

@@ -51,7 +51,7 @@ Two sanity checks on the values themselves:
 
 ```bash
 cd handover_sim2real/sim2real
-python my_policy_runner.py --policy-dir checkpoint/cp3 --cameras wrist,tripod \
+python my_policy_runner.py --run run16 --cameras wrist,tripod \
        --home --step-mode
 ```
 

@@ -225,3 +225,76 @@ def centroid_to_world(c_ee, obs, panda_base_inv_tf, base_pos, base_quat):
     p_base = ee_mat[:3, :3] @ np.asarray(c_ee, dtype=np.float64) + ee_mat[:3, 3]
     R_base = Rot.from_quat(np.asarray(base_quat, dtype=np.float64)).as_matrix()
     return R_base @ p_base + np.asarray(base_pos, dtype=np.float64)
+
+
+# ── the anchor from THIS step's observation (`SIM.anchor_update`) ─────────────
+
+ANCHOR_UPDATES = ("latched", "live")
+
+# WHICH POINT ON THE GIVER the azimuth is measured from (`SIM.anchor_hand_ref`).
+#
+#   wrist          `mano.body.link_state[0, 7]` — the MANO wrist JOINT centre.
+#                  Exact, and available only in simulation.
+#   hand_centroid  the centroid of the segmented hand POINT CLOUD, which is what
+#                  `my_regrasp_policy_runner._set_direction` uses on the real rig
+#                  (`class_centroid(fused.hand_xyz)`).
+#
+# THESE ARE DIFFERENT POINTS. The wrist joint sits at the base of the palm; the
+# cloud centroid sits out in the visible middle of the hand, and only the visible
+# part at that. `wrist` therefore makes the simulator compute an azimuth the
+# robot cannot reproduce — a sim2real gap in the definition of the frame itself,
+# not in the perception feeding it.
+ANCHOR_HAND_REFS = ("wrist", "hand_centroid")
+
+
+def anchor_from_cloud(pc5, obs, env, panda_base_inv_tf, cfg,
+                      state: AnchorState | None = None, wrist=None,
+                      hand_ref: str = "wrist"):
+    """`(R_anchor, centroid_world, meta)` from the cloud observed at THIS step.
+
+    THE ORIGIN MOVES EVEN WHEN NOTHING DOES. The camera is eye-in-hand, so the
+    object's OBSERVED centroid is a function of where the gripper is looking
+    from: at step 0 it is a distant, heavily self-occluded slice of the object
+    and by the close it is a near view of the face the fingers are on. `c` is
+    therefore not a property of the scene, and the anchor built from it at step 0
+    is not the anchor a deployment would compute at step 20.
+
+    `SIM.anchor_update: latched` keeps the historical behaviour — build the frame
+    once at step 0 and hold it for the episode, which is exact only if `c` is
+    stationary. `live` calls this every step, which is what a real rig has to do
+    because it has no step-0 privilege and no ground truth to fall back on.
+
+    Pass the SAME `state` for every step of an episode: the fallback latch is
+    hysteretic (0.04 m in, 0.08 m out) precisely so a live frame cannot chatter
+    between the wrist reference and the base one mid-approach.
+
+    Returns `(None, None, meta)` when the cloud holds no object points — a real
+    situation (`policy.py`'s occlusion note), and one the caller must handle by
+    keeping the previous frame rather than by conditioning on nothing.
+    """
+    from handover_sim2real.regrasp import channels as _channels
+
+    c_ee = _channels.object_centroid(pc5, fallback_to_all=False)
+    if c_ee is None:
+        return None, None, {"mode": None, "no_centroid": True}
+
+    c_world = centroid_to_world(
+        c_ee, obs, panda_base_inv_tf,
+        cfg.ENV.PANDA_BASE_POSITION, cfg.ENV.PANDA_BASE_ORIENTATION)
+    # THE GIVER REFERENCE. Under `hand_centroid` it comes from the SAME cloud the
+    # object centroid came from, so both references move together as the view
+    # changes and neither is ground truth — which is the situation on hardware.
+    # Falls back to the wrist only when the cloud carries no hand points at all;
+    # `anchor_rotation` then engages its own base fallback if that is None too.
+    if str(hand_ref) == "hand_centroid":
+        h_ee = _channels.hand_centroid(pc5)
+        wrist = (wrist_world(env) if h_ee is None else centroid_to_world(
+            h_ee, obs, panda_base_inv_tf,
+            cfg.ENV.PANDA_BASE_POSITION, cfg.ENV.PANDA_BASE_ORIENTATION))
+    elif wrist is None:
+        wrist = wrist_world(env)
+    R, meta = anchor_rotation(
+        c_world, wrist, np.asarray(cfg.ENV.PANDA_BASE_POSITION), state)
+    meta["no_centroid"] = False
+    meta["hand_ref"] = str(hand_ref)
+    return R, c_world, meta

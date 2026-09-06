@@ -48,7 +48,7 @@ BOARD = BoardSpec()
 # valid Python integer literal at all, and one that happens to parse would then
 # never match the string librealsense reports.
 CAMERA_SERIALS: dict[str, str | None] = {
-    "tripod": "825312073923",
+    "tripod": "243122302229",
     "wrist": "045322075902",
 }
 
@@ -114,6 +114,54 @@ GOOD_CHARUCO_CORNERS = 40           # capture overlay turns green at/above this
 # Guidance, not a hard gate: some square-on views are fine, they just must not
 # dominate. The capture overlay turns green at or above this.
 GOOD_BOARD_TILT_DEG = 30.0
+
+# KEEP THE BOARD NEAR THE MIDDLE OF THE FRAME.
+#
+# The colour stream's factory intrinsics carry ZERO distortion coefficients. The
+# lens is not actually distortion-free, and the residual is worst at the edges —
+# where PnP absorbs it not as reprojection error, which stays sub-pixel, but as a
+# tilt of the board. That lands directly in the rotation residual, which is the
+# threshold hand-eye fails first.
+#
+# Measured on session_02, 16 captures, board detection clean throughout at
+# 0.55 px mean PnP reprojection:
+#
+#   captures with the board in the middle half   rot residual 0.324 deg
+#   captures with the board toward the edges     rot residual 0.856 deg
+#   corr(distance from principal point, rot err) +0.70
+#
+# and not a confound: the edge captures were NEARER (-0.36 with distance),
+# no more square-on (-0.13 with tilt), and detected MORE corners (+0.42).
+# Re-solving on the 10 most central captures alone gave 2.43 mm / 0.382 deg —
+# passing both thresholds — with pose diversity unchanged at 38 deg.
+#
+# Re-estimating intrinsics from the hand-eye captures does NOT fix it and makes
+# it worse (0.716 -> 1.917 deg): 16 views of a small board at similar depths
+# cannot separate focal length from distance, and the fit walks the principal
+# point 51 px. Fixing it properly needs a dedicated intrinsics calibration —
+# many views, board filling the frame, all four corners of the image, varied
+# depth. Until then, capture centrally.
+#
+# Fraction of the half-diagonal within which the board centroid should sit.
+GOOD_BOARD_RADIUS_FRAC = 0.35
+
+# RE-SEAT THE BOARD, THEN MOVE THE ARM AROUND BEFORE CAPTURING ANYTHING.
+#
+# A board on a wrist mount SETTLES, and it does so during the first few poses —
+# exactly the ones you are recording. In session_03 the five earliest captures
+# were the five most costly in a leave-one-out, despite tilts of 33-40 deg and
+# 0.55 px detection, and the recovered gripper->board translation stepped ~4 mm
+# in y around the ninth capture. Neither is visible in any per-image metric; it
+# shows up only as rotation residual that decreases through the session
+# (corr(capture order, rot err) = -0.74).
+#
+# So: clamp or tape the board so it cannot rotate on the mount, then jog the arm
+# through the full range you intend to capture over BEFORE the first capture. Any
+# settling then happens off the record.
+#
+# Note the leave-one-out was flat — the best single capture to drop bought
+# 0.048 deg — so this is not a bad-frame problem and cannot be fixed by
+# discarding captures.
 
 MIN_SAMPLES = 10                    # refuse to solve below this many captures
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Run a Phase-1/4 BC policy (checkpoint/cp2 or cp3) on the physical FR3.
+Run a Phase-1/4 BC policy (checkpoint/run12, run16, run19) on the physical FR3.
 
 Two checkpoints, one runner. They share the observation contract below and
 differ only in how many viewpoints fill the cloud:
@@ -58,7 +58,7 @@ Usage:
     python my_policy_runner.py --home --enable-gripper
 
     # cp3, both cameras fused (needs a validated hand-eye session)
-    python my_policy_runner.py --policy-dir checkpoint/cp3 \
+    python my_policy_runner.py --run run16 \
            --cameras wrist,tripod --calib-session session_02 --home --step-mode
 """
 from __future__ import annotations
@@ -69,7 +69,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 import cv2
 import numpy as np
@@ -86,8 +86,32 @@ HANDOVER_SIM2REAL_ROOT = SIM2REAL_DIR.parents[1]
 PROJECT_ROOT = HANDOVER_SIM2REAL_ROOT.parent
 HANDS_SEG_ROOT = PROJECT_ROOT / "hands-segmentation-pytorch"
 
-DEFAULT_POLICY_DIR = SIM2REAL_DIR / "checkpoint" / "cp2"
-DEFAULT_HAND_SEG_CKPT = SIM2REAL_DIR / "checkpoint" / "cp1" / "checkpoint.ckpt"
+# NAMED AFTER THE DAgger RUN THEY CAME FROM, not cp1/cp2/cp3. The old names said
+# nothing: "cp3" does not tell you what it was trained on, which checkpoint
+# inside the run it is, or how to find the log that explains its behaviour — and
+# a rollout labelled "cp3" is unreproducible six months later. run16 does all
+# three, because output/dagger_runs/dagger4_run16/ is right there.
+#
+# checkpoint/cp1 is deliberately NOT renamed: it is the hand SEGMENTATION model
+# (HandSegModel, 2021), not a policy, and has no run behind it.
+CHECKPOINT_DIR = SIM2REAL_DIR / "checkpoint"
+DEFAULT_RUN = "run12"
+DEFAULT_POLICY_DIR = CHECKPOINT_DIR / DEFAULT_RUN
+DEFAULT_HAND_SEG_CKPT = CHECKPOINT_DIR / "cp1" / "checkpoint.ckpt"
+
+
+def available_runs() -> list[str]:
+    """Installed policy folders, for the --run help text and its error message.
+
+    A folder counts only if it holds all three files a policy needs, so a
+    half-copied checkpoint is not offered as a choice.
+    """
+    if not CHECKPOINT_DIR.is_dir():
+        return []
+    return sorted(
+        d.name for d in CHECKPOINT_DIR.iterdir()
+        if d.is_dir() and all((d / f).exists() for f in
+                              ("config.yaml", "normalization.npz", "best.pt")))
 
 if not HANDS_SEG_ROOT.exists():
     raise FileNotFoundError(
@@ -103,12 +127,21 @@ from pointcloud_multicam import (  # noqa: E402
     NUM_HAND_POINTS,
     NUM_OBJECT_POINTS,
     PC_CHANNELS,
+    FINGER_EXCLUSION_MODES,
     ROBOT_EXCLUSION,
+    CALIB_DIR,
     HandSegmenter,
     MultiCameraPerception,
+    apply_camera_model,
+    check_session_camera,
     build_policy_cloud,
     build_rigs,
     overlay_mask,
+)
+from sam2_segmenter import (  # noqa: E402
+    add_segmentation_args,
+    build_segmenter,
+    describe_segmenter,
 )
 from cloud_viewer import source_for_cloud  # noqa: E402
 from dual_cloud_window import (  # noqa: E402
@@ -164,12 +197,48 @@ GRIPPER_MOVE_GOAL_TYPE = "franka_gripper/MoveActionGoal"
 GRIPPER_STATE_TOPIC = "/franka_gripper/joint_states"
 GRIPPER_STATE_TYPE = "sensor_msgs/JointState"
 
+# Carries F_T_EE, which is the ONLY authority on which frame /cartesian_pose is
+# publishing. See measure_ee_offset_z.
+FRANKA_STATE_TOPIC = "/franka_state_controller/franka_states"
+FRANKA_STATE_TYPE = "franka_msgs/FrankaState"
+GRIPPER_HOMING_GOAL_TOPIC = "/franka_gripper/homing/goal"
+GRIPPER_HOMING_GOAL_TYPE = "franka_gripper/HomingActionGoal"
+GRIPPER_STOP_GOAL_TOPIC = "/franka_gripper/stop/goal"
+GRIPPER_STOP_GOAL_TYPE = "franka_gripper/StopActionGoal"
+# Liveness, not existence. actionlib publishes a GoalStatusArray on this topic
+# continuously while the server is up, so one message is proof something is
+# listening for goals — which advertising the goal topic ourselves is not.
+GRIPPER_GRASP_STATUS_TOPIC = "/franka_gripper/grasp/status"
+GRIPPER_STATUS_TYPE = "actionlib_msgs/GoalStatusArray"
+
+# THESE TOPICS COME FROM franka_ros, NOT FROM THE IMPEDANCE CONTROLLER. The
+# `load_gripper:=True` on
+#
+#   roslaunch franka_human_friendly_controllers \
+#       cartesian_variable_impedance_controller.launch robot_ip:=... load_gripper:=True
+#
+# reaches franka_control.launch in that package, which does
+# `<include file="$(find franka_gripper)/launch/franka_gripper.launch" if="$(arg
+# load_gripper)">`. So the gripper is served by the stock franka_gripper node and
+# the interface is the stock one: grasp/move/homing/stop action servers plus
+# /franka_gripper/joint_states. The package's own reference client
+# (python/LfD/panda.py) publishes GraspActionGoal to /franka_gripper/grasp/goal
+# exactly as below, which is the confirmation that goal topics work here without
+# an action client.
 GRIPPER_MAX_FINGER_M = 0.04   # sim: gripper_norm = joint_pos[7] / 0.04
 GRASP_WIDTH_M = 0.0           # close all the way; epsilon/force do the work
 GRASP_SPEED = 0.05
 GRASP_FORCE = 20.0
-GRASP_EPSILON_INNER = 0.04
-GRASP_EPSILON_OUTER = 0.04
+# WIDE ON PURPOSE. libfranka calls an object grasped only if the final finger
+# distance d satisfies width - inner < d < width + outer, and reports failure
+# otherwise. With width = 0 that makes epsilon the maximum object thickness the
+# grasp will admit — at 0.04 anything thicker than 40 mm came back as a failed
+# grasp, which covers a good part of the YCB set. The reference client in the
+# controller package uses 0.3 for the same reason, i.e. "any width counts". The
+# fingers close and clamp identically either way; this only decides what the
+# action result says.
+GRASP_EPSILON_INNER = 0.3
+GRASP_EPSILON_OUTER = 0.3
 
 # -----------------------------------------------------------------------------
 # Frames
@@ -228,23 +297,60 @@ HOME_JOINTS = (0.0, -1.285, 0.0, -2.356, 0.0, 1.571, 0.785)
 HOME_STEP_TRANS_M = 0.02
 HOME_STEP_ROT_DEG = 5.0
 HOME_SETTLE_TIMEOUT_S = 3.0
-HOME_REFINE_PASSES = 6      # re-command home once the droop estimate exists
-HOME_REFINE_TOL_M = 0.002   # stop refining below this (was SETTLE_POS_TOL_M=5 mm)
+HOME_REFINE_PASSES = 6      # backstop; the refine exits as soon as it is inside
+                            # HOME_REFINE_TOL_M, which is normally the first pass
+
+# HOME IS A STARTING POSE, NOT A PRECISION TARGET, and asking for more precision
+# than the arm can deliver is what made homing hunt.
+#
+# This was 2 mm. The arm has a ~17 mm standing droop and an under-travel gain
+# that varies 0.44-0.92 between consecutive moves, so 2 mm is below what it can
+# reliably land: each refine pass overshot, the next corrected back, and with six
+# passes of up to CREEP_MAX_NUDGES each that is a lot of small motions around
+# home. Reported from hardware as the arm "trying to find exact home position but
+# not able to".
+#
+# Nothing downstream needs the precision. Every training episode began at
+# ENV.PANDA_INITIAL_POSITION, but the policy is single-frame and closed-loop —
+# it observes wherever the arm actually is and steps from there, so a couple of
+# centimetres at t=0 is a slightly different starting state, not an error that
+# accumulates. 2 cm is the operator's call on this rig.
+HOME_REFINE_TOL_M = 0.020   # --home-tol
 HOME_WAY_TOL_M = 0.008      # intermediate waypoints are a path, not a target
 
-# z offset from panda_hand to whatever frame /cartesian_pose publishes.
+# STREAMED HOMING. The waypoint loop already knew the intermediate poses are "a
+# path, not a target" — HOME_WAY_TOL_M says so — but it still called settle() on
+# each one, and settle() ends by waiting for the arm to hold still for
+# SETTLE_STILL_HOLD_S. So a 30 cm home executed as fifteen 2 cm moves separated
+# by fifteen dead stops. The path was smooth; the traversal of it was not.
 #
-# MEASURED ON THIS ROBOT AS ZERO. /cartesian_pose matches O_T_EE to 4e-6 m, and
-# franka_states reports F_T_EE = translation (0,0,0) with a -45 deg z rotation —
-# NOT the Franka Hand default of (0,0,0.1034) with that rotation. Flange + Rz(-45)
-# is exactly how panda_gripper_hand_camera.urdf defines panda_hand, so this
-# controller already publishes the policy's frame. Confirmed independently:
-# pybullet FK of panda_hand at the robot's reported q lands within 0.06 mm of
-# /cartesian_pose.
+# Streaming publishes the same interpolated path on a clock instead, so the arm
+# is always being told to go somewhere slightly ahead of where it is and never
+# arrives anywhere until the end. Unlike the policy loop this cannot deadlock:
+# the waypoints are absolute and pre-computed, so they advance whether or not
+# the arm keeps up, and no break-away lead is needed to make progress.
 #
-# Set --ee-offset-z 0.1034 if you ever reconfigure the EE to the fingertip TCP
-# (F_T_EE translation becomes 0.1034); leaving it wrong is a silent, constant
-# 10 cm error in both the observation and every commanded target.
+# Speed is set here rather than derived from the waypoint spacing, and the
+# spacing then follows from the publish rate. That is the right way round — it
+# means changing the rate changes only smoothness, never how fast the arm moves
+# across the room.
+HOME_SPEED_M_S = 0.08       # Cartesian speed of the streamed path
+HOME_STREAM_DT_S = 0.05     # publish period; spacing = speed * this = 4 mm
+
+# Fallback z offset from panda_hand to whatever frame /cartesian_pose publishes,
+# used ONLY when the robot does not publish F_T_EE. `measure_ee_offset_z` reads
+# the real value at startup; see there for why this is no longer a constant.
+#
+# THIS CONSTANT WAS ONCE 0 AND WAS ONCE RIGHT, which is the whole cautionary
+# tale. franka_states then reported F_T_EE = (0,0,0) with a -45 deg z rotation,
+# and flange + Rz(-45) is exactly how panda_gripper_hand_camera.urdf defines
+# panda_hand — so the controller was publishing the policy's frame, confirmed
+# to 0.06 mm against pybullet FK. The robot's configured end effector later
+# became the Franka Hand TCP, F_T_EE became (0,0,0.1034), and every one of
+# those statements silently stopped being true.
+#
+# 0 is kept as the fallback rather than 0.1034 because a robot that publishes no
+# F_T_EE at all is most likely not a Franka Hand setup either.
 DEFAULT_EE_OFFSET_Z = 0.0
 
 # -----------------------------------------------------------------------------
@@ -293,6 +399,49 @@ SETTLE_ROT_TOL_DEG = 3.0
 # that, so 2.0 s left no margin and would have turned slow steps into timeouts.
 SETTLE_TIMEOUT_S = 3.0
 SETTLE_POLL_S = 0.02
+
+# ── abort ────────────────────────────────────────────────────────────────────
+# 't' at any moment. THIS IS A SOFT STOP AND NOT AN EMERGENCY STOP — say so
+# plainly, because a key that claims to stop a robot will be trusted in exactly
+# the situation where being wrong matters. /equilibrium_pose is the only
+# interface here, so the strongest thing available is to re-command the
+# equilibrium AT THE ARM'S MEASURED POSE: the position error goes to zero, the
+# controller stops pulling, and the arm holds roughly where it stands. It does
+# not brake, it does not go rigid, and it still sags by the standing droop
+# (~17 mm). The button on the wall is the emergency stop.
+#
+# The reason this needs machinery at all rather than another `elif` in the key
+# handler is that the key handler does not run while the robot is moving. A
+# policy step can sit inside settle() for up to 9 s, homing streams for several,
+# and a gripper open blocks for up to 15. A stop that is only noticed after the
+# motion it was meant to interrupt has finished is not a stop, so the blocking
+# loops poll for it themselves through `poll_stop()`.
+stop_requested = False
+_stop_poller: Optional[Callable[[], bool]] = None
+# Keys seen by the inner poller that were NOT the abort key. cv2.waitKey
+# consumes what it reads, so without this a SPACE or a 'q' pressed during a
+# motion would be swallowed by the poll rather than merely delayed by it.
+_swallowed_keys: list[str] = []
+
+
+def clear_stop() -> None:
+    """Acknowledge an abort. Called only after the arm has actually been frozen."""
+    global stop_requested
+    stop_requested = False
+
+
+def poll_stop() -> bool:
+    """Has the abort key been pressed? Safe to call from inside a motion loop."""
+    global stop_requested
+    if stop_requested:
+        return True
+    if _stop_poller is not None:
+        try:
+            if _stop_poller():
+                stop_requested = True
+        except Exception:
+            pass                    # a viewer that has gone away must not abort
+    return stop_requested
 
 # Motion-stopped criterion — the one that actually fires on this robot. Per-poll
 # movement below these for SETTLE_STILL_HOLD_S means the arm has finished
@@ -378,23 +527,77 @@ MAX_DROOP_COMP_M = 0.30
 # well inside what the closed-loop policy corrects for on the next observation,
 # and the passes cap keeps a step from stalling the episode if the arm is blocked.
 STEP_CONVERGE_PASSES = 3
-# 5 mm, not 3. This is the other half of the smoothness fix and it is the half
-# the symptom actually pointed at: "the arm moves a certain distance and then it
-# does some fine motions" IS the tail of a 39 mm step being chased down to 3 mm.
-# The last few millimetres are the expensive part — the arm has to be led far
-# enough past the target to break loose at all, so every millimetre down there
-# costs a correction — and swept across the plausible plants, tightening 5 mm to
-# 3 mm roughly triples the corrections per step and quadruples the time the arm
-# spends stopped mid-move, to buy about 1.5 mm.
-#
-# It is not accuracy that is being given up, because the loop is closed: the next
-# observation is of where the arm actually IS, so a 5 mm residual is not an error
-# the policy is blind to, it is a slightly shorter step. Measured, 95% of each
-# commanded step is still executed. 5 mm is also well inside cp2's own action
-# scale (action_std 16-21 mm), so it is small compared with the resolution at
-# which the policy is steering in the first place.
-STEP_CONVERGE_TOL_M = 0.005
 
+# How close a step has to land before the policy is allowed to look again.
+#
+# RELATIVE to the step, not absolute, and that is the whole point. Two things
+# push in opposite directions and a single number cannot serve both:
+#
+#   the approach   Steps are 30-50 mm and the arm is nowhere near the object.
+#                  Precision here buys nothing — the loop is closed, so a short
+#                  step is just a short step, and the next observation is of
+#                  wherever the arm actually is. What precision COSTS here is
+#                  corrections, and corrections are what the arm visibly does
+#                  after the big move.
+#   the placement  Near the object the policy commands millimetres, and there a
+#                  correction is the point.
+#
+# The fraction handles both, and it has a property a fixed tolerance does not:
+# it can never exceed the step, so a step can never be satisfied without moving.
+# A fixed 20 mm tolerance would make any commanded step under 20 mm a complete
+# no-op — the arm would sit still while the policy believed it had moved.
+#
+# 0.6 is where the corrections stop, measured against a plant carrying this
+# robot's own gain jitter (see below): 3.2 commands per step at 5 mm, 2.0 at
+# 8 mm, 1.0 at 0.6 of the step. The arm then executes ~75% of each commanded
+# step in one continuous motion instead of ~91% in three or four bursts.
+#
+# WHY THE JITTER FORCES THIS. Four consecutive steps on the robot measured
+# under-travel gains of 0.51, 0.44, 0.85, 0.92 — the plant is genuinely different
+# every move, because the direction changes and friction and the arm's
+# configuration change with it. No feed-forward can land a first command
+# precisely against that; precision requires measuring and correcting, and
+# correcting requires stopping. The trade is real and this is which side of it
+# to be on for a closed-loop policy.
+STEP_CONVERGE_TOL_FRAC = 0.6
+STEP_CONVERGE_TOL_MIN_M = 0.004
+STEP_CONVERGE_TOL_M = 0.005     # only a default for callers with no step size
+
+
+def step_tolerance(step_m: float, frac: float = STEP_CONVERGE_TOL_FRAC) -> float:
+    """Convergence tolerance for a commanded step of `step_m`."""
+    return max(STEP_CONVERGE_TOL_MIN_M, frac * float(step_m))
+
+# -----------------------------------------------------------------------------
+# WHY THIS LOOP IS SLOWER THAN THE PAPER'S, which is a design difference and not
+# a performance bug. Worth stating plainly because the instinct is to blame the
+# network, and the network is not the cost.
+#
+# CVPR2023 (Christen et al., arXiv 2303.17592) runs a FIXED-RATE loop. Its
+# rollout is, per policy step:
+#
+#     action = policy(obs)
+#     tjp    = IK(current_ee_pose @ delta)
+#     for _ in range(steps_action_repeat):    # 0.15 s / 0.001 s = 150 substeps
+#         obs = env.step(tjp)
+#
+# POLICY.TIME_ACTION_REPEAT = 0.15, so it re-observes and re-predicts at 6.7 Hz
+# and NEVER checks whether the arm arrived. It cannot get stuck waiting, and the
+# arm is permanently chasing a target that has already moved — which is what
+# makes it look continuous. Undershoot needs no correction pass because the next
+# action is a fresh delta from wherever the arm actually got to; the error is
+# absorbed by the next prediction rather than by a settling loop.
+#
+# This runner instead waits for convergence before it will look again: move_to()
+# runs settle() until the arm is inside tolerance and has held still for
+# SETTLE_STILL_HOLD_S. That buys a clean single-frame observation — the policy is
+# Markov and its robot_state is an EE pose that would otherwise be paired with a
+# cloud captured while the arm was moving — and it costs the entire step time.
+# Perception is ~43 ms and inference ~10 ms against a settle measured in seconds.
+#
+# So the honest trade is: fixed-rate is smooth and matches training, wait-for-
+# arrival is easier to reason about on hardware and lets step mode gate every
+# motion. Nothing below makes the wait cheap; it only makes it shorter.
 # -----------------------------------------------------------------------------
 # Creep correction — why the arm used to move in stop-go-stop-go bursts
 # -----------------------------------------------------------------------------
@@ -514,18 +717,81 @@ CREEP_LATENCY_MARGIN_S = 0.02   # added to the observed round trip
 # travelling anyway, and the creep closes the difference. That is the whole
 # reason this is a scalar: it exists only to make the FIRST command land close so
 # few nudges are needed, and correctness never rests on it.
-TRAVEL_LEAD_BETA = 0.5       # EMA weight on each converged move's lead
+GAIN_BETA = 0.35             # EMA weight on each move's measured gain
+GAIN_MIN = 0.10              # floor; see observe_move
+
+# A GAIN IS ONLY A GAIN IF THE ARM HAS FINISHED MOVING, and `--control rate` by
+# definition never lets it.
+#
+# observe_move divides what a command achieved by what it asked for. settle()
+# waits for the arm to stop before reading that, so the division is honest.
+# The fixed-rate loop dwells for a fixed period and reads whatever the arm has
+# reached by then — which with tau ~ 0.12 s against a 0.15 s period is 71% of
+# the exponential, so a true gain of 0.85 measures as ~0.46. The estimator then
+# inverts it, and 1/0.46 - 1 asks for a lead of 1.2x travel where the honest
+# answer is 0.18x.
+#
+# Measured on hardware, minutes apart on the same arm: homing (which waits)
+# reported gain 0.85, while the rate loop reported 0.10-0.30 and drove the lead
+# to 171 mm on 25 mm policy steps — nearly 7x the move it was leading.
+#
+# So the fixed-rate loop no longer teaches the estimator; it only reads it. The
+# lead then comes from moves that actually settled — homing before every
+# episode, and any settle/step-mode run — and `lead_for`'s travel/scale term
+# takes it down to the right size for a 25 mm step. Rate mode keeps its
+# break-away, which is what covers a small step against a stall band and is
+# driven by the arm being stuck rather than by any gain estimate.
+# The cap that follows from that. A lead may be at most 1.25x the move it is
+# leading PLUS a fixed allowance, and the two terms are not interchangeable:
+#
+#   the ratio    1.25x is what a gain of 0.444 asks for, and 0.44 is the worst
+#                this arm has ever honestly measured. Past that is not a stiff
+#                arm, it is the broken measurement above.
+#   the offset   a multiplicative gain CANNOT represent the standing offset —
+#                this controller settles ~17 mm short of any target, so an 8 mm
+#                command against it moves the arm not at all, and the lead that
+#                gets it moving is necessarily larger than the step. Capping by
+#                ratio alone starves exactly those small moves: measured, an
+#                8 mm step then fell 27.5 mm short of its goal over 60 ticks.
+#
+# Together they bound the 171 mm lead seen on 25 mm steps down to 51 mm, while
+# leaving a small step the headroom it needs to break away at all.
+#
+# Under-leading is self-correcting — the loop is closed, so the next observation
+# simply sees a shorter step. Over-leading is not: the policy fights it. That
+# asymmetry is why this is a cap and not a tuned gain.
+MAX_LEAD_TRAVEL_RATIO = 1.25
+LEAD_STALL_ALLOWANCE_M = 0.020
 TRAVEL_LEAD_MIN_M = 0.005    # moves shorter than this do not inform the estimate
-TRAVEL_LEAD_MAX_M = 0.05     # cap, same spirit as MAX_DROOP_COMP_M
 
 MAX_POLICY_STEPS = 50   # dagger/evaluator.py EvalParams.max_steps
 
+# handover_sim2real/config.py: POLICY.TIME_ACTION_REPEAT = 0.15 against
+# SIM.TIME_STEP = 0.001, i.e. 150 substeps per policy step. That is the rate the
+# policy was trained and evaluated at, so it is the default for --control rate
+# rather than anything tuned here.
+RATE_CONTROL_HZ = 1.0 / 0.15
+
+# Displacement over one tick below which the arm counts as not having moved, and
+# the fixed-rate loop starts adding break-away lead. Well above the pose noise
+# and well below anything a real step achieves, so it separates "stuck" from
+# "slow" rather than firing on both.
+RATE_STUCK_M = 0.0005
+
 # How long each step-mode iteration idles pumping the 3D window's events before
-# recomputing perception. One iteration of perception + policy is ~80-100 ms, so
-# without this the viewer is pumped at ~10 Hz and a trackpad drag is sampled far
-# too coarsely to orbit smoothly. Any keypress breaks the pump immediately, so
-# this never delays SPACE. Only used in --step-mode: in continuous mode the loop
-# rate is the control rate and must not be traded away for a debug view.
+# recomputing perception. One iteration of perception + policy is ~50 ms
+# (measured: tripod get_frames 33 ms, hand segmentation 24 ms at 384 px overlapped
+# with it, full observe() 33-47 ms, policy cloud assembly free), so without this
+# the viewer is pumped at ~20 Hz and a trackpad drag is sampled too coarsely to
+# orbit smoothly. Any keypress breaks the pump immediately, so this never delays
+# SPACE.
+#
+# It applies ONLY when a 3D window actually exists AND --step-mode is on. Both
+# guards matter. In continuous mode the loop rate is the control rate and must
+# not be traded away for a debug view. And without --show-cloud there is no
+# window to pump — tick() and drain_keys() return immediately — so the pump
+# would be 200 ms of idle per iteration buying nothing, which is 4x the loop's
+# entire real workload and drops the camera preview from ~20 Hz to ~4 Hz.
 VIEWER_PUMP_S = 0.20
 
 # -----------------------------------------------------------------------------
@@ -607,6 +873,62 @@ def z_offset_transform(dz: float) -> np.ndarray:
     return T
 
 
+def measure_ee_offset_z(client, timeout_s: float = 5.0) -> Optional[float]:
+    """Read the panda_hand -> published-frame z offset off the robot.
+
+    WHY THIS IS MEASURED AND NOT A CONSTANT. It used to be a constant, correct
+    at the time it was written, and it went stale without a single error: the
+    robot's configured end effector changed to the Franka Hand TCP, `F_T_EE`
+    became (0, 0, 0.1034), and `/cartesian_pose` started publishing a frame
+    103.4 mm ahead of `panda_hand` along the approach axis.
+
+    Nothing complains, because the observation and the commanded target are
+    BOTH in the wrong frame and stay self-consistent. What breaks is the one
+    relationship that is not: where the point cloud sits relative to the
+    gripper. An object just beyond the fingertips (panda_hand z ~ 0.16) renders
+    at z ~ 0.06 — between the finger boxes — and the policy closes about 10 cm
+    short of it, which is exactly how this was found on hardware.
+
+    `F_T_EE` is published every control cycle and is the authority, so the
+    constant is only ever a fallback for a robot that does not publish it.
+
+    Returns None when the topic never arrives or the transform is not a pure
+    z offset — the latter because this whole correction is `Tz(-dz)`, and
+    silently applying it to a transform with x/y translation would trade a
+    known error for a subtler one.
+    """
+    import roslibpy
+
+    got: dict[str, Any] = {}
+    topic = roslibpy.Topic(client, FRANKA_STATE_TOPIC, FRANKA_STATE_TYPE)
+    try:
+        topic.subscribe(lambda m: got.setdefault("msg", m))
+        t0 = time.time()
+        while "msg" not in got and time.time() - t0 < timeout_s:
+            time.sleep(0.05)
+    finally:
+        try:
+            topic.unsubscribe()
+        except Exception:
+            pass
+
+    if "msg" not in got:
+        return None
+    raw = got["msg"].get("F_T_EE")
+    if raw is None or len(raw) != 16:
+        return None
+
+    # libfranka ships 4x4 transforms COLUMN-major.
+    F = np.asarray(raw, dtype=np.float64).reshape(4, 4).T
+    tx, ty, tz = F[:3, 3]
+    if abs(tx) > 1e-6 or abs(ty) > 1e-6:
+        print(f"[frames] F_T_EE has x/y translation ({tx * 1e3:.1f}, "
+              f"{ty * 1e3:.1f}) mm, which a z offset cannot express. "
+              "Falling back to --ee-offset-z.")
+        return None
+    return float(tz)
+
+
 def pose_error(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     """(translation error in m, rotation error in rad) between two 4x4 poses."""
     dt = float(np.linalg.norm(a[:3, 3] - b[:3, 3]))
@@ -654,6 +976,58 @@ def clamp_command_lead(T_command: np.ndarray, T_current: np.ndarray,
     out = T_command.copy()
     out[:3, 3] = T_current[:3, 3] + lead * (max_lead_m / n)
     return out
+
+
+def clip_lead_to_error(lead: np.ndarray, err: np.ndarray) -> np.ndarray:
+    """Forbid a lead that points against the way the arm still has to go.
+
+    A lead exists to get the arm somewhere; one aimed the other way is wrong
+    whatever model produced it, so this needs no assumption about the controller
+    and cannot be tuned incorrectly.
+
+    It is here because of a real deadlock, and the deadlock is not obvious. The
+    lead accumulates while the arm falls short, which is right. But if a move
+    then OVERSHOOTS, the error reverses while the accumulated lead does not: the
+    equilibrium is still tens of millimetres beyond the target, which is still
+    ahead of the arm, so the controller keeps pulling the arm further the wrong
+    way. Nudging shrinks the lead by only a fraction of a now-small error, so it
+    takes more nudges to walk the equilibrium back behind the arm than the nudge
+    budget allows. Measured: 8.4 mm past the target, all twelve nudges spent,
+    never settling — and since the estimate only learns from settled moves, every
+    later step repeated it exactly. Twelve commands per step, forever.
+
+    Clipping the opposing component puts the equilibrium at the target at worst,
+    which the arm can always fall short of in the correct direction.
+    """
+    n = float(np.linalg.norm(err))
+    if n < 1e-12:
+        return lead
+    u = np.asarray(err, dtype=np.float64) / n
+    along = float(np.asarray(lead, dtype=np.float64) @ u)
+    if along >= 0.0:
+        return lead
+    return lead - along * u     # remove only the opposing part
+
+
+def freeze_arm(pub, seq: int, times: int = 3) -> int:
+    """Re-command the equilibrium at the arm's MEASURED pose. Returns next seq.
+
+    With the equilibrium on top of the arm the position error is zero, so the
+    controller generates no restoring force and the arm stops where it stands.
+    That is the entire mechanism, and its limits follow from it: the arm is not
+    braked and not stiffened, so it will still sag by the standing droop and can
+    still be pushed. Published `times` over rather than once because a single
+    dropped websocket frame would leave the previous target — the one we are
+    trying to abandon — as the live command.
+    """
+    if pub is None or current_msg is None:
+        return seq
+    T_now = pose_msg_to_matrix(current_msg)
+    for _ in range(times):
+        pub.publish(roslibpy.Message(
+            matrix_to_pose_msg_like(current_msg, T_now, seq)))
+        seq += 1
+    return seq
 
 
 def clamp_target_pose(T: np.ndarray) -> np.ndarray:
@@ -727,15 +1101,83 @@ class FrankaGripper:
 
     def __init__(self, client: Optional[roslibpy.Ros], enabled: bool):
         self.enabled = bool(enabled and client is not None)
-        self._grasp = self._move = None
+        self._client = client
+        # UNIQUE PER PROCESS. The counter alone restarts at 0 every run, so two
+        # runs sent byte-identical goal ids. actionlib's ActionServer discards a
+        # goal whose id is already in its status list, so a repeat can be dropped
+        # in silence — and this interface has no action client to notice. The pid
+        # costs nothing and removes the class of bug.
+        self._tag = f"my_policy_runner_{os.getpid()}"
+        self._grasp = self._move = self._homing = self._stop = None
         self._seq = 0
         if self.enabled:
             self._grasp = roslibpy.Topic(
                 client, GRIPPER_GRASP_GOAL_TOPIC, GRIPPER_GRASP_GOAL_TYPE)
             self._move = roslibpy.Topic(
                 client, GRIPPER_MOVE_GOAL_TOPIC, GRIPPER_MOVE_GOAL_TYPE)
+            self._homing = roslibpy.Topic(
+                client, GRIPPER_HOMING_GOAL_TOPIC, GRIPPER_HOMING_GOAL_TYPE)
             self._grasp.advertise()
             self._move.advertise()
+            self._stop = roslibpy.Topic(
+                client, GRIPPER_STOP_GOAL_TOPIC, GRIPPER_STOP_GOAL_TYPE)
+            self._homing.advertise()
+            self._stop.advertise()
+
+    def server_is_up(self, timeout_s: float = 3.0) -> bool:
+        """Is anything actually listening for grasp goals?
+
+        WORTH CHECKING, BECAUSE THE FAILURE IS SILENT. Publishing a goal to a
+        topic no action server has subscribed to succeeds: rosbridge takes the
+        message, nobody acts on it, and nothing anywhere reports a problem. The
+        run then looks normal right up to the CLOSE that does not happen — with
+        a human holding an object, which is an expensive place to find out.
+
+        The state this catches is real and easy to reach: launching the
+        controller WITHOUT load_gripper:=True leaves /franka_gripper/joint_states
+        publishing (the joint_state_publisher source list still names it) while
+        every grasp/move/homing topic is absent. So the width readback looks
+        healthy and the commands go nowhere.
+
+        Testing the status topic rather than the goal topic is the point.
+        actionlib publishes a GoalStatusArray continuously while a server is up,
+        so one message proves a server exists; the goal topic would show up as
+        soon as WE advertised it, which proves only that we are running.
+        """
+        if not self.enabled:
+            return False
+        seen = []
+        topic = roslibpy.Topic(self._client, GRIPPER_GRASP_STATUS_TOPIC,
+                               GRIPPER_STATUS_TYPE)
+        try:
+            topic.subscribe(lambda _msg: seen.append(1))
+            t0 = time.time()
+            while not seen and time.time() - t0 < timeout_s:
+                time.sleep(0.05)
+        finally:
+            try:
+                topic.unsubscribe()
+            except Exception:
+                pass
+        return bool(seen)
+
+    def home(self) -> None:
+        """Calibrate the finger travel. Needed once per gripper power cycle.
+
+        franka_gripper.launch does NOT do this for you, and until it has run the
+        reported width is uncalibrated — which matters here beyond the grasp
+        itself, because `read_gripper_norm` feeds both robot_state[25] and the
+        position of the finger exclusion boxes. It takes a few seconds and moves
+        the fingers through their full range, so it is opt-in rather than
+        automatic: nothing should move at startup that the flags did not ask for.
+        """
+        if not self.enabled:
+            print("[gripper] homing skipped (disabled)")
+            return
+        self._seq += 1
+        self._homing.publish(roslibpy.Message(_action_goal_msg(
+            f"{self._tag}_homing_{self._seq}", {})))
+        print("[gripper] homing goal sent (fingers will open and close fully)")
 
     def close(self) -> None:
         if not self.enabled:
@@ -743,7 +1185,7 @@ class FrankaGripper:
             return
         self._seq += 1
         self._grasp.publish(roslibpy.Message(_action_goal_msg(
-            f"my_policy_runner_grasp_{self._seq}",
+            f"{self._tag}_grasp_{self._seq}",
             {
                 "width": GRASP_WIDTH_M,
                 "epsilon": {"inner": GRASP_EPSILON_INNER,
@@ -753,16 +1195,97 @@ class FrankaGripper:
             })))
         print(f"[gripper] grasp goal sent (width={GRASP_WIDTH_M} force={GRASP_FORCE}N)")
 
+    def wait_for_width(self, want_m: float, timeout_s: float = 8.0,
+                       tol_m: float = 0.004) -> bool:
+        """Block until the fingers reach `want_m` each, or give up.
+
+        Goals go out over the goal TOPIC, so there is no result to wait on — the
+        only feedback available is /franka_gripper/joint_states. Watching it is
+        the difference between knowing a command worked and assuming it did,
+        which for the gripper is the difference between the policy being told
+        the truth about robot_state[25] and being told 1.0 because nothing
+        contradicted it.
+        """
+        if not self.enabled:
+            return False
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            if (gripper_finger_m is not None
+                    and abs(gripper_finger_m - want_m) <= tol_m):
+                return True
+            if poll_stop():
+                return False
+            time.sleep(0.05)
+        return False
+
+    def prepare(self, home_first: bool) -> bool:
+        """Put the gripper in the state the policy was trained to see: OPEN.
+
+        WHY THIS EXISTS. Nothing used to open the gripper at startup, and the
+        episode ENDS on a close — so every run after one that actually grasped
+        began with the fingers shut. Two things then go wrong at once and
+        neither announces itself:
+
+          * robot_state[25] is the normalised finger position, and it reads 0.
+            The policy was trained on approaches where it is 1.0 throughout,
+            because the episode terminates at the close. Being told the gripper
+            is already shut from step 0 is off-distribution before the first
+            action, which is what "the arm moves in a weird way and not toward
+            the object" looks like.
+          * finger_q_m is 0, so the two finger exclusion boxes MEET (inner_y is
+            -0.6 mm) and cover the whole jaw volume. Object points between the
+            jaws are then deleted — the exact failure GraspRegion exists to
+            prevent, arriving through the gripper state instead.
+
+        Homing runs AFTER the open, not before. Homing drives the fingers
+        through their full range, and doing that while they are clamped on an
+        object is how a homing goal quietly fails — which is the other half of
+        "it homes the first time and never again".
+        """
+        if not self.enabled:
+            return False
+        target = GRIPPER_MAX_FINGER_M
+        self.open()
+        if not self.wait_for_width(target):
+            print(f"[gripper] open did not complete: width now "
+                  f"{'unknown' if gripper_finger_m is None else f'{gripper_finger_m*1000:.1f} mm'}",
+                  flush=True)
+        if home_first:
+            self.home()
+            if not self.wait_for_width(target, timeout_s=15.0):
+                print("[gripper] homing did not finish inside 15 s — the "
+                      "fingers may be obstructed, or the goal was dropped.",
+                      flush=True)
+                return False
+            print("[gripper] homed", flush=True)
+            # Homing ends open, but say so explicitly rather than assume it.
+            self.open()
+            self.wait_for_width(target)
+        return self.wait_for_width(target, timeout_s=1.0)
+
+    def stop(self) -> None:
+        """Abort whatever the gripper is doing. Leaves the fingers where they are.
+
+        franka_gripper's stop action cancels the goal in flight, which matters
+        during an abort for one case in particular: a grasp that is closing on
+        something it should not be closing on.
+        """
+        if not self.enabled or self._stop is None:
+            return
+        self._seq += 1
+        self._stop.publish(roslibpy.Message(_action_goal_msg(
+            f"{self._tag}_stop_{self._seq}", {})))
+
     def open(self) -> None:
         if not self.enabled:
             return
         self._seq += 1
         self._move.publish(roslibpy.Message(_action_goal_msg(
-            f"my_policy_runner_move_{self._seq}",
+            f"{self._tag}_move_{self._seq}",
             {"width": 2 * GRIPPER_MAX_FINGER_M, "speed": GRASP_SPEED})))
 
     def shutdown(self) -> None:
-        for topic in (self._grasp, self._move):
+        for topic in (self._grasp, self._move, self._homing, self._stop):
             if topic is not None:
                 try:
                     topic.unadvertise()
@@ -883,24 +1406,38 @@ class DroopCompensator:
            (`--no-creep`). `compensate` applies it; `update` re-estimates it by
            integral feedback from what the last command achieved.
 
-      `s`  a lead MAGNITUDE applied along the direction of the current move,
-           used by the creep path. `initial_lead` applies it; `observe_travel`
-           re-estimates it from the lead a converged move actually needed.
+      `g`  the fraction of a commanded displacement the arm actually executes,
+           used by the creep path. `lead_for` turns it into a lead; `observe_move`
+           re-estimates it from what a move's first command achieved.
 
-    They are deliberately not mixed. Under creep the standing offset is
-    re-derived within every move by the creep itself, which is strictly more
-    robust than carrying a vector across moves that go in different directions —
-    see the TRAVEL_LEAD_* block. Disabled, all four are no-ops: the creep still
-    converges, it just starts each move from a zero lead and pays a nudge or two
-    for it.
+    A GAIN and not a lead magnitude, which is what this held first. A lead is a
+    distance, so it is only ever right for the move it was learned on: correct
+    for a 40 mm step, far too large for the 4 mm correction at the end of one,
+    and unbounded above as steps grow. A gain is dimensionless. It says the same
+    true thing about the controller at every scale, and `lead_for` recovers the
+    right distance for whatever error is actually in front of it.
+
+    They are deliberately not mixed. Disabled, all of it is a no-op: the creep
+    still converges, it just starts each move from a zero lead and pays a nudge
+    or two for it.
     """
 
     def __init__(self, enabled: bool = True):
         self.enabled = bool(enabled)
         self.d = np.zeros(3, dtype=np.float64)
         self.samples = 0
-        self.s = 0.0            # travel-direction lead, metres
-        self.s_samples = 0
+        # 1.0 means "executes what it is told", i.e. no lead. Starting there
+        # rather than at a guess means the first move of an episode is commanded
+        # honestly and the estimate is built from what it does, instead of the
+        # arm being thrown at a lead nobody has measured yet.
+        self.g = 1.0
+        self.g_samples = 0
+        self.s = 0.0           # lead magnitude for a full-step first command, m
+        # The travel `s` was measured over. A lead magnitude is only meaningful
+        # at the scale it was learned at, and until this existed nothing recorded
+        # what that scale was — so `lead_for` applied a full-step lead to a 2 mm
+        # correction. See lead_for.
+        self.s_scale = 0.0
 
     def compensate(self, T_target: np.ndarray) -> np.ndarray:
         if not self.enabled:
@@ -909,44 +1446,132 @@ class DroopCompensator:
         T[:3, 3] = T[:3, 3] + self.d
         return T
 
-    def initial_lead(self, travel: np.ndarray) -> np.ndarray:
-        """The lead to command before the arm has moved, for a move covering
-        `travel` (target minus current position)."""
+    def gain(self) -> float:
+        """Fraction of a commanded displacement this arm actually executes."""
+        return self.g if self.enabled else 1.0
+
+    def lead_for(self, travel: np.ndarray) -> np.ndarray:
+        """The lead for the FIRST command of a move covering `travel`.
+
+        A magnitude along the direction of travel, learned from what previous
+        first commands needed. It is a magnitude and not a gain because a gain
+        has to be re-applied at other scales to be useful and this one is not
+        clean enough to survive that — see observe_move. It is a magnitude along
+        TRAVEL and not a vector because friction opposes the direction of motion,
+        so a vector learned on the last move points the wrong way as soon as the
+        policy reverses, which during a handover it does constantly.
+
+        NEVER LARGER THAN THE SCALE IT WAS MEASURED AT. `observe_move` refuses to
+        learn from a move shorter than TRAVEL_LEAD_MIN_M — "a short move says
+        nothing about the gain" — and for a long time nothing enforced the
+        matching rule when APPLYING it. That asymmetry had a specific symptom.
+        `go_home`'s refine is a move of a few millimetres, and its first command
+        got the full lead learned over ~30 mm policy steps, which
+        MAX_DROOP_COMP_M lets reach hundreds. The arm shot past home, the next
+        pass shot back, and homing hunted for all six refine passes — while
+        `observe_move` ignored every one of those moves as too short to learn
+        from, so it could not correct itself out of it either.
+
+        Reported from hardware as homing working the first time and hunting
+        afterwards, which is exactly the shape of the bug: the first home runs
+        with s = 0 because no episode has been flown yet.
+
+        Scaling by travel/scale is the physically right relation, not a fudge:
+        the lead that lands a move is `e * (1/g - 1)`, linear in the distance
+        covered. Clamped at 1.0 rather than extrapolated up, because a magnitude
+        that does not extrapolate is the property observe_move chose it for.
+        """
         if not self.enabled or self.s <= 0.0:
             return np.zeros(3, dtype=np.float64)
         n = float(np.linalg.norm(travel))
         if n < 1e-9:
             return np.zeros(3, dtype=np.float64)
-        return self.s * (np.asarray(travel, dtype=np.float64) / n)
+        mag = self.s
+        if self.s_scale > 1e-9:
+            mag *= min(1.0, n / self.s_scale)
+        mag = min(mag, MAX_LEAD_TRAVEL_RATIO * n + LEAD_STALL_ALLOWANCE_M)
+        return mag * (np.asarray(travel, dtype=np.float64) / n)
 
-    def observe_travel(self, lead_used: np.ndarray, travel: np.ndarray) -> None:
-        """Learn from a move that converged, by projecting the lead it ended up
-        needing onto the direction it travelled.
+    def observe_move(self, commanded0: float, shortfall: np.ndarray,
+                     travel: np.ndarray) -> None:
+        """Learn from what the move's FIRST command achieved.
 
-        Only the along-travel component is kept. The perpendicular part is real —
-        gravity does not care which way the arm is going — but it is not
-        separable from the direction-dependent part in a single move, and
-        carrying a mis-attributed vector forward is the failure this whole scheme
-        exists to avoid. The creep re-derives it each move for the cost of a
-        nudge.
+        Every move measures the controller's under-travel directly, and this uses
+        that rather than assuming it. The first command asked the arm to cover
+        `commanded0` and it covered `e0 - shortfall`, so
+
+            g = (e0 - shortfall) / commanded0
+
+        is the fraction of a commanded displacement this arm actually executes,
+        here, now, in this direction. Landing `e0` therefore wants a commanded
+        `e0 / g`, i.e. a lead of `e0/g - e0`. That has the right fixed point for
+        free: if the command already landed on target, g = e0/commanded0 and the
+        formula returns the lead that command used.
+
+        `commanded0` is what was ACTUALLY PUBLISHED, measured from the pose, not
+        the lead this code intended. The two differ whenever clamp_command_lead
+        truncates the command, and using the intended value there is a genuine
+        runaway: g comes out too small, the ideal lead too large, the next
+        command is truncated harder, and the estimate walks to its cap and stays
+        there. Measured, that turned a 3-command step into a 20-command one.
+
+        Everything about this is measured per move, which is the point. The
+        previous version corrected by the raw shortfall instead — deliberately
+        under-correcting so the estimate would approach from below and never
+        overshoot — and that is safe but far too slow: it closes only a fraction
+        g of the gap per move, so at g = 0.5 with the EMA on top it needed ten to
+        fifteen moves. On hardware that reads as the corrections never going
+        away, because an episode is fifty steps and the arm is still converging
+        for a third of it.
+
+        Only the along-travel component is used. The perpendicular part is real —
+        gravity does not care which way the arm is going — but is not separable
+        from the direction-dependent part in a single move, and carrying a
+        mis-attributed vector forward is the failure this whole scheme exists to
+        avoid. The creep re-derives it each move for the cost of a nudge.
         """
         if not self.enabled:
             return
-        n = float(np.linalg.norm(travel))
-        if n < TRAVEL_LEAD_MIN_M:
-            return              # a short move says nothing about travel lead
-        along = float(np.asarray(lead_used, dtype=np.float64) @ (travel / n))
-        if along <= 0.0:
-            # The move finished needing a lead pointing BACKWARDS along the way
-            # it went, which happens when it overshot and the corrections walked
-            # the lead back past zero. That is evidence about that move, not
-            # evidence that no lead is needed, and folding it in as a zero halves
-            # a perfectly good estimate: measured, one such move dropped a
-            # converged 22 mm lead to 11 mm and cost seven commands to rebuild.
+        e0 = float(np.linalg.norm(travel))
+        if e0 < TRAVEL_LEAD_MIN_M:
+            return              # a short move says nothing about the gain
+        u = np.asarray(travel, dtype=np.float64) / e0
+        short_along = float(np.asarray(shortfall, dtype=np.float64) @ u)
+
+        commanded = float(commanded0)
+        if commanded <= 1e-6:
             return
-        self.s = ((1.0 - TRAVEL_LEAD_BETA) * self.s
-                  + TRAVEL_LEAD_BETA * min(along, TRAVEL_LEAD_MAX_M))
-        self.s_samples += 1
+        # Floored, not merely guarded against zero: an arm that barely moved
+        # gives a gain near zero and so a lead near infinity, and the honest
+        # reading of "it hardly moved" is "lead a good deal more", not "lead by
+        # forty metres". The floor turns that into a bounded step the next move
+        # refines. Capped at 1.0 because a controller that over-travels is not
+        # something this compensation should try to exploit.
+        g_obs = float(np.clip((e0 - short_along) / commanded, GAIN_MIN, 1.0))
+
+        # Store the LEAD this move wanted, not the gain that implies it. The gain
+        # is the honest way to compute it — but it is contaminated by the
+        # standing offset (achieved = g*commanded - offset, so a measured gain is
+        # always g - offset/commanded, an underestimate) and re-applying that
+        # underestimate at a different scale over-leads badly. Measured on a
+        # 17 mm offset it settled at 0.35 against a true 0.50, over-led the first
+        # command, and cost seven commands a step walking the overshoot back.
+        #
+        # A lead magnitude does not extrapolate, so it cannot be wrong that way.
+        # It is only ever applied to the FIRST command of a move, and first
+        # commands are always one full policy step, which is the scale it was
+        # measured at. The corrections after it accumulate from the actual error.
+        ideal = e0 / g_obs - e0
+        if ideal <= 0.0:
+            return              # this move wanted to be aimed backwards; ignore
+        self.s = ((1.0 - GAIN_BETA) * self.s
+                  + GAIN_BETA * min(ideal, MAX_DROOP_COMP_M))
+        # Track the scale alongside the magnitude, on the same EMA, so the two
+        # always describe the same moves. `lead_for` needs it to avoid handing a
+        # full-step lead to a millimetre-scale correction.
+        self.s_scale = (1.0 - GAIN_BETA) * self.s_scale + GAIN_BETA * e0
+        self.g = g_obs
+        self.g_samples += 1
 
     def update(self, T_commanded: np.ndarray, T_measured: np.ndarray) -> None:
         """D = commanded - measured, EMA-blended and capped.
@@ -966,8 +1591,9 @@ class DroopCompensator:
     def describe(self) -> str:
         if not self.enabled:
             return "droop compensation OFF"
-        if self.s_samples:
-            return f"lead={self.s*1000:.1f} mm along travel  n={self.s_samples}"
+        if self.g_samples:
+            return (f"lead={self.s*1000:.0f} mm along travel (gain {self.g:.2f})"
+                    f"  n={self.g_samples}")
         return (f"droop=({self.d[0]*1000:+.1f}, {self.d[1]*1000:+.1f}, "
                 f"{self.d[2]*1000:+.1f}) mm  n={self.samples}")
 
@@ -1029,7 +1655,16 @@ def settle(pub, template_msg: dict, T_base_ctrl_target: np.ndarray, seq: int,
         lead = (droop.compensate(T_base_ctrl_target)[:3, 3] - target_xyz
                 if droop is not None else np.zeros(3))
     else:
-        lead = droop.initial_lead(travel) if droop is not None else np.zeros(3)
+        # The FIRST command is sized from the learned gain, which is honest
+        # here and only here: the gain was measured on moves of exactly this
+        # scale — a full policy step — so applying it at that scale is applying
+        # it where it was identified. The corrections that follow accumulate
+        # instead, because by then the error is small and the standing offset
+        # dominates it, and a gain cannot represent an additive offset. Using the
+        # gain all the way down under-leads the tail badly: measured, 10 commands
+        # a step against 1.8.
+        lead = droop.lead_for(travel) if droop is not None else np.zeros(3)
+
 
     def publish(seq: int) -> tuple[np.ndarray, int]:
         """Command target+lead, bounded so the equilibrium never sits more than
@@ -1045,6 +1680,15 @@ def settle(pub, template_msg: dict, T_base_ctrl_target: np.ndarray, seq: int,
         return T_cmd, seq + 1
 
     T_command, seq = publish(seq)
+    # What the FIRST command actually ASKED FOR, along the direction of travel,
+    # read back off the published pose so a clamp is included ...
+    u0 = travel / max(float(np.linalg.norm(travel)), 1e-12)
+    commanded0 = float((T_command[:3, 3] - (T_start[:3, 3] if T_start is not None
+                                            else T_command[:3, 3])) @ u0)
+    first_rest = None           # ... and where it left the arm. See
+                                # DroopCompensator.observe_move for why the
+                                # estimate must come from these two and not from
+                                # whatever the move ends up accumulating.
     t0 = t_pub = time.time()
     latency = None              # round trip, once the link has demonstrated one
     armed_at = t0 + CREEP_DEAD_S
@@ -1057,6 +1701,10 @@ def settle(pub, template_msg: dict, T_base_ctrl_target: np.ndarray, seq: int,
 
     while time.time() - t0 < timeout_s:
         time.sleep(SETTLE_POLL_S)
+        # Checked here because this loop is where a policy step spends its time,
+        # so this is where an abort has to be noticed to mean anything.
+        if poll_stop():
+            break
         if current_msg is None:
             continue
         T_now = pose_msg_to_matrix(current_msg)
@@ -1092,6 +1740,8 @@ def settle(pub, template_msg: dict, T_base_ctrl_target: np.ndarray, seq: int,
         if still_since is None:
             continue
         quiet = time.time() - still_since
+        if first_rest is None and quiet >= CREEP_STALL_HOLD_S:
+            first_rest = T_now[:3, 3].copy()
 
         if not creep:
             if quiet >= SETTLE_STILL_HOLD_S:
@@ -1126,7 +1776,7 @@ def settle(pub, template_msg: dict, T_base_ctrl_target: np.ndarray, seq: int,
                 # much.
                 step = err_vec / max(float(np.linalg.norm(err_vec)), 1e-12)
                 step = step * CREEP_BREAKAWAY_M
-            lead = lead + step
+            lead = clip_lead_to_error(lead + step, err_vec)
             n = float(np.linalg.norm(lead))
             if n > MAX_DROOP_COMP_M:
                 lead *= MAX_DROOP_COMP_M / n
@@ -1145,11 +1795,166 @@ def settle(pub, template_msg: dict, T_base_ctrl_target: np.ndarray, seq: int,
     # estimate.
     if droop is not None and settled and current_msg is not None:
         if creep:
-            droop.observe_travel(lead, travel)
+            if first_rest is None:      # converged before ever coming to rest
+                first_rest = pose_msg_to_matrix(current_msg)[:3, 3]
+            droop.observe_move(commanded0, target_xyz - first_rest, travel)
         else:
             droop.update(T_command, pose_msg_to_matrix(current_msg))
 
     return SettleResult(settled, dt, drot, seq, nudges)
+
+
+class RateCommander:
+    """Fixed-rate control: publish once per tick, never wait for arrival.
+
+    This is the CVPR2023 loop (arXiv 2303.17592), transplanted. Its rollout is
+
+        action = policy(obs)
+        tjp    = IK(current_ee_pose @ delta)
+        for _ in range(int(0.15 / 0.001)):      # POLICY.TIME_ACTION_REPEAT
+            obs = env.step(tjp)
+
+    — one command, a fixed 0.15 s of execution, then look again, with no test of
+    whether the arm got there. The arm is permanently chasing a target that has
+    already moved, which is what makes the motion continuous instead of
+    stop-start, and undershoot needs no correction pass because the NEXT action
+    is a fresh delta from wherever the arm actually reached. Error is absorbed by
+    the next prediction rather than by a settling loop.
+
+    WHAT IS PUBLISHED IS EXACTLY WHAT settle() PUBLISHES FIRST: target plus the
+    droop lead along travel, bounded by clamp_command_lead. Fixed-rate mode is
+    then precisely "settle's first command, then stop waiting", which keeps one
+    definition of a well-formed command instead of two.
+
+    THE LEAD IS NOT OPTIONAL HERE, and the reason is worth stating because
+    dropping it looks safe. The target is rebuilt every tick from the MEASURED
+    pose, so a command the arm is too stiff to execute does not accumulate: the
+    equilibrium is re-placed at the same physical spot, the arm stays put, the
+    observation does not change, the policy predicts the same delta, and the loop
+    deadlocks. In settle() the creep nudges break that; here the standing lead is
+    the only thing that does. It is why `--no-droop-compensation` and
+    `--control rate` together are a bad combination near the object, where the
+    deltas are smallest.
+
+    The estimator keeps learning across ticks, from the same quantities settle
+    uses: what the last command asked for along travel, and how far the arm got
+    by the time the next tick came round.
+    """
+
+    def __init__(self, pub, hz: float, droop: "DroopCompensator | None"):
+        self.pub = pub
+        self.period = 1.0 / max(float(hz), 1e-3)
+        self.droop = droop
+        self._next_tick = None
+        self._pending = None        # (commanded0, start_xyz, u0, want)
+        # Extra lead accumulated while the arm is not moving. See _stuck below:
+        # this is creep's break-away, spread across ticks instead of across
+        # nudges inside one settle.
+        self._stuck_lead = 0.0
+
+    def reset(self) -> None:
+        """Forget the tick clock and the outstanding command.
+
+        Between episodes the arm is homed and the gripper re-opened, so the
+        pending command's start pose is meaningless and feeding it to the droop
+        estimator would attribute a homing move to a policy step. The tick clock
+        has to restart too, or the first tick of the new episode inherits an
+        overdue deadline and fires with no dwell at all.
+        """
+        self._next_tick = None
+        self._pending = None
+        self._stuck_lead = 0.0
+
+    def command(self, T_base_ctrl_target: np.ndarray, seq: int) -> tuple[int, float]:
+        """Publish one target. Returns (next_seq, seconds slept since last tick).
+
+        The sleep is what sets the control period, and it is taken AFTER
+        publishing so the arm is moving during it rather than after it. It is
+        also the whole reason perception and inference cost nothing in this mode:
+        they happen inside a period that would otherwise be idle, so anything
+        under the period is free.
+        """
+        now = time.time()
+        if current_msg is None or poll_stop():
+            return seq, 0.0
+        # The template is read live, exactly as move_to passes current_msg into
+        # settle: it carries the frame_id and stamp fields the controller expects
+        # and only the pose is overwritten.
+        template = current_msg
+        T_now = pose_msg_to_matrix(template)
+
+        # Learn from the PREVIOUS tick before issuing the next: this is the only
+        # moment we know both what was asked and what it achieved.
+        if self._pending is not None and self.droop is not None:
+            # THE TWO DISTANCES ARE NOT THE SAME AND observe_move NEEDS BOTH.
+            # `want` is the displacement the policy actually asked for;
+            # `commanded0` is what got published, which is `want` plus the lead
+            # and possibly truncated by clamp_command_lead. The gain it derives
+            # is (achieved / commanded), so passing the commanded distance as
+            # the desired one would make every tick look like a perfect move and
+            # freeze the estimate at its starting value.
+            commanded0, start_xyz, u0, want = self._pending
+            achieved = float((T_now[:3, 3] - start_xyz) @ u0)
+            if commanded0 > 1e-6 and want > 1e-6:
+                self.droop.observe_move(commanded0, u0 * (want - achieved),
+                                        u0 * want)
+            # BREAK-AWAY, and it is load-bearing on small steps. observe_move
+            # ignores any move under TRAVEL_LEAD_MIN_M (5 mm) because a short
+            # move is a terrible gain estimator — right for settle(), where the
+            # creep nudges get a small step home instead. Fixed-rate has no
+            # nudges, so on a 4 mm step against a stall band the estimator is
+            # never fed, the lead stays zero, the arm never moves, the
+            # observation never changes, and the policy re-issues the same
+            # delta forever. Measured: 0.00 mm over 60 ticks.
+            #
+            # So growth is driven by the arm being stuck, not by the estimator.
+            # One break-away per stalled tick, exactly as creep adds one per
+            # stalled nudge, and cleared as soon as the arm moves — the same
+            # re-derive-per-move discipline, for the same reason: friction
+            # depends on direction, so a lead earned going one way is not
+            # evidence about the next.
+            if achieved < RATE_STUCK_M:
+                self._stuck_lead = min(self._stuck_lead + CREEP_BREAKAWAY_M,
+                                       MAX_COMMAND_LEAD_M)
+            else:
+                self._stuck_lead = 0.0
+        self._pending = None
+
+        target_xyz = T_base_ctrl_target[:3, 3]
+        travel = target_xyz - T_now[:3, 3]
+        lead = (self.droop.lead_for(travel) if self.droop is not None
+                else np.zeros(3))
+        n_travel = float(np.linalg.norm(travel))
+        if self._stuck_lead > 0.0 and n_travel > 1e-9:
+            lead = lead + (travel / n_travel) * self._stuck_lead
+
+        T_cmd = T_base_ctrl_target.copy()
+        T_cmd[:3, 3] = target_xyz + lead
+        T_cmd = clamp_command_lead(T_cmd, T_now)
+        self.pub.publish(roslibpy.Message(
+            matrix_to_pose_msg_like(template, T_cmd, seq)))
+
+        n = float(np.linalg.norm(travel))
+        if n > 1e-9:
+            u0 = travel / n
+            self._pending = (float((T_cmd[:3, 3] - T_now[:3, 3]) @ u0),
+                             T_now[:3, 3].copy(), u0, n)
+
+        # Hold the period from the tick BEFORE, not from now, so perception and
+        # inference are inside the budget rather than added to it. A tick that
+        # overran does not then try to claw the time back.
+        if self._next_tick is None:
+            self._next_tick = now
+        self._next_tick += self.period
+        slept = self._next_tick - time.time()
+        if slept > 0:
+            time.sleep(slept)
+        else:
+            # Fell behind: perception plus inference exceeded the period. Resync
+            # rather than accumulate a debt that would make every later tick
+            # instant and turn this into an unthrottled loop.
+            self._next_tick = time.time()
+        return seq + 1, max(slept, 0.0)
 
 
 def move_to(pub, T_target_ctrl: np.ndarray, seq: int, timeout_s: float,
@@ -1170,26 +1975,39 @@ def move_to(pub, T_target_ctrl: np.ndarray, seq: int, timeout_s: float,
     It converges — homing showed 17.6 -> 2.97 -> 0.94 mm — it just converges
     visibly, at the joints.
 
-    Returns (next_seq, pos_err, rot_err, passes_used).
+    Returns (next_seq, pos_err, rot_err, passes_used, commands_issued).
+
+    `commands_issued` is what tells you how the motion actually LOOKED: it is the
+    number of separate equilibrium commands the arm responded to, so 1 is a
+    single continuous move and 3 is a jump plus two visible adjustments. Without
+    it the log cannot distinguish "converged in one go" from "converged after
+    three corrections", which are the same final millimetres and completely
+    different to watch.
     """
     dp = dr = float("inf")
     used = 0
+    commands = 0
     for i in range(max_passes):
+        if poll_stop():
+            break
         res = settle(pub, current_msg, T_target_ctrl, seq, timeout_s, droop,
                      tol_m=tol_m if creep else SETTLE_POS_TOL_M, creep=creep)
         dp, dr, seq = res.pos_err, res.rot_err, res.next_seq
+        commands += 1 + res.nudges
         used = i + 1
         if dp < tol_m:
             break
         if label and i + 1 < max_passes:
             print(f"{label} pass {i+1}: {dp*1000:.1f} mm out, "
                   f"{droop.describe() if droop else ''}", flush=True)
-    return seq, dp, dr, used
+    return seq, dp, dr, used, commands
 
 
 def go_home(pub, T_ctrl_hand: np.ndarray, T_hand_ctrl: np.ndarray,
             seq: int, droop: "DroopCompensator | None" = None,
-            creep: bool = True) -> int:
+            creep: bool = True, stream: bool = True,
+            speed_m_s: float = HOME_SPEED_M_S,
+            tol_m: float = HOME_REFINE_TOL_M) -> int:
     """Drive the arm to the sim's episode-start pose, in interpolated steps.
 
     Every training episode began at ENV.PANDA_INITIAL_POSITION, so the policy
@@ -1209,26 +2027,66 @@ def go_home(pub, T_ctrl_hand: np.ndarray, T_hand_ctrl: np.ndarray,
 
     T_start = pose_msg_to_matrix(current_msg) @ T_ctrl_hand
     dist, ang = pose_error(T_start, T_BASE_HAND_HOME)
-    n = max(int(np.ceil(max(dist / HOME_STEP_TRANS_M,
-                           np.rad2deg(ang) / HOME_STEP_ROT_DEG))), 1)
 
-    print(f"[home] {dist*100:.1f} cm / {np.rad2deg(ang):.1f} deg away — "
-          f"{n} interpolated waypoints")
+    # Streaming picks its own, much finer, waypoint spacing: nothing is paid per
+    # waypoint any more, so the only reason to space them out is gone and finer
+    # is strictly smoother. The stepwise path keeps HOME_STEP_TRANS_M, where each
+    # waypoint costs a settle and a hold.
+    if stream:
+        step_m = max(float(speed_m_s) * HOME_STREAM_DT_S, 1e-4)
+        n = max(int(np.ceil(max(dist / step_m,
+                                np.rad2deg(ang) / HOME_STEP_ROT_DEG))), 1)
+        print(f"[home] {dist*100:.1f} cm / {np.rad2deg(ang):.1f} deg away — "
+              f"streaming {n} waypoints at {speed_m_s*100:.0f} cm/s "
+              f"(~{n * HOME_STREAM_DT_S:.1f} s, continuous)")
+    else:
+        n = max(int(np.ceil(max(dist / HOME_STEP_TRANS_M,
+                                np.rad2deg(ang) / HOME_STEP_ROT_DEG))), 1)
+        print(f"[home] {dist*100:.1f} cm / {np.rad2deg(ang):.1f} deg away — "
+              f"{n} interpolated waypoints, settling at each")
 
     key_rots = Rot.from_matrix(np.stack([T_start[:3, :3], T_BASE_HAND_HOME[:3, :3]]))
     slerp = Slerp([0.0, 1.0], key_rots)
 
+    next_tick = time.time()
     for i in range(1, n + 1):
+        if poll_stop():
+            print("[home] aborted", flush=True)
+            return seq
         s = i / n
         T_way = np.eye(4)
         T_way[:3, :3] = slerp(s).as_matrix()
         T_way[:3, 3] = (1 - s) * T_start[:3, 3] + s * T_BASE_HAND_HOME[:3, 3]
+        T_cmd = clamp_target_pose(T_way @ T_hand_ctrl)
+
+        if stream:
+            # The standing droop offset only — no travel lead. Consecutive
+            # waypoints already pull the arm forward, which is what a lead is
+            # for; adding one on top would aim past the end of the path and
+            # arrive with momentum at exactly the pose we then want to hold.
+            if droop is not None:
+                T_cmd = droop.compensate(T_cmd)
+            # Bounds how far the equilibrium may run ahead of the arm, and so how
+            # hard the controller pulls, if the arm cannot keep up with the
+            # commanded speed. Without it a too-fast path becomes a growing
+            # position error and a growing force.
+            T_cmd = clamp_command_lead(T_cmd, pose_msg_to_matrix(current_msg))
+            pub.publish(roslibpy.Message(
+                matrix_to_pose_msg_like(current_msg, T_cmd, seq)))
+            seq += 1
+            next_tick += HOME_STREAM_DT_S
+            sleep_s = next_tick - time.time()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            else:
+                next_tick = time.time()
+            continue
 
         # Intermediate waypoints get a loose tolerance on purpose: they are a
         # path, not a destination, and converging each one to millimetres would
         # add a creep and a full hold per waypoint for no benefit. The refine
         # below is where home is actually reached.
-        res = settle(pub, current_msg, clamp_target_pose(T_way @ T_hand_ctrl),
+        res = settle(pub, current_msg, T_cmd,
                      seq, HOME_SETTLE_TIMEOUT_S, droop,
                      tol_m=HOME_WAY_TOL_M, creep=creep)
         seq = res.next_seq
@@ -1241,10 +2099,14 @@ def go_home(pub, T_ctrl_hand: np.ndarray, T_hand_ctrl: np.ndarray,
     # learned on the way. Re-commanding home now closes that gap — and doubles as
     # the estimator's calibration, so the policy loop starts with a converged
     # value instead of learning it during your first real steps.
-    if creep or (droop is not None and droop.enabled):
-        seq, _, _, _ = move_to(pub, clamp_target_pose(T_BASE_HAND_HOME @ T_hand_ctrl),
+    # Unconditional when streaming, where it is not a refinement but the only
+    # thing that lands the pose at all: nothing along a streamed path ever waits
+    # for the arm, so it arrives trailing the last waypoint by whatever the droop
+    # and its own lag amount to.
+    if stream or creep or (droop is not None and droop.enabled):
+        seq, _, _, _, _ = move_to(pub, clamp_target_pose(T_BASE_HAND_HOME @ T_hand_ctrl),
                                seq, HOME_SETTLE_TIMEOUT_S, droop,
-                               HOME_REFINE_PASSES, HOME_REFINE_TOL_M,
+                               HOME_REFINE_PASSES, tol_m,
                                "[home] refine", creep=creep)
 
     T_end = pose_msg_to_matrix(current_msg) @ T_ctrl_hand
@@ -1255,13 +2117,63 @@ def go_home(pub, T_ctrl_hand: np.ndarray, T_hand_ctrl: np.ndarray,
 
 
 # -----------------------------------------------------------------------------
-def parse_args() -> argparse.Namespace:
+class Phase4Policy:
+    """The default policy this runner drives, behind the adapter interface.
+
+    THE ADAPTER EXISTS SO A SECOND POLICY DOES NOT MEAN A SECOND RUNNER. The
+    regrasp policy differs from this one in three narrow places — how it is
+    loaded, that it needs a commanded direction per episode, and that its cloud
+    carries two extra channels — against roughly seven hundred lines of camera
+    bring-up, calibration checking, homing, gripper handling, abort polling and
+    viewer plumbing that are identical. Copying those would fork every hardware
+    fix in them, and this repo already has one pair of runners that diverged
+    exactly that way (see "Why the two runners differ").
+
+    Everything below is a no-op hook for this policy and a real one for regrasp.
+    """
+
+    def load(self, args, device: str, policy_dir: Path, ckpt: str) -> None:
+        self.device = device
+        self.model, self.run_cfg = load_bc_policy(policy_dir, ckpt, device)
+        _assert_state_layout(self.run_cfg)
+        warm_up_policy(self.model, device)
+
+    def reset(self) -> None:
+        """Called at every episode start."""
+
+    def act(self, pc: np.ndarray, rs: np.ndarray, *, fused=None,
+            T_base_hand=None) -> np.ndarray:
+        return policy_act(self.model, pc, rs, self.device)
+
+    def hud(self) -> str:
+        """Extra text for the on-screen HUD, or empty."""
+        return ""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Every flag, as a parser rather than parsed arguments.
+
+    Split out so `my_regrasp_policy_runner.py` can add its own flags to THIS
+    parser instead of restating fifty-odd of them. Two runners with two
+    hand-maintained copies of the same flag list is how they end up disagreeing
+    about a default, and the disagreement shows up as a robot behaving
+    differently for no visible reason.
+    """
     p = argparse.ArgumentParser(
-        description="Run a Phase-4 BC policy (checkpoint/cp2 or cp3) on the FR3.")
+        description="Run a Phase-4 BC policy from checkpoint/<run> on the FR3.")
     p.add_argument("--rosbridge-host", type=str, default=ROSBRIDGE_HOST)
     p.add_argument("--rosbridge-port", type=int, default=ROSBRIDGE_PORT)
-    p.add_argument("--policy-dir", type=str, default=str(DEFAULT_POLICY_DIR),
-                   help="run dir holding config.yaml, normalization.npz, best.pt")
+    p.add_argument("--run", type=str, default=None, metavar="NAME",
+                   help="policy to run, by the DAgger run it came from: "
+                        f"{', '.join(available_runs()) or 'none installed'}. "
+                        "Shorthand for --policy-dir checkpoint/NAME. The "
+                        "folders are named after the run because that is the "
+                        "only name that identifies which policy a rollout used "
+                        "— 'cp3' does not say what it was trained on.")
+    p.add_argument("--policy-dir", type=str, default=None,
+                   help="run dir holding config.yaml, normalization.npz, "
+                        "best.pt. Use --run for one inside checkpoint/; this is "
+                        f"for a dir anywhere else. Default: {DEFAULT_RUN}.")
     p.add_argument("--ckpt", type=str, default=None,
                    help="explicit .pt path (default: <policy-dir>/best.pt)")
     p.add_argument("--hand-seg-ckpt", type=str, default=str(DEFAULT_HAND_SEG_CKPT))
@@ -1269,25 +2181,73 @@ def parse_args() -> argparse.Namespace:
                    help="4x4 .npy T_hand_cam (camera -> panda_hand). Defaults to "
                         "the sim's nominal wrist mount, which is NOT a "
                         "calibration of your D435.")
-    p.add_argument("--ee-offset-z", type=float, default=DEFAULT_EE_OFFSET_Z,
+    p.add_argument("--ee-offset-z", type=float, default=None,
                    help="z offset from panda_hand to the frame /cartesian_pose "
-                        "publishes. Measured as 0 on this robot (F_T_EE has no "
-                        "translation, so it already publishes panda_hand); use "
-                        "0.1034 only if the EE is reconfigured to the TCP.")
+                        "publishes. DEFAULT IS TO READ IT off the robot's own "
+                        "F_T_EE, which is the only authority on it: 0 when the "
+                        "controller publishes panda_hand, 0.1034 when the EE is "
+                        "configured to the Franka Hand TCP. Pass a value only to "
+                        "override that, and expect a loud warning if it "
+                        "disagrees with the robot.")
     p.add_argument("--enable-gripper", action="store_true",
-                   help="actually command franka_gripper on a CLOSE prediction")
+                   help="actually command franka_gripper on a CLOSE prediction. "
+                        "Needs the controller launched with load_gripper:=True, "
+                        "which is what starts the franka_gripper node.")
+    p.add_argument("--home-gripper", action="store_true",
+                   help="send a homing goal at startup (implies "
+                        "--enable-gripper). The Franka Hand needs this once per "
+                        "power cycle before its reported width is calibrated, "
+                        "and franka_gripper.launch does not do it for you. The "
+                        "fingers open and close fully, so keep them clear.")
+    p.add_argument("--control", choices=("settle", "rate"), default="settle",
+                   help="how a predicted step reaches the robot. 'settle' "
+                        "(default) commands the target and BLOCKS until the arm "
+                        "has arrived and held still, which is where ~95%% of a "
+                        "step goes. 'rate' is the CVPR2023 loop: publish once, "
+                        "dwell --rate-hz, look again, never check arrival — "
+                        "continuous motion, and the regime the policy was "
+                        "actually trained in.")
+    p.add_argument("--rate-hz", type=float, default=RATE_CONTROL_HZ,
+                   help=f"policy rate for --control rate (default "
+                        f"{RATE_CONTROL_HZ:.2f} Hz = the paper's "
+                        "POLICY.TIME_ACTION_REPEAT of 0.15 s). Ignored by "
+                        "--control settle.")
     p.add_argument("--step-mode", action="store_true",
                    help="SAFE MODE: preview each predicted step and only execute "
                         "it when you press SPACE. Nothing moves unprompted.")
     p.add_argument("--home", action="store_true",
                    help="drive to the sim's episode-start pose before running "
                         "(interpolated Cartesian move — keep the workspace clear)")
+    p.add_argument("--home-speed", type=float, default=HOME_SPEED_M_S,
+                   help=f"Cartesian speed of the homing path in m/s (default "
+                        f"{HOME_SPEED_M_S}). The path is streamed on a clock, so "
+                        "this sets how fast the arm crosses the workspace; the "
+                        "publish rate only sets how finely.")
+    p.add_argument("--home-tol", type=float, default=HOME_REFINE_TOL_M,
+                   help=f"how close to home is close enough, in metres (default "
+                        f"{HOME_REFINE_TOL_M}). Home is a starting pose, not a "
+                        "target: the policy observes wherever the arm actually "
+                        "is and steps from there. Asking for less than the arm "
+                        "can reliably land — it has ~17 mm of standing droop and "
+                        "a gain that varies 2x between moves — makes the refine "
+                        "overshoot and hunt instead of stopping.")
+    p.add_argument("--home-stepwise", action="store_true",
+                   help="home the old way: settle on every 2 cm waypoint. That "
+                        "is one dead stop per waypoint — fifteen for a 30 cm "
+                        "home — which is what made homing stutter. Kept as an "
+                        "escape hatch and for comparison.")
     p.add_argument("--home-only", action="store_true",
                    help="home and exit, without running the policy")
     p.add_argument("--no-droop-compensation", action="store_true",
                    help="command equilibrium poses raw. The impedance controller "
                         "settles ~17 mm short of any target, so each step then "
                         "executes as (delta - droop) rather than delta.")
+    p.add_argument("--step-tol-frac", type=float, default=STEP_CONVERGE_TOL_FRAC,
+                   help="how close a step must land, as a fraction of the step "
+                        "itself. Lower is more precise and less smooth: the arm "
+                        "corrects more, and every correction is a visible stop "
+                        f"and restart. Default {STEP_CONVERGE_TOL_FRAC}; 0.15 "
+                        "restores tight per-step convergence.")
     p.add_argument("--no-creep", action="store_true",
                    help="revert to the multi-pass step correction: command, wait "
                         "for a dead stop, re-command, repeat. Converges to the "
@@ -1305,6 +2265,18 @@ def parse_args() -> argparse.Namespace:
                         "no 424x240 depth, unlike its color stream")
     p.add_argument("--depth-height", type=int, default=DEPTH_HEIGHT)
     p.add_argument("--camera-fps", type=int, default=CAMERA_FPS)
+    p.add_argument("--camera-model", choices=("d435", "d435i", "d415", "d455"),
+                   default=None,
+                   help="override the camera body instead of detecting it from "
+                        "the device. Only affects the near-depth floor (a D455 "
+                        "sees nothing closer than 0.40 m against a D435's 0.10) "
+                        "and what is printed. Detection is normally right; use "
+                        "this if the driver's device name is unhelpful.")
+    p.add_argument("--serial", action="append", default=None,
+                   metavar="ROLE=SERIAL",
+                   help="override one role's serial without editing "
+                        "calib_config.py, e.g. --serial tripod=419122270338 "
+                        "after swapping the tripod camera. Repeatable.")
     p.add_argument("--camera-serial", type=str, default=None,
                    help="RealSense serial for the WRIST camera. With two D435s "
                         "attached, librealsense otherwise binds whichever "
@@ -1352,6 +2324,17 @@ def parse_args() -> argparse.Namespace:
                         "The sim excluded the arm by segmentation id; without "
                         "this box a side camera labels the approaching gripper "
                         "as object.")
+    p.add_argument("--finger-boxes", choices=("split", "span", "off"),
+                   default="split",
+                   help="how to exclude the FINGERS, which the gripper box "
+                        "deliberately spares. 'split' (default) is two boxes on "
+                        "the finger bodies only, leaving the jaw gap for the "
+                        "object. 'span' merges them into one box running "
+                        "through the gap: it cannot miss a mis-calibrated "
+                        "finger point, but it also deletes the object once the "
+                        "object is between the jaws, which is the last few "
+                        "steps of every episode. 'off' disables the cut without "
+                        "touching --no-robot-exclusion.")
     p.add_argument("--no-cluster", action="store_true",
                    help="define the object class by the crop sphere alone, as "
                         "before. Default is to keep only the points 3D-connected "
@@ -1376,16 +2359,25 @@ def parse_args() -> argparse.Namespace:
                         "axis, a blob must sit before it is called forearm. "
                         "Larger keeps more (safer for an object held with its "
                         "body toward the human), smaller cuts more arm.")
-    p.add_argument("--arm-lateral", type=float, default=0.12,
+    p.add_argument("--arm-lateral", type=float, default=0.18,
                    help="how far SIDEWAYS of that axis a point may sit and "
                         "still be object. Without this an inclined forearm "
                         "scores near zero on the axis and survives; with it, "
                         "the kept region is a capsule around the hand. Larger "
                         "keeps a long object held across the view, smaller cuts "
                         "more arm.")
+    p.add_argument("--arm-below", type=float, default=0.10,
+                   help="reject object points more than this far BELOW the hand. "
+                        "A forearm descends to the elbow; an object being "
+                        "offered does not hang under the hand holding it. This "
+                        "is what allows --arm-lateral to be wide enough to keep "
+                        "an object held ACROSS the hand-to-robot axis.")
+    add_segmentation_args(p)
     p.add_argument("--wrist-seg-px", type=int, default=None,
                    help="hand-segmentation input size for the wrist camera "
-                        "(default 256, what cp1 was trained at).")
+                        "(default 256, what cp1 was trained at). "
+                        "--segmentation sam2 ignores this: SAM2 has its own "
+                        "fixed input size.")
     p.add_argument("--fixed-seg-px", type=int, default=None,
                    help="hand-segmentation input size for the fixed camera(s) "
                         "(default 384). At ~1 m the hand is a few dozen pixels "
@@ -1393,11 +2385,20 @@ def parse_args() -> argparse.Namespace:
                         "this GPU 384 costs ~10 ms per pass and 512 ~25 ms.")
     p.add_argument("--dry-run", action="store_true",
                    help="run perception + policy and print targets, publish nothing")
-    return p.parse_args()
+    return p
 
 
-def main() -> None:
-    args = parse_args()
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
+
+
+def main(adapter: "Phase4Policy | None" = None,
+         args: "argparse.Namespace | None" = None) -> None:
+    # `adapter` swaps WHICH policy is driven without touching anything about how
+    # the robot is driven; `args` lets a caller supply a parser of its own that
+    # extends build_parser(). Both default to the Phase-4 behaviour exactly.
+    adapter = adapter or Phase4Policy()
+    args = args if args is not None else parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
@@ -1412,7 +2413,22 @@ def main() -> None:
         raise SystemExit("--home/--home-only need a live connection and cannot "
                          "run under --dry-run, which publishes nothing.")
 
-    policy_dir = Path(args.policy_dir).expanduser().resolve()
+    if args.run and args.policy_dir:
+        raise SystemExit(
+            f"--run {args.run} and --policy-dir {args.policy_dir} both name a "
+            "policy. Pass one.")
+    if args.run:
+        policy_dir = (CHECKPOINT_DIR / args.run)
+        if not policy_dir.is_dir():
+            raise SystemExit(
+                f"No checkpoint/{args.run}. Installed: "
+                f"{', '.join(available_runs()) or '(none)'}.\n"
+                "The folders are named after the DAgger run they came from; "
+                "copy best.pt, normalization.npz and config.yaml from "
+                f"output/dagger_runs/dagger4_{args.run}/best/ to add one.")
+    else:
+        policy_dir = Path(args.policy_dir or DEFAULT_POLICY_DIR)
+    policy_dir = policy_dir.expanduser().resolve()
     ckpt = args.ckpt or str(policy_dir / "best.pt")
     hand_seg_ckpt = Path(args.hand_seg_ckpt).expanduser().resolve()
 
@@ -1456,7 +2472,10 @@ def main() -> None:
     print(f"Policy dir     : {policy_dir}")
     print(f"Checkpoint     : {ckpt}")
     print(f"Hand seg ckpt  : {hand_seg_ckpt}")
-    print(f"EE offset z    : {args.ee_offset_z:.4f} m (panda_hand -> published frame)")
+    print("EE offset z    : "
+          + (f"{args.ee_offset_z:.4f} m (OVERRIDE)" if args.ee_offset_z is not None
+             else "from the robot's F_T_EE")
+          + " (panda_hand -> published frame)")
     print(f"Gripper        : {'ENABLED' if args.enable_gripper else 'disabled'}")
     print(f"Droop comp     : {'off' if args.no_droop_compensation else 'on'}")
     print(f"Step motion    : {'multi-pass (stops between passes)' if args.no_creep else 'creep (one stop per step)'}")
@@ -1465,13 +2484,19 @@ def main() -> None:
 
     droop = DroopCompensator(enabled=not args.no_droop_compensation)
 
-    hand_seg_model = load_hand_segmenter(device, hand_seg_ckpt)
-    policy, run_cfg = load_bc_policy(policy_dir, ckpt, device)
-    _assert_state_layout(run_cfg)
-    warm_up_policy(policy, device)
+    # Not loaded under --segmentation sam2: cp1 is 40M parameters and 9-26 ms a
+    # pass on a GPU that is about to hold SAM2, Grounding DINO and the policy,
+    # and in that mode nothing would ever call it.
+    hand_seg_model = (load_hand_segmenter(device, hand_seg_ckpt)
+                      if args.segmentation == "hand-net" else None)
+    adapter.load(args, device, policy_dir, ckpt)
 
-    # panda_hand <-> the frame the controller publishes.
-    T_hand_ctrl = z_offset_transform(args.ee_offset_z)
+    # panda_hand <-> the frame the controller publishes. Provisional: the real
+    # value is read off F_T_EE once rosbridge is up, a few lines below. Only
+    # --dry-run keeps this one, and it never uses it (T_base_hand is identity).
+    ee_offset_z = (args.ee_offset_z if args.ee_offset_z is not None
+                   else DEFAULT_EE_OFFSET_Z)
+    T_hand_ctrl = z_offset_transform(ee_offset_z)
     T_ctrl_hand = invert_transform(T_hand_ctrl)
 
     client = None
@@ -1517,6 +2542,24 @@ def main() -> None:
                       f"{listing}\n[camera] using the 'wrist' serial from "
                       "calib_config.CAMERA_SERIALS.")
 
+        if args.serial:
+            # Layered ON TOP of calib_config's table rather than replacing it,
+            # so overriding the tripod cannot silently unset the wrist. This is
+            # the flag for "I swapped the body on the tripod" — the serial is
+            # what identifies a camera, and a new body is a new serial.
+            sys.path.insert(0, str(CALIB_DIR))
+            import calib_config as _cfg          # noqa: E402
+            serials = dict(serials if serials is not None else _cfg.CAMERA_SERIALS)
+            for item in args.serial:
+                role, _, sn = item.partition("=")
+                if not sn:
+                    raise SystemExit(
+                        f"--serial wants ROLE=SERIAL, got {item!r}. Roles: "
+                        f"{', '.join(sorted(_cfg.CAMERA_SERIALS))}.")
+                serials[role.strip()] = sn.strip()
+                print(f"[camera] {role.strip()} serial -> {sn.strip()} "
+                      "(override; calib_config.py untouched)")
+
         rigs = build_rigs(
             camera_names,
             T_hand_cam_wrist=T_hand_cam,
@@ -1530,6 +2573,7 @@ def main() -> None:
             wrist_seg_px=args.wrist_seg_px,
             fixed_seg_px=args.fixed_seg_px,
             hand_margin_px=args.hand_margin_px,
+            camera_model=args.camera_model,
         )
 
         for rig in rigs:
@@ -1585,6 +2629,22 @@ def main() -> None:
                 raise RuntimeError(
                     f"RealSense '{rig.name}' (serial {rig.serial}) failed to "
                     f"start {modes} ({err}) — {hint}") from err
+            # After start(), because the body is read off the live device. This
+            # is what makes swapping a D455 onto the tripod a hardware change
+            # rather than a code change: the near-depth floor follows the body.
+            print(f"[camera] {apply_camera_model(rig, args.camera_model)}")
+            if rig.kind == "fixed" and args.calib_session:
+                mismatch = check_session_camera(args.calib_session, rig)
+                if mismatch:
+                    raise SystemExit(
+                        f"\n[calibration] CAMERA MISMATCH\n    {mismatch}\n\n"
+                        "    In 'camera calibration/':\n"
+                        "      python generate_color_intrinsics.py --session "
+                        "<new> --role tripod\n"
+                        "      python capture_image_and_pose.py --session <new> "
+                        "--role tripod\n"
+                        "      python calibrate.py --session <new>\n"
+                        "      python validate_calibration.py --session <new>\n")
             p = rig.params
             print(f"[camera] {rig.name:8s} serial={rig.serial}  {rig.kind}  "
                   f"seg={p.seg_input_px}px  "
@@ -1593,7 +2653,19 @@ def main() -> None:
                   + f"  margin={p.hand_margin_px}px"
                   + f"  r_obj={p.object_max_radius_m:.2f}m")
 
-        if not args.dry_run:
+        # A FIXED CAMERA CANNOT BE PLACED WITHOUT THE LIVE POSE, dry run or not.
+        # Its chain is inv(T_base_hand) @ T_base_color, so substituting identity
+        # does not degrade the geometry, it changes the frame: the cloud lands in
+        # the BASE frame while the gripper wireframe and the exclusion boxes are
+        # still drawn at the origin of the frame the cloud is supposed to be in.
+        # The result is a view with the boxes down at the robot's mounting plate,
+        # i.e. below the table, which reads as a calibration fault and is not one.
+        #
+        # So --dry-run still SUBSCRIBES when a fixed camera is present. It stays
+        # a dry run in the only sense that matters: `pub` is never advertised, so
+        # there is nothing that could command the arm.
+        needs_pose = any(r.T_base_cam is not None for r in rigs)
+        if not args.dry_run or needs_pose:
             client = roslibpy.Ros(host=args.rosbridge_host, port=args.rosbridge_port)
             client.run()
             for _ in range(50):
@@ -1601,26 +2673,126 @@ def main() -> None:
                     break
                 time.sleep(0.1)
             if not client.is_connected:
-                raise RuntimeError(
-                    f"Could not connect to rosbridge at "
-                    f"{args.rosbridge_host}:{args.rosbridge_port}")
+                if args.dry_run:
+                    print(f"\n[pose] *** NO ROSBRIDGE AT "
+                          f"{args.rosbridge_host}:{args.rosbridge_port} ***\n"
+                          "    A fixed camera needs the live robot pose to be "
+                          "placed at all. Without\n"
+                          "    it the cloud is in the BASE frame while the "
+                          "gripper and boxes are drawn\n"
+                          "    at the hand frame's origin — expect them below "
+                          "the table. Wrist-only\n"
+                          "    runs are unaffected.\n", flush=True)
+                    client = None
+                else:
+                    raise RuntimeError(
+                        f"Could not connect to rosbridge at "
+                        f"{args.rosbridge_host}:{args.rosbridge_port}")
 
+        if client is not None:
             sub = roslibpy.Topic(client, CURRENT_POSE_TOPIC, POSE_MSG_TYPE)
-            pub = roslibpy.Topic(client, TARGET_POSE_TOPIC, POSE_MSG_TYPE)
-            gripper_sub = roslibpy.Topic(client, GRIPPER_STATE_TOPIC, GRIPPER_STATE_TYPE)
-
             sub.subscribe(pose_cb)
-            gripper_sub.subscribe(gripper_state_cb)
-            pub.advertise()
-            gripper = FrankaGripper(client, args.enable_gripper)
+            if not args.dry_run:
+                pub = roslibpy.Topic(client, TARGET_POSE_TOPIC, POSE_MSG_TYPE)
+                pub.advertise()
+                gripper_sub = roslibpy.Topic(
+                    client, GRIPPER_STATE_TOPIC, GRIPPER_STATE_TYPE)
+                gripper_sub.subscribe(gripper_state_cb)
+            # Never armed in a dry run, whatever --enable-gripper says: the
+            # point of the flag is that nothing can act on the robot.
+            gripper = FrankaGripper(
+                client, (args.enable_gripper or args.home_gripper)
+                and not args.dry_run)
 
-            print(f"Connected to rosbridge at {args.rosbridge_host}:{args.rosbridge_port}")
+            print(f"Connected to rosbridge at {args.rosbridge_host}:{args.rosbridge_port}"
+                  + ("  (READ-ONLY: dry run, subscribed for the robot pose only)"
+                     if args.dry_run else ""))
+
+            # WHICH FRAME IS /cartesian_pose PUBLISHING? Asked of the robot, not
+            # assumed, because getting it wrong is a constant ~10 cm error that
+            # produces no symptom except the policy grasping short.
+            measured = measure_ee_offset_z(client)
+            if measured is None:
+                print(f"[frames] no {FRANKA_STATE_TOPIC} — falling back to "
+                      f"ee_offset_z = {ee_offset_z:.4f} m. If the arm grasps "
+                      "short, this is the first thing to check.")
+            elif args.ee_offset_z is None:
+                ee_offset_z = measured
+                frame = ("panda_hand" if abs(measured) < 1e-4
+                         else f"{measured * 1000:.1f} mm ahead of panda_hand")
+                print(f"[frames] F_T_EE says /cartesian_pose publishes {frame}; "
+                      f"ee_offset_z = {measured:.4f} m")
+            elif abs(measured - args.ee_offset_z) > 1e-3:
+                print(f"\n[frames] *** --ee-offset-z {args.ee_offset_z:.4f} "
+                      f"DISAGREES WITH THE ROBOT ***\n"
+                      f"    F_T_EE reports {measured:.4f} m. Using your value.\n"
+                      f"    A {abs(measured - args.ee_offset_z) * 1000:.0f} mm "
+                      "error here moves the whole cloud along the approach\n"
+                      "    axis, so the object renders nearer the fingers than "
+                      "it is and the\n"
+                      "    policy closes short. Drop the flag to use the "
+                      "robot's own value.\n", flush=True)
+            T_hand_ctrl = z_offset_transform(ee_offset_z)
+            T_ctrl_hand = invert_transform(T_hand_ctrl)
+
             print("Waiting for current pose...")
             t0 = time.time()
             while current_msg is None and time.time() - t0 < 10.0:
                 time.sleep(0.05)
             if current_msg is None:
-                raise RuntimeError(f"No message on {CURRENT_POSE_TOPIC}")
+                if not args.dry_run:
+                    raise RuntimeError(f"No message on {CURRENT_POSE_TOPIC}")
+                print(f"[pose] nothing on {CURRENT_POSE_TOPIC}; the fixed "
+                      "camera's cloud will be in the BASE frame and the boxes "
+                      "will draw below the table.")
+
+            if gripper.enabled and not gripper.server_is_up():
+                print("\n[gripper] *** NO GRASP ACTION SERVER ***\n"
+                      f"    Nothing is publishing {GRIPPER_GRASP_STATUS_TOPIC}, so "
+                      "the goals this\n"
+                      "    sends will be accepted by rosbridge and acted on by "
+                      "nobody. The\n"
+                      "    usual cause is a controller launched without "
+                      "load_gripper:=True —\n"
+                      "    note that /franka_gripper/joint_states keeps "
+                      "publishing either way,\n"
+                      "    so the width readback is NOT evidence the gripper is "
+                      "commandable.\n"
+                      "    Continuing; the CLOSE will simply not happen.\n",
+                      flush=True)
+
+            # OPEN FIRST, ALWAYS. The episode ends on a close, so any run after
+            # one that grasped starts with the fingers shut — and a shut gripper
+            # lies to the policy through robot_state[25] and collapses the finger
+            # exclusion boxes onto the object. See FrankaGripper.prepare.
+            if gripper.enabled:
+                gripper.prepare(home_first=args.home_gripper)
+
+            # Whether the width is actually arriving matters more than it looks:
+            # read_gripper_norm falls back to 1.0 (open) in silence, which is
+            # right for the approach but would place the finger exclusion boxes
+            # at the open position no matter where the fingers really are.
+            if gripper_finger_m is None:
+                print("[gripper] WARNING: nothing on "
+                      f"{GRIPPER_STATE_TOPIC} — width falls back to fully open. "
+                      "Check the controller was launched with load_gripper:=True.")
+            else:
+                print(f"[gripper] finger width {gripper_finger_m * 1000:.1f} mm "
+                      f"per finger ({read_gripper_norm(True):.2f} normalised)")
+                # A closed gripper is not cosmetic, and without --enable-gripper
+                # there is nothing this can do about it except say so.
+                if read_gripper_norm(True) < 0.8:
+                    print("[gripper] *** THE GRIPPER IS NOT OPEN ***\n"
+                          "    robot_state[25] reads closed for the whole "
+                          "approach, which the policy\n"
+                          "    never saw in training (the episode ENDS at the "
+                          "close), and the finger\n"
+                          "    exclusion boxes collapse onto the object and "
+                          "delete it. Expect the arm\n"
+                          "    to move oddly and not toward the object. Re-run "
+                          "with --enable-gripper\n"
+                          "    (which opens it at startup), or open it by hand.",
+                          flush=True)
 
             T0 = pose_msg_to_matrix(current_msg) @ T_ctrl_hand
             print(f"Start panda_hand pose: xyz=({T0[0,3]:+.3f}, {T0[1,3]:+.3f}, "
@@ -1629,29 +2801,61 @@ def main() -> None:
 
             if args.home or args.home_only:
                 hp = T_BASE_HAND_HOME[:3, 3]
-                print(f"About to move the arm to the sim's start pose, base frame "
+                # No prompt: --home IS the confirmation, and there is nothing to
+                # decide at this point that was not decided by typing the flag.
+                # The gate that matters moved to where a gate is actually useful
+                # — the policy does not start until you press 's', with the
+                # cameras and the cloud already up so you can see what it is
+                # about to act on. Homing without --home is still one key ('h')
+                # away in the loop.
+                print(f"Homing to the sim's start pose, base frame "
                       f"xyz=({hp[0]:+.3f}, {hp[1]:+.3f}, {hp[2]:+.3f}), as an "
-                      "interpolated Cartesian path. CLEAR THE WORKSPACE.")
-                if input("Type 'go' to home: ").strip().lower() != "go":
-                    print("Homing declined; exiting without moving.")
-                    return
+                      "interpolated Cartesian path. CLEAR THE WORKSPACE.",
+                      flush=True)
                 publish_seq = go_home(pub, T_ctrl_hand, T_hand_ctrl, publish_seq,
-                                      droop, creep=not args.no_creep)
+                                      droop, creep=not args.no_creep,
+                                      stream=not args.home_stepwise,
+                                      speed_m_s=args.home_speed,
+                                      tol_m=args.home_tol)
                 if args.home_only:
                     return
 
+        # The finger cut is gated on the housing box as well, because both are
+        # "keep the robot out of the object class" and having one on with the
+        # other off is a state nobody asks for on purpose.
+        finger_boxes = (FINGER_EXCLUSION_MODES[args.finger_boxes]
+                        if (not args.no_robot_exclusion
+                            and any(r.exclude_robot for r in rigs))
+                        else None)
         perception = MultiCameraPerception(
             rigs,
-            HandSegmenter(hand_seg_model, device),
+            build_segmenter(args, rigs, device, hand_seg_model=hand_seg_model),
             per_camera_cap=args.per_camera_cap,
             arm_rejection=not args.no_arm_rejection,
             arm_offset_m=args.arm_offset,
             arm_lateral_m=args.arm_lateral,
+            arm_below_m=args.arm_below,
+            finger_exclusion=finger_boxes,
         )
-        print(f"[perception] arm rejection: "
-              + (f"on, capsule {args.arm_offset:.3f} m behind the hand / "
-                 f"{args.arm_lateral:.3f} m sideways"
-                 if not args.no_arm_rejection else "off"))
+        print(describe_segmenter(args))
+        if args.segmentation == "sam2":
+            print("[perception] arm rejection: off (the object mask already "
+                  "excludes the forearm)")
+        else:
+            print(f"[perception] arm rejection: "
+                  + (f"on, capsule {args.arm_offset:.3f} m behind the hand / "
+                     f"{args.arm_lateral:.3f} m sideways"
+                     if not args.no_arm_rejection else "off"))
+        # Printed rather than left implicit: span mode changes what the policy
+        # sees at contact, and a run whose log does not say which was on is a
+        # run you cannot compare to another.
+        if finger_boxes is None:
+            print("[perception] finger boxes: off")
+        elif finger_boxes.span_gap:
+            print("[perception] finger boxes: SPAN — one box through the jaw "
+                  "gap; the object goes with the fingers at contact")
+        else:
+            print("[perception] finger boxes: split — two boxes, jaw gap spared")
 
         # The SAME window test_perception_viz.py opens, from the same module.
         # These were two implementations that drew the same data differently
@@ -1667,6 +2871,9 @@ def main() -> None:
                            if (not args.no_robot_exclusion
                                and any(r.exclude_robot for r in rigs))
                            else None),
+            # The same object the filter is using, so the wireframe can never
+            # show you a mode you are not running.
+            finger_boxes=finger_boxes,
             context_max=args.context_max,
             enabled=args.show_cloud,
         )
@@ -1680,30 +2887,159 @@ def main() -> None:
         if args.step_mode:
             print(f"STEP MODE ({args.max_steps} policy steps max). The overlay "
                   "previews each predicted action; press SPACE in the image "
-                  "window to execute one step, 'h' to re-home, 'q' to quit.")
+                  "window to execute one step, 'h' to re-home, 't' to STOP, "
+                  "'q' to quit.")
         else:
             print(f"CONTINUOUS MODE ({args.max_steps} policy steps max). Steps "
                   "execute as soon as they are predicted. 'h' to re-home, "
                   "'q' or Esc to quit.")
+        print("Press 's' in any window to start the policy. Until then the "
+              "cameras and the cloud run but the robot is not commanded.",
+              flush=True)
+
+        # Fixed-rate control, or None for the settle path. Built here rather
+        # than at parse time because it needs the publisher, and it holds state
+        # across ticks (the tick clock and the last command, which is what the
+        # droop estimate is learned from).
+        rate_cmd = None
+        if args.control == "rate" and not args.dry_run and pub is not None:
+            rate_cmd = RateCommander(pub, args.rate_hz, droop)
+            print(f"CONTROL: fixed rate, {args.rate_hz:.2f} Hz "
+                  f"({1000/args.rate_hz:.0f} ms/step) — one command per step, "
+                  "no arrival check. The arm keeps moving between steps; this "
+                  "is the loop the policy was trained in.", flush=True)
+            if droop is not None and not droop.enabled:
+                print("CONTROL: WARNING — droop compensation is off. In this "
+                      "mode the target is rebuilt from the measured pose every "
+                      "tick, so a command too small to move the arm repeats "
+                      "forever instead of accumulating. Expect stalls on the "
+                      "small steps near the object.", flush=True)
+        elif args.control == "rate":
+            print("CONTROL: --control rate ignored (--dry-run or no robot)",
+                  flush=True)
+        else:
+            print("CONTROL: settle — each step blocks until the arm arrives and "
+                  "holds still. Smooth motion is --control rate.", flush=True)
+
+        # THE ABORT POLLER. Installed here because it needs both key sources.
+        # It runs from inside settle(), go_home() and the gripper waits, where
+        # the main loop's key handling is not running at all — which is exactly
+        # when the robot is moving and an abort is worth having.
+        def _poll_keys() -> bool:
+            hit = False
+            k = cv2.waitKey(1) & 0xFF
+            if 32 <= k < 127:
+                c = chr(k)
+                if c == "t":
+                    hit = True
+                else:
+                    _swallowed_keys.append(c)
+            elif k == 27:
+                _swallowed_keys.append("q")
+            if viewer.enabled:
+                for c in viewer.drain_keys():
+                    if c == "t":
+                        hit = True
+                    else:
+                        _swallowed_keys.append(c)
+            return hit
+
+        globals()["_stop_poller"] = _poll_keys
 
         step = 0
         stop_reason = "max steps reached"
+        # Previous step's target and arm pose, for the overshoot diagnostic in
+        # the step log. Reset per episode with everything else.
+        prev_target = prev_arm = None
+        # The episode ending does not end the program. The robot stops taking
+        # commands, but perception, the overlays and the 3D window keep running
+        # so the scene the policy stopped on stays inspectable. 'q' is the only
+        # way out. This matters most on a CLOSE: the frame the policy decided to
+        # grasp from is exactly the one worth looking at, and it used to be torn
+        # down the instant it appeared.
+        episode_over = False
+        # And it does not START until you say so. Perception, the overlays and
+        # the 3D window come up first and run un-armed, so the scene the policy
+        # will act on is on screen BEFORE anything can be published — which is
+        # the moment you actually want a gate, unlike the old "type go to home"
+        # prompt that fired at a blank terminal with no view of anything.
+        # Continuous mode needs this or the first step lands the instant the
+        # window opens; step mode gets it too, so both modes start the same way.
+        armed = False
 
-        while step < args.max_steps:
-            if args.dry_run:
+        def announce_end(reason: str) -> None:
+            print(f"Episode ended after {step} policy steps: {reason}")
+            print("Episode over - camera and cloud windows stay live. "
+                  "'h' to re-home, 's' to run another episode, 'q' to quit.",
+                  flush=True)
+
+        def start_episode() -> None:
+            """Begin a new episode without restarting the process.
+
+            EVERYTHING PER-EPISODE IS RESET AND EVERYTHING LEARNED IS KEPT. The
+            step budget, the stop reason and the stale-cloud caches belong to the
+            episode that just ended; the droop estimate does not — it is a
+            property of the arm, took several moves to converge, and throwing it
+            away would make the first steps of every later episode lumpy again.
+
+            The gripper is re-opened here rather than in the 'h' handler, because
+            it has to happen whether or not you homed first. An episode ends on a
+            CLOSE, so a second episode would otherwise begin with the fingers
+            shut — which reads to the policy as robot_state[25] = 0 for the whole
+            approach, and collapses the finger exclusion boxes onto the object.
+            That is the same failure that made consecutive PROCESS runs behave
+            oddly; restarting in-process reintroduces it by a shorter path.
+            """
+            nonlocal step, episode_over, stop_reason, armed
+            nonlocal prev_target, prev_arm
+            prev_target = prev_arm = None
+            step = 0
+            stop_reason = "max steps reached"
+            episode_over = False
+            armed = True
+            # Stale per-camera clouds are kept across frames so a momentary
+            # segmentation dropout does not blank the observation. Across
+            # EPISODES they are a lie: the scene has changed.
+            perception.reset()
+            adapter.reset()
+            if rate_cmd is not None:
+                rate_cmd.reset()
+            if gripper.enabled:
+                gripper.prepare(home_first=False)
+            print(f"\n=== new episode (max {args.max_steps} steps) ===",
+                  flush=True)
+
+        while True:
+            if not episode_over and step >= args.max_steps:
+                episode_over = True
+                announce_end(stop_reason)
+
+            # Keyed on whether a pose EXISTS, not on --dry-run. A dry run with a
+            # fixed camera subscribes precisely so this branch can be the real
+            # one; identity is the last resort, and it silently reframes the
+            # cloud rather than merely making it stale.
+            if current_msg is not None:
+                T_base_hand = pose_msg_to_matrix(copy.deepcopy(current_msg)) @ T_ctrl_hand
+            elif args.dry_run:
                 T_base_hand = np.eye(4)
             else:
-                if current_msg is None:
-                    time.sleep(0.01)
-                    continue
-                T_base_hand = pose_msg_to_matrix(copy.deepcopy(current_msg)) @ T_ctrl_hand
+                time.sleep(0.01)
+                continue
 
             # ---- segment, deproject and fuse every camera into panda_hand ----
             # The pose is read BEFORE the frames are grabbed and used to place
             # the fixed camera's points, so a stale pose shifts that camera's
             # cloud bodily. The wrist camera is immune — its extrinsics are
             # constant — which is the practical reason it stays the anchor view.
-            fused = perception.observe(T_base_hand)
+            # One gripper reading per iteration, shared by the cloud and the
+            # robot state. Reading it twice would let the two disagree by a
+            # frame, and the finger exclusion boxes are placed from it.
+            gripper_norm = read_gripper_norm(assume_open=True)
+            _t = time.time()
+            fused = perception.observe(
+                T_base_hand, gripper_norm * GRIPPER_MAX_FINGER_M)
+            ms_obs = (time.time() - _t) * 1e3
+            ms_pol = 0.0
             object_policy = fused.object_xyz
             hand_policy = fused.hand_xyz
             have_obs = fused.usable
@@ -1743,9 +3079,12 @@ def main() -> None:
                         oi, hi, fused.object_source, fused.hand_source,
                         NUM_OBJECT_POINTS, NUM_HAND_POINTS), ctx)
                     last_cloud_draw = time.time()
-                rs = build_robot_state(T_base_hand, read_gripper_norm(assume_open=True))
+                rs = build_robot_state(T_base_hand, gripper_norm)
 
-                action = policy_act(policy, pc, rs, device)   # [7], ch6 in {0, 1}
+                _t = time.time()
+                action = adapter.act(pc, rs, fused=fused,
+                                     T_base_hand=T_base_hand)  # [7], ch6 {0,1}
+                ms_pol = (time.time() - _t) * 1e3
                 grasp_close = bool(action[6] < 0.5)
 
                 if not grasp_close:
@@ -1761,6 +3100,12 @@ def main() -> None:
             for rig in rigs:
                 color_bgr, hand_mask = perception.last_frames[rig.name]
                 view = overlay_mask(color_bgr, hand_mask)
+                # The object mask, where there is one, tinted separately. With
+                # two masks the interesting failure is them disagreeing about
+                # the same pixels, and one colour cannot show that.
+                obj_mask = perception.last_object_masks.get(rig.name)
+                if obj_mask is not None:
+                    view = overlay_mask(view, obj_mask, colour=(0, 0, 255))
                 d = fused.per_camera[rig.name]
                 cv2.putText(view, f"{rig.name}  obj={d['object']} hand={d['hand']}"
                             + (f"  -{d['cluster_dropped']} declust"
@@ -1770,8 +3115,16 @@ def main() -> None:
                                else "")
                             + (f"  -{d['robot_pts_removed']} robot"
                                if d["robot_pts_removed"] else "")
+                            + (f"  -{d['finger_pts_removed']} finger"
+                               if d["finger_pts_removed"] else "")
                             + ("  STALE" if d["used_last_hand"] or d["used_last_object"]
-                               else ""),
+                               else "")
+                            # A tracker being re-seeded every frame produces
+                            # entirely plausible point counts, so this is the
+                            # only place that failure is visible.
+                            + ("  RESEED" if d.get("seg_reseeded") else "")
+                            + (f"  x{d['seg_reseeds']}"
+                               if d.get("seg_reseeds") else ""),
                             (10, view.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX,
                             0.5, (255, 255, 0), 1, cv2.LINE_AA)
                 if overlay is None:
@@ -1783,7 +3136,19 @@ def main() -> None:
                 f"step {step}/{args.max_steps}  obj={len(object_policy)} "
                 f"hand={len(hand_policy)}   {fused.summary()}",
             ]
-            if not have_obs:
+            extra = adapter.hud()
+            if extra:
+                lines.append(extra)
+            if episode_over:
+                lines.append(f"EPISODE OVER: {stop_reason}  -  's' to run again")
+            elif not armed:
+                # Still shows what the policy WOULD do, so you can watch the
+                # prediction settle before arming rather than after.
+                lines.append("NOT STARTED - press 's'"
+                             + ("" if not have_obs else
+                                ("   (would CLOSE)" if grasp_close else
+                                 f"   (would move {np.linalg.norm(delta6[:3])*100:.1f}cm)")))
+            elif not have_obs:
                 lines.append("NO OBSERVATION - holding")
             elif grasp_close:
                 lines.append("PENDING: CLOSE GRIPPER")
@@ -1792,8 +3157,10 @@ def main() -> None:
                     f"PENDING: d={np.linalg.norm(delta6[:3])*100:.1f}cm "
                     f"r={np.rad2deg(np.linalg.norm(Rot.from_matrix(unpack_action(delta6)[:3, :3]).as_rotvec())):.1f}deg"
                     + ("  CLAMPED" if clamped else ""))
-            lines.append("SPACE=execute  h=home  q=quit" if args.step_mode
-                         else "q=quit  h=home")
+            lines.append("s=new episode  h=home  t=STOP  q=quit" if episode_over
+                         else "s=start  h=home  t=STOP  q=quit" if not armed
+                         else ("SPACE=execute  t=STOP  h=home  q=quit" if args.step_mode
+                               else "t=STOP  q=quit  h=home"))
 
             for i, text in enumerate(lines):
                 cv2.putText(overlay, text, (10, 22 + 20 * i),
@@ -1819,7 +3186,24 @@ def main() -> None:
             # be the wrong trade.
             key = 255
             view_keys: list = []
-            pump_until = time.time() + (VIEWER_PUMP_S if args.step_mode else 0.0)
+            # ... and skipped when there is no 3D window either, which is the
+            # common case: without --show-cloud, tick() and drain_keys() are both
+            # no-ops, so the pump is 200 ms of pure idle per iteration on top of
+            # ~50 ms of real work. That alone took the camera preview from ~20 Hz
+            # to ~4 Hz, which reads as "perception is running slow" even though
+            # perception measures 33-47 ms.
+            # Before the episode starts and after it ends the loop is waiting
+            # for a human in BOTH modes — there is no control rate left to
+            # protect — so continuous mode joins step mode in spending that wait
+            # on the 3D window. That is the whole point of the window being up:
+            # an un-pumped cloud you cannot orbit is not much better than a
+            # closed one, and setting up the scene before pressing 's' is
+            # exactly when you want to orbit it.
+            pump_until = time.time() + (VIEWER_PUMP_S
+                                        if (args.step_mode or episode_over
+                                            or not armed)
+                                        and viewer.enabled
+                                        else 0.0)
             while True:
                 viewer.tick()
                 # The 3D window's keys are drained into the same list the OpenCV
@@ -1839,6 +3223,12 @@ def main() -> None:
             if key == 27:
                 pressed.append("q")
             pressed.extend(view_keys)
+            # Anything the abort poller read while the robot was moving. It has
+            # to consume keys to see 't', so it hands the rest back here instead
+            # of eating them.
+            if _swallowed_keys:
+                pressed.extend(_swallowed_keys)
+                _swallowed_keys.clear()
 
             # View-only keys never touch the robot, so they are handled here and
             # dropped before the step keys below see them.
@@ -1860,21 +3250,59 @@ def main() -> None:
                 elif k == "x":
                     viewer.roll(+10.0)
 
+            if "t" in pressed or stop_requested:
+                publish_seq = freeze_arm(pub, publish_seq)
+                clear_stop()
+                gripper.stop()
+                if not episode_over:
+                    stop_reason = "stopped by user ('t')"
+                    episode_over = True
+                    announce_end(stop_reason)
+                armed = False
+                print("[STOP] equilibrium re-commanded at the current pose. "
+                      "This is a SOFT stop — the arm is holding, not braked. "
+                      "Use the hardware E-stop if it is not enough.", flush=True)
+                continue
             if "q" in pressed:
                 stop_reason = "user quit"
                 break
-            if key == ord("h"):
+            # Read from `pressed` rather than `key` so it works from the 3D
+            # window too — which is where you will be looking when you decide
+            # the scene is ready.
+            if "s" in pressed:
+                if episode_over:
+                    start_episode()
+                    # Fresh observation before acting. start_episode() re-opens
+                    # the gripper, and the frame above it was segmented and its
+                    # robot_state read while the fingers were still shut.
+                    continue
+                elif not armed:
+                    armed = True
+                    print("Policy started.", flush=True)
+            if "h" in pressed:
                 if args.dry_run:
                     print("[home] ignored in --dry-run")
                 else:
                     publish_seq = go_home(pub, T_ctrl_hand, T_hand_ctrl,
                                           publish_seq, droop,
-                                          creep=not args.no_creep)
+                                          creep=not args.no_creep,
+                                          stream=not args.home_stepwise,
+                                          speed_m_s=args.home_speed,
+                                          tol_m=args.home_tol)
                 continue
 
             # ---- EXECUTE ----
             # Step mode gates every single motion on SPACE; nothing the policy
             # predicts reaches the robot until you ask for it.
+            #
+            # Before 's' and after the episode, everything above this line still
+            # runs and nothing below it does: the policy keeps predicting and
+            # the HUD keeps showing what it would do, but no target is ever
+            # published and no step is consumed. 'h' is the one exception,
+            # handled above — it is how you re-home before arming, and the usual
+            # next thing you want after a grasp.
+            if episode_over or not armed:
+                continue
             if not have_obs:
                 time.sleep(0.01)   # nothing segmented; does NOT consume a step
                 continue
@@ -1885,30 +3313,92 @@ def main() -> None:
                 print(f"[{step:02d}] policy commanded CLOSE", flush=True)
                 gripper.close()
                 stop_reason = "policy closed the gripper"
-                break
+                episode_over = True
+                announce_end(stop_reason)
+                continue
 
             pos = T_base_ctrl_target[:3, 3]
             # fused.summary() carries the per-camera split and the declustered
             # count. Without it a clean object cloud and one that fell back to
             # the sphere every frame print identically.
+            # WHERE THE ARM ACTUALLY IS, and how it did against the LAST target.
+            #
+            # Without this the log cannot tell an oscillating controller from an
+            # oscillating observation, because the target it prints is
+            # arm_pose (*) delta — so a wobbling target is equally consistent
+            # with the arm overshooting and with the policy changing its mind.
+            # `res` is the signed residual to the previous target along the
+            # direction that target was in: negative means the arm went PAST it.
+            # BOTH IN panda_hand. `pos` above is the CONTROL frame, 103.4 mm
+            # ahead of the hand on this robot, so measuring the arm against it
+            # would report that constant offset as a residual on every step.
+            arm = T_base_hand[:3, 3]
+            hand_target = T_base_hand_target[:3, 3]
+            diag = ""
+            if prev_target is not None:
+                to_prev = prev_target - prev_arm
+                n_prev = float(np.linalg.norm(to_prev))
+                if n_prev > 1e-9:
+                    u = to_prev / n_prev
+                    got = float((arm - prev_arm) @ u)
+                    diag = (f"  arm=({arm[0]:+.3f},{arm[1]:+.3f},{arm[2]:+.3f})"
+                            f" moved={got*1000:+6.1f}/{n_prev*1000:5.1f}mm"
+                            f" res={(n_prev - got)*1000:+6.1f}mm")
+            prev_target, prev_arm = hand_target.copy(), arm.copy()
+
             print(f"[{step:02d}] target xyz=({pos[0]:+.3f}, {pos[1]:+.3f}, "
                   f"{pos[2]:+.3f})  |d|={np.linalg.norm(delta6[:3]):.4f}m "
                   f"obj={len(object_policy):4d} hand={len(hand_policy):4d}"
                   f"  {fused.summary()}"
-                  f"{'  CLAMPED' if clamped else ''}", flush=True)
+                  f"{'  CLAMPED' if clamped else ''}{diag}", flush=True)
 
-            if not args.dry_run:
-                publish_seq, dpos, drot, passes = move_to(
+            if not args.dry_run and rate_cmd is not None:
+                _t = time.time()
+                publish_seq, slept = rate_cmd.command(
+                    T_base_ctrl_target, publish_seq)
+                ms_move = (time.time() - _t) * 1e3
+                print(f"     published, dwelt {slept*1000:.0f}ms "
+                      f"(obs {ms_obs:.0f} + policy {ms_pol:.0f} inside the "
+                      f"{1000/args.rate_hz:.0f}ms period)"
+                      + (f"; {droop.describe()}" if droop is not None else ""),
+                      flush=True)
+            elif not args.dry_run:
+                tol = step_tolerance(float(np.linalg.norm(delta6[:3])),
+                                     args.step_tol_frac)
+                _t = time.time()
+                publish_seq, dpos, drot, passes, commands = move_to(
                     pub, T_base_ctrl_target, publish_seq, args.settle_timeout,
-                    droop, STEP_CONVERGE_PASSES, STEP_CONVERGE_TOL_M,
+                    droop, STEP_CONVERGE_PASSES, tol,
                     creep=not args.no_creep)
-                if dpos >= STEP_CONVERGE_TOL_M:
-                    print(f"     step short by {dpos*1000:.1f}mm "
-                          f"{np.rad2deg(drot):.1f}deg after {passes} passes",
-                          flush=True)
+                ms_move = (time.time() - _t) * 1e3
+                # Always logged, not only on failure. How many commands the arm
+                # was given IS what the motion looks like — 1 is one continuous
+                # move, 3 is the jump-plus-two-adjustments people report — and
+                # the lead beside it says whether that count is going to come
+                # down: a lead that has stopped changing while commands stay
+                # above 1 means the estimate has saturated, not converged.
+                # WHERE THE STEP ACTUALLY GOES. Printed every step because the
+                # answer is counter-intuitive and people reach for the network
+                # first: perception and inference are tens of milliseconds, and
+                # waiting for the arm to stop is seconds. See the note above
+                # settle() on why we wait at all, and what the CVPR2023 loop
+                # does instead (a fixed 0.15 s dwell, no convergence check).
+                total = ms_obs + ms_pol + ms_move
+                print(f"     moved in {commands} command"
+                      f"{'' if commands == 1 else 's'}, "
+                      f"{dpos*1000:.1f}mm short of {tol*1000:.0f}mm"
+                      + (f", {droop.describe()}" if droop is not None else ""),
+                      flush=True)
+                print(f"     {total/1000:.2f}s  =  obs {ms_obs:.0f}ms + policy "
+                      f"{ms_pol:.0f}ms + motion {ms_move:.0f}ms "
+                      f"({100*ms_move/max(total,1e-9):.0f}% waiting for the arm)",
+                      flush=True)
             step += 1
 
-        print(f"Episode ended after {step} policy steps: {stop_reason}")
+        # Only the quit path reaches here un-announced; an episode that ended on
+        # its own said so at the time and has been idling ever since.
+        if not episode_over:
+            print(f"Episode ended after {step} policy steps: {stop_reason}")
 
     finally:
         for rig in rigs:

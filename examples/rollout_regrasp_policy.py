@@ -269,6 +269,8 @@ def draw_gripper(pose_mat, colour, line_ids, line_width=2.0):
 _BIN_RGB = _viz.BIN_RGB
 draw_anchor_frame = _viz.draw_anchor_frame
 draw_bin_sphere = _viz.draw_bin_sphere
+draw_direction = _viz.draw_direction
+draw_grasp_point = _viz.draw_grasp_point
 
 
 # ── rollout ──────────────────────────────────────────────────────────────────
@@ -281,7 +283,7 @@ def rollout(env, model, point_listener, scene_idx, device,
             hold_steps=3, dwell_steps=20, show_pred_grasp=False,
             grasp_idx=0, show_anchor_frame=False, show_bin_sphere=False,
             bin_sphere_radius=0.10, bin_sphere_points=2400,
-            command_axes="BINS"):
+            command_axes="BINS", show_d=False, d_rule=None):
     obs = env.reset(idx=scene_idx)
 
     # REGRASP: which DIRECTION this roll is commanded to approach from. It is
@@ -296,6 +298,12 @@ def rollout(env, model, point_listener, scene_idx, device,
     # own `SIM.command_deploy` (`--command`).
     if isinstance(command_axes, str):
         command_axes = _dirs.BINS
+    # `SIM.d_rule`: what a direction is DERIVED FROM, a separate knob from what
+    # the command IS. It decides what "the direction the gripper achieved"
+    # means, so the achieved arrow below is measured under the same rule
+    # `evaluator._dir_block` scores `dir_err` with.
+    if d_rule is None:
+        d_rule = _dirs.DirectionRule()
     cond_goal = None if pin_table is None else pin_table.pose(scene_idx, grasp_idx)
     _meta = ({} if pin_table is None
              else pin_table.scene_meta.get(int(scene_idx), {}))
@@ -335,14 +343,14 @@ def rollout(env, model, point_listener, scene_idx, device,
     # ONE clear for every overlay that lives on `goal_marker_ids`. It used to sit
     # inside the show_goal_grasp branch, which would wipe whatever the frame
     # overlay had just drawn whenever both flags were on.
-    if show_anchor_frame or show_bin_sphere or show_goal_grasp:
+    if show_anchor_frame or show_bin_sphere or show_goal_grasp or show_d:
         if goal_marker_ids is None:
             goal_marker_ids = []
         for _d in goal_marker_ids:
             pybullet.removeUserDebugItem(_d)
         goal_marker_ids.clear()
 
-    if show_anchor_frame or show_bin_sphere:
+    if show_anchor_frame or show_bin_sphere or show_d:
         meta = (pin_table.scene_meta.get(int(scene_idx), {})
                 if pin_table is not None else {})
         a_R = meta.get("anchor_R")
@@ -360,9 +368,66 @@ def rollout(env, model, point_listener, scene_idx, device,
             if show_anchor_frame:
                 draw_anchor_frame(a_R, c_w, goal_marker_ids,
                                   length=max(bin_sphere_radius * 1.5, 0.12))
+            b = pin_table.bin_of(int(scene_idx), grasp_idx)
+            b = None if b is None or int(b) < 0 else int(b)
             print(f"  anchor frame at centroid {c_w.round(3)}  mode="
                   f"{meta.get('anchor_mode', '?')}  commanded bin="
-                  f"{_dirs.BIN_SHORT[pin_table.bin_of(int(scene_idx), grasp_idx)]}")
+                  f"{'-' if b is None else _dirs.BIN_SHORT[b]}")
+
+            # THREE ARROWS, BECAUSE THE COMMAND AND THE TRAINING LABEL NEED NOT
+            # AGREE. Run 9 makes them disagree deliberately — the labels are
+            # each grasp's own `d_grasp_world`, deployment issues the bin's
+            # centroid axis — so one arrow cannot tell you whether the policy is
+            # being asked for something it ever saw. Drawn from the anchor
+            # ORIGIN, since `d` is a direction and the length is a display
+            # choice, and with the same functions `visualize_bc_dataset.py`
+            # draws recorded episodes with, so the two views compare by eye.
+            #
+            #   white        `d_world` — the vector the two conditioning
+            #                channels encode, recomputed in the EE frame every
+            #                step. This is what `--command` decides.
+            #   bin colour   the NOMINAL bin axis. Under `bin_centroid` the
+            #                command has drifted off it, and by how much is the
+            #                entire difference between run 2 and run 9.
+            #   yellow       this run's `d_rule` applied to the PINNED grasp,
+            #                i.e. the label a demonstration of this slot carries.
+            if show_d:
+                _viz.draw_direction(d_world, c_w, goal_marker_ids,
+                                    colour=(1.0, 1.0, 1.0),
+                                    label="d commanded", length=0.24)
+                if b is not None:
+                    axis = _dirs.to_world(_dirs.BINS[b], a_R)
+                    off = float(_dirs.angle_between(d_world, axis))
+                    if off > 1e-6:
+                        _viz.draw_direction(
+                            axis, c_w, goal_marker_ids,
+                            colour=_BIN_RGB[b % len(_BIN_RGB)],
+                            label=f"bin axis {_dirs.BIN_SHORT[b]}",
+                            length=0.19, width=3.0)
+                    print(f"  [d] commanded is {off:.1f} deg off the nominal "
+                          f"{_dirs.BIN_SHORT[b]} axis")
+                d_label = d_rule.of(cond_goal, c_w)
+                if d_label is not None:
+                    _viz.draw_direction(
+                        d_label, c_w, goal_marker_ids, colour=(1.0, 0.85, 0.1),
+                        label=f"d label ({d_rule.rule})", length=0.28)
+                    print(f"  [d] commanded vs the pinned grasp's own "
+                          f"{d_rule.rule} label: "
+                          f"{float(_dirs.angle_between(d_world, d_label)):.1f} deg")
+                # Under `grasp_offset` the vector is only interpretable next to
+                # the two things that define it: the fingertip midpoint and the
+                # chord from the centroid to it. A stub chord means `d` is
+                # centroid noise, which is what `d_min_offset` exists to reject.
+                if d_rule.needs_centroid() and cond_goal is not None:
+                    off_m = _viz.draw_grasp_point(cond_goal, c_w, goal_marker_ids,
+                                                  depth=d_rule.depth)
+                    if off_m is not None:
+                        print(f"  [d] centroid -> fingertip midpoint: "
+                              f"{off_m * 100:.1f} cm"
+                              + ("   ** below d_min_offset "
+                                 f"{d_rule.min_offset * 100:.0f} cm — `d` here is "
+                                 f"centroid noise **"
+                                 if off_m < d_rule.min_offset else ""))
 
     # Optionally overlay the grasp the policy is supposed to be aiming at. Drawn
     # once (the object is static) and left up for the whole roll so you can watch
@@ -408,6 +473,7 @@ def rollout(env, model, point_listener, scene_idx, device,
     info = {}
     dist = float("nan")
     close_step = -1
+    ee_final = None
     grasped = False
     success = False
     reason = None
@@ -422,6 +488,11 @@ def rollout(env, model, point_listener, scene_idx, device,
     for step in range(max_steps):
         pc = _point_cloud(obs, point_listener, panda_base_inv_tf)   # [N,5] EE frame
         rs = _robot_state(obs, prev_act6d)                          # [32]
+        # The pose `dir_err` is measured at: rs[18:21] xyz, rs[21:25] quat wxyz,
+        # SIM WORLD. Same construction as `evaluator._ee_mat_from_state`, and
+        # taken BEFORE the action like the evaluator does, so the achieved
+        # direction is read at the pose the close decision was made from.
+        ee_final = unpack_pose(np.hstack([rs[18:21], rs[21:25]]))
 
         # Recomputed every step from the RAW rs, exactly as BCDataset does at
         # training time — the world direction is fixed but the EE moves, so the
@@ -534,6 +605,23 @@ def rollout(env, model, point_listener, scene_idx, device,
             reason = "DROP"
         else:
             reason = "TIMEOUT"
+    # COMMANDED (white) vs ACHIEVED (cyan), which is the eyeball version of the
+    # headline metric. Measured with the run's own `d_rule` applied to the pose
+    # the policy finished at — the same two lines `evaluator._dir_block`
+    # computes `dir_err` from, so the arrow on screen and the number in
+    # `eval_log.csv` cannot disagree.
+    if show_d and draw:
+        _c = _meta.get("centroid_world")
+        if ee_final is not None and _c is not None:
+            _c = np.asarray(_c, dtype=np.float64)
+            achieved = d_rule.of(ee_final, _c)
+            if achieved is not None:
+                _viz.draw_direction(achieved, _c, goal_marker_ids,
+                                    colour=(0.15, 0.9, 0.9),
+                                    label="d achieved", length=0.20, width=4.0)
+                print(f"  dir_err (commanded vs achieved, {d_rule.rule}): "
+                      f"{float(_dirs.angle_between(d_world, achieved)):.1f} deg")
+
     closed = f"close@{close_step}" if close_step >= 0 else "never closed"
     print(f"  result: {'SUCCESS' if success else 'FAIL'} [{reason}]  "
           f"({closed}, grasped={grasped}, ee→ycb={dist:.3f} m)")
@@ -572,7 +660,13 @@ def parse_args():
                    help="simulator config (e.g. examples/pretrain.yaml). Derived "
                         "from the run's config.yaml when --run is given.")
     p.add_argument("--scene",    type=int, default=0, help="scene index to roll out")
-    p.add_argument("--max-steps", type=int, default=30, help="max policy steps")
+    # 50, MATCHING `EVAL.max_steps` IN EVERY REGRASP CONFIG. It used to be 30,
+    # which is below the budget the policy was scored under: `mean_close_step`
+    # is 25.6 on run 10 at iteration 21, so a real fraction of episodes that
+    # close fine in eval timed out in the viewer and read as policy failures
+    # with no indication that the horizon, not the policy, ended them.
+    p.add_argument("--max-steps", type=int, default=50,
+                   help="max policy steps (default 50 = EVAL.max_steps)")
     p.add_argument("--hold-steps", type=int, default=3,
                    help="stable_grasp: policy-steps to hold the gripper shut after "
                         "the close before checking the object is secured. Match the "
@@ -660,6 +754,24 @@ def parse_args():
                    help="--show-bin-sphere radius in metres (default 0.10)")
     p.add_argument("--bin-sphere-points", type=int, default=2400,
                    help="--show-bin-sphere point count (default 2400)")
+    p.add_argument("--show-d", action="store_true",
+                   help="draw the conditioning vector from the anchor origin: "
+                        "white = the `d` ISSUED to the policy (--command), bin "
+                        "colour = the nominal bin axis it drifted from, yellow "
+                        "= this run's d_rule applied to the pinned grasp (the "
+                        "training LABEL), cyan = the direction actually "
+                        "achieved, i.e. `dir_err` on screen")
+    p.add_argument("--d-rule", default=None,
+                   choices=list(_dirs.D_RULES),
+                   help="override SIM.d_rule for --show-d and the achieved "
+                        "arrow. Default comes from --run's config (run 10+: "
+                        "grasp_offset), else approach_axis")
+    p.add_argument("--d-point-depth", type=float, default=None,
+                   help="metres along the gripper's +z to the fingertip "
+                        "midpoint for d_rule=grasp_offset (default 0.1122)")
+    p.add_argument("--d-min-offset", type=float, default=None,
+                   help="d_rule=grasp_offset: flag a centroid->fingertip chord "
+                        "shorter than this as centroid noise")
     p.add_argument("--command", default=None,
                    choices=["bin_axis", "bin_centroid", "grasp_axis"],
                    help="which rule builds the commanded direction. MUST match "
@@ -769,6 +881,23 @@ def main():
     from handover_sim2real.regrasp.setup import resolve_command_axes
     command_axes = resolve_command_axes(pin_table, args.command)
 
+    # `d_rule` decides what the yellow LABEL arrow and the cyan ACHIEVED arrow
+    # mean, and getting it wrong compares two different questions and reports the
+    # difference as policy error: `approach_axis` is a property of the gripper's
+    # ORIENTATION, `grasp_offset` of its POSITION, and on a grasp reaching down
+    # onto an underside the two are nearly perpendicular. --run reads it from the
+    # run's own config, which is the only place it is recorded.
+    d_rule = _dirs.DirectionRule(
+        rule=args.d_rule or (spec.d_rule if args.run else "approach_axis"),
+        **{k: v for k, v in (
+            ("depth", args.d_point_depth if args.d_point_depth is not None
+             else (spec.d_point_depth if args.run else None)),
+            ("min_offset", args.d_min_offset if args.d_min_offset is not None
+             else (spec.d_min_offset if args.run else None)),
+        ) if v is not None})
+    if args.show_d:
+        print(f"d overlay: {d_rule.describe()}")
+
     def print_bin_legend(scene_idx=None) -> None:
         """`--bin N` -> which direction, and what this scene actually offers.
 
@@ -873,7 +1002,9 @@ def main():
                        show_bin_sphere=(args.show_bin_sphere and draw),
                        bin_sphere_radius=args.bin_sphere_radius,
                        bin_sphere_points=args.bin_sphere_points,
-                       command_axes=command_axes)
+                       command_axes=command_axes,
+                       show_d=(args.show_d and draw),
+                       d_rule=d_rule)
 
     # Headless benchmark: roll out many scenes, report success / grasp / dist.
     if args.benchmark:

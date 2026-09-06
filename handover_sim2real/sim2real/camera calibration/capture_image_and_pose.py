@@ -190,6 +190,26 @@ def main() -> None:
     cam.start()
     sub.start()
 
+    # WHICH CAMERA THIS SESSION IS FOR, recorded next to the extrinsics.
+    #
+    # A calibration is a statement about one physical camera in one place. The
+    # session folder never said which, so swapping the body on the tripod and
+    # then loading the old session is a silent, total failure: every point lands
+    # somewhere plausible and entirely wrong, with nothing in any log to
+    # question. The runner reads this back and refuses to be quiet about a
+    # mismatch. Written at capture time rather than at solve time because this
+    # is the moment the camera is actually in front of us.
+    (session.root / "camera.json").write_text(json.dumps({
+        "role": args.role,
+        "serial": serial,
+        "device_name": cam.device_name,
+        "model": cam.model_key,
+        "width": cfg.STREAM.width,
+        "height": cfg.STREAM.height,
+    }, indent=2))
+    print(f"[camera] {cam.device_name}  serial {serial}  "
+          f"{cfg.STREAM.width}x{cfg.STREAM.height}")
+
     idx = next_index(session)
     print(f"session dir : {session.root}")
     print(f"pose topic  : {args.pose_topic} [{args.pose_source}]")

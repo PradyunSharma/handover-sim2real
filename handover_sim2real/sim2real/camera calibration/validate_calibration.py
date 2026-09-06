@@ -57,6 +57,16 @@ def main() -> int:
         err = np.linalg.norm(proj.reshape(-1, 2) - r["img_points"].reshape(-1, 2), axis=1)
         reproj_px.append(float(np.sqrt(np.mean(err ** 2))))
 
+    # How far off-centre each board sat, as a fraction of the image half-diagonal.
+    # Reported because unmodelled edge distortion is absorbed as board TILT and
+    # shows up here as rotation residual while reprojection stays sub-pixel —
+    # see GOOD_BOARD_RADIUS_FRAC.
+    half_diag = 0.5 * float(np.hypot(cfg.STREAM.width, cfg.STREAM.height))
+    centre = np.array([K[0, 2], K[1, 2]])
+    rad_frac = np.array([
+        float(np.linalg.norm(r["img_points"].reshape(-1, 2).mean(0) - centre))
+        / half_diag for r in results])
+
     trans_mm = np.array(trans_mm)
     rot_deg = np.array(rot_deg)
     reproj_px = np.array(reproj_px)
@@ -76,9 +86,45 @@ def main() -> int:
         print(f"{label:22s}{arr.mean():9.3f}{np.median(arr):9.3f}{arr.max():9.3f}"
               f"{thr:9.2f} {unit}{flag}")
 
+    # WHAT THE NUMBERS MEAN WHERE THE ROBOT WORKS, because two of the three are
+    # in units that do not compare across cameras and the thresholds were set on
+    # one.
+    #
+    # Rotation is the one that matters. It is the only term that GROWS with
+    # distance, and being a fixed bias it does not average away over the points
+    # in a cloud the way depth noise does. Translation is a constant offset
+    # everywhere and is usually the smaller of the two by the time you are a
+    # metre out.
+    #
+    # Reprojection is in PIXELS, which is not a property of the calibration
+    # alone — it is the calibration seen through this camera's focal length. A
+    # wide-FOV body has coarser pixels, so the same physical error prints as a
+    # smaller number, and a fixed px threshold silently means something
+    # different on every camera. Converted here so it can be compared with the
+    # other two, and with a previous session on a different body.
+    #
+    # It is also the only row that can see the INTRINSICS: trans and rot are
+    # both consistency checks on T_gripper_board and are blind to fx, fy, cx, cy
+    # and the distortion model, all of which are factory values here. So
+    # reprojection failing while the other two pass points at the intrinsics or
+    # at the chain as a whole, not at the hand-eye solve.
+    fx = float(K[0, 0])
+    print(f"\nat the working distance (fx = {fx:.1f} px):")
+    print(f"{'':22s}{'0.6 m':>9s}{'1.0 m':>9s}{'1.5 m':>9s}")
+    for label, val in (("rotation", np.deg2rad(rot_deg.mean())),
+                       ("reprojection", reproj_px.mean() / fx),
+                       ("translation", None)):
+        if val is None:
+            print(f"{label:22s}{trans_mm.mean():9.1f}{trans_mm.mean():9.1f}"
+                  f"{trans_mm.mean():9.1f}   mm (constant)")
+        else:
+            print(f"{label:22s}{val * 600:9.1f}{val * 1000:9.1f}"
+                  f"{val * 1500:9.1f}   mm")
+
     print("\nper image:")
     for n, te, re_, pe in zip(names, trans_mm, rot_deg, reproj_px):
-        print(f"  {n}: trans={te:6.3f} mm  rot={re_:5.3f} deg  reproj={pe:6.3f} px")
+        print(f"  {n}: trans={te:6.3f} mm  rot={re_:5.3f} deg  reproj={pe:6.3f} px"
+              f"  r={rad_frac[names.index(n)]:.2f}")
 
     worst = int(np.argmax(trans_mm))
     if trans_mm[worst] > 3 * np.median(trans_mm):
@@ -92,6 +138,15 @@ def main() -> int:
 
     if failed:
         print("\nFAILED: " + ", ".join(failed))
+        off = rad_frac > cfg.GOOD_BOARD_RADIUS_FRAC
+        if off.any() and (~off).any():
+            print(f"{off.sum()}/{len(rad_frac)} captures had the board past "
+                  f"r={cfg.GOOD_BOARD_RADIUS_FRAC} of the half-diagonal; those "
+                  f"average {rot_deg[off].mean():.3f} deg rotation residual "
+                  f"against {rot_deg[~off].mean():.3f} deg for the central ones. "
+                  "Unmodelled edge distortion is absorbed as board tilt, so it "
+                  "lands in rotation while reprojection stays sub-pixel — "
+                  "recapture nearer the middle of the frame before adding poses.")
         print("Usual causes: too few poses, insufficient rotation diversity, a "
               "mis-measured square_length_m in calib_config.py, motion blur, or a "
               "board that shifted during capture.")

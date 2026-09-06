@@ -46,11 +46,24 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-# GA-DDPG's Panda control points (core/utils.get_control_point_tensor), in the
-# panda_hand frame: fingertips at z = 0.105, finger bases at z = 0.075, spread
-# +/-0.053 in x. Hard-coded rather than imported so the viewer stays usable
-# without $GADDPG_DIR on sys.path.
-_FINGER_HALF_X = 0.053
+# GA-DDPG's Panda control points (core/utils.get_control_point_tensor):
+# fingertips at z = 0.105, finger bases at z = 0.075, spread +/-0.053.
+# Hard-coded rather than imported so the viewer stays usable without
+# $GADDPG_DIR on sys.path.
+#
+# THE SPREAD IS ALONG y, NOT x. The raw array in get_control_point_tensor puts
+# it on x because that array is in GraspNet's grasp frame; the function's
+# `rotz` flag applies Rz(90 deg) to bring it into the robot's hand frame, and
+# panda_scene._get_relative_goal_pose does the same to a pose with the comment
+# "to be compatible with graspnet" on the un-rotated branch. The URDF settles
+# it independently: panda_finger_joint1 has axis (0, 1, 0) in panda_hand, so
+# the real fingers open along y. This wireframe lives in panda_hand — the frame
+# the cloud is in — so it takes the rotated convention.
+#
+# Only the drawing was ever wrong. The cloud, the policy input and the emitted
+# actions are all in panda_hand and were unaffected; RobotExclusionBox and
+# GraspRegion are both symmetric in x and y and cannot tell the two apart.
+_FINGER_HALF_Y = 0.053
 _FINGER_BASE_Z = 0.075
 _FINGER_TIP_Z = 0.105
 
@@ -81,10 +94,10 @@ def _gripper_lineset(o3d):
     pts = np.array([
         [0.0, 0.0, 0.0],                                    # 0 flange origin
         [0.0, 0.0, _FINGER_BASE_Z],                         # 1 between the bases
-        [+_FINGER_HALF_X, 0.0, _FINGER_BASE_Z],             # 2
-        [-_FINGER_HALF_X, 0.0, _FINGER_BASE_Z],             # 3
-        [+_FINGER_HALF_X, 0.0, _FINGER_TIP_Z],              # 4
-        [-_FINGER_HALF_X, 0.0, _FINGER_TIP_Z],              # 5
+        [0.0, +_FINGER_HALF_Y, _FINGER_BASE_Z],             # 2
+        [0.0, -_FINGER_HALF_Y, _FINGER_BASE_Z],             # 3
+        [0.0, +_FINGER_HALF_Y, _FINGER_TIP_Z],              # 4
+        [0.0, -_FINGER_HALF_Y, _FINGER_TIP_Z],              # 5
     ])
     lines = [[0, 1], [2, 3], [2, 4], [3, 5]]
     ls = o3d.geometry.LineSet(
@@ -95,14 +108,11 @@ def _gripper_lineset(o3d):
     return ls
 
 
-def _box_lineset(o3d, box, colour=(0.45, 0.13, 0.13)):
-    # Deliberately dim. The box is the largest object in the scene (0.32 m deep
-    # against a ~0.1 m gripper) and at full saturation it dominates the view it
-    # is only context for.
-    """Wireframe of the robot-exclusion box, in the panda_hand frame."""
-    xs = (-box.half_x, box.half_x)
-    ys = (-box.half_y, box.half_y)
-    zs = (box.z_min, box.z_max)
+def _aabb_lineset(o3d, lo, hi, colour):
+    """Wireframe of one axis-aligned box, from its two opposite corners."""
+    xs = (lo[0], hi[0])
+    ys = (lo[1], hi[1])
+    zs = (lo[2], hi[2])
     pts = np.array([[x, y, z] for x in xs for y in ys for z in zs])
     # indices follow the x-major, y, z nesting above
     lines = [[0, 1], [2, 3], [4, 5], [6, 7],
@@ -114,6 +124,45 @@ def _box_lineset(o3d, box, colour=(0.45, 0.13, 0.13)):
     ls.colors = o3d.utility.Vector3dVector(
         np.tile(np.array([colour]), (len(lines), 1)))
     return ls
+
+
+def _box_lineset(o3d, box, colour=(0.45, 0.13, 0.13)):
+    # Deliberately dim. The box is the largest object in the scene (0.32 m deep
+    # against a ~0.1 m gripper) and at full saturation it dominates the view it
+    # is only context for.
+    """Wireframe of the robot-exclusion box, in the panda_hand frame."""
+    return _aabb_lineset(o3d, (-box.half_x, -box.half_y, box.z_min),
+                         (box.half_x, box.half_y, box.z_max), colour)
+
+
+def _finger_linesets(o3d, fingers, finger_q_m=0.04, colour=(0.55, 0.20, 0.16)):
+    """The two finger-exclusion boxes, in the panda_hand frame.
+
+    Drawn a little brighter than the housing box because they are small and
+    sit inside it in projection, and because these are the ones you go looking
+    for: they are what tells you whether the fingers your camera can see line
+    up with where the robot says they are. If the finger points in the cloud
+    sit beside these boxes rather than inside them, that offset IS your
+    calibration error, measured against a 21 x 26 mm object of known position.
+
+    Drawn at the fully-open position by default. The jaws stay open for the
+    whole approach — the episode ends at the close — so a static wireframe is
+    not a simplification here, it is the only configuration you ever see.
+
+    Returns ONE box in span mode and two in split mode, which is the point:
+    the wireframe count tells you at a glance which filter is running, and in
+    span mode the single box visibly swallows the jaw gap the object has to
+    end up in.
+    """
+    m = fingers.margin_m
+    q = float(np.clip(finger_q_m, 0.0, 0.04))
+    x, z0, z1 = fingers.half_x + m, fingers.z_lo - m, fingers.z_hi + m
+    y1 = q + fingers.depth_y + m
+    if fingers.span_gap:
+        return [_aabb_lineset(o3d, (-x, -y1, z0), (+x, +y1, z1), colour)]
+    y0 = q + fingers.inner_y
+    return [_aabb_lineset(o3d, (-x, +y0, z0), (+x, +y1, z1), colour),
+            _aabb_lineset(o3d, (-x, -y1, z0), (+x, -y0, z1), colour)]
 
 
 # PolicyCloudViewer lived here: a legacy-Visualizer window that drew the policy

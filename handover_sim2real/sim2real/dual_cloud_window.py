@@ -44,6 +44,7 @@ from cloud_viewer import (  # noqa: E402
     CAMERA_COLOURS,
     CLASS_COLOURS,
     _box_lineset,
+    _finger_linesets,
     _gripper_lineset,
 )
 from transforms import transform_points  # noqa: E402
@@ -134,7 +135,8 @@ class DualCloudWindow:
     does not need a null object or a guard at each call site.
     """
 
-    def __init__(self, camera_names, exclusion_box=None, width=1100, height=820,
+    def __init__(self, camera_names, exclusion_box=None, finger_boxes=None,
+                 width=1100, height=820,
                  context_point_size=1.0, policy_point_size=5.0,
                  context_max=30000, policy_size=1024, enabled=True):
         self._camera_names = list(camera_names)
@@ -210,6 +212,9 @@ class DualCloudWindow:
         if exclusion_box is not None:
             self._scene.add_geometry("exclusion", _box_lineset(o3d, exclusion_box),
                                      self._m_line)
+        if finger_boxes is not None:
+            for i, ls in enumerate(_finger_linesets(o3d, finger_boxes)):
+                self._scene.add_geometry(f"finger{i}", ls, self._m_line)
         self._scene.add_geometry(
             "origin", o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05),
             m_mesh)

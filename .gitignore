@@ -88,5 +88,29 @@ venv*/*
 *.ckpt
 *.bag
 *.mp4
-handover_sim2real/sim2real/checkpoint/**/*.pt
+# WEIGHTS, ANYWHERE — not just under sim2real/checkpoint/. That path-anchored
+# rule is why a 149 MB SAM2 checkpoint reached the index: a bad cwd created a
+# duplicate package tree at sim2real/handover_sim2real/sim2real/checkpoint/sam2/,
+# which has an extra `handover_sim2real/sim2real/` in the middle and so matched
+# nothing. An unanchored rule cannot be dodged by where the file lands, and a
+# binary that size is effectively permanent — deleting it in a later commit
+# leaves it in history and every clone still pays for it.
+#
+# The small files BESIDE a checkpoint stay tracked (config.yaml,
+# normalization.npz, README.md, source.txt): the payload does not carry the
+# Normalizer and the .h5 it was fitted on lives on /scratch, so those are the
+# only record of how to denormalize a policy's output.
+*.pt
+*.pth
+*.safetensors
+
+# The stray duplicate package tree itself. It holds nothing but the checkpoint
+# above; the real tree is at the repo root.
+handover_sim2real/sim2real/handover_sim2real/
+
+# SLURM job output. `*.log` near the top of this file does not match .out/.err.
+slurm_logs/
+*.out
+*.err
+
 output_home_shards/

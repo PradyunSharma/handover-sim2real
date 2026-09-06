@@ -19,6 +19,60 @@ class CameraIntrinsics:
     coeffs: Tuple[float, float, float, float, float]
 
 
+@dataclass(frozen=True)
+class CameraModel:
+    """The handful of things that differ between D400 bodies and matter here.
+
+    Intrinsics are read off the device and need no table. These four do not
+    appear in any stream profile, and getting them wrong is quiet rather than
+    loud — a min_z set for the wrong body does not error, it just returns
+    garbage depth in the near field and calls it a measurement.
+
+    THE BASELINE IS WHY YOU WOULD SWAP THE BODY AT ALL. Stereo depth noise goes
+    as sigma_z = z^2 * sigma_disparity / (f * baseline), so the D455's 95 mm
+    against the D435's 50 mm is very nearly a halving of depth error at the same
+    range, for the same sensor and the same disparity quality. No resolution
+    change on a D435 comes close to that; the measured spread across every mode
+    it offers was about 12%.
+
+    MIN_Z IS THE PRICE, and it is the one that can bite. A longer baseline means
+    the two imagers stop overlapping sooner, so the D455 sees nothing closer
+    than about 0.4 m where the D435 manages 0.1. That is comfortable for a
+    tripod at 0.6-1.5 m and disqualifying for a wrist camera at 0.3 m.
+
+    RGB_HFOV_DEG matters because this pipeline aligns depth TO COLOUR, so the
+    colour frame clips the cloud. On a D435 that is a real loss — 69 deg of
+    colour against 87 of depth, and only 55 in the 4:3 modes. The D455's colour
+    is WIDER than its depth, so alignment throws nothing away.
+    """
+    name: str
+    baseline_m: float
+    min_z_m: float
+    max_range_m: float
+    rgb_hfov_deg: float
+
+
+CAMERA_MODELS = {
+    "d435": CameraModel("D435", 0.050, 0.10, 3.0, 69.0),
+    "d435i": CameraModel("D435i", 0.050, 0.10, 3.0, 69.0),
+    "d415": CameraModel("D415", 0.055, 0.16, 3.0, 69.0),
+    "d455": CameraModel("D455", 0.095, 0.40, 6.0, 90.0),
+}
+DEFAULT_CAMERA_MODEL = "d435"
+
+
+def model_from_device_name(device_name: str) -> Optional[str]:
+    """'Intel RealSense D455' -> 'd455'. None if it is not one we have a row for.
+
+    Matched longest-key-first so 'd435i' is not swallowed by the 'd435' prefix.
+    """
+    low = str(device_name).lower().replace(" ", "")
+    for key in sorted(CAMERA_MODELS, key=len, reverse=True):
+        if key in low:
+            return key
+    return None
+
+
 class RealSenseCamera:
     def __init__(
         self,
@@ -41,7 +95,18 @@ class RealSenseCamera:
 
         self.depth_scale: Optional[float] = None
         self.intrinsics: Optional[CameraIntrinsics] = None
+        # Filled from the device at start(). Detected rather than declared: the
+        # body is a physical fact the driver already knows, and a flag that has
+        # to be repeated across calibration and deployment is a flag that will
+        # eventually disagree with the hardware in one of them.
+        self.device_name: Optional[str] = None
+        self.model_key: Optional[str] = None
         self.started = False
+
+    @property
+    def model(self) -> CameraModel:
+        """The body's constants, falling back to the D435 row if unrecognised."""
+        return CAMERA_MODELS[self.model_key or DEFAULT_CAMERA_MODEL]
 
     def start(self) -> None:
         if self.serial is not None:
@@ -63,12 +128,47 @@ class RealSenseCamera:
 
         profile = self.pipeline.start(self.config)
 
-        depth_sensor = profile.get_device().first_depth_sensor()
+        device = profile.get_device()
+        depth_sensor = device.first_depth_sensor()
         self.depth_scale = float(depth_sensor.get_depth_scale())
+        self.device_name = str(device.get_info(rs.camera_info.name))
+        self.model_key = model_from_device_name(self.device_name)
 
         # Warm up a few frames for auto-exposure/stability.
-        for _ in range(10):
-            self.pipeline.wait_for_frames()
+        #
+        # THIS IS WHERE A BAD LINK SHOWS UP, and it is worth catching here
+        # because the bare librealsense message ("Frame didn't arrive within
+        # 5000") reads like a timeout to tune rather than a fault to fix. Note
+        # what has already succeeded by this line: the device enumerated, and
+        # pipeline.start() accepted both modes — which it validates against the
+        # device's own profile list, without a single frame flowing. So getting
+        # this far says nothing about bandwidth or power, and anything that only
+        # reads stream profiles (generate_color_intrinsics.py) will happily
+        # succeed against a camera that cannot stream at all.
+        try:
+            for _ in range(10):
+                self.pipeline.wait_for_frames()
+        except RuntimeError as err:
+            usb = "unknown"
+            try:
+                usb = str(device.get_info(rs.camera_info.usb_type_descriptor))
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"{self.device_name or 'RealSense'} accepted color "
+                f"{self.color_size[0]}x{self.color_size[1]} + depth "
+                f"{self.depth_size[0]}x{self.depth_size[1]} @ {self.fps}fps but "
+                f"delivered no frames ({err}).\n"
+                f"  USB link reports: {usb}\n"
+                "  The modes are valid, so this is a link or power fault, not a "
+                "config one. In order of likelihood: a USB2 or charge-only "
+                "cable (the link must read 3.x); a hub or front-panel port that "
+                "cannot supply enough power; another process holding the "
+                "device; two cameras on one controller. A D455 draws more than "
+                "a D435 and is less forgiving of a marginal link.\n"
+                "  Colour alone is roughly half the bandwidth: if --stream "
+                "color works and this does not, the link is the constraint."
+            ) from err
 
         frames = self.pipeline.wait_for_frames()
         aligned = self.align.process(frames)

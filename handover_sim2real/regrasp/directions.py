@@ -116,6 +116,37 @@ BIN_HIT_DEG = 30.0
 # reason to change it.
 NEIGHBOUR_DEG = 30.0
 
+# ── THE RETRY LADDER: which direction to try, in what order ──────────────────
+#
+# `+x, +z, +y, -y, -z, -x` — bin indices (0, 4, 2, 3, 5, 1).
+#
+# ORDERED BY MEASURED PER-BIN SUCCESS, not by index. Runs 1-15 walked the pin
+# table's SLOT order, which is ascending bin index, and that is arbitrary with
+# respect to how good each direction is: `-x` is bin 1, so the WORST bin
+# (0.333 on run 11 it 22) was tried SECOND whenever a scene had it, while `+z`
+# (0.737) sat at index 4 and was tried nearly last. Ordering by success is the
+# whole point of a ladder — the first rung should be the direction most likely
+# to work.
+#
+# The order is from run 11 iteration 22, which is the largest well-measured
+# per-bin sample under `grasp_offset`:
+#
+#     +x 0.778 (n=54)   +z 0.737 (n=19)   +y 0.649 (n=37)
+#     -y 0.600 (n=25)   -z 0.538 (n=26)   -x 0.333 (n=33)
+#
+# A FIXED ORDER MAKES RUNG k A DEFINITE DIRECTION. Under the slot walk, rung k
+# was a mixture across scenes (rung 1 was `+x` on only 54% of them), so the
+# curve could not be read as "then it tried +y". With this it can, and
+# `retry_bin_frac_k` collapses to 1.0 by construction rather than reporting a
+# mixture.
+#
+# IT IS A CONSTANT, NOT A FIT. Re-deriving it per run from that run's own
+# per-bin rates would make the ladder a function of the thing it is scoring, so
+# `retry_at_k` would improve whenever the ordering got luckier — which is not a
+# property of the policy. If the ranking is ever revisited it should move here,
+# deliberately, and the runs either side of the change stop being comparable.
+RETRY_LADDER = (0, 4, 2, 3, 5, 1)
+
 
 def normalize(v, axis=-1, eps: float = 1e-12):
     """Unit vector(s). Zero-length input returns zeros rather than NaN.

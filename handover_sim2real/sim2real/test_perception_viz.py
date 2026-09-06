@@ -63,12 +63,17 @@ from scipy.spatial.transform import Rotation as Rot  # noqa: E402
 from pointcloud_multicam import (  # noqa: E402
     NUM_HAND_POINTS,
     NUM_OBJECT_POINTS,
+    FINGER_EXCLUSION_MODES,
     ROBOT_EXCLUSION,
-    HandSegmenter,
     MultiCameraPerception,
     build_policy_cloud,
     build_rigs,
     overlay_mask,
+)
+from sam2_segmenter import (  # noqa: E402
+    add_segmentation_args,
+    build_segmenter,
+    describe_segmenter,
 )
 from cloud_viewer import source_for_cloud  # noqa: E402
 from dual_cloud_window import (  # noqa: E402
@@ -188,12 +193,20 @@ class PerceptionWorker(threading.Thread):
         # that join() calls during teardown, and shadowing it with an Event
         # makes every join() raise "'Event' object is not callable".
         self._stop_evt = threading.Event()
+        # Reset is REQUESTED, not performed, because `observe()` runs here and
+        # the keyboard runs on the main thread. Calling reset() directly from
+        # there can land between a tracker's append-frame and its track-frame
+        # and hand the second one a state the first one no longer has.
+        self._reset_evt = threading.Event()
         self.ok = True
         self.error = None
 
     def latest(self):
         with self._lock:
             return self._snap
+
+    def request_reset(self):
+        self._reset_evt.set()
 
     def stop(self):
         self._stop_evt.set()
@@ -203,6 +216,9 @@ class PerceptionWorker(threading.Thread):
         try:
             while not self._stop_evt.is_set():
                 t0 = time.time()
+                if self._reset_evt.is_set():
+                    self._reset_evt.clear()
+                    self._perception.reset()
                 T_base_hand = (np.eye(4) if self._pose is None
                                else pose_msg_to_matrix(self._pose.latest()))
 
@@ -232,6 +248,7 @@ class PerceptionWorker(threading.Thread):
                     "summary": fused.summary(),
                     "per_camera": fused.per_camera,
                     "frames": dict(self._perception.last_frames),
+                    "object_masks": dict(self._perception.last_object_masks),
                     "arm_clusters": fused.arm_clusters,
                     "arm_dropped": fused.arm_dropped,
                 }
@@ -279,12 +296,18 @@ def main() -> None:
     p.add_argument("--no-context", action="store_true",
                    help="start with the white scene cloud hidden ('w' toggles)")
     p.add_argument("--no-robot-exclusion", action="store_true")
+    p.add_argument("--finger-boxes", choices=("split", "span", "off"),
+                   default="split",
+                   help="two boxes on the finger bodies ('split'), one box "
+                        "through the jaw gap as well ('span'), or no finger "
+                        "cut ('off'). See my_policy_runner.py --finger-boxes.")
     # Mirrors my_policy_runner, so what this window shows is what the policy is
     # fed. A debugging view running different perception settings from the thing
     # being debugged is worse than no view at all.
     p.add_argument("--no-cluster", action="store_true",
                    help="object class from the crop sphere alone (pre-clustering "
                         "behaviour, tight radii restored)")
+    add_segmentation_args(p)
     p.add_argument("--wrist-seg-px", type=int, default=None)
     p.add_argument("--fixed-seg-px", type=int, default=None)
     p.add_argument("--hand-margin-px", type=int, default=None,
@@ -347,8 +370,9 @@ def main() -> None:
         print("[calib] wrist T_hand_cam is the SIM's nominal mount, not a "
               "calibration of your D435.")
 
-    seg_model = HandSegModel.load_from_checkpoint(
+    seg_model = (HandSegModel.load_from_checkpoint(
         args.hand_seg_ckpt, map_location="cpu").to(device).eval()
+        if args.segmentation == "hand-net" else None)
 
     rigs = build_rigs(
         camera_names, T_hand_cam_wrist=T_hand_cam, fixed_session=args.calib_session,
@@ -374,17 +398,25 @@ def main() -> None:
             rig.camera.start()
             print(f"[camera] {rig.name:8s} serial={rig.serial}  {rig.kind}")
 
+        finger_boxes = (FINGER_EXCLUSION_MODES[args.finger_boxes]
+                        if (not args.no_robot_exclusion
+                            and any(r.exclude_robot for r in rigs)) else None)
         perception = MultiCameraPerception(
-            rigs, HandSegmenter(seg_model, device),
+            rigs, build_segmenter(args, rigs, device, hand_seg_model=seg_model),
             arm_rejection=not args.no_arm_rejection,
             arm_offset_m=args.arm_offset,
-            arm_lateral_m=args.arm_lateral)
+            arm_lateral_m=args.arm_lateral,
+            finger_exclusion=finger_boxes)
+        print(describe_segmenter(args))
 
         window = DualCloudWindow(
             [r.name for r in rigs],
             exclusion_box=(ROBOT_EXCLUSION
                            if (not args.no_robot_exclusion
                                and any(r.exclude_robot for r in rigs)) else None),
+            # Same object the filter uses, so the wireframe cannot show a mode
+            # that is not running.
+            finger_boxes=finger_boxes,
             context_max=args.context_max)
         window.show_context = not args.no_context
 
@@ -462,23 +494,39 @@ def main() -> None:
                             continue
                         color_bgr, mask = pair
                         view = overlay_mask(color_bgr, mask)
+                        obj_mask = snap["object_masks"].get(rig.name)
+                        if obj_mask is not None:
+                            view = overlay_mask(view, obj_mask, colour=(0, 0, 255))
                         d = snap["per_camera"][rig.name]
                         txt = [
                             f"{rig.name}  ({rig.kind})  serial {rig.serial}",
                             f"obj={d['object']}  hand={d['hand']}"
                             + (f"  -{d['robot_pts_removed']} robot"
                                if d["robot_pts_removed"] else "")
+                            + (f"  -{d['finger_pts_removed']} finger"
+                               if d["finger_pts_removed"] else "")
                             + ("  STALE" if d["used_last_hand"] or d["used_last_object"]
-                               else ""),
+                               else "")
+                            + ("  RESEED" if d.get("seg_reseeded") else ""),
                             # The declustered count is the whole point of
                             # looking: it is the table and background mass that
                             # would otherwise be object points. A zero here
                             # every frame means clustering is not biting.
-                            f"declustered={d['cluster_dropped']}"
-                            + (f"  [{d['cluster_fallback']}]"
-                               if d["cluster_fallback"] else "")
-                            + f"   seg={rig.params.seg_input_px}px",
-                            f"mask px={int(mask.sum())}",
+                            #
+                            # Under a measured object mask neither number
+                            # exists — nothing was declustered because nothing
+                            # was derived — so the line says what DID decide the
+                            # class instead of printing a misleading zero.
+                            (f"object MEASURED   reseeds={d.get('seg_reseeds', 0)}"
+                             if d.get("object_from_mask") else
+                             f"declustered={d['cluster_dropped']}"
+                             + (f"  [{d['cluster_fallback']}]"
+                                if d["cluster_fallback"] else "")
+                             + f"   seg={rig.params.seg_input_px}px"),
+                            f"mask px={int(mask.sum())}"
+                            + (f"   obj px={int(obj_mask.sum())}"
+                               if obj_mask is not None else "")
+                            + (f"   {d['seg_reason']}" if d.get("seg_reason") else ""),
                         ]
                         if not snap["usable"]:
                             txt.append("NOT USABLE - a class is empty")
@@ -517,6 +565,16 @@ def main() -> None:
                         last_draw = 0.0
                     elif k == "r":
                         window.cycle_rotate_mode()
+                    elif k == "n":
+                        # Re-prompt the tracker. This harness has no episodes,
+                        # so nothing else ever calls reset() — without a key for
+                        # it, recovering a lost track means restarting the
+                        # process, which is the worst possible loop to be in
+                        # while judging whether a tracker holds.
+                        worker.request_reset()
+                        print("segmentation re-seeded"
+                              if args.segmentation == "sam2"
+                              else "perception reset (stale clouds cleared)")
                     elif k == "z":
                         window.roll(-10.0)
                     elif k == "x":

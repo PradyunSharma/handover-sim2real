@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pointcloud_multicam import (  # noqa: E402
     NUM_HAND_POINTS,
     NUM_OBJECT_POINTS,
+    FINGER_EXCLUSION_MODES,
     ROBOT_EXCLUSION,
     CameraRig,
     FIXED_PARAMS,
@@ -188,6 +189,133 @@ def _robot_exclusion() -> None:
         keep = bool(ROBOT_EXCLUSION.keep_mask(np.array([p], dtype=np.float32))[0])
         assert keep == want_keep, f"{label}: kept={keep}, wanted {want_keep}"
         print(f"  {label:36s} -> {'keep' if keep else 'DROP'}")
+
+
+def _finger_exclusion() -> None:
+    """The finger boxes must swallow the finger MESH and spare the jaw gap.
+
+    The finger points are not invented here. They are the collision mesh's own
+    corners, placed by the URDF's own joint definition:
+
+        panda_leftfinger : origin (0, +q, 0.0584), no rotation
+        panda_rightfinger: origin (0, -q, 0.0584), mesh rpy (0, 0, pi)
+        finger.obj       : x -0.01048..0.01049, y -0.00013..0.02640,
+                           z  0.00013..0.05385
+
+    so if FingerExclusion's constants ever drift from the robot, a corner falls
+    outside a box and this fails. Re-derive them with:
+
+        python3 -c "import numpy as np; v=np.array([[float(x) for x in l.split()[1:4]]
+          for l in open('.../meshes/collision/finger.obj') if l[:2]=='v ']);
+          print(v.min(0), v.max(0))"
+    """
+    lo = np.array([-0.01048, -0.00013, 0.00013])
+    hi = np.array([+0.01049, +0.02640, 0.05385])
+    corners = np.array([[x, y, z] for x in (lo[0], hi[0])
+                        for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+
+    def finger_mesh(q: float) -> np.ndarray:
+        left = corners + np.array([0.0, q, 0.0584])
+        right = corners * np.array([-1.0, -1.0, 1.0]) + np.array([0.0, -q, 0.0584])
+        return np.concatenate([left, right]).astype(np.float32)
+
+    ang = np.linspace(0, 2 * np.pi, 60, endpoint=False)
+    ball = np.stack([0.028 * np.cos(ang),
+                     0.028 * np.sin(ang),
+                     np.full_like(ang, 0.100)], axis=1).astype(np.float32)
+
+    # Both modes must swallow the fingers — that is the job, and it is the only
+    # thing they agree on.
+    for name in ("split", "span"):
+        boxes = FINGER_EXCLUSION_MODES[name]
+        for q in (0.04, 0.03, 0.02, 0.0):
+            pts = finger_mesh(q)
+            keep = boxes.keep_mask(pts, q)
+            assert not keep.any(), (
+                f"{name} q={q:.2f}: {int(keep.sum())}/{len(pts)} finger mesh "
+                f"corners survived at {pts[keep].tolist()}")
+            # And the boxes must MOVE with the jaws. Without some form of this
+            # the test would pass on a hard-coded q and hide the very thing
+            # that makes the filter track the robot — but the two modes need
+            # different statements of it.
+            #
+            # SPLIT boxes translate outward, so the open-position pair sits
+            # clear of a closed gripper's fingers and must miss them.
+            #
+            # SPAN's single box GROWS outward from y = 0 instead, so the
+            # q = 0.04 box strictly contains the q = 0.02 one and catching a
+            # closed finger proves nothing. The equivalent claim there is that
+            # its outer wall moves: a point just beyond the closed box has to
+            # be outside at that q and inside at the open one.
+            if q < 0.03 and not boxes.span_gap:
+                stale = boxes.keep_mask(pts, 0.04)
+                assert stale.any(), (
+                    f"{name} q={q:.2f}: fingers all still caught by the q=0.04 "
+                    "boxes; they are not tracking the gripper")
+            if q < 0.03 and boxes.span_gap:
+                wall = q + boxes.depth_y + boxes.margin_m + 0.001
+                just_out = np.array([[0.0, wall, 0.100]], dtype=np.float32)
+                assert boxes.keep_mask(just_out, q)[0], (
+                    f"span q={q:.2f}: outer wall is beyond where q puts it")
+                assert not boxes.keep_mask(just_out, 0.04)[0], (
+                    f"span q={q:.2f}: outer wall did not move when the jaws "
+                    "opened; the box is not tracking the gripper")
+        print(f"  {name:5s}  finger mesh corners dropped at every jaw width, "
+              f"bounds track q")
+
+    # THE JAW GAP IS WHERE THE TWO MODES DIFFER, and the whole reason for the
+    # flag. Asserting both halves here means neither mode can silently become
+    # the other.
+    # A narrow object — one that fits inside the 37 mm column the box spans in
+    # x — is the clean case: span takes all of it, split none of it.
+    narrow = np.stack([0.012 * np.cos(ang),
+                       0.012 * np.sin(ang),
+                       np.full_like(ang, 0.100)], axis=1).astype(np.float32)
+    split = FINGER_EXCLUSION_MODES["split"].keep_mask(narrow, 0.04)
+    span = FINGER_EXCLUSION_MODES["span"].keep_mask(narrow, 0.04)
+    assert split.all(), (
+        f"split: {int((~split).sum())}/{len(narrow)} points of a 24 mm object "
+        "at the grasp centre were eaten; the jaw gap must be spared")
+    assert not span.any(), (
+        f"span: {int(span.sum())}/{len(narrow)} points of a 24 mm object at "
+        "the grasp centre survived; span is meant to cover the gap")
+    print(f"  24 mm object at the jaw centre: split keeps all {len(narrow)}, "
+          f"span drops all {len(narrow)}")
+
+    # A wider one keeps the parts that stick out past the column in x. Worth
+    # asserting explicitly, because it is the difference between "span deletes
+    # the object" (what it is easy to assume) and "span deletes the 37 mm of
+    # the object that is between the jaws" (what it does).
+    split = FINGER_EXCLUSION_MODES["split"].keep_mask(ball, 0.04)
+    span = FINGER_EXCLUSION_MODES["span"].keep_mask(ball, 0.04)
+    assert split.all(), (
+        f"split: {int((~split).sum())}/{len(ball)} points of a 56 mm object at "
+        "the grasp centre were eaten; the jaw gap must be spared")
+    assert span.any() and not span.all(), (
+        f"span kept {int(span.sum())}/{len(ball)} of a 56 mm object; it should "
+        "take the middle band and leave the ends")
+    print(f"  56 mm object at the jaw centre: split keeps all {len(ball)}, "
+          f"span keeps {int(span.sum())} (the ends, past the 37 mm column)")
+
+    # A finger point displaced into the gap by calibration error is the case
+    # span mode exists for: split cannot see it, span must.
+    strayed = np.array([[0.0, 0.033, 0.100]], dtype=np.float32)   # 7 mm inboard
+    assert FINGER_EXCLUSION_MODES["split"].keep_mask(strayed, 0.04)[0], \
+        "split unexpectedly caught a point 7 mm inside the jaw gap"
+    assert not FINGER_EXCLUSION_MODES["span"].keep_mask(strayed, 0.04)[0], \
+        "span missed a finger point displaced into the gap"
+    print("  finger point 7 mm inside the gap: split misses it, span catches it")
+
+    # An object shifted onto a finger SHOULD lose the part inside the box in
+    # either mode, otherwise the filter is doing nothing at all.
+    shifted = ball + np.array([0.0, 0.050, 0.0], dtype=np.float32)
+    for name in ("split", "span"):
+        keep = FINGER_EXCLUSION_MODES[name].keep_mask(shifted, 0.04)
+        assert not keep.all(), f"{name}: a cloud over the left finger lost nothing"
+        print(f"  {name:5s}  same object over the left finger: "
+              f"{int((~keep).sum())} dropped")
+
+    assert FINGER_EXCLUSION_MODES["off"] is None, "'off' must disable the cut"
 
 
 def _hand_connected_clustering() -> None:
@@ -734,6 +862,275 @@ def _live(session: str | None, cameras: list[str]) -> None:
             rig.camera.stop()
 
 
+def _hand_mask_selection() -> None:
+    """The hand blob must be chosen by distance to the robot, not by area.
+
+    Staged as the tripod actually sees it: a face high in frame and further from
+    the robot, a hand lower and extended toward it, with the face 3x the area.
+    Area picks the face — which is the shipped behaviour for the wrist camera and
+    was wrong the moment a camera could see a whole person.
+
+    The consequence is not a cosmetic wobble, which is why this is asserted all
+    the way through to the object class rather than on the mask alone:
+    `hand_center` is the origin of the object crop, the connectivity seed and the
+    arm-rejection capsule, so a mask on the face rejects the real hand and its
+    object as arm.
+    """
+    from pointcloud_multicam import select_hand_component, largest_component
+
+    class _Cam:
+        def depth_to_pointcloud(self, depth, mask=None, stride=1,
+                                min_depth=0.05, max_depth=2.0):
+            vv, uu = np.nonzero(mask)
+            vv, uu = vv[::stride], uu[::stride]
+            z = depth[vv, uu]
+            ok = (z > min_depth) & (z < max_depth)
+            vv, uu, z = vv[ok], uu[ok], z[ok]
+            x = (uu - 320) / 600.0 * z
+            y = (vv - 240) / 600.0 * z
+            return np.stack([x, y, z], 1).astype(np.float32), None, None
+
+    mask = np.zeros((480, 640), np.uint8)
+    depth = np.zeros((480, 640), np.float32)
+    mask[60:150, 280:370] = 1                       # face: 8100 px, 1.30 m
+    depth[60:150, 280:370] = 1.30
+    mask[300:350, 200:250] = 1                      # hand: 2500 px, 0.95 m
+    depth[300:350, 200:250] = 0.95
+
+    T_base_cam = np.eye(4)
+    T_base_cam[2, 3] = -0.2
+
+    def which(m):
+        vv, _ = np.nonzero(m)
+        return "face" if vv.mean() < 240 else "hand"
+
+    by_area = which(largest_component(mask))
+    by_dist = which(select_hand_component(mask, depth, _Cam(), T_base_cam))
+    print("hand mask selection")
+    print(f"  face 8100 px @1.30 m, hand 2500 px @0.95 m")
+    print(f"  by area              -> {by_area}")
+    print(f"  by distance to base  -> {by_dist}")
+    assert by_area == "face", (
+        "the staged scene no longer fools area selection, so it cannot show "
+        "what distance selection is for")
+    assert by_dist == "hand", "distance selection did not pick the hand"
+
+    # It must degrade to area selection rather than to nothing.
+    empty_depth = np.zeros((480, 640), np.float32)
+    fallback = select_hand_component(mask, empty_depth, _Cam(), T_base_cam)
+    assert which(fallback) == which(largest_component(mask)), (
+        "with no usable depth this must fall back to area, not fail closed")
+    print("  no depth anywhere    -> falls back to area selection")
+
+    # A single blob must be returned untouched, whatever its distance.
+    one = np.zeros((480, 640), np.uint8)
+    one[300:350, 200:250] = 1
+    assert select_hand_component(one, depth, _Cam(), T_base_cam).sum() == one.sum()
+    print("  single blob          -> returned unchanged")
+
+
+def _object_orientation() -> None:
+    """A held object must survive whichever way the hand is turned.
+
+    Reported from hardware: "the object is only detected if I hold it with my
+    arm parallel to the ground; if I hold it slightly vertically the object
+    points drop below 20". That is geometry, not segmentation. Without the
+    below-hand term the kept region is a CYLINDER about the hand-to-robot axis —
+    generous along it, `max_lateral_m` across it — so the same object gets 0.26 m
+    of room held one way and 0.12 m held another, and forearm posture decides
+    which.
+
+    Widening the cylinder alone is not a fix, and this measures why: near the
+    hand a vertical forearm and an object held across the axis occupy the same
+    region, so widening lets the forearm through at exactly the rate it rescues
+    the object. The two terms below are complementary, and both are checked with
+    the other disabled so neither can be quietly carrying the other.
+    """
+    from pointcloud_pipeline import reject_arm_clusters
+
+    print("object orientation")
+    rng = np.random.default_rng(7)
+    hand = rng.normal(0.0, 0.02, size=(500, 3)).astype(np.float32)
+    robot_origin = np.array([0.0, 0.0, -0.8])       # robot along -z
+    up = np.array([0.0, -1.0, 0.0])                 # +y is down here
+
+    def bar(c, e, n=600):
+        return (np.array(c, np.float32)
+                + rng.uniform(-1, 1, (n, 1)) * np.array(e, np.float32)
+                + rng.normal(0, 0.006, (n, 3))).astype(np.float32)
+
+    # 1) A 16 cm object swung across the axis IN THE HORIZONTAL PLANE, so
+    #    "across" is not confounded with "below" — an object pointing at the
+    #    floor is genuinely ambiguous with a forearm and is not the reported case.
+    print("  object swung across the axis (level), object kept:")
+    for lat, want in ((0.12, False), (0.18, True)):
+        row = []
+        for deg in (0, 30, 60, 90):
+            t = np.deg2rad(deg)
+            d = np.array([np.sin(t), 0.0, -np.cos(t)])
+            L = rng.uniform(0.02, 0.16, (600, 1))
+            obj = (L * d + rng.normal(0, 0.008, (600, 3))).astype(np.float32)
+            arm = bar([0.0, 0.06, 0.20], [0.015, 0.015, 0.10])
+            k, _ = reject_arm_clusters(np.concatenate([obj, arm]), hand,
+                                       robot_origin, voxel_m=0.012,
+                                       max_lateral_m=lat, up_axis=up)
+            row.append(k[:len(obj)].mean())
+        print(f"    lateral {lat:.2f}: "
+              + "  ".join(f"{d:>2}deg {v:>4.0%}" for d, v in
+                          zip((0, 30, 60, 90), row)))
+        if want:
+            assert min(row) > 0.95, (
+                f"lateral {lat}: an object held across the axis is still being "
+                f"cut — {min(row):.0%} kept")
+        else:
+            assert min(row) < 0.8, (
+                "the narrow lateral bound no longer loses a sideways object, so "
+                "this case cannot show what widening it is for")
+
+    # 2) And the forearm hanging straight down must still go. Without the
+    #    below-hand term the wide bound lets most of it through.
+    print("  forearm hanging straight down, arm kept:")
+    for below, want_max in ((999.0, None), (0.10, 0.30)):
+        r2 = np.random.default_rng(5)
+        L = r2.uniform(0.06, 0.28, (600, 1))
+        limb = (L * np.array([0.0, 1.0, 0.0])
+                + r2.normal(0, 0.02, (600, 3))).astype(np.float32)
+        obj = bar([0.0, 0.0, -0.07], [0.03, 0.03, 0.04])
+        k, _ = reject_arm_clusters(np.concatenate([obj, limb]), hand,
+                                   robot_origin, voxel_m=0.012,
+                                   max_lateral_m=0.18, max_below_m=below,
+                                   up_axis=up)
+        arm_kept = k[len(obj):].mean()
+        tag = "no below-term" if below > 1 else f"below {below:.2f}"
+        print(f"    {tag:>14}: {arm_kept:>4.0%}   (object {k[:len(obj)].mean():.0%})")
+        if want_max is None:
+            assert arm_kept > 0.4, (
+                "a 0.18 lateral bound no longer leaks the vertical forearm, so "
+                "the below-hand term is not being shown to do anything")
+        else:
+            assert arm_kept <= want_max, (
+                f"the vertical forearm survives at {arm_kept:.0%}")
+            assert k[:len(obj)].all(), "the below-hand term ate the object"
+
+
+def _positive_object_mask() -> None:
+    """A supplied object mask must REPLACE the negative derivation, not feed it.
+
+    Staged as the case the README says the current pipeline provably cannot fix
+    (`Defining the object class`): a hand holding an object that is RESTING ON A
+    TABLE. Connectivity cannot separate the two, because at 0.6 m adjacent pixels
+    are a millimetre apart and the object is genuinely touching the surface — so
+    the table joins the hand's component and comes through as object.
+
+    Both paths are run on the identical scene, which is the only way to show the
+    difference is the definition of "object" and not the staging.
+    """
+    from pointcloud_pipeline import extract_hand_object_clouds
+
+    FX = FY = 600.0
+    CX, CY = 320.0, 240.0
+
+    class _Cam:
+        """Pinhole matching camera.RealSenseCamera.depth_to_pointcloud."""
+
+        def depth_to_pointcloud(self, depth_m, color_bgr=None, mask=None,
+                                stride=1, min_depth=0.05, max_depth=2.0):
+            valid = np.ones_like(depth_m, bool) if mask is None else mask.astype(bool)
+            valid = valid & (depth_m > min_depth) & (depth_m < max_depth)
+            if stride > 1:
+                sub = np.zeros_like(valid)
+                sub[::stride, ::stride] = True
+                valid &= sub
+            vv, uu = np.nonzero(valid)
+            z = depth_m[vv, uu]
+            x = (uu - CX) * z / FX
+            y = (vv - CY) * z / FY
+            return (np.stack([x, y, z], 1).astype(np.float32), None,
+                    np.stack([vv, uu], 1).astype(np.int32))
+
+    depth = np.zeros((480, 640), np.float32)
+    hand_mask = np.zeros((480, 640), np.uint8)
+    object_mask = np.zeros((480, 640), np.uint8)
+
+    hand_mask[240:280, 300:340] = 1                 # hand, left of the object
+    depth[240:280, 300:340] = 0.60
+    object_mask[240:280, 340:380] = 1               # the held object
+    depth[240:280, 340:380] = 0.60
+    depth[280:300, 200:450] = 0.60                  # the table it rests on
+
+    # v >= 280 is table and nothing else, so one coordinate separates the two.
+    y_table = (280 - CY) * 0.60 / FY
+
+    common = dict(color_bgr=None, depth_m=depth, hand_mask=hand_mask, cam=_Cam(),
+                  crop_radius_m=0.12, object_max_radius_m=0.10,
+                  cluster_voxel_m=0.010, hand_margin_px=4,
+                  min_depth_m=0.10, max_depth_m=1.50, full_cloud_stride=2)
+
+    derived = extract_hand_object_clouds(**common)
+    measured = extract_hand_object_clouds(**common, object_mask=object_mask)
+
+    n_table_derived = int((derived.object_xyz[:, 1] >= y_table - 1e-6).sum())
+    n_table_measured = int((measured.object_xyz[:, 1] >= y_table - 1e-6).sum())
+
+    print("positive object mask")
+    print(f"  hand holding an object resting on a table, 0.60 m")
+    print(f"  derived (crop+connectivity): {len(derived.object_xyz):4d} object pts, "
+          f"{n_table_derived} of them table")
+    print(f"  measured (object mask)     : {len(measured.object_xyz):4d} object pts, "
+          f"{n_table_measured} of them table")
+
+    assert n_table_derived > 0, (
+        "the staged table no longer leaks into the derived object class, so this "
+        "scene cannot show what the object mask is for")
+    assert n_table_measured == 0, "table survived a mask that does not contain it"
+
+    # The object cloud must be the mask, deprojected — not the mask after the
+    # crop sphere and connectivity have had another go at it.
+    expected, _, _ = _Cam().depth_to_pointcloud(
+        depth_m=depth, mask=object_mask, stride=2,
+        min_depth=0.10, max_depth=1.50)
+    assert len(measured.object_xyz) == len(expected), (
+        f"object mask deprojected to {len(expected)} points but the pipeline "
+        f"returned {len(measured.object_xyz)} — something downstream is still "
+        "filtering a positive mask")
+    assert measured.debug["object_from_mask"] is True
+    assert derived.debug["object_from_mask"] is False
+    print(f"  object cloud == deprojected mask exactly ({len(expected)} pts)")
+
+    # The hand class comes off `hand_cloud_stride` here rather than the crop's
+    # `full_cloud_stride`, so it is DENSER than the derived path's, deliberately.
+    # The two densities had to match while connectivity was voxelizing both
+    # classes together; with connectivity gone the only consumer is the 128-point
+    # resample, which is better served by the finer sampling.
+    hand_expected, _, _ = _Cam().depth_to_pointcloud(
+        depth_m=depth, mask=hand_mask, stride=1, min_depth=0.10, max_depth=1.50)
+    assert len(measured.hand_xyz) == len(hand_expected), (
+        "the positive path did not return the full-resolution hand cloud")
+    print(f"  hand class {len(measured.hand_xyz)} pts at stride 1 "
+          f"(derived path: {len(derived.hand_xyz)} at stride 2)")
+
+    # A hand dropout must no longer take the object with it. Under the negative
+    # derivation the object was defined relative to `hand_center`, so no hand
+    # meant no object; here the two are independent and only the hand is lost.
+    blind = extract_hand_object_clouds(
+        **{**common, "hand_mask": np.zeros((480, 640), np.uint8)},
+        object_mask=object_mask)
+    assert len(blind.hand_xyz) == 0, "staging error: the hand should be gone"
+    assert len(blind.object_xyz) == len(expected), (
+        "losing the hand also lost the object — the two classes are still "
+        "coupled through hand_center")
+    print("  hand mask emptied -> hand class 0, object class unchanged")
+
+    # And the round-trip that keeps every pre-existing caller working.
+    from pointcloud_multicam import SegmentationResult, as_segmentation
+    bare = np.ones((4, 4), np.uint8)
+    assert as_segmentation(bare).object is None
+    assert as_segmentation(bare).hand is bare
+    wrapped = SegmentationResult(hand=bare, object=bare)
+    assert as_segmentation(wrapped) is wrapped
+    print("  bare-array segmenters still mean 'derive the object'")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -753,10 +1150,16 @@ def main() -> None:
     _source_provenance()
     print("\nrobot exclusion box")
     _robot_exclusion()
+    print("\nfinger exclusion boxes")
+    _finger_exclusion()
     print("\nhand-connected object clustering")
     _hand_connected_clustering()
     print("\nforearm rejection")
     _arm_rejection()
+    _hand_mask_selection()
+    _object_orientation()
+    print()
+    _positive_object_mask()
     print("\nall offline checks passed")
 
     if args.viz:

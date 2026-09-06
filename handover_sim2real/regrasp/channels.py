@@ -60,6 +60,28 @@ STORED_CHANNELS = 8
 MODEL_CHANNELS = 7
 
 
+def hand_centroid(pc):
+    """Centroid of the HAND points, in the cloud's own frame. None if there are none.
+
+    THE ANCHOR'S SECOND REFERENCE, and it is not the same quantity as the MANO
+    wrist joint. `anchor.wrist_world` reads `mano.body.link_state[0, 7]` — a
+    simulator-only ground-truth joint centre — while the real rig has no joints
+    to read and `my_regrasp_policy_runner._set_direction` uses
+    `class_centroid(fused.hand_xyz)`, the centroid of the segmented hand cloud.
+    Those differ: the wrist joint sits at the base of the palm, the cloud
+    centroid sits out in the middle of the visible hand, so the azimuth
+    `horizontal(c_obj - c_hand)` is not the azimuth `horizontal(c_obj - wrist)`.
+
+    Using this makes sim compute what hardware computes, at the cost of a
+    reference that is observation-dependent rather than exact.
+    """
+    p = np.asarray(pc, dtype=np.float64)
+    if p.size == 0:
+        return None
+    mask = p[:, CH_HAND] > 0.5
+    return p[mask, CH_XYZ].mean(axis=0) if mask.any() else None
+
+
 def object_centroid(pc, fallback_to_all: bool = True):
     """Centroid of the object points, in the cloud's own frame. None if undefined.
 

@@ -428,74 +428,77 @@ python examples/rollout_regrasp_policy.py \
     --run regrasp_run2 --iter 13 --scene 32 --bin 4 --show-goal-grasp
 ```
 
-`--run` derives `--run-dir`, `--cfg-file`, `--grasp-pin-table` **and `--command`**
-from the run's own `config.yaml`, the same way the replay viewer does, and prints
-what it chose. `--command` matters most: it defaults to `bin_axis`, which is right
-for runs 2–8 and **wrong for every run since 9** (`bin_centroid`) — and getting it
-wrong means watching a different experiment than the one that was scored, with no
-error to say so.
+`--run` derives `--run-dir`, `--cfg-file`, `--grasp-pin-table`, `--command` and
+`--d-rule` from `<run>/config.yaml` and prints what it chose. Pass those by hand
+and a wrong one is silent: `--command bin_axis` on a run-9+ policy issues a
+different vector than the one it was scored under.
 
-`--iter N` selects `<run>/iters/iter_NN`; `--ckpt best` (the default) or
-`--ckpt last` select the run-level checkpoints. Either way it loads
-`checkpoints/best.pt` and falls back to `last.pt`. `--run-dir` still takes a raw
-path for anything that is not a Regrasp run. GUI is on by default; `--no-render`
-disables it.
+**`--bin`, not `--grasp-idx`.** A rollout issues a command, and the command is
+`to_world(axes[bin], anchor_R)` — the bin alone determines it. Where a bin holds
+several grasps (run 3: scene 32's `+x` is slots 0, 4, 8) all of them issue the
+same vector; the slot only picks which grasp is drawn and pinned. `--grasp-idx`
+is the only selector that identifies a recorded *demonstration* (see replay).
 
-**Use `--bin` for a rollout.** A rollout does not replay anything — it issues a
-command, and the command is built from the bin and the anchor alone:
-`to_world(axes[bin], anchor_R)`, where `axes` is the bin axes or, under
-`SIM.command_deploy: bin_centroid` (run 9), the bins' empirical centroids. So
-the bin *fully determines* what the policy is told, and `--bin` is the only way
-to issue the same command across scenes — slot 1 is `+y` on one scene and `−y`
-on another.
+| argument | options / default | what it does |
+|---|---|---|
+| `--run NAME` | — | run name; derives the six flags below. One of `--run`/`--run-dir` is required |
+| `--run-dir PATH` | — | raw checkpoint dir, for non-Regrasp runs |
+| `--run-root PATH` | — | extra root to search for the run |
+| `--iter N` | — | `<run>/iters/iter_NN`; overrides `--ckpt` |
+| `--ckpt` | `best` (default), `last` | run-level checkpoint; loads `best.pt`, falls back to `last.pt` |
+| `--cfg-file PATH` | — | benchmark config; required unless `--run` |
+| `--grasp-pin-table PATH` | — | the run's `SIM.grasp_pin_table`. Needed by `--bin` and every overlay |
+| `--scene N` | `0` | scene index |
+| `--scenes A,B,C` | — | explicit pool |
+| `--num-scenes N` | all | first N scenes |
+| `--scenes-from-run NAME` | — | reuse another run's eval pool |
+| `--bin N` | `0..5` = `+x −x +y −y +z −z` | the commanded direction. Errors listing the scene's bins if absent |
+| `--grasp-idx N` | `0` | exact slot, when `--bin` is not enough |
+| `--all-grasps` | off | roll every slot of the scene |
+| `--command` | `bin_axis`, `bin_centroid`, `grasp_axis` | what a bin turns into. Must match `SIM.command_deploy`; the resolved vectors are in `<run>/command_axes.json` |
+| `--d-rule` | `approach_axis`, `grasp_offset` | what a direction is derived *from*; sets the label and achieved arrows |
+| `--d-point-depth M` | `0.1122` | fingertip depth along the gripper `+z` for `grasp_offset` |
+| `--d-min-offset M` | `0.0` | flag a shorter centroid→fingertip chord as centroid noise |
+| `--max-steps N` | `50` | policy steps before timeout; matches `EVAL.max_steps` |
+| `--hold-steps N` | `3` | hold after the close, for the `stable_grasp` test |
+| `--dwell-steps N` | `20` | extra shut-gripper steps, viewing only |
+| `--show-goal-grasp` | off | green wireframe at the pinned goal grasp |
+| `--show-grasp-set` | off | plus the full filtered candidate set, faint grey |
+| `--show-pred-grasp` | off | magenta wireframe of the run-13 aux head's belief, every step |
+| `--show-anchor-frame` | off | x/y/z at the object centroid (x away from the wrist, z world up) |
+| `--show-bin-sphere` | off | point shell coloured by bin, labelled ray down each axis |
+| `--bin-sphere-radius M` | `0.10` | shell radius |
+| `--bin-sphere-points N` | `2400` | shell point count |
+| `--show-d` | off | the conditioning vectors — see below |
+| `--benchmark` | off | headless over the pool; reports success / grasp / distance |
+| `--no-render` | off | disable the GUI |
+| `--egl` | off | EGL GPU renderer when headless (else software) |
+| `--device` | `cuda` | torch device |
+| `--freeze-partial-pointcloud` | off | freeze the observed cloud |
+| `--freeze-at-step N` | — | step to freeze it at |
 
-Where a bin holds several grasps (a `--per-bin 3` table: scene 32's `+x` is
-slots 0, 4 and 8) the command is identical for all of them; the slot only
-decides which grasp `--show-goal-grasp` draws and which pose gets pinned for
-scoring. The first — the closest to the bin axis — is used. `--grasp-idx` still
-names an exact grasp when that matters, and it is the *only* selector that
-identifies a recorded demonstration (see the replay section below).
+`--show-d` draws four arrows from the anchor origin, and prints the angle
+between each pair:
 
-`--bin` needs `--grasp-pin-table`, and errors with the scene's actual bin list
-when that scene has no demonstration for the bin.
+| colour | vector |
+|---|---|
+| white | `d` **issued** to the policy, i.e. what `--command` built |
+| bin colour | the **nominal** bin axis the command drifted off (`bin_centroid` only) |
+| yellow | the run's `d_rule` on the pinned grasp — the **training label** for this slot. Under `grasp_offset` the fingertip midpoint and the centroid→fingertip chord are drawn with it |
+| cyan | the direction **achieved**, measured as `evaluator._dir_block` measures `dir_err` |
 
-To see what a scene offers before rolling it:
-
-```bash
-python -c "
-import sys; sys.path.insert(0,'.')
-from handover_sim2real.regrasp.grasp_pin import GraspPinTable
-from handover_sim2real.regrasp import directions as D
-t=GraspPinTable('output/regrasp_pins_train.json'); s=32
-print(', '.join(f'--bin {t.bin_of(s,g)} ({D.BIN_SHORT[t.bin_of(s,g)]}) = slot {g}'
-                for g in range(t.num_grasps_for(s))))"
-```
-
-`--run-dir` `--cfg-file` `--scene` `--scenes 10,12,40` `--num-scenes`
-`--scenes-from-run` `--max-steps` `--hold-steps` `--dwell-steps` `--device`
-`--no-render` `--benchmark` `--show-goal-grasp` `--show-grasp-set`
-`--bin N` `--grasp-idx N` `--all-grasps` `--show-pred-grasp` `--grasp-pin-table`
-`--command {bin_axis,bin_centroid,grasp_axis}` `--show-anchor-frame`
-`--show-bin-sphere` `--bin-sphere-radius` `--bin-sphere-points`
-`--freeze-partial-pointcloud` `--freeze-at-step` `--egl`
-
-`--command` must match the run's `SIM.command_deploy` (`bin_axis` for runs 2–8,
-`bin_centroid` for run 9, `grasp_axis` for run 1) or you are watching a
-different command than the one that was scored. The resolved vectors are in
-`<run>/command_axes.json`.
-
-Conditioning overlays (both need `--grasp-pin-table`):
+White vs yellow is the run-9 question (train on the grasp's own `d`, deploy the
+bin centroid); white vs cyan is `dir_err` on screen.
 
 ```bash
 python examples/rollout_regrasp_policy.py \
-    --run regrasp_run2 --iter 13 --scene 32 --grasp-idx 1 \
-    --show-anchor-frame --show-bin-sphere --show-goal-grasp
+    --run regrasp_run2 --iter 13 --scene 32 --bin 4 \
+    --show-anchor-frame --show-bin-sphere --show-d --show-goal-grasp
 ```
 
-`--show-anchor-frame` draws x/y/z at the object centroid (x away from the giver's
-wrist, z world up); `--show-bin-sphere` draws a point shell coloured by bin with
-a labelled ray down each bin axis, colours matching `plot_regrasp_run.py`. Both
-read `anchor_R` / `centroid_world` from the pin table's `scene_meta`.
+Colours match `plot_regrasp_run.py` and `visualize_bc_dataset.py`, so the same
+bin is the same colour everywhere. Overlays read `anchor_R` / `centroid_world`
+from the pin table's `scene_meta`.
 
 Scenes with all four live bins under the run-2 table: **32, 52, 91, 92, 94**
 (slots `0=+x 1=+y 2=−y 3=+z`; under a `--per-bin 3` table the same four bins

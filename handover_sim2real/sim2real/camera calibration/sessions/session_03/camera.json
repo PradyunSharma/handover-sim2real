@@ -1,0 +1,9 @@
+{
+  "role": "tripod",
+  "serial": "825312073923",
+  "device_name": "Intel RealSense D435",
+  "model": "d435",
+  "width": 640,
+  "height": 480,
+  "_note": "Backfilled; this session predates camera.json being written at capture time. The serial is CAMERA_SERIALS['tripod'] and the model is the D435 that was attached, matching this session's color_intrinsics.json (640x480, fx 615.4). Correct it if that is wrong."
+}

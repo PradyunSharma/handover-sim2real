@@ -24,6 +24,7 @@ from typing import Any
 import numpy as np
 
 from handover_sim2real.regrasp import directions as _rg_directions
+from handover_sim2real.regrasp import anchor as _rg_anchor
 from handover_sim2real.regrasp.env_setup import build_sim_cfg, build_sim_context
 from handover_sim2real.regrasp.evaluator import EvalParams
 from handover_sim2real.regrasp.grasp_box import build_box_params
@@ -167,6 +168,23 @@ def resolve_d_rule(pin_table, sim_cfg_d: dict, *, verbose: bool = True):
             f"discard the aggregate. Rebuild the table with "
             f"`build_direction_table.py --d-rule {want.rule}` (and re-assign, "
             f"re-collect, re-audit), or set SIM.d_rule: {from_table.rule}.")
+    # DEPTH IS PART OF THE RULE, and this guard used to compare only the name.
+    # `d_point_depth` decides WHICH POINT on the gripper `d` is measured to, so a
+    # config at one depth against a table built at another produces exactly the
+    # failure the rule check exists to catch: measured on
+    # `regrasp_pins_train_off.json`, moving 0.1122 -> 0.1034 turns the direction
+    # a median 9.9 deg (p90 18.6) and re-bins 8.0% of the 1418 grasps. That is
+    # `bin_assigned` and `bin_realized` disagreeing on one episode in twelve,
+    # with the miscaption filter silently discarding them.
+    if pin_table is not None and abs(want.depth - from_table.depth) > 1e-9:
+        raise SystemExit(
+            f"[cfg] SIM.d_point_depth: {want.depth} but "
+            f"{getattr(pin_table, 'path', 'the pin table')} was built at "
+            f"{from_table.depth}. `d` is measured to a different point on the "
+            f"gripper, so the table's bins do not caption your directions. "
+            f"Rebuild with `build_direction_table.py --d-rule {want.rule} "
+            f"--d-point-depth {want.depth}` (then re-assign, re-collect, "
+            f"re-audit), or set SIM.d_point_depth: {from_table.depth}.")
     if verbose:
         print(f"[d_rule] {want.describe()}")
     return want
@@ -238,6 +256,19 @@ class RegraspContext:
     # `command_axes`, which is what a BIN turns into: the rule decides what a bin
     # means, the axes decide which vector names it.
     d_rule: Any = None
+    # `SIM.anchor_update`: when the anchor frame is built. `latched` = once at
+    # step 0 and held (runs 1-15); `live` = rebuilt from every step's observed
+    # cloud, with the command re-issued to match. Carried here because the
+    # collector's params are built by train_regrasp.py, which needs the same
+    # value the evaluator got — the two disagreeing is silent in every rate.
+    anchor_update: str = "latched"
+    # `SIM.anchor_hand_ref`: `wrist` (the MANO joint, sim-only) or
+    # `hand_centroid` (the segmented hand cloud, what the real rig uses).
+    anchor_hand_ref: str = "wrist"
+    # `EVAL.dir_drop_short`: whether an episode whose `grasp_offset` chord is
+    # shorter than `d_min_offset` is EXCLUDED from `dir_err` and the confusion
+    # matrix, or measured anyway at `min_offset` 0.
+    dir_drop_short: bool = True
 
 
 def build_regrasp_context(cfg4: dict, *, seed: int = 0,
@@ -303,6 +334,25 @@ def build_regrasp_context(cfg4: dict, *, seed: int = 0,
     command_mode = str(sim_cfg_d.get("command_deploy", "bin_axis"))
     command_axes = resolve_command_axes(pin_table, command_mode, verbose=verbose)
     d_rule = resolve_d_rule(pin_table, sim_cfg_d, verbose=verbose)
+    anchor_update = str(sim_cfg_d.get("anchor_update", "latched"))
+    if anchor_update not in _rg_anchor.ANCHOR_UPDATES:
+        raise SystemExit(
+            f"[cfg] SIM.anchor_update must be one of "
+            f"{_rg_anchor.ANCHOR_UPDATES}, got {anchor_update!r}")
+    anchor_hand_ref = str(sim_cfg_d.get("anchor_hand_ref", "wrist"))
+    if anchor_hand_ref not in _rg_anchor.ANCHOR_HAND_REFS:
+        raise SystemExit(
+            f"[cfg] SIM.anchor_hand_ref must be one of "
+            f"{_rg_anchor.ANCHOR_HAND_REFS}, got {anchor_hand_ref!r}")
+    dir_drop_short = bool(ev.get("dir_drop_short", True))
+    if verbose:
+        print(f"[anchor] {anchor_update}: the frame is "
+              + ("rebuilt from the observed cloud EVERY STEP and the command "
+                 "re-issued with it" if anchor_update == "live"
+                 else "built once at step 0 and held for the episode"))
+        if not dir_drop_short:
+            print("[dir] short-chord episodes are MEASURED, not dropped "
+                  "(EVAL.dir_drop_short: false)")
 
     pool, eval_scenes = scene_pools(sim.num_scenes, ev, usable=usable)
 
@@ -336,6 +386,9 @@ def build_regrasp_context(cfg4: dict, *, seed: int = 0,
         # ...and what `d` MEANS, so `dir_err` and `bin_realized` are measured in
         # the same terms the command is issued in.
         d_rule=d_rule,
+        anchor_update=anchor_update,
+        anchor_hand_ref=anchor_hand_ref,
+        dir_drop_short=dir_drop_short,
         verbose=bool(ev.get("verbose", False)))
 
     # Phase 5. `pool` and `eval_scenes` stay SCENE lists, not (scene, grasp)
@@ -366,4 +419,6 @@ def build_regrasp_context(cfg4: dict, *, seed: int = 0,
         select_on=str(ev.get("select_on", "success_rate")),
         n_excluded=n_excluded, usable=usable,
         demo_ok=demo_ok_report,
-        command_axes=command_axes, command_mode=command_mode, d_rule=d_rule)
+        command_axes=command_axes, command_mode=command_mode, d_rule=d_rule,
+        anchor_update=anchor_update, anchor_hand_ref=anchor_hand_ref,
+        dir_drop_short=dir_drop_short)

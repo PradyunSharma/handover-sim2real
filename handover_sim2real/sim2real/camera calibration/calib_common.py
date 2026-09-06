@@ -323,6 +323,16 @@ def resolve_serial(explicit: str | None = None, role: str | None = None) -> str:
     if explicit:
         if explicit not in serials:
             raise SystemExit(f"Serial {explicit} not attached. Attached:\n  {listing}")
+        # Disagreeing with the table is not an error — it is the whole point of
+        # passing a serial, and it is what swapping a camera body looks like.
+        # Worth one line, because the session is about to be named after the
+        # role while describing a device the role no longer points at.
+        configured = cfg.CAMERA_SERIALS.get(role or cfg.DEFAULT_ROLE)
+        if configured is not None and str(configured) != explicit:
+            print(f"[camera] {role or cfg.DEFAULT_ROLE} = {explicit}, which is "
+                  f"NOT CAMERA_SERIALS[{role or cfg.DEFAULT_ROLE!r}] "
+                  f"({configured}). Update calib_config.py once this session is "
+                  "the one you deploy with.")
         return explicit
 
     role = role or cfg.DEFAULT_ROLE
@@ -356,12 +366,24 @@ def resolve_serial(explicit: str | None = None, role: str | None = None) -> str:
     )
 
 
-def add_camera_args(parser) -> None:
-    parser.add_argument("--serial", type=str, default=None,
-                        help="RealSense serial. Overrides the configured role.")
+def add_camera_args(parser, required: bool = False) -> None:
+    """Camera selection args. `--serial` overrides the role's configured serial.
+
+    Worth knowing when to reach for it: CAMERA_SERIALS is a convenience, and it
+    is exactly what goes stale when a camera body is swapped. At deployment a
+    stale entry is loud — the extrinsics stop matching and the cloud is visibly
+    displaced. At calibration time it is silent, because aiming the tripod at
+    the board while the table hands back the wrist serial still succeeds at
+    every stage. `--preview` shows each attached camera with its serial
+    overlaid, and the session's camera.json records whichever was used.
+    """
+    parser.add_argument("--serial", type=str, required=required, default=None,
+                        help="RealSense serial. Overrides the configured role. "
+                             "`python calib_common.py` lists what is attached.")
     parser.add_argument("--role", type=str, default=cfg.DEFAULT_ROLE,
                         choices=sorted(cfg.CAMERA_SERIALS),
-                        help="which configured camera to use")
+                        help="which mount this camera is on. Names the session's "
+                             "record; the serial says which device.")
 
 
 # Colour-only, cheapest first. Identification needs no depth, and dropping it

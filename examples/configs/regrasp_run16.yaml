@@ -1,0 +1,353 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRASP RUN 16 — THE ANCHOR FRAME COMPUTED LIVE, AND NO EPISODE EXCUSED FROM
+# THE DIRECTION METRICS.
+#
+# Run 11 with two changes. Everything else — the `_off` tables, `grasp_offset`
+# at 0.1122 m, six live bins, `d_source: d_grasp_world`, `bin_centroid` at
+# deployment, `episodes_per_iter: 600`, 25 iterations, beta 0.9 -> 0.75, the aux
+# head, DART on both bands, `reach_filter: true` — is byte-identical to
+# regrasp_run11.yaml.
+#
+#   SIM.anchor_update     (new key)  latched -> live
+#   SIM.anchor_hand_ref   (new key)  wrist   -> hand_centroid
+#   SIM.d_point_depth     0.1122 -> 0.1034   (pad far edge -> pad midpoint)
+#   EVAL.dir_drop_short   (new key)  true    -> false
+#   EVAL.scene_select     (new key)  linspace -> per_bin_frac (bin_frac 0.3)
+#   EVAL.full_bin_coverage (new key) false   -> true
+#
+# THREE OF THE FOUR CHANGE WHAT `d` IS. Only `dir_drop_short` is scoring-only.
+# `d_point_depth` in particular needs the direction table rebuilt at the same
+# depth, or `resolve_d_rule` refuses the run — see below.
+#
+# ── CHANGE 1: THE ANCHOR ORIGIN IS NOT A PROPERTY OF THE SCENE ───────────────
+#
+# `d` is expressed in a frame whose origin is the object's centroid and whose
+# x axis is `horizontal(c - p_wrist)`. Runs 1-15 built that frame ONCE, from the
+# cloud observed at step 0, and held it for the episode. The collector says so in
+# as many words: "the hand is STATIC for the whole episode, so one read is the
+# whole truth."
+#
+# THE HAND IS STATIC. THE OBSERVATION IS NOT. The camera is eye-in-hand, so `c`
+# is not the object's centre — it is the centre of the PART OF THE OBJECT THE
+# GRIPPER CAN CURRENTLY SEE. At step 0 that is a distant, heavily self-occluded
+# slice; by the close it is a near view of the face the fingers are on. The
+# centroid therefore moves through the episode even though nothing in the scene
+# does, and a frame pinned to its worst estimate is pinned to the least
+# informative view the episode ever had.
+#
+# THIS IS ALSO THE ONLY VERSION A ROBOT CAN RUN. A real rig has no step-0
+# privilege and no ground truth: `my_regrasp_policy_runner._set_direction` builds
+# the frame from segmented camera points, and it currently latches too, which
+# means the deployed frame inherits whatever the first fused cloud happened to
+# see. `live` makes sim and hardware compute the same thing.
+#
+# WHAT MOVES WITH IT. The command is `to_world(axes[bin], anchor_R)`, so a frame
+# that moves re-issues a command that moves. That is the intended behaviour and
+# it is also the risk: the target the policy is tracking is no longer stationary
+# within an episode, and if the centroid estimate is noisy the command jitters.
+# Two things bound it. The x axis is a HORIZONTAL azimuth, so centroid error
+# along gravity does not move the frame at all; and the wrist/base fallback is
+# hysteretic (0.04 m in, 0.08 m out, latched per episode), so the one
+# discontinuity the frame can have cannot chatter. `n_anchor_blind` counts the
+# steps whose cloud held no object points, where the previous frame is KEPT
+# rather than the command dropped — zeroing both direction channels would read to
+# the network as a valid instruction rather than a missing one.
+#
+# The recorded `anchor_R` / `centroid_world` attrs still mean STEP 0, so this
+# run's shards stay readable by everything written for runs 1-15;
+# `anchor_R_final` / `centroid_world_final` carry the frame the episode ended in,
+# and `bin_realized` and `d_grasp_world` are computed against THAT — the closing
+# view is the best estimate of the object's centre the episode ever had.
+#
+# ── CHANGE 2: STOP EXCUSING THE EPISODES THAT STOPPED SHORT ──────────────────
+#
+# `d_min_offset: 0.02` exists so that a fingertip midpoint landing on top of the
+# centroid cannot mint a confident direction out of centroid noise. As a
+# COLLECTION guard that is right: such a label would be wrong in the aggregate.
+#
+# `_dir_block` was applying it to the MEASUREMENT as well, and there it does
+# something different. `d_rule.of` returns None on a short chord, the episode is
+# `continue`d, and it never enters `dir_err`, `sector_err`, `bin_hit_rate` or the
+# confusion matrix. The episodes removed are exactly the ones that ended up on
+# the centroid — a failure mode — so the metric was computed over the subset that
+# did not exhibit it. `dir_drop_short: false` measures every episode that arrived
+# at all, applying the same rule at `min_offset` 0.
+#
+# The direction on a 1 cm chord IS noisier than on a 6 cm one; that is a property
+# of the run, not a reason to hide it. `dir_n` and `dir_n_short` are logged so
+# the size of the affected set is visible rather than inferred.
+#
+# ── WHAT THIS RUN IS AND IS NOT ──────────────────────────────────────────────
+#
+# NOT a clean single-variable test. Change 1 moves what the policy is told during
+# both collection and evaluation; change 2 moves only how the result is scored.
+# They are separable after the fact — re-scoring run 11's rows with
+# `dir_drop_short: false` isolates change 2 offline, since it touches no data —
+# but they are not separated by this run.
+#
+# THE COMPARISON THAT MATTERS is run 11 at `success 0.619 @it22`. A `live` frame
+# should help most where the step-0 view is worst, so the per-bin split is the
+# place to look before the aggregate: `-z` (from beneath) and `-x` (over the
+# giver's fingers) are the two bins whose step-0 view is most occluded, and they
+# are the two `grasp_offset` unlocked in the first place.
+
+SIM:
+  cfg_file: examples/pretrain_multicam_wr.yaml   # wrist + right
+  split: train
+  egl: false
+
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08
+  hand_points_radius: 0.35
+
+  use_standoff: true
+  standoff_dist: 0.08
+
+  # Run 10's tables, unchanged. `_meta.d_rule` must read `grasp_offset` or
+  # `build_regrasp_context` refuses the run.
+  # ⚠ NOT run 11's TABLE. `d_point_depth` moved, so the bins have to be
+  # re-populated at the new depth: measured on `regrasp_pins_train_off.json`,
+  # 0.1122 -> 0.1034 turns `d` a median 9.9 deg (p90 18.6, max 25.7) and
+  # RE-BINS 8.0% of its 1418 grasps. Running against the old table would leave
+  # `bin_assigned` and `bin_realized` disagreeing on one episode in twelve, and
+  # the miscaption filter would silently discard them. `resolve_d_rule` now
+  # refuses the run rather than letting that happen.
+  #
+  # The upstream chain, in order:
+  #   build_direction_table.py   --d-rule grasp_offset --d-point-depth 0.1034
+  #   assign_direction_demos.py  --mode per-bin
+  #   collect_regrasp_demos.py   (base shard: train_regrasp_off1034.h5)
+  #   audit_regrasp_demos.py     --write-ok
+  grasp_pin_table: output/regrasp_pins_train_off1034.json
+  grasp_pin_match_tol: 0.02
+
+  d_rule: grasp_offset
+  # ── CHANGE 3 OF 4: MEASURE TO THE MIDDLE OF THE PADS, NOT THEIR FAR EDGE ───
+  #
+  # `d_point_depth` is a distance in metres along the gripper's own +z from the
+  # EE origin, and it names WHICH POINT ON THE GRIPPER the direction is measured
+  # to: `grasp_point(T, depth) = T[:3,3] + depth * T[:3,2]`.
+  #
+  # The Panda finger pads span local z in [0.0946, 0.1122] (read off
+  # `meshes/collision/finger.obj`). Runs 10-15 used 0.1122 — the DISTAL EDGE, the
+  # very tips. The object is gripped by the whole pad, not by its leading edge,
+  # so the contact patch's centre is the midpoint 0.1034. Moving the measuring
+  # point 0.88 cm back toward the palm shortens every chord by that much, which
+  # matters precisely because the chord is short: the median is 3.90 cm, so this
+  # is a ~23% change in the lever arm the direction is computed over.
+  #
+  # IT MOVES THE LABEL AND THE METRIC TOGETHER. `d_grasp_world` (what run 11+
+  # trains on), `bin_realized`, `dir_err` and the pin table's own `d_anchor` are
+  # all built through `grasp_point`, so this is not a scoring-only tweak — it is
+  # a different definition of `d`, and it needs the direction table rebuilt at
+  # the same depth or `resolve_d_rule` will refuse the run.
+  d_point_depth: 0.1034
+  d_min_offset: 0.02
+
+  # ── CHANGE 1 OF 2: WHEN THE ANCHOR FRAME IS BUILT ─────────────────────────
+  #
+  # `latched` (runs 1-15) builds it once from the step-0 cloud and holds it.
+  # `live` rebuilds it from EVERY step's observed cloud, with the same
+  # `anchor_rotation` call and one `AnchorState` per episode so the wrist/base
+  # fallback still latches hysteretically, and re-issues the command with it.
+  #
+  # ONE KEY BECAUSE COLLECTION AND EVAL MUST AGREE. `train_regrasp.py` passes
+  # this to `CollectParams` and the eval params take it from there rather than
+  # re-reading the config — a run that collected under one command law and
+  # scored under another would report nothing unusual.
+  anchor_update: live
+
+  # ── CHANGE 4 OF 4: MEASURE THE AZIMUTH FROM THE HAND CLOUD, NOT THE JOINT ──
+  #
+  # The anchor's x axis is `horizontal(c_object - p_giver)`, and `p_giver` was
+  # `mano.body.link_state[0, 7]` — the MANO WRIST JOINT. That is a simulator-only
+  # quantity: the real rig has no joints to read, and
+  # `my_regrasp_policy_runner._set_direction` uses `class_centroid(hand_xyz)`,
+  # the centroid of the segmented hand POINT CLOUD.
+  #
+  # THOSE ARE DIFFERENT POINTS, so runs 1-15 defined the frame one way in
+  # simulation and another way on hardware. The wrist joint sits at the base of
+  # the palm; the cloud centroid sits out in the visible middle of the hand — and
+  # only the VISIBLE part, so it moves with the view exactly as the object
+  # centroid does. `hand_centroid` makes both references come from the same
+  # cloud, which is the situation a deployment is in.
+  #
+  # It costs exactness: the reference is now observation-dependent and noisy
+  # rather than ground truth. That is the point — the policy should be trained
+  # against the frame it will actually be given. Falls back to the wrist only
+  # when the cloud carries no hand points at all, and `anchor_rotation`'s own
+  # base fallback still catches the case where that is missing too.
+  anchor_hand_ref: hand_centroid
+
+  exclude_scenes: output/regrasp_pins_train_off1034_excluded.json
+  demo_ok_table: output/regrasp_demos_train_off1034_ok.json
+
+  # ── CHANGE 2 OF 2: WHAT THE POLICY IS COMMANDED WHENEVER IT ACTS ───────────
+  #
+  # The unit mean of every `d_anchor` a bin was assigned, taken over the table
+  # AFTER `demo_ok_table` and `reach_filter` prune it — so the six vectors
+  # summarise the demonstrations this run is actually trained on, not the ones
+  # that were hoped for. Six vectors, no grasp needed, computable on the robot
+  # exactly as `BINS` is. The resolved values are written to
+  # `<run>/command_axes.json`; copy that file with the checkpoint.
+  #
+  # NOTE this is NOT the same six vectors run 9 resolved: run 9's table was
+  # pruned by `demo_ok_table` alone and built under `approach_axis`. Comparing
+  # the two files is the cheapest way to see how much the rule moved the bins.
+  command_deploy: bin_centroid
+
+  # Unchanged from run 10. Drops (scene, bin) pairs whose base demonstration
+  # never reached its grasp — 443 of 1418 (31.2%) on this shard, leaving 966
+  # episodes / 20285 steps. Per-bin reach rates were +x 75.8, -x 58.7, +y 72.7,
+  # -y 59.7, +z 65.7, -z 76.3.
+  reach_filter: true
+  reach_pos_thresh: 0.02        # m,   = DAGGER.close_pos_thresh
+  reach_rot_thresh: 0.34        # rad, = DAGGER.close_rot_thresh
+
+DAGGER:
+  num_iters: 25
+  # 600 = 100 SCENES x max_grasps 6. The reach filter can leave a scene with
+  # fewer live bins, so this is a TARGET: `sample_pairs` draws m // max_grasps
+  # scenes and expands each to its own count. Read the startup line's collectable
+  # pair count rather than assuming 600.
+  episodes_per_iter: 600
+  max_steps: 50
+  scene_sampling: random
+  seed: 0
+
+  beta_schedule: linear
+  beta_start: 0.9
+  beta_end: 0.75
+  beta_mid: 0.5          # unused by `linear`; kept so a switch to `piecewise`
+  beta_knee: 0.66        # needs no other edit
+  beta_p: 0.7
+
+  close_pos_thresh: 0.02
+  close_rot_thresh: 0.34
+  stop_on_close_label: true
+  stop_on_policy_close: false
+
+  ee_step: 0.04
+  reach_tail: 5
+  min_free: 1
+  max_horizon: 40
+  first_horizon: null
+
+  reach_commit_dist: 0.05
+  reach_skip_eps: 0.01
+  expert_after_commit: true
+
+  dart_ratio: 0.3
+  dart_max_dist: 10.0
+  dart_pos_mag: 0.04
+  dart_rot_mag: 0.3
+  dart_reach_ratio: 0.3
+  dart_reach_pos_mag: 0.01202
+  dart_reach_rot_mag: 0.3
+  dart_reach_max_tries: 5
+  dart_reach_clearance: 0.01
+  dart_reach_path_steps: 4
+
+  outcome_check: true
+
+TRAIN:
+  # ── CHANGE 1 OF 2: WHAT THE EPISODE IS LABELLED WITH ──────────────────────
+  # `bc_regrasp_run9.yaml` is `bc_regrasp_run4.yaml` plus `d_source:
+  # d_grasp_world` — verified identical in every other key, so reusing it keeps
+  # this a one-key change rather than a new file that could drift.
+  train_cfg: examples/configs/bc_regrasp_run9.yaml
+  pc_pretrained:
+  # RE-COLLECTED AT THE NEW DEPTH, for the same reason the pin table is: the
+  # assignment picks, per bin, the goal-set grasp closest to that bin's axis, and
+  # "closest" resolves differently once `d` is measured to a different point. 8%
+  # of grasps change bin, so the demonstrations are not the same set.
+  base_train_h5: ${REGRASP_DATA}/bc_dataset/train_regrasp_off1034.h5
+  val_h5: ${REGRASP_DATA}/bc_dataset/val_regrasp_off1034.h5
+  base_run: null
+  base_epochs: 50
+  iter_epochs: 15
+  train_from_scratch: true
+  init_ckpt: best
+  num_workers: 8
+  device: cuda
+
+EVAL:
+  every: 1
+  num_scenes: 100
+  holdout: false
+  max_steps: 50
+
+  # ── CHANGE 2 OF 2: MEASURE THE EPISODES THAT STOPPED SHORT ────────────────
+  #
+  # `d_min_offset` still guards COLLECTION. This key governs the MEASUREMENT
+  # only: false applies the run's `d_rule` at `min_offset` 0 when computing
+  # `dir_err`, `sector_err`, `bin_hit_rate` and the confusion matrix, so an
+  # episode whose centroid -> fingertip chord came out under 2 cm is counted
+  # instead of dropped. `dir_n` / `dir_n_short` report how many that is.
+  dir_drop_short: false
+
+  # ── CHANGE 5 OF 5: STRATIFY THE EVAL SET BY BIN ───────────────────────────
+  #
+  # `num_scenes: 100` draws scenes and scores every slot of each, so the per-bin
+  # counts are a by-product of the draw. On run 11 that landed at
+  # `+x 54, -x 33, +y 37, -y 25, +z 19, -z 26` — a 2.8x spread. At n=19 one +z
+  # episode is 5.3 percentage points and the binomial standard error is +-11, so
+  # a +-22-point swing between consecutive iterations is a routine 2-sigma event
+  # and most of what the per-bin curves show is that, not learning.
+  #
+  # `per_bin_frac` takes 20% of EACH bin's pairs over the whole usable table.
+  # The sample is proportional to the population by construction, and every
+  # bin's denominator is a stated fraction rather than an accident. Selection is
+  # an np.linspace over each bin's sorted pair list — evenly spread, no seed
+  # consumed — so the same config always scores the same episodes and two runs
+  # are comparable episode by episode.
+  #
+  # IT DOES NOT EQUALISE THE BINS, and cannot: 20% of a bin with 130 pairs is
+  # still five times 20% of one with 26. What it fixes is that the proportions
+  # and the denominators are now known and stable. `num_scenes` is ignored under
+  # this setting.
+  scene_select: per_bin_frac
+  bin_frac: 0.3
+
+  # ── CHANGE 6 OF 6: COMMAND EVERY BIN ON EVERY EVALUATED SCENE ─────────────
+  #
+  # `succ_bin_b` has always meant "told `+z` ON A SCENE THAT DEMONSTRATES `+z`,
+  # how often did it succeed". That is the right question for "did it learn the
+  # training distribution" and the wrong one for "can I deploy this": the retry
+  # ladder commands a direction BECAUSE THE PREVIOUS ONE FAILED, not because a
+  # demonstration exists, so at deployment most commands are for directions that
+  # scene never showed the policy. No run so far has measured one.
+  #
+  # With this on, every selected scene is additionally rolled under every bin it
+  # does NOT carry. Those rows are flagged `in_table: 0` and the metric block
+  # reports both populations from the SAME rollouts — no episode is evaluated
+  # twice:
+  #
+  #   succ_bin_b      in-table rows only. Unchanged, comparable with runs 1-15.
+  #   succ_bin_all_b  every row for that bin. The deployment-facing number.
+  #
+  # The gap between them is the generalisation-to-an-undemonstrated-direction
+  # measurement, and it is the number that says whether `k` is really a
+  # test-time knob or whether the policy only works where it was taught.
+  #
+  # ⚠ COST. It takes the eval from ~290 episodes to scenes x 6. `retry_at_k` is
+  # deliberately NOT folded in — it stays over in-table rows so the reordering
+  # to `RETRY_LADDER` is the only thing that changed about it.
+  full_bin_coverage: true
+  ckpt: best
+  success_mode: stable_grasp
+  hold_steps: 3
+  select_on: success_rate
+  verbose: false
+
+  box_check: true
+  box:
+    min_frac: 0.50
+    open_thresh: 0.8
+    half_x: 0.0088
+    z_lo: 0.0946
+    z_hi: 0.1122
+    inset: 0.002
+    grid_x: 7
+    grid_z: 7

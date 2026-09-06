@@ -39,6 +39,8 @@ else:
         # there; every real use below still fails on the attribute access, with
         # h5py named in the traceback.
         h5py = None
+import zlib
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -750,7 +752,14 @@ class BCDataset(Dataset):
                 # plausible corruption. Deriving the seed from the key rather than
                 # drawing from global state also keeps a DataLoader worker's
                 # output reproducible.
-                seed = (hash((fi, ep_key)) ^ 0x9E3779B9) & 0x7FFFFFFF
+                # `hash()` OF A str IS SALTED PER PROCESS (PYTHONHASHSEED),
+                # so this was the one draw in the pipeline that changed between
+                # two runs of the same config with the same seed — and it
+                # changed per DataLoader worker too. crc32 over the same key is
+                # stable across processes and machines, which is what "seeded on
+                # the episode" was supposed to mean.
+                seed = (zlib.crc32(f"{fi}:{ep_key}".encode())
+                        ^ 0x9E3779B9) & 0x7FFFFFFF
                 d_world = _rg_channels.perturb_direction(
                     d_world, self.d_noise_deg, np.random.default_rng(seed))
             d_ee = direction_in_ee_frame(rs_raw, d_world)

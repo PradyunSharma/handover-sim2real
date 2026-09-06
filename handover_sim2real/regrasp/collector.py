@@ -551,6 +551,18 @@ class CollectParams:
     # every episode into a miscaption. Defaults to `approach_axis`, which is
     # runs 1-9.
     d_rule: object = None
+    # ---- when the anchor frame is built (`SIM.anchor_update`) ---------------
+    # Must match the evaluator's. `latched` builds it once from the step-0 cloud
+    # and holds it; `live` rebuilds it from every step's cloud and re-issues the
+    # command with it. Collection and evaluation disagreeing here is the silent
+    # kind of bug: the policy would be taught under one command law and scored
+    # under another, and every rate would look ordinary.
+    anchor_update: str = "latched"
+    # `SIM.anchor_hand_ref`: which point on the giver the azimuth is measured
+    # from — the MANO wrist JOINT (sim-only ground truth) or the segmented hand
+    # CLOUD's centroid (what the real rig uses). Different points, so different
+    # frames.
+    anchor_hand_ref: str = "wrist"
 
     def __post_init__(self):
         from handover_sim2real.regrasp import directions as _D
@@ -558,6 +570,14 @@ class CollectParams:
             self.command_axes = _D.BINS.copy()
         if self.d_rule is None:
             self.d_rule = _D.DirectionRule()
+        if str(self.anchor_update) not in _rg_anchor.ANCHOR_UPDATES:
+            raise ValueError(
+                f"anchor_update must be one of {_rg_anchor.ANCHOR_UPDATES}, "
+                f"got {self.anchor_update!r}")
+        if str(self.anchor_hand_ref) not in _rg_anchor.ANCHOR_HAND_REFS:
+            raise ValueError(
+                f"anchor_hand_ref must be one of "
+                f"{_rg_anchor.ANCHOR_HAND_REFS}, got {self.anchor_hand_ref!r}")
 
 
 def _grasp_moved(prev, cur, tol: float = 1e-4) -> bool:
@@ -807,6 +827,12 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     # DEFINITION can be changed later as a relabelling pass instead of a
     # collection campaign.
     anchor_R = anchor_mode = wrist = mano_side = None
+    # The step-0 frame, kept under its own name so the recorded `anchor_R` attr
+    # means the same thing on a `live` run as on every run before it.
+    anchor_R0 = centroid_world0 = None
+    _anchor_live = str(params.anchor_update) == "live"
+    anchor_state = _rg_anchor.AnchorState()
+    n_anchor_blind = 0
     # The anchor frame's ORIGIN, needed by `d_rule: grasp_offset` (the direction
     # runs from here to the gripper point). Hoisted out of the step-0 block
     # because the episode dict below has to see it: `approach_axis` never asked
@@ -936,17 +962,40 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
             # changed later as a relabelling pass rather than a re-collection.
             wrist = _rg_anchor.wrist_world(env)
             mano_side = _rg_anchor.handedness(env)
-            _c_ee = _rg_channels.object_centroid(pc5, fallback_to_all=False)
-            if _c_ee is not None:
-                centroid_world = _rg_anchor.centroid_to_world(
-                    _c_ee, obs, sim.panda_base_inv_tf,
-                    sim.cfg.ENV.PANDA_BASE_POSITION,
-                    sim.cfg.ENV.PANDA_BASE_ORIENTATION)
-                anchor_R, _ameta = _rg_anchor.anchor_rotation(
-                    centroid_world, wrist,
-                    np.asarray(sim.cfg.ENV.PANDA_BASE_POSITION),
-                    _rg_anchor.AnchorState())
+            anchor_R, centroid_world, _ameta = _rg_anchor.anchor_from_cloud(
+                pc5, obs, env, sim.panda_base_inv_tf, sim.cfg,
+                anchor_state, wrist=wrist,
+                hand_ref=params.anchor_hand_ref)
+            if anchor_R is not None:
                 anchor_mode = _ameta["mode"]
+                anchor_R0, centroid_world0 = anchor_R, centroid_world
+        elif _anchor_live:
+            # THE ORIGIN MOVES BECAUSE THE CAMERA DOES. Eye-in-hand, so the
+            # object's observed centroid at step 0 is a distant self-occluded
+            # slice and by the close it is a near view of one face. Rebuilding
+            # here is what a real rig has no choice but to do; the step-0 frame
+            # is a privilege only the simulator has.
+            #
+            # A cloud with no object points keeps the previous frame rather than
+            # dropping the command: zeroing both direction channels would read to
+            # the network as a valid instruction, not a missing one.
+            _aR, _cw, _am = _rg_anchor.anchor_from_cloud(
+                pc5, obs, env, sim.panda_base_inv_tf, sim.cfg,
+                anchor_state, wrist=wrist,
+                hand_ref=params.anchor_hand_ref)
+            if _aR is None:
+                n_anchor_blind += 1
+            else:
+                anchor_R, centroid_world, anchor_mode = _aR, _cw, _am["mode"]
+                # RE-ISSUE with the frame just built, and with the SAME
+                # `command_direction` call step 0 made — a moved frame is only
+                # meaningful if the command moves with it.
+                _dw = _rg_directions.command_direction(
+                    bin_assigned, anchor_R, grasp_pose=grasp_pose,
+                    axes=params.command_axes)
+                if _dw is not None:
+                    d_world = _dw
+                    runner.set_direction(d_world)
         n_normal_fallback += int(_pcinfo.get("n_fallback", 0))
         n_no_centroid += int(bool(_pcinfo.get("no_centroid", False)))
         pc = pc8
@@ -1551,15 +1600,32 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         "bin_realized": (-1 if d_grasp is None or anchor_R is None
                          else int(_rg_directions.bin_of(
                              _rg_directions.from_world(d_grasp, anchor_R)))),
-        "anchor_R": (np.eye(3, dtype=np.float32) if anchor_R is None
-                     else np.asarray(anchor_R, dtype=np.float32)),
+        # STEP 0, ALWAYS — the historical meaning of this attr, so a `live` run's
+        # shards stay readable by everything written for runs 1-15. The frame the
+        # episode ENDED in goes below under its own name, and `bin_realized` and
+        # `d_grasp_world` above are computed from THAT one, because the closing
+        # view is the best estimate of the object's centre this episode ever had.
+        "anchor_R": (np.eye(3, dtype=np.float32) if anchor_R0 is None
+                     else np.asarray(anchor_R0, dtype=np.float32)),
+        "anchor_R_final": (np.eye(3, dtype=np.float32) if anchor_R is None
+                           else np.asarray(anchor_R, dtype=np.float32)),
+        # `latched` | `live`, recorded because it changes what `d_world` MEANS:
+        # under `latched` it is one vector held for the episode, under `live` it
+        # is the command standing at the close of a sequence that moved.
+        "anchor_update": str(params.anchor_update),
+        # Steps whose cloud held no object points, so the frame could not be
+        # rebuilt and the previous one was kept. Zero under `latched`.
+        "n_anchor_blind": int(n_anchor_blind),
         # The anchor's ORIGIN. Stored for the same reason `wrist_world` is: with
         # it, `d_rule` becomes a relabelling pass over an existing shard rather
         # than a re-collection, because both rules are recomputable from the
         # grasp pose plus this point. 12 bytes an episode.
         "centroid_world": (np.full(3, np.nan, dtype=np.float32)
-                           if centroid_world is None
-                           else np.asarray(centroid_world, dtype=np.float32)),
+                           if centroid_world0 is None
+                           else np.asarray(centroid_world0, dtype=np.float32)),
+        "centroid_world_final": (np.full(3, np.nan, dtype=np.float32)
+                                 if centroid_world is None
+                                 else np.asarray(centroid_world, dtype=np.float32)),
         "anchor_mode": str(anchor_mode or "unset"),
         "wrist_world": (np.full(3, np.nan, dtype=np.float32) if wrist is None
                         else np.asarray(wrist, dtype=np.float32)),
@@ -1708,7 +1774,13 @@ class DaggerHDF5Writer:
         for _k in ("d_world", "d_grasp_world", "demo_off_deg",
                    "bin_assigned", "bin_realized", "anchor_R",
                    "anchor_mode", "wrist_world", "mano_side", "pin_ok",
-                   "centroid_world"):
+                   "centroid_world",
+                   # `SIM.anchor_update: live` — the frame the episode ended in,
+                   # which is the one `bin_realized` and `d_grasp_world` were
+                   # computed against. Absent on runs 1-15, so every reader must
+                   # fall back to `anchor_R` / `centroid_world`.
+                   "anchor_R_final", "centroid_world_final",
+                   "anchor_update", "n_anchor_blind"):
             if _k in episode:
                 grp.attrs[_k] = episode[_k]
         for name in ("point_clouds", "robot_states", "expert_actions"):
