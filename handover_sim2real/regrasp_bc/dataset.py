@@ -140,7 +140,10 @@ def direction_in_ee_frame(rs_raw: np.ndarray, d_world: np.ndarray) -> np.ndarray
     from transforms3d.quaternions import quat2mat
 
     R_ee = quat2mat(np.asarray(rs_raw[21:25], dtype=np.float64))
-    return _rg_directions.normalize(R_ee.T @ np.asarray(d_world, dtype=np.float64))
+    # A ROTATION, so it already preserves `|d|` exactly — the `normalize` that
+    # used to wrap it was redundant for the two unit rules and destructive for
+    # `location_extent`, whose magnitude IS the commanded eccentricity.
+    return R_ee.T @ np.asarray(d_world, dtype=np.float64)
 
 
 def _as_path_list(paths) -> list[str]:
@@ -358,7 +361,8 @@ class BCDataset(Dataset):
     def __init__(self, hdf5_paths, normalizer: Normalizer | None = None,
                  goal_table=None, reach_tail_weight: float = 1.0,
                  reach_tail: int = 5, direction_cond: bool = True,
-                 d_noise_deg: float = 0.0, d_source: str = "d_world",
+                 d_noise_deg: float = 0.0, d_noise_mag: float = 0.0,
+                 d_source: str = "d_world",
                  reach_filter: bool = True,
                  reach_pos_thresh: float = _rg_reach.DEFAULT_POS_THRESH,
                  reach_rot_thresh: float = _rg_reach.DEFAULT_ROT_THRESH):
@@ -419,6 +423,11 @@ class BCDataset(Dataset):
         # direction. MUST be 0 on the val set or val loss stops being comparable
         # across epochs — train_regrasp builds both from one config block.
         self.d_noise_deg = float(d_noise_deg)
+        # `DATA.d_noise_mag`: multiplicative jitter on `|d|`, i.e. on the
+        # commanded eccentricity. Only meaningful under `location_extent`; 0 for
+        # the unit rules, where `|d|` is 1 and perturbing it would command a
+        # magnitude the rule cannot produce.
+        self.d_noise_mag = float(d_noise_mag)
         # WHICH EPISODE ATTR IS THE LABEL. Both are written by both collectors on
         # every Regrasp episode, so this is a relabelling switch and NOT a
         # re-collection:
@@ -580,7 +589,15 @@ class BCDataset(Dataset):
                         dw = f[k].attrs.get(self.d_source)
                         if dw is None:
                             n_dir_missing += 1
-                        elif np.linalg.norm(np.asarray(dw, float)) < 0.5:
+                        # `D_ZERO_EPS`, NOT 0.5. Under `location_extent` a
+                        # legitimate command can have magnitude 0.05, and the
+                        # old unit-vector test would have discarded four fifths
+                        # of the achievable range as "no direction". A TRUE zero
+                        # is still dropped: it is the null bin, which is a valid
+                        # LABEL but carries no gradient for the two channels, and
+                        # `d_source` decides whether those episodes are wanted.
+                        elif (np.linalg.norm(np.asarray(dw, float))
+                              < _rg_directions.D_ZERO_EPS):
                             # ZERO IS NOT MISSING, IT IS WRONG. Both collectors
                             # write zeros when the vector could not be formed (no
                             # anchor, or no grasp pose), and `normalize` returns
@@ -676,7 +693,9 @@ class BCDataset(Dataset):
                   + (f", MISSING on {n_dir_missing}" if n_dir_missing else "")
                   + f"; clouds {self.stored_pc_channels}ch -> model "
                     f"{MODEL_PC_CHANNELS}ch"
-                  + (f", d noise {self.d_noise_deg} deg" if self.d_noise_deg else ""))
+                  + (f", d noise {self.d_noise_deg} deg" if self.d_noise_deg else "")
+                  + (f" +-{self.d_noise_mag:.0%} on |d|"
+                     if self.d_noise_mag else ""))
             if n_dir_missing:
                 raise RuntimeError(
                     f"{n_dir_missing} episode(s) have no `{self.d_source}` attr. "
@@ -744,7 +763,7 @@ class BCDataset(Dataset):
 
         if self.direction_cond:
             d_world = self._dir_of[(fi, ep_key)]
-            if self.d_noise_deg:
+            if self.d_noise_deg or self.d_noise_mag:
                 # SEEDED ON THE EPISODE, not the step. The augmentation means
                 # "the commanded direction is N degrees off", which is a property
                 # of the command; a per-step draw would instead mean "the command
@@ -760,8 +779,21 @@ class BCDataset(Dataset):
                 # the episode" was supposed to mean.
                 seed = (zlib.crc32(f"{fi}:{ep_key}".encode())
                         ^ 0x9E3779B9) & 0x7FFFFFFF
+                _rng = np.random.default_rng(seed)
                 d_world = _rg_channels.perturb_direction(
-                    d_world, self.d_noise_deg, np.random.default_rng(seed))
+                    d_world, self.d_noise_deg, _rng)
+                # AND THE MAGNITUDE, MULTIPLICATIVELY. Under
+                # `d_rule: location_extent` `|d|` is the commanded eccentricity,
+                # so the angular perturbation alone leaves half the command
+                # un-augmented. Scaling rather than adding is what keeps a null
+                # command null and a small `m` small — an additive +-0.1 would
+                # turn `m = 0.02` ("at the centroid") into 0.12 ("noticeably to
+                # one side"), which is a different instruction, not noise on the
+                # same one. Zero for the two unit rules, where `|d|` is 1 by
+                # construction and must stay there.
+                if self.d_noise_mag:
+                    d_world = _rg_channels.perturb_magnitude(
+                        d_world, self.d_noise_mag, _rng)
             d_ee = direction_in_ee_frame(rs_raw, d_world)
             # [N,8] -> [N,7]: the stored normals are used as-is, so this matches
             # what BCRunner.act computes at inference bit-for-bit.

@@ -104,12 +104,50 @@ LIVE_BINS = (BIN_PLUS_X, BIN_PLUS_Y, BIN_MINUS_Y, BIN_PLUS_Z)
 
 # Short labels for figure titles and CSV headers — `BIN_NAMES` carries the
 # rationale in the name and is too long for a 3.5-inch axis.
-BIN_SHORT = ("+x", "-x", "+y", "-y", "+z", "-z")
+BIN_SHORT = ("+x", "-x", "+y", "-y", "+z", "-z",
+             "0")     # index BIN_NULL: no location preference (location_extent only)
 
 # The Voronoi half-angle for 90-deg-separated bins is 45 deg. `bin_hit_rate` uses
 # 30 to keep margin against boundary noise, so a "hit" is unambiguous rather than
 # a coin flip between two adjacent bins.
 BIN_HIT_DEG = 30.0
+
+# THE NULL BIN — "this grasp expresses no location preference".
+#
+# Only `location_extent` produces it. `d = m * u` with `m` the eccentricity, and
+# a grasp AT the centroid has m ~ 0: there is no side to name, and forcing it
+# onto whichever octahedral axis its noise happens to point at would put a
+# confident label on a quantity that is not there. That is the failure the old
+# `grasp_offset` rule had by construction — `normalize(p_grasp - c)` is undefined
+# as the offset vanishes, so the direction flipped under millimetre
+# perturbations. Retaining the magnitude fixes the geometry; this bin is what
+# makes the BOOKKEEPING honest about it.
+#
+# 6, i.e. one past the octahedral set, so `BINS` stays exactly the six axes and
+# every `range(len(BINS))` loop keeps its meaning. `BIN_SHORT` carries a seventh
+# label for printing; nothing iterates its length (checked).
+#
+# NULL-BIN DEMONSTRATIONS ARE LABELS ONLY. They are legitimate training data —
+# "grasp near the middle" is a real instruction — but the retry ladder must never
+# COMMAND the null bin, because "no preference" is not a hypothesis to fall back
+# to. `RETRY_LADDER` is over `BINS` and so cannot reach it.
+BIN_NULL = 6
+
+# BELOW THIS, `d` IS ZERO — no direction, not a short one.
+#
+# It replaces the `np.linalg.norm(d) < 0.5` test that used to mean "is this a
+# valid unit vector", which was correct while every `d` was unit and is WRONG
+# under `location_extent`: a legitimate command there can have magnitude 0.05,
+# and 0.5 would discard four fifths of the achievable range as invalid.
+D_ZERO_EPS = 1e-6
+
+
+def bin_label(b) -> str:
+    """`BIN_SHORT[b]`, plus a name for the null bin and for "unassigned"."""
+    b = -1 if b is None else int(b)
+    if b == BIN_NULL:
+        return "0"                      # no location preference
+    return BIN_SHORT[b] if 0 <= b < len(BIN_SHORT) else "--"
 
 # The retry machine's neighbour-exclusion radius. See `neighbours` — for the
 # octahedral set this is a no-op, and that is a fact worth knowing rather than a
@@ -221,7 +259,7 @@ def approach_direction(grasp_pose) -> np.ndarray:
 # 14.49 deg from `-R[:,2]`. Position-derived, but it answers the approach_axis
 # question. Use it if `grasp_offset` at fingertip depth proves too noisy and the
 # point is only to remove the orientation dependence.
-D_RULES = ("approach_axis", "grasp_offset")
+D_RULES = ("approach_axis", "grasp_offset", "location_extent")
 
 # Metres along the gripper's local +z. The Panda's finger pads span z in
 # [0.0946, 0.1122] (grasp_box.py, from meshes/collision/finger.obj: the finger
@@ -274,6 +312,128 @@ def grasp_direction(grasp_pose, centroid_world=None, rule: str = "approach_axis"
     return normalize(v)
 
 
+# ── `location_extent`: d = m * u, the EXTENT-NORMALIZED LOCATION COMMAND ─────
+#
+# WHAT IT COMMANDS AND WHY THAT IS THE RIGHT THING TO COMMAND. The other two
+# rules name the gripper's approach ORIENTATION. But orientation is largely
+# determined by local geometry — a parallel jaw closes across the locally narrow
+# dimension — so a policy can in principle read it off the point cloud. LOCATION
+# is what the observation genuinely underdetermines: on an L-shaped object,
+# "approach from above" says nothing about which limb to take, and nothing in the
+# cloud resolves it either. Conditioning should carry what the observation lacks.
+#
+# It is also the factorization the grasp-detection literature converged on —
+# GraspNet samples seed POINTS then predicts approach vectors per seed;
+# Where2Act predicts per-point actionability then orientations at that point.
+# Location outer, orientation conditional.
+#
+#     v   = grasp_point(T, depth) - c
+#     u   = v / |v|                       the direction  (unit)
+#     r_u = percentile((obj - c) @ u, 95) the object's extent ALONG u
+#     m   = clip(|v| / r_u, 0, 1)         the eccentricity
+#     d   = m * u                         NOT a unit vector
+#
+# `m = 0` is a grasp at the centroid, `m = 1` one at the object's extremity in
+# that direction.
+#
+# WHY THE EXTENT AND NOT ONE RADIUS. Normalizing an anisotropic quantity by an
+# isotropic scalar makes `m = 1` unreachable in most directions. With
+# `R_obj = max|p_i - c|` a 6:1 banana reaches 1 along its long axis but caps near
+# 0.17 laterally, so a lateral unit command asks for a location six times further
+# out than the object extends — and the cap varies per object AND per direction,
+# so the same commanded number means a different physical place on every scene.
+# Dividing by the extent along `u` makes `m = 1` achievable in every direction by
+# construction, which is what makes the magnitude comparable across bins at all.
+#
+# WHY RETAINING THE MAGNITUDE FIXES THE FLIP INSTABILITY. `grasp_offset` is
+# `normalize(p_grasp - c)`, which is UNDEFINED as the offset vanishes: a grasp
+# near the centroid projects a vanishing vector onto the unit sphere, so its
+# direction is noise and flips under millimetre perturbations. Keeping the
+# magnitude makes a centroid grasp `d ~ 0`, which is stable AND semantically
+# right — both conditioning channels go uniformly near zero, which tells the
+# policy "no side preference", which is true. Sliding from the middle of a banana
+# toward one end then grows the signal smoothly from zero instead of flipping it.
+# The discontinuity was in the normalization, never in the geometry.
+#
+# THREE DETAILS THAT DECIDE WHETHER THIS WORKS:
+#
+#   95th percentile, NOT max.   One depth outlier at the object silhouette
+#                               otherwise sets the scale for the whole scene.
+#   The OBSERVED cloud, always. A partial view underestimates the extent for
+#                               back-facing directions. That bias is identical at
+#                               collection, training and deployment, so it
+#                               cancels. A mesh or a fused cloud would remove the
+#                               bias and reintroduce a privileged signal the
+#                               robot does not have — strictly worse.
+#   OBJECT points only.         The `ycb` channel, never the `hand` one. Include
+#                               hand points and the giver's forearm inflates the
+#                               extent, shrinking every `m` on that scene.
+
+def extent_along(obj_points, centroid, u, pct: float = 95.0) -> float:
+    """The object's extent from `centroid` along unit `u`, in the cloud's frame.
+
+    `percentile(..., 95)` of the projections rather than the max: the cloud is a
+    single-frame depth observation and its silhouette carries outliers, and one
+    of them setting `r_u` would rescale every `m` on the scene.
+
+    Returns 0.0 when there are no points, or when the observed cloud has no
+    positive extent along `u` at all — which happens for a genuinely back-facing
+    direction on a heavily occluded view. The caller must treat 0.0 as "not
+    measurable" rather than dividing by it.
+    """
+    p = np.asarray(obj_points, dtype=np.float64)
+    if p.ndim != 2 or p.shape[0] == 0:
+        return 0.0
+    proj = (p - np.asarray(centroid, dtype=np.float64)) @ \
+        np.asarray(u, dtype=np.float64)
+    return float(max(np.percentile(proj, float(pct)), 0.0))
+
+
+def location_command(grasp_pose, centroid, obj_points, *,
+                     depth: float = FINGERTIP_DEPTH, m_min: float = 0.0,
+                     pct: float = 95.0):
+    """`(d, m, u, info)` for `location_extent`. `d = m * u`, and is NOT unit.
+
+    `m = 0` with `u = 0` means "no location preference": either the grasp sits on
+    the centroid, or the extent along `u` could not be measured. Both are
+    reported in `info` so the two are never conflated in a census.
+
+    FRAME-AGNOSTIC, LIKE THE OTHER RULES. `m` is a ratio of two projections onto
+    the same axis and `u` is a direction, so any frame works provided
+    `grasp_pose`, `centroid` and `obj_points` are ALL in it. The collector passes
+    world; nothing here converts.
+    """
+    zero = (np.zeros(3), 0.0, np.zeros(3))
+    if grasp_pose is None or centroid is None or obj_points is None:
+        return (*zero, {"reason": "missing input"})
+    c = np.asarray(centroid, dtype=np.float64)
+    v = grasp_point(grasp_pose, depth) - c
+    nv = float(np.linalg.norm(v))
+    if nv < D_ZERO_EPS:
+        # A grasp exactly on the centroid. Genuinely null, not an error.
+        return (*zero, {"reason": "at centroid", "offset": nv})
+    u = v / nv
+    r_u = extent_along(obj_points, c, u, pct)
+    if r_u < D_ZERO_EPS:
+        # The observed cloud has no extent along `u`: a back-facing direction on
+        # an occluded view. `m` is not measurable, so refuse rather than invent
+        # one — an unnormalized `m` would be a different quantity from every other
+        # episode's and would silently widen the bin's magnitude distribution.
+        return (*zero, {"reason": "no extent along u", "offset": nv, "r_u": r_u})
+    # `v @ u` IS `nv` by construction (u = v/nv); written as the ratio because
+    # that is what the quantity means.
+    m = float(np.clip(nv / r_u, 0.0, 1.0))
+    info = {"reason": "ok", "offset": nv, "r_u": r_u, "m_raw": nv / r_u,
+            "clipped": bool(nv / r_u > 1.0)}
+    if m < float(m_min):
+        # Below `m_min` the eccentricity is real but too small to name a side.
+        # `u` is returned anyway so a census can see WHICH way the sub-threshold
+        # grasp leaned, but `d` is zeroed so the label carries no preference.
+        info["reason"] = "below m_min"
+        return np.zeros(3), m, u, info
+    return m * u, m, u, info
+
+
 @dataclass(frozen=True)
 class DirectionRule:
     """`SIM.d_rule` + its two numbers, resolved once and carried as one object.
@@ -288,34 +448,118 @@ class DirectionRule:
     rule: str = "approach_axis"
     depth: float = FINGERTIP_DEPTH
     min_offset: float = 0.0
+    # ---- `location_extent` only -------------------------------------------
+    # `m_min`: below this eccentricity the grasp goes to the NULL bin and its `d`
+    # is zeroed. 0.15 is the starting value — a grasp within 15% of the way to
+    # the object's extremity along its own direction expresses no side.
+    m_min: float = 0.15
+    # The percentile that defines "the object's extent". 95, not 100: see
+    # `extent_along`.
+    extent_pct: float = 95.0
 
     def __post_init__(self):
         if self.rule not in D_RULES:
             raise ValueError(f"SIM.d_rule must be one of {list(D_RULES)}, "
                              f"got {self.rule!r}")
+        if not 0.0 <= self.m_min < 1.0:
+            raise ValueError(f"SIM.d_m_min must be in [0, 1), got {self.m_min}")
+        if not 50.0 <= self.extent_pct <= 100.0:
+            raise ValueError(f"SIM.d_extent_pct must be in [50, 100], "
+                             f"got {self.extent_pct}")
 
     @classmethod
     def from_cfg(cls, block):
         b = block or {}
         return cls(rule=str(b.get("d_rule", "approach_axis")),
                    depth=float(b.get("d_point_depth", FINGERTIP_DEPTH)),
-                   min_offset=float(b.get("d_min_offset", 0.0)))
+                   min_offset=float(b.get("d_min_offset", 0.0)),
+                   m_min=float(b.get("d_m_min", 0.15)),
+                   extent_pct=float(b.get("d_extent_pct", 95.0)))
 
-    def of(self, grasp_pose, centroid_world=None):
-        """This rule's `d` in world for one grasp, or None. See grasp_direction."""
-        return grasp_direction(grasp_pose, centroid_world, self.rule,
-                               self.depth, self.min_offset)
+    # ---- what KIND of vector this rule produces ----------------------------
+    @property
+    def unit(self) -> bool:
+        """Is `d` a unit vector? False for `location_extent`, whose MAGNITUDE is
+        half the command. Everything that touches `d` on the way to the network
+        has to ask: `append_direction_channels` normalized unconditionally, which
+        would have discarded the eccentricity silently and left the two channels
+        identical to `grasp_offset`'s."""
+        return self.rule != "location_extent"
 
     def needs_centroid(self) -> bool:
-        return self.rule == "grasp_offset"
+        return self.rule in ("grasp_offset", "location_extent")
+
+    def needs_points(self) -> bool:
+        """Does evaluating this rule need the OBJECT POINT CLOUD? Only
+        `location_extent`, for `r_u`. Callers that cannot supply one get None
+        rather than a silently un-normalized magnitude."""
+        return self.rule == "location_extent"
+
+    def of(self, grasp_pose, centroid_world=None, obj_points=None):
+        """This rule's `d` for one grasp, or None. See `grasp_direction`.
+
+        Under `location_extent` a NULL result (grasp at the centroid, or an
+        unmeasurable extent) comes back as a ZERO VECTOR, not None: zero is the
+        correct label there — "no side preference" — whereas None means "this
+        rule could not be evaluated" and must not be trained on. `decompose`
+        returns the two apart when the caller needs to tell them apart.
+        """
+        if self.rule != "location_extent":
+            return grasp_direction(grasp_pose, centroid_world, self.rule,
+                                   self.depth, self.min_offset)
+        if grasp_pose is None or centroid_world is None or obj_points is None:
+            return None
+        d, _m, _u, _info = location_command(
+            grasp_pose, centroid_world, obj_points,
+            depth=self.depth, m_min=self.m_min, pct=self.extent_pct)
+        return d
+
+    def decompose(self, grasp_pose, centroid_world=None, obj_points=None):
+        """`(d, m, u, info)`. For the two unit rules `m` is 1 and `u` is `d`, so
+        a caller can store `m`/`u` unconditionally and a `location_extent` shard
+        stays readable by the same code."""
+        if self.rule == "location_extent":
+            return location_command(grasp_pose, centroid_world, obj_points,
+                                    depth=self.depth, m_min=self.m_min,
+                                    pct=self.extent_pct)
+        d = self.of(grasp_pose, centroid_world)
+        if d is None:
+            return None, float("nan"), None, {"reason": "rule not evaluable"}
+        return d, 1.0, d, {"reason": "ok"}
+
+    def bin_of(self, d, bins=None) -> int:
+        """The bin `d` names, `BIN_NULL` when it names none.
+
+        THE NULL CASE IS WHY THIS IS A METHOD. `directions.bin_of` is an argmin
+        over angles and will happily return a confident bin for a 1e-9-magnitude
+        vector, because `angles_to_bins` normalizes first. Under
+        `location_extent` that is exactly the wrong answer: the whole point of
+        keeping the magnitude is that a near-centroid grasp has no side, and the
+        argmin would name whichever axis its noise leans toward.
+        """
+        if d is None:
+            return -1
+        if self.rule == "location_extent" and \
+                float(np.linalg.norm(np.asarray(d, dtype=np.float64))) < D_ZERO_EPS:
+            return BIN_NULL
+        return bin_of(d, bins)
 
     def as_meta(self) -> dict:
-        return {"d_rule": self.rule, "d_point_depth": self.depth,
+        meta = {"d_rule": self.rule, "d_point_depth": self.depth,
                 "d_min_offset": self.min_offset}
+        if self.rule == "location_extent":
+            meta.update({"d_m_min": self.m_min,
+                         "d_extent_pct": self.extent_pct})
+        return meta
 
     def describe(self) -> str:
         if self.rule == "approach_axis":
             return "approach_axis (d = -R_grasp[:,2])"
+        if self.rule == "location_extent":
+            return (f"location_extent (d = m * u, m = |p_grasp - c| / "
+                    f"extent_p{self.extent_pct:g}(u), point at "
+                    f"{self.depth*100:.2f} cm, null below m={self.m_min:g}) "
+                    f"-- NOT a unit vector")
         return (f"grasp_offset (d = centroid -> gripper point at "
                 f"{self.depth*100:.2f} cm"
                 + (f", min {self.min_offset*100:.1f} cm" if self.min_offset else "")
@@ -433,7 +677,7 @@ def to_ee(d_world, ee_rotation) -> np.ndarray:
                      @ np.asarray(d_world, dtype=np.float64))
 
 
-def centroid_axes(members, bins=None) -> np.ndarray:
+def centroid_axes(members, bins=None, magnitude: bool = False) -> np.ndarray:
     """[k, 3] the UNIT MEAN of each bin's assigned directions; `bins[b]` if empty.
 
     `members` is an iterable of `(bin_idx, d_anchor)` — the assignment a pin table
@@ -464,17 +708,39 @@ def centroid_axes(members, bins=None) -> np.ndarray:
     """
     bins = BINS if bins is None else np.asarray(bins, dtype=np.float64)
     acc = np.zeros_like(bins)
+    cnt = np.zeros(len(bins), dtype=np.int64)
     for b, d in members:
         if b is None or d is None:
             continue
         b = int(b)
+        # `0 <= b < len(bins)` EXCLUDES `BIN_NULL` by construction, which is
+        # what should happen: a null-bin demonstration expresses no direction, so
+        # averaging it into one would drag that bin's centroid toward zero.
         if 0 <= b < len(bins):
-            acc[b] += normalize(np.asarray(d, dtype=np.float64))
-    out = normalize(acc)
-    # `normalize` returns zeros for a zero-length input, which is exactly the
-    # empty-bin case; fall back per row rather than testing counts separately.
-    dead = np.linalg.norm(out, axis=-1) < 0.5
-    out[dead] = bins[dead]
+            v = np.asarray(d, dtype=np.float64)
+            # MAGNITUDE MODE KEEPS `|d|`. Under `location_extent` the magnitude
+            # IS the eccentricity, so normalizing each member before averaging
+            # would throw away exactly the half of the command this rule adds and
+            # produce a unit axis — i.e. silently fall back to `bin_axis`.
+            acc[b] += v if magnitude else normalize(v)
+            cnt[b] += 1
+    if not magnitude:
+        out = normalize(acc)
+        # `normalize` returns zeros for a zero-length input, which is exactly the
+        # empty-bin case; fall back per row rather than testing counts separately.
+        dead = np.linalg.norm(out, axis=-1) < 0.5
+        out[dead] = bins[dead]
+        return out
+
+    # THE PLAIN MEAN, and NO axis fallback. An empty bin has no magnitude, and
+    # `BINS[b]` would assert `m = 1` — the extremity of the object — which is the
+    # one command this rule must never issue unprompted: it is both the most
+    # aggressive location available and, on a bin with no demonstrations, one the
+    # policy has never seen. Zero rows are left zero and the caller must refuse
+    # to command them; `resolve_command_axes` does.
+    out = np.zeros_like(bins)
+    live = cnt > 0
+    out[live] = acc[live] / cnt[live, None]
     return out
 
 

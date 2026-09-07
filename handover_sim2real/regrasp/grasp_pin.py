@@ -128,7 +128,7 @@ class GraspPinTable:
         b = grasps[int(grasp_idx)].get("bin")
         return None if b is None else int(b)
 
-    def bin_centroids(self):
+    def bin_centroids(self, magnitude: bool = False):
         """[k, 3] the ANCHOR-frame mean direction of each bin's surviving members.
 
         Call this AFTER `keep_only`, always. The centroid is a summary of what
@@ -146,8 +146,9 @@ class GraspPinTable:
         """
         from handover_sim2real.regrasp import directions as _D
         return _D.centroid_axes(
-            (g.get("bin"), g.get("d_anchor"))
-            for grasps in self.entries.values() for g in grasps)
+            ((g.get("bin"), g.get("d_anchor"))
+             for grasps in self.entries.values() for g in grasps),
+            magnitude=bool(magnitude))
 
     def keep_only(self, ok, *, verbose: bool = True) -> dict:
         """Prune to the (scene, BIN) pairs listed in `ok`, renumbering the slots.

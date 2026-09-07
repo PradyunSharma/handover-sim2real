@@ -391,6 +391,11 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
         # Perturb the command by this much, TRAIN ONLY. Weighting or perturbing
         # val would change what val_loss means across epochs.
         d_noise = float(cfg["DATA"].get("d_noise_deg", 0.0))
+        # `location_extent` only: multiplicative jitter on the commanded
+        # eccentricity `|d|`. Zero everywhere else, and zero on VAL below for the
+        # same reason the angular noise is — a validation set must measure the
+        # fit, not the augmentation.
+        d_noise_mag = float(cfg["DATA"].get("d_noise_mag", 0.0))
         # WHICH ATTR IS THE LABEL — `d_world` (what the episode was commanded,
         # runs 1-8) or `d_grasp_world` (the axis the expert actually flew). Both
         # ride on every Regrasp episode, so this is a relabelling switch and
@@ -405,6 +410,7 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
         train_ds = BCDataset(cfg["DATA"]["train_h5"], normalizer=normalizer,
                              goal_table=goal_table,
                              direction_cond=direction_cond, d_noise_deg=d_noise,
+                             d_noise_mag=d_noise_mag,
                              d_source=d_source,
                              reach_tail_weight=float(cfg["DATA"].get(
                                  "reach_tail_weight", 1.0)),
@@ -417,6 +423,7 @@ def train_on_aggregate(train_cfg: dict, train_files: list[str], val_h5: str | No
         # 1-9, whose val set carried them.
         val_ds = (BCDataset(val_h5, normalizer=normalizer, goal_table=goal_table,
                             direction_cond=direction_cond, d_noise_deg=0.0,
+                            d_noise_mag=0.0,
                             d_source=d_source, **reach_kw)
                   if val_h5 and os.path.exists(val_h5) else None)
     else:
@@ -1186,11 +1193,16 @@ def main() -> None:
     # `build_regrasp_context` resolves the same key the same way in each worker;
     # this is the manager's copy and the one that is shipped.
     command_mode = str(sim_cfg_d.get("command_deploy", "bin_axis"))
-    command_axes = resolve_command_axes(pin_table, command_mode)
     # WHAT `d` IS DERIVED FROM. A different question from `command_deploy`: the
     # rule decides what a bin MEANS, the axes decide which vector names it.
     # Cross-checked against the table, which is what actually populated the bins.
+    #
+    # RESOLVED FIRST, because the axis set depends on it: under
+    # `location_extent` `d` is `m * u` and the centroids must keep their
+    # magnitude, so `resolve_command_axes` needs the rule to know that — and
+    # refuses `bin_axis`, which would issue |d| = 1 on every bin.
     d_rule = resolve_d_rule(pin_table, sim_cfg_d)
+    command_axes = resolve_command_axes(pin_table, command_mode, d_rule=d_rule)
     # WHEN the frame that turns a bin into a vector is built. `latched` (runs
     # 1-15) builds it once from the step-0 cloud; `live` rebuilds it from every
     # step's cloud, because the camera is eye-in-hand and the object's OBSERVED

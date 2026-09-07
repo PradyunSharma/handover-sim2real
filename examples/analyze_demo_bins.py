@@ -33,7 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from handover_sim2real.regrasp.directions import BIN_SHORT      # noqa: E402
+from handover_sim2real.regrasp.directions import BINS, BIN_SHORT  # noqa: E402
 
 DEFAULT_CSV = "output/bc_dataset/tables/train_regrasp_demo_success_detail.csv"
 CRITERIA = ("reach", "close_label", "caption", "all")
@@ -131,7 +131,10 @@ def main() -> None:
     print(f"  {'all':<4} {d:>7} {n_scenes:>7} {k:>8} {100 * k / d:>6.1f}%")
 
     live = sum(1 for a in BIN_SHORT if tally.get(a, [0])[0])
-    print(f"\n  live bins: {live}/{len(BIN_SHORT)} — the retry ladder has {live} "
+    # len(BINS), NOT len(BIN_SHORT): the latter carries a seventh label for the
+    # null bin (`location_extent`'s "no location preference"), which is not an
+    # octahedral axis and is never a retry hypothesis.
+    print(f"\n  live bins: {live}/{len(BINS)} — the retry ladder has {live} "
           f"rungs, and chained_retry_at_k saturates at k={live}.")
 
     # ---- how many grasp poses each scene carries -----------------------------

@@ -103,7 +103,7 @@ COMMAND_MODES = ("bin_axis", "bin_centroid", "grasp_axis")
 
 
 def resolve_command_axes(pin_table, mode: str = "bin_axis", *,
-                         verbose: bool = True):
+                         verbose: bool = True, d_rule=None):
     """`SIM.command_deploy` -> the [k, 3] axis set, or None for `grasp_axis`.
 
     None is the grasp-axis rule rather than an error: `directions.command_
@@ -117,17 +117,47 @@ def resolve_command_axes(pin_table, mode: str = "bin_axis", *,
     if mode not in COMMAND_MODES:
         raise SystemExit(f"[cfg] SIM.command_deploy must be one of "
                          f"{list(COMMAND_MODES)}, got {mode!r}")
+    # `location_extent` COMMANDS A MAGNITUDE, so `d` is `m * u` and the axis set
+    # is not unit. Two consequences, and both are refusals rather than fixes:
+    #
+    #   `bin_axis` is FORBIDDEN. `BINS[b]` has |d| = 1, i.e. "grasp the object's
+    #   extremity in that direction" — simultaneously the most aggressive
+    #   location available and, on most bins, an `m` the policy never saw. There
+    #   is no sensible default magnitude to substitute, so the run is refused.
+    #
+    #   `grasp_axis` is FORBIDDEN too: it derives `d` from the pose being scored,
+    #   which is not available at deployment and was run 1's mistake.
+    unit = True if d_rule is None else bool(getattr(d_rule, "unit", True))
+    if not unit and mode != "bin_centroid":
+        raise SystemExit(
+            f"[cfg] SIM.d_rule: location_extent needs "
+            f"SIM.command_deploy: bin_centroid, not {mode!r}. `d` is `m * u` "
+            f"there, and {mode!r} would issue |d| = 1 — the object's extremity "
+            f"in that direction, which is both the most aggressive location "
+            f"available and an eccentricity most bins never demonstrate. The "
+            f"empirical centroid carries the magnitude the data actually has.")
     if mode == "grasp_axis":
         return None
     if mode == "bin_axis" or pin_table is None:
         return _rg_directions.BINS.copy()
-    axes = pin_table.bin_centroids()
+    axes = pin_table.bin_centroids(magnitude=not unit)
     if verbose:
         off = _rg_directions.angle_between(axes, _rg_directions.BINS)
         print("[command] deploy on the BIN CENTROID, not the bin axis; "
               "offset from each axis (deg): "
               + "  ".join(f"{_rg_directions.BIN_SHORT[b]} {off[b]:.1f}"
                           for b in _rg_directions.LIVE_BINS))
+        if not unit:
+            mags = np.linalg.norm(axes, axis=-1)
+            print("[command] and its MAGNITUDE m (0 = centroid, 1 = extremity): "
+                  + "  ".join(f"{_rg_directions.BIN_SHORT[b]} {mags[b]:.3f}"
+                              for b in range(len(_rg_directions.BINS))))
+            dead = [b for b in range(len(_rg_directions.BINS))
+                    if mags[b] < _rg_directions.D_ZERO_EPS]
+            if dead:
+                print("[command] bins with NO members and therefore no "
+                      "magnitude — never command these: "
+                      + ", ".join(_rg_directions.BIN_SHORT[b] for b in dead))
     return axes
 
 
@@ -151,7 +181,9 @@ def resolve_d_rule(pin_table, sim_cfg_d: dict, *, verbose: bool = True):
     from_table = _rg_directions.DirectionRule(
         rule=str(meta.get("d_rule", "approach_axis")),
         depth=float(meta.get("d_point_depth", _rg_directions.FINGERTIP_DEPTH)),
-        min_offset=float(meta.get("d_min_offset", 0.0)))
+        min_offset=float(meta.get("d_min_offset", 0.0)),
+        m_min=float(meta.get("d_m_min", 0.15)),
+        extent_pct=float(meta.get("d_extent_pct", 95.0)))
     asked = sim_cfg_d.get("d_rule")
     if asked is None:
         if verbose and from_table.needs_centroid():
@@ -176,6 +208,21 @@ def resolve_d_rule(pin_table, sim_cfg_d: dict, *, verbose: bool = True):
     # a median 9.9 deg (p90 18.6) and re-bins 8.0% of the 1418 grasps. That is
     # `bin_assigned` and `bin_realized` disagreeing on one episode in twelve,
     # with the miscaption filter silently discarding them.
+    # `m_min` AND `extent_pct` TOO, under `location_extent`. `m_min` decides
+    # which grasps the ASSIGNMENT sent to the null bin, and `extent_pct` decides
+    # every `m` in the table. A config that disagrees on either is scoring
+    # against bins drawn by a different rule — the same class of silent wrong
+    # answer the depth check catches, one level further in.
+    if (pin_table is not None and want.rule == "location_extent"
+            and (abs(want.m_min - from_table.m_min) > 1e-9
+                 or abs(want.extent_pct - from_table.extent_pct) > 1e-9)):
+        raise SystemExit(
+            f"[cfg] SIM.d_m_min/{want.m_min} d_extent_pct/{want.extent_pct} but "
+            f"{getattr(pin_table, 'path', 'the pin table')} was assigned at "
+            f"m_min={from_table.m_min} extent_pct={from_table.extent_pct}. "
+            f"`m_min` decides which grasps went to the NULL bin, so the table's "
+            f"bins are not the bins your config would draw. Rebuild the table, "
+            f"or match the table's values.")
     if pin_table is not None and abs(want.depth - from_table.depth) > 1e-9:
         raise SystemExit(
             f"[cfg] SIM.d_point_depth: {want.depth} but "
@@ -332,8 +379,11 @@ def build_regrasp_context(cfg4: dict, *, seed: int = 0,
     # AFTER the demo filter, before anything that commands: the centroid rule
     # summarises the assignment that survived `keep_only`.
     command_mode = str(sim_cfg_d.get("command_deploy", "bin_axis"))
-    command_axes = resolve_command_axes(pin_table, command_mode, verbose=verbose)
+    # d_rule FIRST: it decides whether a non-unit axis set is required, and
+    # `resolve_command_axes` refuses `bin_axis` under `location_extent`.
     d_rule = resolve_d_rule(pin_table, sim_cfg_d, verbose=verbose)
+    command_axes = resolve_command_axes(pin_table, command_mode,
+                                        verbose=verbose, d_rule=d_rule)
     anchor_update = str(sim_cfg_d.get("anchor_update", "latched"))
     if anchor_update not in _rg_anchor.ANCHOR_UPDATES:
         raise SystemExit(

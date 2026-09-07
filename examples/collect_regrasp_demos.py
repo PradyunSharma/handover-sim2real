@@ -554,9 +554,6 @@ def main():
     # one. That is a ~1% difference and it is recorded in the shard's attrs
     # below, but it is the reason `bin_centroid` belongs on the DEPLOYMENT side
     # rather than here.
-    from handover_sim2real.regrasp.setup import resolve_command_axes
-    command_axes = resolve_command_axes(pin_table, args.command)
-
     # THE `d` RULE COMES FROM THE TABLE unless overridden. The table's bins were
     # populated under one rule; deriving `bin_realized` under another would
     # disagree with `bin_assigned` on most episodes and the demo audit would
@@ -567,10 +564,21 @@ def main():
         rule=str(args.d_rule or _m.get("d_rule", "approach_axis")),
         depth=float(args.d_point_depth if args.d_point_depth is not None
                     else _m.get("d_point_depth", _rg_directions.FINGERTIP_DEPTH)),
-        min_offset=float(_m.get("d_min_offset", 0.0)))
+        min_offset=float(_m.get("d_min_offset", 0.0)),
+        # `location_extent`'s two numbers. From the table, never a CLI default:
+        # `m_min` decides which grasps went to the NULL bin when the table was
+        # assigned, so a different value here would re-bin the labels relative to
+        # the assignment they are being collected against.
+        m_min=float(_m.get("d_m_min", 0.15)),
+        extent_pct=float(_m.get("d_extent_pct", 95.0)))
     print(f"d rule: {d_rule.describe()}"
           + ("  (from the pin table's _meta)" if args.d_rule is None else
              "  (CLI OVERRIDE)"))
+
+    from handover_sim2real.regrasp.setup import resolve_command_axes
+    # `d_rule=` so the centroids keep their magnitude under `location_extent`
+    # and `bin_axis` is refused there rather than silently issuing |d| = 1.
+    command_axes = resolve_command_axes(pin_table, args.command, d_rule=d_rule)
 
     # The work list: every (scene, slot) the table offers, scene-major, so a
     # partial run still covers whole scenes and `--num-episodes` stays readable.

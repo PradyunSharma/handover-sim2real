@@ -1,0 +1,417 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRASP RUN 17 — `d` BECOMES A LOCATION COMMAND, EXTENT-NORMALIZED.
+#
+# Run 16 with ONE change: `SIM.d_rule: grasp_offset -> location_extent`. The
+# live anchor frame, the hand-cloud azimuth, the 0.1034 m fingertip point, the
+# 30%-per-bin stratified eval with full bin coverage, and the measured (not
+# dropped) short chords all carry over unchanged, so run 17 against run 16 is a
+# single-variable test of what `d` MEANS.
+#
+# ── WHAT CHANGES, AND WHY IT IS THE RIGHT QUANTITY TO COMMAND ────────────────
+#
+#   approach_axis   (runs 1-9)    d = -R_grasp[:,2]              orientation
+#   grasp_offset    (runs 10-16)  d = normalize(p_grasp - c)     direction only
+#   location_extent (run 17)      d = m * u,  m in [0, 1]        LOCATION
+#
+# Runs 1-9 command the gripper's approach ORIENTATION. But orientation is
+# largely determined by local geometry — a parallel jaw closes across the
+# locally narrow dimension — so a policy can in principle read it off the point
+# cloud. LOCATION is what the observation genuinely underdetermines: on an
+# L-shaped object held by the giver, "approach from above" says nothing about
+# which limb to take, and nothing in the cloud resolves it either. Conditioning
+# should carry what the observation LACKS.
+#
+# It is also the factorization the grasp-detection literature converged on.
+# GraspNet samples seed POINTS then predicts approach vectors per seed;
+# Where2Act predicts per-point actionability then orientations at that point.
+# Location outer, orientation conditional.
+#
+#     v   = grasp_point(T, 0.1034) - c
+#     u   = v / |v|                          the direction
+#     r_u = percentile((obj - c) @ u, 95)     the object's extent ALONG u
+#     m   = clip(|v| / r_u, 0, 1)             the eccentricity
+#     d   = m * u                             NOT a unit vector
+#
+# ── WHY THE EXTENT AND NOT ONE RADIUS ───────────────────────────────────────
+#
+# Normalizing an anisotropic quantity by an isotropic scalar makes `m = 1`
+# unreachable in most directions. Measured on a synthetic 6:1 object: with
+# `R_obj = max|p_i - c|` the long axis reaches m = 1.00 but the lateral
+# direction caps at **0.17**, so a lateral unit command asks for a location six
+# times further out than the object extends — and the cap varies per object AND
+# per direction, so the same commanded number names a different physical place
+# on every scene. Dividing by the extent along `u` makes m = 1 achievable in
+# every direction by construction (verified: m(+y) = 1.00, m(+x) = 1.00 on the
+# same object), which is what makes the magnitude comparable across bins at all.
+#
+# ── WHY KEEPING THE MAGNITUDE FIXES THE FLIP INSTABILITY ─────────────────────
+#
+# `grasp_offset` is `normalize(p_grasp - c)`, UNDEFINED as the offset vanishes:
+# a grasp near the centroid projects a vanishing vector onto the unit sphere, so
+# its direction is noise. MEASURED, on a grasp 1 mm from the centroid jittered
+# by +-0.5 mm over 200 draws:
+#
+#     grasp_offset      |d| = 1.000   angular spread median 44.4 deg, max 176.2
+#     location_extent   |d| = 0.000   null — there is no direction to flip
+#
+# Retaining the magnitude makes a centroid grasp `d ~ 0`, which is stable AND
+# semantically right: both conditioning channels go uniformly near zero, telling
+# the policy "no side preference", which is true. Sliding from the middle of a
+# banana toward one end then grows the signal smoothly from zero instead of
+# flipping it. The discontinuity was in the normalization, never the geometry.
+#
+# ── THE NULL BIN ────────────────────────────────────────────────────────────
+#
+# `d_m_min: 0.15`. Below that eccentricity a grasp names no side and goes to
+# `BIN_NULL` (index 6, one past the octahedral set, so `BINS` stays exactly six
+# and every `range(len(BINS))` loop keeps its meaning). Null demonstrations are
+# LABELS ONLY — "grasp near the middle" is a real instruction and legitimate
+# training data — but the retry ladder must never COMMAND the null bin, because
+# "no preference" is not a hypothesis to fall back to. `RETRY_LADDER` is over
+# `BINS`, so it cannot reach it.
+#
+# ── THE COMMAND MUST BE THE CENTROID, AND `bin_axis` IS REFUSED ──────────────
+#
+# `resolve_command_axes` raises under `location_extent` unless
+# `command_deploy: bin_centroid`. `BINS[b]` has |d| = 1 — "grasp the object's
+# extremity in that direction" — which is simultaneously the most aggressive
+# location available and, on most bins, an eccentricity the policy never saw.
+# The empirical centroid carries the magnitude the data actually has, and
+# extent-normalization is what makes averaging `m` across scenes meaningful
+# rather than an average over incomparable quantities.
+#
+# Assignment stays argmax over the FIXED axes. Centroids must never feed back
+# into assignment — that would be k-means and would reintroduce data-dependent
+# bin placement.
+#
+# ── CHANNELS ARE UNCHANGED, AND THAT REQUIRED A FIX ─────────────────────────
+#
+# Still `[d.n_i, d.normalize(p_i - c)]`, 7 model inputs. Both now scale with
+# `|d|`, so direction and eccentricity arrive multiplied — separable in
+# principle, since uniform scaling across 1024 points looks different from a
+# rotation.
+#
+# `append_direction_channels` used to call `normalize(d)` unconditionally. That
+# would have made this entire run a silent no-op: the channels would have come
+# out identical to run 16's while every log, table and figure said something new
+# was being tested. Removed — and verified to be a bit-for-bit no-op for the two
+# unit rules, whose producers already normalize.
+#
+# IF `dir_track` COMES BACK WEAK, the reserve is a third channel that
+# disentangles them: `e_i = ((p_i - c) @ u) / r_u`, `channel_3 = e_i - m`, zero
+# at points sitting at the commanded eccentricity. 8 inputs. NOT added
+# preemptively.
+#
+# ── AUGMENTATION ────────────────────────────────────────────────────────────
+#
+# `d_noise_deg` perturbs `u` angularly as before. `d_noise_mag` perturbs `m`
+# MULTIPLICATIVELY, which matters: `m` is an eccentricity whose small values are
+# meaningful, so an additive +-0.1 would turn m = 0.02 ("at the centroid") into
+# 0.12 ("noticeably to one side") — a different instruction, not noise on the
+# same one. Scaling leaves zero at zero.
+#
+# Both are 0 here, matching run 16's `d_noise_deg: 0`. Turn `d_noise_mag` on in
+# a later run if the eccentricity proves brittle; it is a one-key change.
+#
+# ── WHAT THIS DOES NOT CHANGE ───────────────────────────────────────────────
+#
+# The anchor frame, the octahedral bin set as a fixed constant, per-point-only
+# injection with no global branch, angular-distance-only retry ranking, and the
+# pinned-pose expert path — OMG still needs a concrete pose, and only what the
+# POLICY is told changes.
+#
+# ⚠ FULL UPSTREAM REBUILD. `d_rule` decides which grasp each bin gets, so the
+# direction table, the assignment, the base shard and the audit are all rebuilt
+# (`*_loc` paths below). The five offline analyses that were meant to gate this
+# — aspect ratios, the new bin census, residual variance both ways, per-bin std
+# of m isotropic vs anisotropic, and the pair histogram — have NOT been run;
+# they need the new direction table, which stage 1 produces. Run
+# `analyze_demo_bins.py` on it before committing to the collection.
+
+SIM:
+  cfg_file: examples/pretrain_multicam_wr.yaml   # wrist + right
+  split: train
+  egl: false
+
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08
+  hand_points_radius: 0.35
+
+  use_standoff: true
+  standoff_dist: 0.08
+
+  # Run 10's tables, unchanged. `_meta.d_rule` must read `grasp_offset` or
+  # `build_regrasp_context` refuses the run.
+  # ⚠ NOT run 11's TABLE. `d_point_depth` moved, so the bins have to be
+  # re-populated at the new depth: measured on `regrasp_pins_train_off.json`,
+  # 0.1122 -> 0.1034 turns `d` a median 9.9 deg (p90 18.6, max 25.7) and
+  # RE-BINS 8.0% of its 1418 grasps. Running against the old table would leave
+  # `bin_assigned` and `bin_realized` disagreeing on one episode in twelve, and
+  # the miscaption filter would silently discard them. `resolve_d_rule` now
+  # refuses the run rather than letting that happen.
+  #
+  # The upstream chain, in order:
+  #   build_direction_table.py   --d-rule grasp_offset --d-point-depth 0.1034
+  #   assign_direction_demos.py  --mode per-bin
+  #   collect_regrasp_demos.py   (base shard: train_regrasp_off1034.h5)
+  #   audit_regrasp_demos.py     --write-ok
+  grasp_pin_table: output/regrasp_pins_train_loc.json
+  grasp_pin_match_tol: 0.02
+
+  d_rule: location_extent
+  # ── CHANGE 3 OF 4: MEASURE TO THE MIDDLE OF THE PADS, NOT THEIR FAR EDGE ───
+  #
+  # `d_point_depth` is a distance in metres along the gripper's own +z from the
+  # EE origin, and it names WHICH POINT ON THE GRIPPER the direction is measured
+  # to: `grasp_point(T, depth) = T[:3,3] + depth * T[:3,2]`.
+  #
+  # The Panda finger pads span local z in [0.0946, 0.1122] (read off
+  # `meshes/collision/finger.obj`). Runs 10-15 used 0.1122 — the DISTAL EDGE, the
+  # very tips. The object is gripped by the whole pad, not by its leading edge,
+  # so the contact patch's centre is the midpoint 0.1034. Moving the measuring
+  # point 0.88 cm back toward the palm shortens every chord by that much, which
+  # matters precisely because the chord is short: the median is 3.90 cm, so this
+  # is a ~23% change in the lever arm the direction is computed over.
+  #
+  # IT MOVES THE LABEL AND THE METRIC TOGETHER. `d_grasp_world` (what run 11+
+  # trains on), `bin_realized`, `dir_err` and the pin table's own `d_anchor` are
+  # all built through `grasp_point`, so this is not a scoring-only tweak — it is
+  # a different definition of `d`, and it needs the direction table rebuilt at
+  # the same depth or `resolve_d_rule` will refuse the run.
+  d_point_depth: 0.1034
+  # IGNORED under `location_extent` — it guarded `grasp_offset`'s normalization
+  # against a vanishing offset, and `m` handles that case directly by going to
+  # zero. Left at its run-16 value so the diff against run 16 is one rule key.
+  d_min_offset: 0.02
+
+  # ── THE NULL THRESHOLD ────────────────────────────────────────────────────
+  # Below this eccentricity `d` is zeroed and the grasp goes to `BIN_NULL`. 0.15
+  # is the starting value: a grasp within 15% of the way to the object's
+  # extremity along its own direction expresses no side, and forcing it onto
+  # whichever axis its noise leans toward would put a confident label on a
+  # quantity that is not there.
+  #
+  # IT IS AN ASSIGNMENT PARAMETER, not just a label one — it decides which
+  # grasps the direction table sends to the null bin — so `resolve_d_rule`
+  # refuses a config whose value disagrees with the table's `_meta`.
+  d_m_min: 0.15
+
+  # The percentile of the object-point projections that defines "the extent
+  # along u". 95, NOT 100: the cloud is a single-frame depth observation and one
+  # silhouette outlier would otherwise set the scale for the whole scene.
+  #
+  # Measured from the OBSERVED cloud always, and from the `ycb` channel only.
+  # A partial view underestimates the extent for back-facing directions, but the
+  # bias is identical at collection, training and deployment, so it cancels — a
+  # mesh or a fused cloud would remove the bias and reintroduce a privileged
+  # signal the robot does not have. Including hand points would let the giver's
+  # forearm inflate the extent and shrink every `m` on that scene.
+  d_extent_pct: 95.0
+
+  # ── CHANGE 1 OF 2: WHEN THE ANCHOR FRAME IS BUILT ─────────────────────────
+  #
+  # `latched` (runs 1-15) builds it once from the step-0 cloud and holds it.
+  # `live` rebuilds it from EVERY step's observed cloud, with the same
+  # `anchor_rotation` call and one `AnchorState` per episode so the wrist/base
+  # fallback still latches hysteretically, and re-issues the command with it.
+  #
+  # ONE KEY BECAUSE COLLECTION AND EVAL MUST AGREE. `train_regrasp.py` passes
+  # this to `CollectParams` and the eval params take it from there rather than
+  # re-reading the config — a run that collected under one command law and
+  # scored under another would report nothing unusual.
+  anchor_update: live
+
+  # ── CHANGE 4 OF 4: MEASURE THE AZIMUTH FROM THE HAND CLOUD, NOT THE JOINT ──
+  #
+  # The anchor's x axis is `horizontal(c_object - p_giver)`, and `p_giver` was
+  # `mano.body.link_state[0, 7]` — the MANO WRIST JOINT. That is a simulator-only
+  # quantity: the real rig has no joints to read, and
+  # `my_regrasp_policy_runner._set_direction` uses `class_centroid(hand_xyz)`,
+  # the centroid of the segmented hand POINT CLOUD.
+  #
+  # THOSE ARE DIFFERENT POINTS, so runs 1-15 defined the frame one way in
+  # simulation and another way on hardware. The wrist joint sits at the base of
+  # the palm; the cloud centroid sits out in the visible middle of the hand — and
+  # only the VISIBLE part, so it moves with the view exactly as the object
+  # centroid does. `hand_centroid` makes both references come from the same
+  # cloud, which is the situation a deployment is in.
+  #
+  # It costs exactness: the reference is now observation-dependent and noisy
+  # rather than ground truth. That is the point — the policy should be trained
+  # against the frame it will actually be given. Falls back to the wrist only
+  # when the cloud carries no hand points at all, and `anchor_rotation`'s own
+  # base fallback still catches the case where that is missing too.
+  anchor_hand_ref: hand_centroid
+
+  exclude_scenes: output/regrasp_pins_train_loc_excluded.json
+  demo_ok_table: output/regrasp_demos_train_loc_ok.json
+
+  # ── CHANGE 2 OF 2: WHAT THE POLICY IS COMMANDED WHENEVER IT ACTS ───────────
+  #
+  # The unit mean of every `d_anchor` a bin was assigned, taken over the table
+  # AFTER `demo_ok_table` and `reach_filter` prune it — so the six vectors
+  # summarise the demonstrations this run is actually trained on, not the ones
+  # that were hoped for. Six vectors, no grasp needed, computable on the robot
+  # exactly as `BINS` is. The resolved values are written to
+  # `<run>/command_axes.json`; copy that file with the checkpoint.
+  #
+  # NOTE this is NOT the same six vectors run 9 resolved: run 9's table was
+  # pruned by `demo_ok_table` alone and built under `approach_axis`. Comparing
+  # the two files is the cheapest way to see how much the rule moved the bins.
+  command_deploy: bin_centroid
+
+  # Unchanged from run 10. Drops (scene, bin) pairs whose base demonstration
+  # never reached its grasp — 443 of 1418 (31.2%) on this shard, leaving 966
+  # episodes / 20285 steps. Per-bin reach rates were +x 75.8, -x 58.7, +y 72.7,
+  # -y 59.7, +z 65.7, -z 76.3.
+  reach_filter: true
+  reach_pos_thresh: 0.02        # m,   = DAGGER.close_pos_thresh
+  reach_rot_thresh: 0.34        # rad, = DAGGER.close_rot_thresh
+
+DAGGER:
+  num_iters: 25
+  # 600 = 100 SCENES x max_grasps 6. The reach filter can leave a scene with
+  # fewer live bins, so this is a TARGET: `sample_pairs` draws m // max_grasps
+  # scenes and expands each to its own count. Read the startup line's collectable
+  # pair count rather than assuming 600.
+  episodes_per_iter: 600
+  max_steps: 50
+  scene_sampling: random
+  seed: 0
+
+  beta_schedule: linear
+  beta_start: 0.9
+  beta_end: 0.75
+  beta_mid: 0.5          # unused by `linear`; kept so a switch to `piecewise`
+  beta_knee: 0.66        # needs no other edit
+  beta_p: 0.7
+
+  close_pos_thresh: 0.02
+  close_rot_thresh: 0.34
+  stop_on_close_label: true
+  stop_on_policy_close: false
+
+  ee_step: 0.04
+  reach_tail: 5
+  min_free: 1
+  max_horizon: 40
+  first_horizon: null
+
+  reach_commit_dist: 0.05
+  reach_skip_eps: 0.01
+  expert_after_commit: true
+
+  dart_ratio: 0.3
+  dart_max_dist: 10.0
+  dart_pos_mag: 0.04
+  dart_rot_mag: 0.3
+  dart_reach_ratio: 0.3
+  dart_reach_pos_mag: 0.01202
+  dart_reach_rot_mag: 0.3
+  dart_reach_max_tries: 5
+  dart_reach_clearance: 0.01
+  dart_reach_path_steps: 4
+
+  outcome_check: true
+
+TRAIN:
+  # ── CHANGE 1 OF 2: WHAT THE EPISODE IS LABELLED WITH ──────────────────────
+  # `bc_regrasp_run9.yaml` is `bc_regrasp_run4.yaml` plus `d_source:
+  # d_grasp_world` — verified identical in every other key, so reusing it keeps
+  # this a one-key change rather than a new file that could drift.
+  train_cfg: examples/configs/bc_regrasp_run9.yaml
+  pc_pretrained:
+  # RE-COLLECTED AT THE NEW DEPTH, for the same reason the pin table is: the
+  # assignment picks, per bin, the goal-set grasp closest to that bin's axis, and
+  # "closest" resolves differently once `d` is measured to a different point. 8%
+  # of grasps change bin, so the demonstrations are not the same set.
+  base_train_h5: ${REGRASP_DATA}/bc_dataset/train_regrasp_loc.h5
+  val_h5: ${REGRASP_DATA}/bc_dataset/val_regrasp_loc.h5
+  base_run: null
+  base_epochs: 50
+  iter_epochs: 15
+  train_from_scratch: true
+  init_ckpt: best
+  num_workers: 8
+  device: cuda
+
+EVAL:
+  every: 1
+  num_scenes: 100
+  holdout: false
+  max_steps: 50
+
+  # ── CHANGE 2 OF 2: MEASURE THE EPISODES THAT STOPPED SHORT ────────────────
+  #
+  # `d_min_offset` still guards COLLECTION. This key governs the MEASUREMENT
+  # only: false applies the run's `d_rule` at `min_offset` 0 when computing
+  # `dir_err`, `sector_err`, `bin_hit_rate` and the confusion matrix, so an
+  # episode whose centroid -> fingertip chord came out under 2 cm is counted
+  # instead of dropped. `dir_n` / `dir_n_short` report how many that is.
+  dir_drop_short: false
+
+  # ── CHANGE 5 OF 5: STRATIFY THE EVAL SET BY BIN ───────────────────────────
+  #
+  # `num_scenes: 100` draws scenes and scores every slot of each, so the per-bin
+  # counts are a by-product of the draw. On run 11 that landed at
+  # `+x 54, -x 33, +y 37, -y 25, +z 19, -z 26` — a 2.8x spread. At n=19 one +z
+  # episode is 5.3 percentage points and the binomial standard error is +-11, so
+  # a +-22-point swing between consecutive iterations is a routine 2-sigma event
+  # and most of what the per-bin curves show is that, not learning.
+  #
+  # `per_bin_frac` takes 20% of EACH bin's pairs over the whole usable table.
+  # The sample is proportional to the population by construction, and every
+  # bin's denominator is a stated fraction rather than an accident. Selection is
+  # an np.linspace over each bin's sorted pair list — evenly spread, no seed
+  # consumed — so the same config always scores the same episodes and two runs
+  # are comparable episode by episode.
+  #
+  # IT DOES NOT EQUALISE THE BINS, and cannot: 20% of a bin with 130 pairs is
+  # still five times 20% of one with 26. What it fixes is that the proportions
+  # and the denominators are now known and stable. `num_scenes` is ignored under
+  # this setting.
+  scene_select: per_bin_frac
+  bin_frac: 0.3
+
+  # ── CHANGE 6 OF 6: COMMAND EVERY BIN ON EVERY EVALUATED SCENE ─────────────
+  #
+  # `succ_bin_b` has always meant "told `+z` ON A SCENE THAT DEMONSTRATES `+z`,
+  # how often did it succeed". That is the right question for "did it learn the
+  # training distribution" and the wrong one for "can I deploy this": the retry
+  # ladder commands a direction BECAUSE THE PREVIOUS ONE FAILED, not because a
+  # demonstration exists, so at deployment most commands are for directions that
+  # scene never showed the policy. No run so far has measured one.
+  #
+  # With this on, every selected scene is additionally rolled under every bin it
+  # does NOT carry. Those rows are flagged `in_table: 0` and the metric block
+  # reports both populations from the SAME rollouts — no episode is evaluated
+  # twice:
+  #
+  #   succ_bin_b      in-table rows only. Unchanged, comparable with runs 1-15.
+  #   succ_bin_all_b  every row for that bin. The deployment-facing number.
+  #
+  # The gap between them is the generalisation-to-an-undemonstrated-direction
+  # measurement, and it is the number that says whether `k` is really a
+  # test-time knob or whether the policy only works where it was taught.
+  #
+  # ⚠ COST. It takes the eval from ~290 episodes to scenes x 6. `retry_at_k` is
+  # deliberately NOT folded in — it stays over in-table rows so the reordering
+  # to `RETRY_LADDER` is the only thing that changed about it.
+  full_bin_coverage: true
+  ckpt: best
+  success_mode: stable_grasp
+  hold_steps: 3
+  select_on: success_rate
+  verbose: false
+
+  box_check: true
+  box:
+    min_frac: 0.50
+    open_thresh: 0.8
+    half_x: 0.0088
+    z_lo: 0.0946
+    z_hi: 0.1122
+    inset: 0.002
+    grid_x: 7
+    grid_z: 7

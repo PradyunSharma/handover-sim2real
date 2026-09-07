@@ -121,6 +121,16 @@ def parse_args() -> argparse.Namespace:
                         "from -R[:,2] — i.e. position-derived but answering the "
                         "approach_axis question. Use it if the fingertip rule "
                         "proves too noisy.")
+    p.add_argument("--d-m-min", type=float, default=0.15,
+                   help="d_rule=location_extent: below this eccentricity a "
+                        "grasp goes to the NULL bin and its `d` is zeroed. "
+                        "A grasp within 15%% of the way to the object's "
+                        "extremity along its own direction names no side.")
+    p.add_argument("--d-extent-pct", type=float, default=95.0,
+                   help="d_rule=location_extent: the percentile of the object "
+                        "point projections that defines 'the extent along u'. "
+                        "95, not 100 — one silhouette outlier would otherwise "
+                        "set the scale for the whole scene.")
     p.add_argument("--d-min-offset", type=float, default=0.02,
                    help="grasp_offset only: drop a grasp whose point lands "
                         "closer than this to the centroid, where the direction "
@@ -168,7 +178,9 @@ def main() -> None:
         depth=(D.FINGERTIP_DEPTH if args.d_point_depth is None
                else float(args.d_point_depth)),
         min_offset=(float(args.d_min_offset)
-                    if args.d_rule == "grasp_offset" else 0.0))
+                    if args.d_rule == "grasp_offset" else 0.0),
+        m_min=float(args.d_m_min),
+        extent_pct=float(args.d_extent_pct))
 
     table = {"_meta": {
         "phase": "regrasp", "schema": "direction-table-v1",
@@ -186,6 +198,7 @@ def main() -> None:
     goal_hist = np.zeros(len(bins), dtype=np.int64)
     member_spread: list[float] = []
     n_ok = n_no_plan = n_no_hand = n_fallback = n_no_object = n_short = 0
+    n_null = 0          # location_extent: grasps that name no side
     modes, sides = Counter(), Counter()
     t0 = time.time()
 
@@ -218,6 +231,13 @@ def main() -> None:
         c_world = A.centroid_to_world(
             c_ee, obs, sim.panda_base_inv_tf,
             cfg.ENV.PANDA_BASE_POSITION, cfg.ENV.PANDA_BASE_ORIENTATION)
+        # `location_extent` needs the OBJECT CLOUD, not just its centroid, for
+        # `r_u`. From the SAME `pc` read the centroid came from — `_point_cloud`
+        # resamples 1024 points on every call, so a second read at one sim step
+        # would measure the extent of a different cloud than the centroid.
+        obj_world = (A.object_points_world(
+            pc, obs, sim.panda_base_inv_tf, cfg.ENV.PANDA_BASE_POSITION,
+            cfg.ENV.PANDA_BASE_ORIENTATION) if rule.needs_points() else None)
 
         R, meta = A.anchor_rotation(c_world, wrist, base, A.AnchorState())
         modes[meta["mode"]] += 1
@@ -248,7 +268,21 @@ def main() -> None:
         # centroid than `--d-min-offset`, where the direction is centroid noise
         # rather than geometry). Those grasps are dropped from the assignment
         # rather than binned, and counted.
-        d_list = [rule.of(T, c_world) for T in poses]
+        # `location_extent` returns a ZERO vector for a null grasp (at the
+        # centroid, or below `m_min`) and None only when the rule cannot be
+        # evaluated at all. Both are excluded from the assignment below — a null
+        # grasp names no axis — but they are counted apart, because "this scene
+        # has grasps that express no side" and "this rule could not be applied
+        # here" call for different responses.
+        d_list = [rule.of(T, c_world, obj_world) for T in poses]
+        if rule.needs_points():
+            n_null += sum(
+                1 for d in d_list
+                if d is not None
+                and float(np.linalg.norm(d)) < D.D_ZERO_EPS)
+            d_list = [None if (d is not None
+                              and float(np.linalg.norm(d)) < D.D_ZERO_EPS)
+                      else d for d in d_list]
         keepmask = np.array([d is not None for d in d_list])
         n_short += int((~keepmask).sum())
         if not keepmask.any():
@@ -337,6 +371,11 @@ def main() -> None:
         # grasp_offset only: goal-set members dropped because the point landed
         # inside `--d-min-offset` of the centroid. Zero under approach_axis.
         "n_short_offset": int(n_short),
+        # `location_extent`: goal-set grasps whose eccentricity was below
+        # `m_min`, or whose extent along `u` could not be measured. They express
+        # no location preference, so they are not assigned to an axis. Zero under
+        # the two unit rules.
+        "n_null_bin": int(n_null),
         "scenes_with_bin": scenes_with.tolist(),
         "goal_set_bin_histogram": goal_hist.tolist(),
         "members_per_bin": int(args.members_per_bin),

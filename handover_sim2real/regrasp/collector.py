@@ -830,6 +830,12 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     # The step-0 frame, kept under its own name so the recorded `anchor_R` attr
     # means the same thing on a `live` run as on every run before it.
     anchor_R0 = centroid_world0 = None
+    # THE OBJECT CLOUD IN WORLD, from the same read the anchor was built from.
+    # `location_extent` needs it for `r_u`; the other two rules ignore it. Held
+    # at episode scope so the label below uses the SAME points the frame came
+    # from rather than a fresh resample (`_point_cloud` redraws 1024 points on
+    # every call, so a second read at one sim step is a different cloud).
+    obj_world = None
     _anchor_live = str(params.anchor_update) == "live"
     anchor_state = _rg_anchor.AnchorState()
     n_anchor_blind = 0
@@ -966,6 +972,11 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                 pc5, obs, env, sim.panda_base_inv_tf, sim.cfg,
                 anchor_state, wrist=wrist,
                 hand_ref=params.anchor_hand_ref)
+            if params.d_rule.needs_points():
+                obj_world = _rg_anchor.object_points_world(
+                    pc5, obs, sim.panda_base_inv_tf,
+                    sim.cfg.ENV.PANDA_BASE_POSITION,
+                    sim.cfg.ENV.PANDA_BASE_ORIENTATION)
             if anchor_R is not None:
                 anchor_mode = _ameta["mode"]
                 anchor_R0, centroid_world0 = anchor_R, centroid_world
@@ -987,6 +998,11 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                 n_anchor_blind += 1
             else:
                 anchor_R, centroid_world, anchor_mode = _aR, _cw, _am["mode"]
+                if params.d_rule.needs_points():
+                    obj_world = _rg_anchor.object_points_world(
+                        pc5, obs, sim.panda_base_inv_tf,
+                        sim.cfg.ENV.PANDA_BASE_POSITION,
+                        sim.cfg.ENV.PANDA_BASE_ORIENTATION)
                 # RE-ISSUE with the frame just built, and with the SAME
                 # `command_direction` call step 0 made — a moved frame is only
                 # meaningful if the command moves with it.
@@ -1554,7 +1570,18 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     # with no centroid / a degenerate offset) — and None is carried through as a
     # zero vector plus `bin_realized: -1`, which the dataset drops rather than
     # trains on.
-    d_grasp = params.d_rule.of(grasp_pose, centroid_world)
+    # `location_extent` needs the OBJECT POINT CLOUD for `r_u`, so the rule is
+    # evaluated against the same step-0 cloud the anchor was built from (or the
+    # closing cloud under `anchor_update: live`) — `obj_ee`/`obj_centroid_ee`
+    # below. Frame-agnostic: `m` is a ratio of two projections onto one axis, so
+    # any frame works provided the pose, centroid and points share it. The
+    # cloud is EE-frame, so the EE-frame centroid goes with it.
+    #
+    # `decompose` rather than `of`: `m` and `u` are stored so the split between
+    # WHICH WAY and HOW FAR is recoverable offline without re-deriving `r_u` from
+    # a cloud that was resampled since.
+    d_grasp, d_m, d_u, _dinfo = params.d_rule.decompose(
+        grasp_pose, centroid_world, obj_world)
 
     episode = {
         "point_clouds": np.asarray(point_clouds, dtype=np.float32),
@@ -1597,9 +1624,28 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # and re-binning is not available because the scene already has a
         # demonstration for the bin it actually flew to.
         "bin_assigned": int(bin_assigned) if bin_assigned is not None else -1,
+        # `params.d_rule.bin_of`, NOT the bare `directions.bin_of`. The latter is
+        # an argmin over angles and normalizes first, so it returns a confident
+        # bin for a 1e-9 vector — under `location_extent` that is exactly wrong,
+        # because a near-centroid grasp has NO side and the argmin would name
+        # whichever axis its noise leans toward. The rule's version returns
+        # `BIN_NULL` there.
         "bin_realized": (-1 if d_grasp is None or anchor_R is None
-                         else int(_rg_directions.bin_of(
+                         else int(params.d_rule.bin_of(
                              _rg_directions.from_world(d_grasp, anchor_R)))),
+        # ---- the DECOMPOSITION of `d`, so it is recoverable offline ----------
+        # `d_m` is the eccentricity and `d_u` the direction; `d_grasp_world` is
+        # their product. Stored separately because recomputing `m` later needs
+        # `r_u`, which needs the exact cloud this episode observed — and that
+        # cloud is resampled on every read, so it is not recoverable from the
+        # shard. 1 float and 3 floats an episode.
+        #
+        # Under the two unit rules `d_m` is 1.0 and `d_u` == `d_grasp_world`, so
+        # every shard carries the same three attrs and one reader handles all
+        # three rules.
+        "d_m": float(d_m) if d_m is not None else float("nan"),
+        "d_u": (np.zeros(3, dtype=np.float32) if d_u is None
+                else np.asarray(d_u, dtype=np.float32)),
         # STEP 0, ALWAYS — the historical meaning of this attr, so a `live` run's
         # shards stay readable by everything written for runs 1-15. The frame the
         # episode ENDED in goes below under its own name, and `bin_realized` and
@@ -1780,7 +1826,10 @@ class DaggerHDF5Writer:
                    # computed against. Absent on runs 1-15, so every reader must
                    # fall back to `anchor_R` / `centroid_world`.
                    "anchor_R_final", "centroid_world_final",
-                   "anchor_update", "n_anchor_blind"):
+                   "anchor_update", "n_anchor_blind",
+                   # `d_rule: location_extent` — the (m, u) split of `d`.
+                   # Absent on runs 1-16, where m is identically 1.
+                   "d_m", "d_u"):
             if _k in episode:
                 grp.attrs[_k] = episode[_k]
         for name in ("point_clouds", "robot_states", "expert_actions"):

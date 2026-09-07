@@ -205,6 +205,53 @@ def handedness(env) -> str | None:
     return "left" if str(name).endswith("_left") else "right"
 
 
+def points_to_world(pts_ee, obs, panda_base_inv_tf, base_pos, base_quat):
+    """`[N, 3]` EE-frame points -> WORLD. `centroid_to_world` for a whole cloud.
+
+    `d_rule: location_extent` needs the OBJECT CLOUD, not just its centroid, to
+    measure `r_u` — and it needs it in the frame the grasp pose and centroid are
+    in, which is world. Batched rather than a loop over `centroid_to_world`
+    because it runs per step under `anchor_update: live` and rebuilds the EE
+    matrix each call otherwise.
+
+    `m` is frame-invariant (a ratio of two projections onto one axis), so this
+    is a convenience, not a correctness requirement — but mixing frames between
+    the pose and the cloud IS a correctness bug, and having one function makes
+    that mixing hard to write by accident.
+    """
+    from scipy.spatial.transform import Rotation as Rot
+    from collect_bc_dataset import _ee_pose_mat
+
+    p = np.asarray(pts_ee, dtype=np.float64)
+    if p.ndim != 2 or p.shape[0] == 0:
+        return np.zeros((0, 3))
+    ee_mat = _ee_pose_mat(obs["panda_body"], obs["panda_link_ind_hand"],
+                          panda_base_inv_tf)
+    p_base = p @ ee_mat[:3, :3].T + ee_mat[:3, 3]
+    R_base = Rot.from_quat(np.asarray(base_quat, dtype=np.float64)).as_matrix()
+    return p_base @ R_base.T + np.asarray(base_pos, dtype=np.float64)
+
+
+def object_points_world(pc5, obs, panda_base_inv_tf, base_pos, base_quat):
+    """The OBJECT points of an EE-frame `[N, 5]` cloud, in world.
+
+    OBJECT ONLY — the `ycb` channel, never `hand`. Including hand points lets the
+    giver's forearm inflate the measured extent, which shrinks every `m` on that
+    scene and does so by an amount that depends on how much of the arm the wrist
+    camera happens to see.
+    """
+    from handover_sim2real.regrasp import channels as _channels
+
+    p = np.asarray(pc5, dtype=np.float64)
+    if p.ndim != 2 or p.shape[0] == 0:
+        return np.zeros((0, 3))
+    mask = p[:, _channels.CH_YCB] > 0.5
+    if not mask.any():
+        return np.zeros((0, 3))
+    return points_to_world(p[mask, _channels.CH_XYZ], obs, panda_base_inv_tf,
+                           base_pos, base_quat)
+
+
 def centroid_to_world(c_ee, obs, panda_base_inv_tf, base_pos, base_quat):
     """An EE-frame point -> WORLD, via the panda base.
 

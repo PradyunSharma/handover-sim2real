@@ -221,7 +221,7 @@ def _resolve_grasp_pose(sim, scene_idx: int, pin_table, grasp_idx: int = 0):
 
 def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
                   grasp_pose=None, target_pose=None, d_world=None,
-                  bin_idx=None, anchor_R=None) -> dict:
+                  bin_idx=None, anchor_R=None, centroid_world_in=None) -> dict:
     """`grasp_pose` is what the gripper must end up on; `target_pose` is what the
     POLICY is steering to. They are the same pose in grasp mode and 6.4 cm apart
     in pre-grasp mode, where the difference is covered by the blind push."""
@@ -295,6 +295,11 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
     anchor_final = None if anchor_R is None else np.asarray(anchor_R)
     centroid_final = None
     n_anchor_blind = 0
+    # The centroid the achieved direction is measured FROM, and the achieved
+    # direction itself. `anchor_c0` tracks the live centroid so `location_extent`
+    # measures `m` against the same origin the command was built in.
+    anchor_c0 = centroid_world_in
+    d_achieved = None
 
     for step in range(params.max_steps):
         pc = _point_cloud(obs, sim.point_listener, sim.panda_base_inv_tf)
@@ -312,6 +317,7 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
                 n_anchor_blind += 1
             else:
                 anchor_final, centroid_final = aR, cw
+                anchor_c0 = cw
                 d_live = _rg_dirs.command_direction(
                     bin_idx, aR, grasp_pose=grasp_pose,
                     axes=params.command_axes)
@@ -322,6 +328,23 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
         # (rs[18:21] xyz, rs[21:25] wxyz). Overwritten every step, so whatever
         # the episode ends on is what cond_track measures.
         ee_final = _ee_mat_from_state(rs)
+        # THE ACHIEVED DIRECTION, COMPUTED HERE AND NOT IN `_dir_block`.
+        # `location_extent` needs the object cloud for `r_u`, and the cloud only
+        # exists inside this loop — `_dir_block` runs over rows after the sim has
+        # moved on. Recomputing it there would hand the rule `obj_points=None`,
+        # which returns None, which `continue`s every episode: `dir_err`,
+        # `bin_realized` and the whole confusion matrix would come out empty and
+        # the run would look like it had no direction signal at all.
+        #
+        # The two unit rules need no cloud, so this is the same number
+        # `_dir_block` would have computed; it just computes it once, here.
+        if params.d_rule.needs_points():
+            _cw = (None if anchor_c0 is None else np.asarray(anchor_c0))
+            _obj = _rg_anchor.object_points_world(
+                pc, obs, sim.panda_base_inv_tf,
+                sim.cfg.ENV.PANDA_BASE_POSITION,
+                sim.cfg.ENV.PANDA_BASE_ORIENTATION)
+            d_achieved = params.d_rule.of(ee_final, _cw, _obj)
         action = runner.act(pc, rs)          # [7], ch6 in {0,1}
         prev_act6d = action[:6].astype(np.float32)
 
@@ -420,6 +443,10 @@ def _eval_episode(sim, runner, scene_idx, *, params: EvalParams,
         "centroid_world_final": centroid_final,
         "d_world_final": d_world,
         "n_anchor_blind": int(n_anchor_blind),
+        # Computed in the loop above, where the cloud still exists. `_dir_block`
+        # prefers this over recomputing, which it cannot do under
+        # `location_extent`.
+        "d_achieved": d_achieved,
         "success": int(success),
         "grasped": int(grasped),
         "closed": int(close_step >= 0),
@@ -688,7 +715,8 @@ def eval_one(sim, runner, scene, gi, *, params: EvalParams, pin_table=None) -> d
     row = _eval_episode(sim, runner, scene, params=params,
                         grasp_pose=grasp_pose, target_pose=target_pose,
                         d_world=d_world, bin_idx=b,
-                        anchor_R=None if anchor_R is None else np.asarray(anchor_R))
+                        anchor_R=None if anchor_R is None else np.asarray(anchor_R),
+                        centroid_world_in=meta.get("centroid_world"))
     row["grasp_idx"] = int(gi)
     row["grasp_pose"] = grasp_pose
     row["bin_idx"] = -1 if b is None else int(b)
@@ -1094,6 +1122,7 @@ def _dir_block(rows, d_rule=None, drop_short: bool = True):
 
     dir_errs, sector_errs = [], []
     n_short = 0
+    n_null = 0
     confusion = np.zeros((len(_D.BINS), len(_D.BINS)), dtype=np.int64)
     for r in rows:
         d_cmd = r.get("d_world")
@@ -1103,9 +1132,25 @@ def _dir_block(rows, d_rule=None, drop_short: bool = True):
         if ee is None:
             continue
         c = r.get("centroid_world")
-        achieved = d_rule.of(np.asarray(ee), None if c is None else np.asarray(c))
+        # THE ROW'S OWN VALUE FIRST. `_eval_episode` computes it while the point
+        # cloud still exists, which is the only place `location_extent` can be
+        # evaluated at all — recomputing here would hand it no cloud and drop
+        # every episode. The two unit rules fall through to the recomputation,
+        # which is the identical number and keeps old rows scoreable.
+        achieved = r.get("d_achieved")
+        if achieved is None:
+            achieved = d_rule.of(np.asarray(ee),
+                                 None if c is None else np.asarray(c))
         if achieved is None:
             n_short += 1
+            continue
+        achieved = np.asarray(achieved, dtype=np.float64)
+        # A ZERO achieved direction is the NULL case, not a missing one: the
+        # gripper finished on the object's centroid, so it expressed no side.
+        # Counted apart from the short-chord drops — "ended nowhere in
+        # particular" is a different outcome from "could not be measured".
+        if float(np.linalg.norm(achieved)) < _D.D_ZERO_EPS:
+            n_null += 1
             continue
         dir_errs.append(float(_D.angle_between(d_cmd, achieved)))
         if c is not None:
@@ -1136,4 +1181,9 @@ def _dir_block(rows, d_rule=None, drop_short: bool = True):
         # subset of it.
         "dir_n": int(de.size),
         "dir_n_short": int(n_short),
+        # `location_extent` only: episodes that ended ON the centroid, so the
+        # achieved direction is genuinely null rather than unmeasurable. A rising
+        # `dir_n_null` is the policy converging on the object's middle, which is
+        # a real behaviour and not a metric failure.
+        "dir_n_null": int(n_null),
     }, confusion

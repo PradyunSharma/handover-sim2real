@@ -134,7 +134,17 @@ def append_direction_channels(pc, d, normals=None, centroid=None,
     `normals.py` on why that holds and what would break it.
     """
     p = np.asarray(pc, dtype=np.float64)
-    d = normalize(np.asarray(d, dtype=np.float64))
+    # NOT `normalize(d)`. It was, and under `d_rule: location_extent` that would
+    # have been the bug that made the whole rule a no-op: `d = m * u` carries the
+    # eccentricity in its MAGNITUDE, and normalizing here would have produced
+    # channels identical to `grasp_offset`'s while every log, table and figure
+    # said the run was testing something new.
+    #
+    # Safe for the two unit rules because their producers already normalize:
+    # `approach_direction` and `grasp_direction` both return `normalize(...)`,
+    # and `direction_in_ee_frame` is a pure rotation. So this line was defensive,
+    # never semantic — and the defence cost more than it bought.
+    d = np.asarray(d, dtype=np.float64)
     if p.shape[1] not in (5, STORED_CHANNELS):
         raise ValueError(
             f"expected [N, 5] or [N, {STORED_CHANNELS}], got [N, {p.shape[1]}]")
@@ -180,15 +190,21 @@ def perturb_direction(d, deg: float, rng=None) -> np.ndarray:
     a cone of known half-angle, so "trained with 12 degrees of slop" is a
     statement about the data rather than about a tail. `deg <= 0` is the identity.
     """
-    d = normalize(np.asarray(d, dtype=np.float64))
-    if deg <= 0.0 or float(np.linalg.norm(d)) < 0.5:
+    # MAGNITUDE-PRESERVING. `d` may be `m * u` with `m` well under 1
+    # (`location_extent`), so neither normalizing it nor treating `|d| < 0.5` as
+    # invalid is correct any more — that test would have rejected four fifths of
+    # the achievable range as a zero vector.
+    d = np.asarray(d, dtype=np.float64)
+    mag = float(np.linalg.norm(d))
+    if deg <= 0.0 or mag < 1e-6:
         return d
+    u = d / mag
     rng = np.random.default_rng() if rng is None else rng
     # A random vector, made perpendicular to d. Retry only in the vanishingly
     # unlikely case that it came out parallel.
     for _ in range(8):
         v = rng.normal(size=3)
-        v = v - np.dot(v, d) * d
+        v = v - np.dot(v, u) * u
         n = np.linalg.norm(v)
         if n > 1e-8:
             axis = v / n
@@ -196,8 +212,33 @@ def perturb_direction(d, deg: float, rng=None) -> np.ndarray:
     else:
         return d
     th = np.radians(float(deg))
-    # Rodrigues, with d . axis == 0 so the third term drops out.
-    return normalize(d * np.cos(th) + np.cross(axis, d) * np.sin(th))
+    # Rodrigues, with u . axis == 0 so the third term drops out. Re-scaled by the
+    # ORIGINAL magnitude: this augmentation is about the DIRECTION being off by
+    # `deg`, and it must not also perturb the eccentricity — `perturb_magnitude`
+    # does that, separately and multiplicatively.
+    return mag * normalize(u * np.cos(th) + np.cross(axis, u) * np.sin(th))
+
+
+def perturb_magnitude(d, frac: float, rng=None) -> np.ndarray:
+    """Scale `|d|` by `1 +- frac`, leaving its direction alone.
+
+    MULTIPLICATIVE, NOT ADDITIVE, and that is the whole point. Under
+    `location_extent` `m` is an eccentricity in [0, 1] whose small values are
+    meaningful: `m = 0.02` is "essentially at the centroid". An additive +-0.1
+    would turn that into 0.12 -- a different instruction -- and would push
+    genuinely null commands off zero, which is the one value that has to stay
+    exact. Scaling leaves zero at zero and small values small.
+
+    Clipped to [0, 1] because `m > 1` names a location outside the object.
+    `frac <= 0` is the identity, which is what the two unit rules use.
+    """
+    d = np.asarray(d, dtype=np.float64)
+    mag = float(np.linalg.norm(d))
+    if frac <= 0.0 or mag < 1e-6:
+        return d
+    rng = np.random.default_rng() if rng is None else rng
+    scale = 1.0 + float(frac) * rng.uniform(-1.0, 1.0)
+    return (d / mag) * float(np.clip(mag * scale, 0.0, 1.0))
 
 
 def build_model_cloud(pc5, d_ee, k: int = DEFAULT_K):
