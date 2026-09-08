@@ -98,12 +98,14 @@ def parse_args() -> argparse.Namespace:
                         "payload (a few MB).")
     # ---- WHAT `d` IS DERIVED FROM. See directions.py for the measurement. ----
     p.add_argument("--d-rule", default="approach_axis",
-                   choices=["approach_axis", "grasp_offset"],
+                   choices=["approach_axis", "grasp_offset",
+                            "location_extent"],
                    help="approach_axis (default, runs 1-9): d = -R_grasp[:,2], "
                         "'which side the gripper comes from'. grasp_offset "
                         "(run 10): d = centroid -> the point between the "
                         "fingertips, 'which part of the object the fingers "
                         "close on' — independent of the grasp's ORIENTATION. "
+                        "location_extent (run 17): d = m * u, a LOCATION command whose MAGNITUDE m in [0,1] is the eccentricity (0 = the object's centroid, 1 = its extremity along u), normalised by the object's extent along u so m = 1 is reachable in every direction. NOT a unit vector. "
                         "THEY ARE NOT THE SAME QUESTION: measured on s0/train, "
                         "grasp_offset makes -z the third-largest bin (526 "
                         "grasps over 235 scenes) where approach_axis has ZERO, "

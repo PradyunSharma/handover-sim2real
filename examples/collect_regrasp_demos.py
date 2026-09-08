@@ -435,7 +435,8 @@ def parse_args():
                    help="cap on slots per scene (default: every slot the table "
                         "holds, i.e. K from build_direction_table.py)")
     p.add_argument("--d-rule", default=None,
-                   choices=["approach_axis", "grasp_offset"],
+                   choices=["approach_axis", "grasp_offset",
+                            "location_extent"],
                    help="what `d` is derived from. DEFAULT: read from the pin "
                         "table's `_meta`, which is what you want — the table's "
                         "bins were populated under one rule and measuring the "

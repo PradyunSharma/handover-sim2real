@@ -30,7 +30,7 @@ cd "$(dirname "$0")/../.."
 
 RUN=regrasp_run16
 CFG=examples/configs/regrasp_run16.yaml
-export SCRATCH_ROOT="${SCRATCH_ROOT:-$HOME/h2r-data}"
+export SCRATCH_ROOT="${SCRATCH_ROOT:-$HOME/h2r-runs}"
 export REGRASP_DATA="${REGRASP_DATA:-$SCRATCH_ROOT/output}"
 NEED_GB=5
 

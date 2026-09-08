@@ -992,7 +992,7 @@ def parse_args():
                         "was COMMANDED (`d_world`), yellow = this shard's d_rule "
                         "applied to the grasp it flew (run 10: grasp_offset, "
                         "centroid -> fingertip midpoint), grey = `-R_grasp[:,2]`")
-    p.add_argument("--d-rule", default=None, choices=["approach_axis", "grasp_offset"],
+    p.add_argument("--d-rule", default=None, choices=["approach_axis", "grasp_offset", "location_extent"],
                    help="override the rule for --show-d. Default reads "
                         "`_meta.d_rule` from --grasp-pin-table, which is what the "
                         "shard was actually labelled under")

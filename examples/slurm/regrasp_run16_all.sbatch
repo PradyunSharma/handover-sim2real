@@ -80,7 +80,7 @@ export OMG_PLANNER_DIR="${OMG_PLANNER_DIR:-$PWD/OMG-Planner}"
 # ── the one knob: where the big files live ──────────────────────────────────
 # NOT /scratch. /scratch is purged by age; the ask was /home. Both the run dir
 # and the shards follow this.
-export SCRATCH_ROOT="${SCRATCH_ROOT:-$HOME/h2r-data}"
+export SCRATCH_ROOT="${SCRATCH_ROOT:-$HOME/h2r-runs}"
 export REGRASP_DATA="${REGRASP_DATA:-$SCRATCH_ROOT/output}"
 export OUT_ROOT="${OUT_ROOT:-$SCRATCH_ROOT/output/dagger_runs}"
 mkdir -p "$REGRASP_DATA/bc_dataset" "$OUT_ROOT" slurm_logs output
