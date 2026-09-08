@@ -275,6 +275,7 @@ def main() -> None:
         # has grasps that express no side" and "this rule could not be applied
         # here" call for different responses.
         d_list = [rule.of(T, c_world, obj_world) for T in poses]
+        n_null_before = n_null
         if rule.needs_points():
             n_null += sum(
                 1 for d in d_list
@@ -284,7 +285,14 @@ def main() -> None:
                               and float(np.linalg.norm(d)) < D.D_ZERO_EPS)
                       else d for d in d_list]
         keepmask = np.array([d is not None for d in d_list])
-        n_short += int((~keepmask).sum())
+        # `n_null` ALREADY COUNTED the zero-magnitude ones above and then set
+        # them to None, so counting every None here would attribute them to
+        # `n_short_offset` as well. The two mean different things — "names no
+        # side" vs "the rule could not be evaluated" — and a census that adds
+        # them together cannot tell whether `m_min` is too high or the clouds are
+        # too occluded to measure an extent.
+        n_short += int((~keepmask).sum()) - (
+            n_null - n_null_before if rule.needs_points() else 0)
         if not keepmask.any():
             n_no_plan += 1
             table[str(idx)] = None

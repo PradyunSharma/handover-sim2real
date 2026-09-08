@@ -154,7 +154,14 @@ if [ ! -f "${PIN}" ]; then
         DROP_BINS="$(python - "${DIR_TABLE}" <<'PY'
 import json, sys
 m = (json.load(open(sys.argv[1])).get("_meta") or {})
-print("" if m.get("d_rule") == "grasp_offset" else "-z_beneath,-x_over_fingers")
+# WHITELIST `approach_axis`, do not blacklist `grasp_offset`. This read
+# `== "grasp_offset"` and would therefore have handed `location_extent` the
+# approach_axis drop list, killing `-z` and `-x` -- the two bins that rule is
+# most likely to REVIVE. Under `location_extent` `-z` means "grasp the lower
+# part of the object", which a lateral approach reaches and which never
+# touches the table constraint that made "approach from beneath" 0/623.
+print("-z_beneath,-x_over_fingers"
+      if m.get("d_rule", "approach_axis") == "approach_axis" else "")
 PY
 )"
     fi
