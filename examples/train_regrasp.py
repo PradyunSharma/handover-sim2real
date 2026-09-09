@@ -604,6 +604,14 @@ LOG_FIELDS = [
     # reach-tail DART is live — runs before this fix logged `dart_reach` = 0 under
     # dart_noise even while it was firing (run 12).
     "dart_reach", "dart_reject",
+    # THE SHIELD (run 19). `shield_policy` is the load-bearing one: steps on
+    # which the learner was overruled and the expert driven instead. Divide it by
+    # `steps - expert_steps` for the fraction of the learner's own control that
+    # was taken away — i.e. how far the EFFECTIVE beta sits above the configured
+    # one, which is what makes a shielded run comparable to its baseline or not.
+    # `shield_jolt_reject` is the free-approach analogue of `dart_reject`;
+    # `shield_blind` counts unsafe steps with no expert action to substitute.
+    "shield_policy", "shield_jolt_reject", "shield_blind",
     # DART-paper noise (DAGGER.dart_mode: dart_noise). `dart_sigma_trace` is
     # tr(Sigma_hat), the measured learner-supervisor error, and is logged in BOTH
     # modes — in a jolt run it is the counterfactual "what the noise would have
@@ -954,6 +962,9 @@ def collect_columns(c: dict) -> dict:
         "dart_env_done": c.get("n_dart_env_done", -1),
         "dart_reach": c.get("n_dart_reach", -1),
         "dart_reject": c.get("n_dart_reject", -1),
+        "shield_policy": c.get("n_shield_policy", -1),
+        "shield_jolt_reject": c.get("n_shield_jolt_reject", -1),
+        "shield_blind": c.get("n_shield_blind", -1),
         "dart_sigma_trace": _r(c.get("dart_sigma_trace"), 6),
         "dart_noise_steps": c.get("n_dart_noise", -1),
         "dart_alpha": _r(c.get("dart_alpha"), 4),
@@ -1507,6 +1518,12 @@ def main() -> None:
         dart_reach_max_tries=int(dag.get("dart_reach_max_tries", 5)),
         dart_reach_clearance=float(dag.get("dart_reach_clearance", 0.01)),
         dart_reach_path_steps=int(dag.get("dart_reach_path_steps", 4)),
+        # THE SHIELD (run 19). Off unless the config asks, so every earlier run
+        # keeps its behaviour and its RNG stream — see CollectParams.shield.
+        shield=bool(dag.get("shield", False)),
+        shield_clearance=float(dag.get("shield_clearance", 0.01)),
+        shield_path_steps=int(dag.get("shield_path_steps", 4)),
+        shield_jolt_max_tries=int(dag.get("shield_jolt_max_tries", 5)),
         # What the LEARNER is conditioned on during the rollout. Not necessarily
         # what the aggregate is captioned with — see the d_source guard above.
         command_axes=command_axes,

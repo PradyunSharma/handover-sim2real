@@ -48,7 +48,7 @@ BOARD = BoardSpec()
 # valid Python integer literal at all, and one that happens to parse would then
 # never match the string librealsense reports.
 CAMERA_SERIALS: dict[str, str | None] = {
-    "tripod": "243122302229",
+    "tripod": "825312073923",
     "wrist": "045322075902",
 }
 

@@ -527,6 +527,29 @@ class CollectParams:
     dart_reach_clearance: float = 0.01   # metres
     dart_reach_path_steps: int = 4       # interpolation samples along the recovery
 
+    # ---- THE SHIELD (run 19) -------------------------------------------------
+    # A per-step collision veto covering BOTH phases and BOTH drivers, where the
+    # reach jolt's rejection sampling covered only itself. Off by default, so
+    # every run before 19 keeps its exact behaviour AND its exact RNG stream.
+    #
+    #   a refused JOLT   is redrawn, up to `shield_jolt_max_tries`, and if every
+    #                    draw is refused the step takes no jolt at all.
+    #   a refused POLICY action is replaced by the expert's. The recorded label
+    #                    is untouched — it was always pi*(s) — so the learner
+    #                    still sees "here is what you should have done here".
+    #
+    # WHAT THIS COSTS, and it is not nothing. DAgger's guarantee comes from
+    # training on the state distribution the LEARNER induces. Overruling the
+    # learner keeps the episode alive but means the states downstream of a
+    # collision are never visited, so the run trades coverage of the failure for
+    # more of the episodes that produce close labels. Run 9 loses 26.8% of
+    # held-out episodes to knocking the object down, which is what makes that
+    # trade worth measuring rather than assuming.
+    shield: bool = False
+    shield_clearance: float = 0.01       # metres, same units as dart_reach_clearance
+    shield_path_steps: int = 4           # interpolation samples along the step
+    shield_jolt_max_tries: int = 5       # redraws before the jolt is abandoned
+
     # ---- what the LEARNER is commanded during the rollout (SIM.command_deploy)
     # [k, 3] axis set, or None for run 1's grasp-axis rule. The default is the
     # STRING "BINS", resolved in __post_init__, because None is a MEANINGFUL
@@ -746,6 +769,45 @@ def _jolt_is_safe(pc, jolt_delta, recover_delta, *, clearance: float,
     return jolted >= min(float(clearance), nominal)
 
 
+def _step_is_safe(pc, cand_delta, ref_delta, *, clearance: float,
+                  path_steps: int) -> bool:
+    """Would executing `cand_delta` from HERE stay as clear as `ref_delta` would?
+
+    The shield's predicate. Same geometry as `_jolt_is_safe` — gripper control
+    points swept against the object- and hand-flagged points of the EE-frame
+    cloud — but a different segment: a jolt teleports and then servos back to a
+    frozen waypoint, so that sweep runs jolt -> recovery, while an ordinary step
+    just moves from where it is to where the action puts it, i.e. zero -> delta.
+
+    THE BAR IS RELATIVE, and it has to be for the same reason the jolt's is. By
+    the end of the reach the gripper is supposed to be millimetres from an object
+    held in a human hand; an absolute floor would refuse the expert's own
+    trajectory and the shield would fire on every step of every grasp. So the
+    reference is what the EXPERT was going to do from this same state: the
+    candidate may come as close as pi*(s) was going to come, and no closer, and
+    never inside `clearance` when there was room to spare.
+
+    `ref_delta=None` falls back to the absolute floor. That path exists only for
+    the diagnostic count of steps the shield could not adjudicate because no
+    expert action was available.
+
+    True when the cloud holds nothing to avoid — an empty scene cannot refute a
+    step, and a blind step is not the shield's problem to solve.
+    """
+    obstacles = pc[(pc[:, 3] > 0.5) | (pc[:, 4] > 0.5), :3]
+    if obstacles.shape[0] == 0:
+        return True
+
+    zero = np.zeros(6, dtype=np.float64)
+    cand = _path_min_dist(obstacles, zero,
+                          np.asarray(cand_delta, dtype=np.float64), path_steps)
+    if ref_delta is None:
+        return cand >= float(clearance)
+    nominal = _path_min_dist(obstacles, zero,
+                             np.asarray(ref_delta, dtype=np.float64), path_steps)
+    return cand >= min(float(clearance), nominal)
+
+
 def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                            beta: float, params: CollectParams, pin_table=None,
                            grasp_idx: int = 0):
@@ -882,6 +944,17 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     # the geometry and jolts are being silently skipped.
     n_dart_reach = 0
     n_dart_reject = 0
+    # ---- the shield (run 19) ----
+    # `n_shield_policy` is THE number to read. It is how many steps the learner
+    # was overruled on, and every one of them raises the EFFECTIVE expert
+    # fraction above `beta`: a run whose shield fires on a large share of policy
+    # steps is not comparable to its unshielded baseline at the same beta, and
+    # this counter is what says so. `n_shield_jolt_reject` is the free-approach
+    # analogue of `n_dart_reject`. `n_shield_blind` counts steps the shield
+    # judged unsafe but could not fix, having no expert action to substitute.
+    n_shield_jolt_reject = 0
+    n_shield_policy = 0
+    n_shield_blind = 0
     last_exec_dart = False
     # Per-episode OUTCOME (params.outcome_check). `reason` above stays the loop's
     # terminal cause; these are the handover's result, on the evaluator's taxonomy.
@@ -1357,6 +1430,37 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                     break
                 n_dart_reject += 1
 
+        # ----- the free-approach jolt, drawn HERE so the shield can redraw it --
+        # Runs 1-18 drew this inline at execution time. It moves up because a
+        # refused draw has to be replaced before anything is committed, and
+        # because `dart` may have to be CLEARED: with every draw refused there is
+        # no jolt to take and the step must fall back to the ordinary beta
+        # mixture, which is exactly what `dart_ratio` not firing would have done.
+        #
+        # THE RNG STREAM IS UNCHANGED when `shield` is off. `dart` and the beta
+        # coin are mutually exclusive — `use_expert` starts with `not dart`, so
+        # Python short-circuits the beta draw on a jolt step — and the reach band
+        # requires `committed_reach is not None` while this one requires None. So
+        # the same numbers come out in the same order as every run before 19.
+        dart_delta = None
+        shielded = False
+        if dart:
+            tries = int(params.shield_jolt_max_tries) if params.shield else 1
+            for _ in range(max(tries, 1)):
+                cand = np.concatenate([
+                    rng.uniform(-params.dart_pos_mag, params.dart_pos_mag, size=3),
+                    rng.uniform(-params.dart_rot_mag, params.dart_rot_mag, size=3),
+                ]).astype(np.float32)
+                if not params.shield or _step_is_safe(
+                        pc, cand, expert_delta,
+                        clearance=params.shield_clearance,
+                        path_steps=params.shield_path_steps):
+                    dart_delta = cand
+                    break
+                n_shield_jolt_reject += 1
+            if dart_delta is None:
+                dart = False
+
         # ----- choose what to EXECUTE: pi_i = beta*pi* + (1-beta)*pi_hat -----
         # pi_i = beta*pi* + (1-beta)*pi_hat, except that the committed reach can
         # be forced onto the expert (see CollectParams.expert_after_commit): the
@@ -1389,10 +1493,7 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                 exec_delta = dart_reach_delta
             else:
                 n_dart += 1
-                exec_delta = np.concatenate([
-                    rng.uniform(-params.dart_pos_mag, params.dart_pos_mag, size=3),
-                    rng.uniform(-params.dart_rot_mag, params.dart_rot_mag, size=3),
-                ]).astype(np.float32)
+                exec_delta = dart_delta
             target_jp = action_to_target_joint(
                 np.concatenate([exec_delta, [1.0]]).astype(np.float32), obs)
         elif use_expert:
@@ -1480,9 +1581,39 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                 else:
                     policy_action = policy_action.copy()
                     policy_action[6] = 1.0  # override: keep approaching
-            target_jp = action_to_target_joint(policy_action, obs)
             exec_delta = policy_action[:6].astype(np.float32)
-        last_exec_expert = bool(use_expert)
+            # ----- THE SHIELD: the learner does not get to drive into the object
+            # Relative bar, `expert_delta` as the reference — see `_step_is_safe`.
+            # The learner may come as close as pi*(s) was going to come from this
+            # same state, and no closer.
+            #
+            # THE RECORDED LABEL IS UNTOUCHED. It was written above this line and
+            # is pi*(s) at the state the learner actually reached — the pair
+            # DAgger wants, and the one that teaches "do not go there". Only the
+            # EXECUTED action changes. What the run gives up is the states
+            # DOWNSTREAM of a collision, which it never visits.
+            if (params.shield and expert_target_jp is not None
+                    and not _step_is_safe(
+                        pc, exec_delta, expert_delta,
+                        clearance=params.shield_clearance,
+                        path_steps=params.shield_path_steps)):
+                n_shield_policy += 1
+                shielded = True
+                target_jp = expert_target_jp
+                exec_delta = expert_delta
+            else:
+                if (params.shield and expert_target_jp is None
+                        and not _step_is_safe(
+                            pc, exec_delta, None,
+                            clearance=params.shield_clearance,
+                            path_steps=params.shield_path_steps)):
+                    n_shield_blind += 1
+                target_jp = action_to_target_joint(policy_action, obs)
+        # A SHIELDED STEP WAS DRIVEN BY THE EXPERT, and the ENV_DONE handler below
+        # keys its dropped-tail rule on exactly that: an expert-driven step that
+        # ends the episode carries a label teaching the collision, so the pair is
+        # popped. Reporting a shielded step as learner-driven would keep it.
+        last_exec_expert = bool(use_expert or shielded)
         last_exec_dart = bool(dart or dart_reach_delta is not None)
 
         prev_act6d = np.asarray(exec_delta, dtype=np.float32).copy()
@@ -1562,7 +1693,10 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                       "n_dart": int(n_dart),
                       "n_dart_env_done": int(n_dart_env_done),
                       "n_dart_reach": int(n_dart_reach),
-                      "n_dart_reject": int(n_dart_reject)}
+                      "n_dart_reject": int(n_dart_reject),
+                      "n_shield_policy": int(n_shield_policy),
+                      "n_shield_jolt_reject": int(n_shield_jolt_reject),
+                      "n_shield_blind": int(n_shield_blind)}
 
     # What the expert's grasp means UNDER THE RUN'S RULE, computed once here so
     # `d_grasp_world`, `demo_off_deg` and `bin_realized` cannot disagree about
@@ -1750,6 +1884,13 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # n_dart + n_dart_reach.
         "n_dart_reach": int(n_dart_reach),
         "n_dart_reject": int(n_dart_reject),
+        # The shield. Read `n_shield_policy` against the learner-driven step
+        # count, `steps - n_expert_steps`: that ratio is how much of the
+        # learner's own control was taken away, and therefore how far the
+        # EFFECTIVE beta sits above the configured one.
+        "n_shield_policy": int(n_shield_policy),
+        "n_shield_jolt_reject": int(n_shield_jolt_reject),
+        "n_shield_blind": int(n_shield_blind),
         "min_pos": min_pos,
         "min_rot": min_rot,
         # Approach-label scale. `n_tiny_labels` counts labels the policy cannot
@@ -1916,6 +2057,7 @@ def collect_iteration(sim, runner, pairs, out_path, *, rng,
            "n_policy_close_cmds": 0, "n_dropped_tail": 0,
            "n_dart": 0, "n_dart_env_done": 0,
            "n_dart_reach": 0, "n_dart_reject": 0,
+           "n_shield_policy": 0, "n_shield_jolt_reject": 0, "n_shield_blind": 0,
            "n_close_labels": 0, "n_approach_labels": 0, "sum_label_pos": 0.0,
            "n_settle_steps": 0,
            "n_tiny_labels": 0, "n_revisits": 0, "n_grasp_mismatch": 0,
@@ -1990,6 +2132,10 @@ def collect_iteration(sim, runner, pairs, out_path, *, rng,
         "dart_reach_pos_mag": float(params.dart_reach_pos_mag),
         "dart_reach_rot_mag": float(params.dart_reach_rot_mag),
         "dart_reach_clearance": float(params.dart_reach_clearance),
+        "shield": bool(params.shield),
+        "shield_clearance": float(params.shield_clearance),
+        "shield_path_steps": int(params.shield_path_steps),
+        "shield_jolt_max_tries": int(params.shield_jolt_max_tries),
         # Which pin table the labels aim at. The base collector has always written
         # this; the DAgger shards did not, which meant an aggregate could not say
         # what its `scene_idx` values were relative to. BCDataset's auxiliary
@@ -2068,6 +2214,9 @@ def collect_iteration(sim, runner, pairs, out_path, *, rng,
                 agg["n_dart_env_done"] += st["n_dart_env_done"]
                 agg["n_dart_reach"] += st.get("n_dart_reach", 0)
                 agg["n_dart_reject"] += st.get("n_dart_reject", 0)
+                agg["n_shield_policy"] += st.get("n_shield_policy", 0)
+                agg["n_shield_jolt_reject"] += st.get("n_shield_jolt_reject", 0)
+                agg["n_shield_blind"] += st.get("n_shield_blind", 0)
                 agg["n_close_labels"] += st["n_close_labels"]
                 agg["n_approach_labels"] += st["n_approach_labels"]
                 agg["sum_label_pos"] += st["sum_label_pos"]

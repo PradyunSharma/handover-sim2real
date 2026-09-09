@@ -1,0 +1,3 @@
+snapshot of: /home/pradyunsharma/h2r-runs/output/dagger_runs/regrasp_run11/iters/iter_25
+checkpoint : best.pt
+DAgger iteration 25 (last)

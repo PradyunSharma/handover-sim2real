@@ -10,7 +10,7 @@ Two runners, **different policies, not interchangeable** (see
 |---|---|---|
 | `policy_runner.py` | CVPR2023 GA-DDPG | `output/cvpr2023_models/...` |
 | `my_policy_runner.py` | Phase-1/4 BC | `checkpoint/run12`, `run16`, `run19` |
-| `my_regrasp_policy_runner.py` | regrasp BC, direction-conditioned | `output/dagger_runs/regrasp_run9/best` |
+| `my_regrasp_policy_runner.py` | regrasp BC, direction-conditioned | `checkpoint/regrasp_run9/`, `regrasp_run11/` (26 iterations each) |
 
 `my_regrasp_policy_runner.py` **imports** `my_policy_runner` rather than copying
 it — see [Regrasp](#regrasp-grasping-from-a-commanded-direction).
@@ -232,6 +232,10 @@ checkpoint/sam2/                 SAM 2.1 weights, if --segmentation sam2
 checkpoint/run12/                run 12 — wrist only
 checkpoint/run16/                run 16 iter 16 — wrist + left + right
 checkpoint/run19/                run 19 iter 19 — right camera only
+checkpoint/regrasp_run9/         REGRASP run 9 — approach_axis, all 26
+                                 iterations plus best/ and last/. See its README.
+checkpoint/regrasp_run11/        REGRASP run 11 — grasp_offset, same layout.
+                                 A DIFFERENT command, not another tuning.
    best.pt / normalization.npz / config.yaml / source.txt
 ```
 
@@ -937,6 +941,8 @@ python my_regrasp_policy_runner.py --direction +x --cameras tripod \
 
 python my_regrasp_policy_runner.py --direction +x --cameras tripod \
     --calib-session d455 --home --step-mode
+
+python my_regrasp_policy_runner.py --regrasp-iter 23     --cameras tripod --calib-session d455 --segmentation sam2     --seg-object-prompt "a brown cuboidal box." --home --control rate --enable-gripper --home-gripper --show-cloud --direction +x
 ```
 
 Every flag of `my_policy_runner` works here — same control modes, homing,
@@ -946,11 +952,26 @@ bring-up. Only the policy differs.
 
 | extra flag | default | meaning |
 |---|---|---|
-| `--direction {+x,+y,-y,+z}` | **required** | which side to approach from |
-| `--regrasp-run-dir DIR` | `output/dagger_runs/regrasp_run9/best` | run snapshot |
+| `--direction {+x,+y,-y,+z}` | **required** | which side to approach from; `-y` and `=-y` both parse |
+| `--regrasp-run {9,11}` | `9` | which installed regrasp run — different `d_rule` |
+| `--regrasp-iter N` | `best` | pick an iteration by number, or `best` / `last` |
+| `--anchor-ref {base,hand}` | `base` | which point the anchor azimuth is measured from |
+| `--regrasp-run-dir DIR` | — | a run dir anywhere else; overrides `--regrasp-run` |
 | `--regrasp-ckpt` | `best` | `best` or `last` inside the run |
 | `--command-axes PATH` | beside the run dir | the deployment axes |
 | `--selftest` | off | check the direction geometry offline and exit |
+
+**`--anchor-ref` is the one place a regrasp deployment can be quietly wrong.**
+Run 9's bins are *named* in an anchor frame whose azimuth reference is the MANO
+wrist joint — its config sets no `SIM.anchor_hand_ref`, and the pin table records
+none, which `setup.resolve_anchor_ref` reads as `wrist` by construction. The rig
+has no wrist joint, so it approximates that frame, and the two approximations are
+not equally good: `horizontal(base - object)` changes 7.7% of bin labels against
+the wrist frame and has a 61 cm lever arm, while the segmented hand cloud's
+centroid is the run-16 mismatch — measured at 40% bin agreement, on a 9 cm lever
+arm that shrinks to 7.7 cm at the close and falls back to an *opposite* sign
+below 4 cm. Hence the `base` default. `hand` exists to A/B that claim on this
+hardware.
 
 **The direction is anchored to the scene, not the robot.** `+x` does not mean
 the robot's +x — it means the free end of the object, in a frame built from
@@ -986,10 +1007,59 @@ centroids are **not** mutually orthogonal — `+y` and `-y` meet at **150.5°**,
 `-x` (over the giver's fingers) and `-z` (from beneath) are bins but have no
 demonstrations behind them, so they are not offered.
 
-`--selftest` asserts the anchor's x axis really is `horizontal(object − wrist)`,
-that all four commands are unit vectors producing four *different* actions (so
-the conditioning is reaching the network), and that anchoring preserves every
-pairwise angle. It needs no camera, robot or ROS.
+**Which run.** Two are installed, and they take a *different* command rather
+than being two tunings of one. Run 9's `d_rule` is `approach_axis` — `d` is the
+gripper's approach axis, "come at the object from this side". Run 11's is
+`grasp_offset` — `d` is the grasp point's offset from the object centroid,
+"grasp this part of the object". Their `command_axes.json` files are therefore
+not interchangeable, and the runner prints which rule is in force at startup.
+
+At their best iterations run 11 grasps more often and obeys less: success 0.619
+against 0.592 and close rate 0.778 against 0.685, but `bin_hit_rate` 0.14
+against 0.65 and `cond_sep` 0.31 against 0.89 — and a low `cond_sep` is the
+evaluator's name for "the policy ignores the conditioning". Run 11 also has all
+six bins live where run 9 has four, and its `-y` scores 0.600 against run 9's
+0.434. Full comparison in `checkpoint/regrasp_run11/README.md`.
+
+```bash
+python my_regrasp_policy_runner.py --direction +x --regrasp-run 9    # iter 23
+python my_regrasp_policy_runner.py --direction -y --regrasp-run 11   # iter 22
+```
+
+**Which iteration.** All 26 of each are installed, every one a loadable run dir,
+selected with `--regrasp-iter`:
+
+```bash
+python my_regrasp_policy_runner.py --direction +x --regrasp-iter 23   # = run 9's best
+python my_regrasp_policy_runner.py --direction +x --regrasp-run 11 --regrasp-iter 22
+python my_regrasp_policy_runner.py --direction +x --regrasp-iter last --regrasp-ckpt last
+```
+
+**Success is not monotonic in the iteration**, so a later one is not
+automatically a better one — run 9's 23 is its best at 0.592 while 16 dips to
+0.391, and run 11's 22 is its best at 0.619 while 23 drops straight to 0.474.
+The per-iteration tables are in each folder's README. Those numbers are in-loop
+eval on the TRAIN split (`EVAL.holdout: false`), so treat them as a ranking
+rather than an absolute.
+
+The `.pt` files are **hard links** into `output/dagger_runs/`, so all 52
+iterations cost almost nothing rather than 2.4 GB. They read exactly like copies
+and deleting either side leaves the other intact; use `cp -a` instead of
+`cp -al` if you ever want independent files.
+
+**A direction with no demonstrations behind it is refused**, per run: its
+`command_axes` entry is then the untouched geometric axis rather than a centroid
+of anything, so the policy would fly it confidently with nothing behind it. Run
+9 refuses `-x` and `-z` on those grounds; run 11 accepts all six.
+
+`--selftest` asserts that `--direction -y` survives argparse, that both
+installed runs' axis files load with the live bins they should have, that the
+anchor's x axis really is `horizontal(base − object)` under the default
+reference and `horizontal(object − hand)` under `--anchor-ref hand` — and that
+the two are not the same frame, which is the check that would have caught the
+run-16 mismatch — that every command is a unit vector producing a *different*
+action (so the conditioning reaches the network), and that anchoring preserves
+every pairwise angle. It needs no camera, robot or ROS.
 
 ---
 

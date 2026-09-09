@@ -283,7 +283,8 @@ def rollout(env, model, point_listener, scene_idx, device,
             hold_steps=3, dwell_steps=20, show_pred_grasp=False,
             grasp_idx=0, show_anchor_frame=False, show_bin_sphere=False,
             bin_sphere_radius=0.10, bin_sphere_points=2400,
-            command_axes="BINS", show_d=False, d_rule=None):
+            command_axes="BINS", show_d=False, d_rule=None,
+            bin_override=None):
     obs = env.reset(idx=scene_idx)
 
     # REGRASP: which DIRECTION this roll is commanded to approach from. It is
@@ -304,12 +305,26 @@ def rollout(env, model, point_listener, scene_idx, device,
     # `evaluator._dir_block` scores `dir_err` with.
     if d_rule is None:
         d_rule = _dirs.DirectionRule()
-    cond_goal = None if pin_table is None else pin_table.pose(scene_idx, grasp_idx)
+    # COMMANDING A BIN THIS SCENE NEVER DEMONSTRATES IS ALLOWED, and it is a
+    # thing you want to watch: the whole claim behind direction conditioning is
+    # that `k` is a test-time knob, and the only way to see whether the policy
+    # interpolates to a direction it was never shown ON THIS SCENE is to command
+    # it and look. Nothing about the COMMAND needs a demonstration — it is
+    # `to_world(axes[b], anchor_R)`, and `anchor_R` is a property of the SCENE
+    # (it lives in `scene_meta`, built from the giver's wrist and the object
+    # centroid), not of any grasp. What a demonstration would have added is a
+    # pinned grasp, which only the overlays and the pin-based scoring use.
+    unpinned = bin_override is not None
+    cond_goal = (None if (pin_table is None or unpinned)
+                 else pin_table.pose(scene_idx, grasp_idx))
     _meta = ({} if pin_table is None
              else pin_table.scene_meta.get(int(scene_idx), {}))
     _anchor_R = _meta.get("anchor_R")
+    cmd_bin = (int(bin_override) if unpinned else
+               (None if pin_table is None
+                else pin_table.bin_of(scene_idx, grasp_idx)))
     d_world = _dirs.command_direction(
-        None if pin_table is None else pin_table.bin_of(scene_idx, grasp_idx),
+        cmd_bin,
         None if _anchor_R is None else np.asarray(_anchor_R),
         grasp_pose=cond_goal, axes=command_axes)
     if d_world is None:
@@ -368,8 +383,7 @@ def rollout(env, model, point_listener, scene_idx, device,
             if show_anchor_frame:
                 draw_anchor_frame(a_R, c_w, goal_marker_ids,
                                   length=max(bin_sphere_radius * 1.5, 0.12))
-            b = pin_table.bin_of(int(scene_idx), grasp_idx)
-            b = None if b is None or int(b) < 0 else int(b)
+            b = None if cmd_bin is None or int(cmd_bin) < 0 else int(cmd_bin)
             print(f"  anchor frame at centroid {c_w.round(3)}  mode="
                   f"{meta.get('anchor_mode', '?')}  commanded bin="
                   f"{'-' if b is None else _dirs.BIN_SHORT[b]}")
@@ -440,7 +454,8 @@ def rollout(env, model, point_listener, scene_idx, device,
     # correct rollout looks like a miss.
     if show_goal_grasp:
         env.run_omg_planner(omg_steps or max_steps, scene_idx)  # plans, no sim step
-        if pin_table is not None and pin_table.apply(env, scene_idx, grasp_idx):
+        if (pin_table is not None and not unpinned
+                and pin_table.apply(env, scene_idx, grasp_idx)):
             # Pruning the goal set renumbers it, so replan to re-resolve the goal
             # index against the pinned grasp. reset_scene=False keeps the scene.
             env.run_omg_planner(omg_steps or max_steps, scene_idx, reset_scene=False)
@@ -722,8 +737,18 @@ def parse_args():
                         "direction across scenes: slot 1 is `+y` on one scene "
                         "and `-y` on another. Where a bin holds several grasps "
                         "(--per-bin 3) the first is used for the goal overlay; "
-                        "the command is identical either way. Overrides "
-                        "--grasp-idx. Needs --grasp-pin-table.")
+                        "the command is identical either way. A BIN THIS SCENE "
+                        "NEVER DEMONSTRATES IS ALLOWED for a single-scene "
+                        "rollout and is the point of the flag: the command needs "
+                        "only the bin and the scene's anchor, so commanding an "
+                        "unseen direction and watching is the eyeball test of "
+                        "whether the conditioning interpolates. It runs UNPINNED "
+                        "— no goal-grasp overlay, no `d label` arrow, nothing "
+                        "scored against a pinned pose — and says so. --benchmark "
+                        "still SKIPS those scenes, because it is a scored "
+                        "population and widening it silently would break "
+                        "comparability (the evaluator's in_table / all split). "
+                        "Overrides --grasp-idx. Needs --grasp-pin-table.")
     p.add_argument("--all-grasps", action="store_true",
                    help="--benchmark only: sweep every pinned slot of every "
                         "scene, i.e. the conditional table retry@k comes from")
@@ -921,8 +946,10 @@ def main():
         for b in range(len(_dirs.BINS)):
             v = axes[b] if b < len(axes) else _dirs.BINS[b]
             off = float(_dirs.angle_between(v, _dirs.BINS[b]))
+            # `--` means no demonstration for this bin ON THIS SCENE. It is not
+            # a refusal: --bin commands it unpinned. See --bin's help.
             mark = (f"slot {have[b]}" if b in have else
-                    ("--" if scene_idx is not None else ""))
+                    ("-- (unpinned)" if scene_idx is not None else ""))
             print(f"  --bin {b}  {_dirs.BIN_SHORT[b]:<3} "
                   f"{_dirs.BIN_NAMES[b]:<17} "
                   f"[{v[0]:+.3f} {v[1]:+.3f} {v[2]:+.3f}]"
@@ -935,6 +962,7 @@ def main():
                   f"{', '.join(_dirs.BIN_SHORT[b] for b in sorted(have)) or 'nothing'}"
                   + (f"; no demonstration for "
                      f"{', '.join(_dirs.BIN_SHORT[b] for b in missing)}"
+                     f" — those are still commandable, unpinned"
                      if missing else ""))
         print("  the vectors above are in the ANCHOR frame; what the policy is "
               "issued is\n  to_world(vector, anchor_R), which moves with the "
@@ -942,8 +970,12 @@ def main():
 
     print_bin_legend(scene if pin_table is not None else None)
 
-    def slot_for(scene_idx: int) -> int:
-        """`--bin` -> a slot of this scene in that bin; `--grasp-idx` unchanged.
+    def slot_for(scene_idx: int, quiet: bool = False):
+        """`--bin` -> `(slot, bin_override)`; `--grasp-idx` unchanged.
+
+        `bin_override` is None on the normal path. It is the bin number when the
+        scene has no demonstration for it — see the UNDEMONSTRATED block below.
+        `quiet` suppresses that block's report, for the benchmark's sweep.
 
         A SLOT IS A GRASP, A BIN IS A DIRECTION, and the map between them is
         neither the identity nor one-to-one. Scenes reach different subsets of
@@ -965,7 +997,7 @@ def main():
         selector that identifies one.
         """
         if args.bin is None:
-            return int(args.grasp_idx)
+            return int(args.grasp_idx), None
         if pin_table is None:
             raise SystemExit("--bin needs --grasp-pin-table: the bin -> slot "
                              "mapping is per scene and lives in the table.")
@@ -975,17 +1007,57 @@ def main():
             b = pin_table.bin_of(int(scene_idx), gi)
             if b is not None and int(b) >= 0 and int(b) not in have:
                 have[int(b)] = gi        # first match: closest to the bin axis
-        if int(args.bin) not in have:
-            names = ", ".join(f"{_dirs.BIN_SHORT[b]}(--bin {b})"
-                              for b in sorted(have)) or "none"
+        if int(args.bin) in have:
+            return have[int(args.bin)], None
+
+        # ---- UNDEMONSTRATED ON THIS SCENE: command it anyway ----------------
+        # This used to be a SystemExit, and refusing was wrong. A rollout is a
+        # VIEWER, not a scored evaluation: the command is well defined without a
+        # demonstration (`to_world(axes[b], anchor_R)`, and the anchor belongs to
+        # the scene), and watching the policy handle a direction this scene never
+        # taught is the only eyeball test of the claim that makes `k` a test-time
+        # knob. What is genuinely missing is the PINNED GRASP, so the pin-derived
+        # overlays go quiet — and that is worth saying out loud rather than
+        # letting a silently absent green gripper read as a failed rollout.
+        b = int(args.bin)
+        names = ", ".join(f"{_dirs.BIN_SHORT[k]}(--bin {k})"
+                          for k in sorted(have)) or "none"
+        if command_axes is None:
+            # `SIM.command_deploy: grasp_axis` (run 1's rule): the command IS the
+            # pinned grasp's own axis, so with no pin there is genuinely nothing
+            # to issue — not a policy of refusal, an absence of the input. Every
+            # later run deploys on the bin axis or its centroid and has no such
+            # dependency, which is the whole reason `command_deploy` exists.
             raise SystemExit(
-                f"scene {scene_idx} has no demonstration for bin "
-                f"{args.bin} ({_dirs.BIN_SHORT[int(args.bin)]}). This scene "
-                f"reaches: {names}. Bins are per scene — pick another bin or "
-                f"another scene.")
-        return have[int(args.bin)]
+                f"scene {scene_idx} has no demonstration for bin {b} "
+                f"({_dirs.BIN_SHORT[b]}), and --command grasp_axis builds the "
+                f"command FROM the pinned grasp, so there is nothing to command "
+                f"without one. This scene reaches: {names}. Use --command "
+                f"bin_axis or bin_centroid to roll an undemonstrated bin.")
+        axis = np.asarray(_dirs.BINS[b], dtype=np.float64)
+        cmd = np.asarray(command_axes[b], dtype=np.float64)
+        run_wide = bool(np.allclose(cmd, axis, atol=1e-9))
+        if quiet:
+            return None, b
+        print(f"\n  !! scene {scene_idx} has NO DEMONSTRATION for bin {b} "
+              f"({_dirs.BIN_SHORT[b]}). Commanding it anyway, UNPINNED.")
+        print(f"     this scene demonstrates: {names}")
+        print(f"     the command is still exact: axes[{b}] = "
+              f"{cmd.round(3).tolist()} in the scene's own anchor frame.")
+        print("     no pinned grasp, so: --show-goal-grasp falls back to OMG's "
+              "own free pick\n     (which need not lie in this bin), the yellow "
+              "`d label` arrow is unavailable,\n     and nothing here is scored "
+              "against a pinned pose.")
+        if run_wide:
+            print(f"     !! AND bin {b} is undemonstrated RUN-WIDE — "
+                  f"command_axes[{b}] is the raw\n        geometric axis, not an "
+                  f"empirical centroid, so the policy has never been\n        "
+                  f"trained on this direction on ANY scene. Pure extrapolation.")
+        print()
+        return None, b
 
     def do_rollout(s, draw=render, g=None):
+        _gi, _bo = slot_for(s) if g is None else (g, None)
         return rollout(env, model, point_listener, s, args.device,
                        panda_base_inv_tf, steps_action_repeat, args.max_steps,
                        R_base, panda_base_pos, draw=draw,
@@ -997,7 +1069,8 @@ def main():
                        hold_steps=args.hold_steps,
                        dwell_steps=args.dwell_steps,
                        show_pred_grasp=(args.show_pred_grasp and draw),
-                       grasp_idx=(slot_for(s) if g is None else g),
+                       grasp_idx=(_gi if g is None else g),
+                       bin_override=(_bo if g is None else None),
                        show_anchor_frame=(args.show_anchor_frame and draw),
                        show_bin_sphere=(args.show_bin_sphere and draw),
                        bin_sphere_radius=args.bin_sphere_radius,
@@ -1025,17 +1098,27 @@ def main():
         if n_slots > 1:
             jobs = [(s, g) for s in ids for g in range(n_slots)]
         else:
-            jobs = []
+            jobs, n_unpinned = [], 0
             for s in ids:
-                try:
-                    jobs.append((s, slot_for(s)))
-                except SystemExit as e:
-                    if args.bin is None:
-                        raise
-                    print(f"  [skip] {e}")
+                gi, bo = slot_for(s, quiet=True)
+                if bo is not None:
+                    # UNDEMONSTRATED ON THIS SCENE, AND THE BENCHMARK SKIPS IT
+                    # even though the single-scene rollout now commands it. A
+                    # benchmark is a SCORED POPULATION, and quietly widening it
+                    # would make these numbers incomparable with every earlier
+                    # --bin sweep. This is exactly the evaluator's in_table / all
+                    # split, which it reports as two series (`succ_bin_*` vs
+                    # `succ_bin_all_*`) precisely because they are not the same
+                    # measurement — see EVAL.full_bin_coverage.
+                    n_unpinned += 1
+                    continue
+                jobs.append((s, gi))
             if args.bin is not None:
                 print(f"  --bin {args.bin}: {len(jobs)} of {len(ids)} scenes "
-                      f"have a demonstration for it")
+                      f"have a demonstration for it"
+                      + (f"; {n_unpinned} skipped. The single-scene rollout "
+                         f"commands those anyway — see --bin's help."
+                         if n_unpinned else ""))
         n = len(jobs)
         for s, g in jobs:
             success, reason, dist, grasped, close_step = do_rollout(s, draw=False, g=g)

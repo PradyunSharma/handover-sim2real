@@ -424,8 +424,7 @@ bash examples/watch_regrasp.sh -f slurm_logs/regrasp_<jobid>.out
 ### One iteration's policy, one scene, one bin
 
 ```bash
-python examples/rollout_regrasp_policy.py \
-    --run regrasp_run2 --iter 13 --scene 32 --bin 4 --show-goal-grasp
+python examples/rollout_regrasp_policy.py     --run regrasp_run9 --iter 23 --scene 32 --show-goal-grasp --show-bin-sphere --show-d --bin 4
 ```
 
 `--run` derives `--run-dir`, `--cfg-file`, `--grasp-pin-table`, `--command` and

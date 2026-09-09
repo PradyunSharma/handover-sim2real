@@ -1,0 +1,3 @@
+snapshot of: /home/pradyunsharma/h2r-runs/output/dagger_runs/regrasp_run9/iters/iter_23
+checkpoint : best.pt
+DAgger iteration 23 — best success_rate=0.5924

@@ -1,0 +1,373 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRASP RUN 19 — RUN 9 WITH A PER-STEP COLLISION SHIELD.
+#
+# ONE change against regrasp_run9.yaml: `DAGGER.shield: true` and its three
+# knobs. Everything else — the per-bin table, `command_deploy: bin_centroid`,
+# `bc_regrasp_run9.yaml`, `d_source: d_grasp_world`, `d_noise_deg: 0`, the
+# 0.9 -> 0.75 beta ramp, `train_from_scratch: true`, 25 iterations, and every
+# DART magnitude — is byte-identical. It reuses run 9's direction table, pin
+# table, demo-ok table and base shards unchanged, so there is NOTHING to rebuild.
+#
+# ── WHY ──────────────────────────────────────────────────────────────────────
+#
+# Run 9's held-out failure budget over 340 episodes on the s0 test split:
+#
+#   success                43.2%
+#   knocked the object down 26.8%   <-- collision
+#   hit the human          19.1%   <-- collision
+#   no release              7.6%
+#   timeout                 3.2%
+#   closed on nothing       0.0%
+#
+# Collisions are 45.9% of episodes and 81% of every failure. The grasp DECISION
+# is not the problem — the policy never closes on empty air and converts 78% of
+# its closes — but `box_chance` is only 44.7%: fewer than half of episodes ever
+# get the object between the jaws, because the approach destroys the scene
+# first. This run tests whether stopping those collisions during COLLECTION buys
+# a better policy.
+#
+# ── WHAT THE SHIELD DOES, IN ALL FOUR CASES ──────────────────────────────────
+#
+# Every step, in BOTH the free approach and the committed reach tail, the
+# candidate action is swept against the object- and hand-flagged points of the
+# observed cloud before anything is committed to pybullet:
+#
+#   free-approach JOLT   refused -> redraw, up to `shield_jolt_max_tries`. If
+#                        every draw is refused the step takes NO jolt and falls
+#                        through to the ordinary beta mixture.
+#   reach-tail JOLT      already rejection-sampled since Phase-4 run 12
+#                        (`dart_reach_clearance`); unchanged, and now joined by
+#                        the same test on the other three paths.
+#   POLICY step          refused -> the expert's action is executed instead.
+#   EXPERT step          never vetoed. It is the reference the others are judged
+#                        against; if pi* collides, that is a scene problem.
+#
+# THE BAR IS RELATIVE, and it has to be. By the end of the reach the gripper is
+# SUPPOSED to be millimetres from an object held in a human hand, so an absolute
+# floor would refuse the demonstration itself and the shield would fire on every
+# step of every grasp. The reference is what the expert was going to do from the
+# same state: the candidate may come as close as pi*(s) was going to come, and
+# no closer, and never inside `shield_clearance` when there was room to spare.
+# This is the rule `_jolt_is_safe` already used for the reach jolt, generalised.
+#
+# ── WHAT IT COSTS, AND IT IS NOT NOTHING ─────────────────────────────────────
+#
+# DAgger's guarantee comes from training on the state distribution the LEARNER
+# induces. Overruling the learner keeps the episode alive but means the states
+# DOWNSTREAM of a collision are never visited — so this run buys more of the
+# episodes that produce close labels by giving up coverage of the failure it is
+# preventing. The label at the shielded state IS still recorded and is still
+# pi*(s), so the learner is told "here is what you should have done"; what it
+# never sees is what happens after it ignores that.
+#
+# READ `shield_policy` AGAINST `steps - expert_steps` BEFORE READING ANYTHING
+# ELSE. That ratio is the fraction of the learner's own control the shield took
+# away, and it raises the EFFECTIVE beta above the configured 0.75. If it is
+# large, run 19 is not a shield test against run 9 — it is a higher-beta run,
+# and the honest comparison is against a run 9 re-run at the matched effective
+# beta. `shield_jolt_reject` is the free-approach analogue of `dart_reject`;
+# `shield_blind` counts unsafe steps with no expert action to substitute.
+#
+# ── COST ─────────────────────────────────────────────────────────────────────
+#
+# `_step_is_safe` is one numpy distance sweep over the gripper control points
+# against the ~1024-point cloud, `shield_path_steps + 1` samples per call, once
+# or twice per step. Negligible against a pybullet step; the reach path has been
+# paying it since run 12.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SIM:
+  cfg_file: examples/pretrain_multicam_wr.yaml   # wrist + right
+
+  split: train
+  egl: false
+
+  # The paper's offline hand-collision-filtered grasp dict. Must be on
+  # cfg.omg_config BEFORE the env is built. Keeps ~623/720 scenes planning,
+  # against ~351 for the runtime 0.08 m filter — which is why that stays off.
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08
+  hand_points_radius: 0.35
+
+  use_standoff: true
+  standoff_dist: 0.08
+
+  # PER-BIN: one grasp for every direction the scene can reach, each the goal-set
+  # grasp CLOSEST TO THAT BIN'S AXIS — which is the vector the policy is
+  # commanded with, so the demonstration is as close as the goal set allows to
+  # the instruction. Built by assign_direction_demos.py --mode per-bin.
+  #
+  # Scenes carry 1 to 4 grasps, so `GraspPinTable.num_grasps` (a MIN) reads 1 and
+  # is the WRONG accessor; `max_grasps` (4) sizes arrays and `num_grasps_for`
+  # iterates. `episodes_per_iter` is divided by max_grasps to get the scene count.
+  grasp_pin_table: output/regrasp_pins_train.json
+  grasp_pin_match_tol: 0.02
+
+  # Scenes with no feasible bin at all (6 of 623). Subtracted from BOTH pools.
+  exclude_scenes: output/regrasp_pins_train_excluded.json
+
+  # The (scene, BIN) pairs base collection actually demonstrated. Written by
+  # audit_regrasp_demos.py --write-ok. `exclude_scenes` is scene-granular and
+  # cannot say "this scene is fine for +x and +z but OMG could not plan -y"; this
+  # can, and without it a per-bin planner failure trains on three directions and
+  # scores four. Applied by pruning the pin table, so the collection pool, the
+  # eval loop and `bin_of` cannot disagree about which pairs exist.
+  demo_ok_table: output/regrasp_demos_train_ok.json
+
+  # ── CHANGE 1 OF 2: WHAT THE POLICY IS COMMANDED WHENEVER IT ACTS ───────────
+  #
+  # `bin_centroid` = the unit mean of every `d_anchor` this bin was assigned,
+  # taken over the table AFTER `demo_ok_table` prunes it — so it summarises the
+  # demonstrations the run is actually trained on, not the ones that were hoped
+  # for. Six vectors, no grasp needed, computable on the robot exactly as `BINS`
+  # is. The resolved values are written to `<run>/command_axes.json`.
+  #
+  # ONE KEY BECAUSE FIVE THINGS MUST AGREE: DAgger rollouts, in-loop eval, the
+  # retry ladder, the test set and the rollout viewer. A run in which any two of
+  # them disagree reports nothing unusual — it simply tells the policy one thing
+  # and scores it on another, and `dir_err` measures against the shifted target
+  # too.
+  #
+  # `bin_axis` (the default, runs 2-8) and `grasp_axis` (run 1, not deployable)
+  # are the other settings.
+  command_deploy: bin_centroid
+
+DAGGER:
+  # 25, planned — the same count run 2 carries. Resumable, so a 24 h timeout at
+  # iteration ~19 costs only the queue wait: resubmit the identical command.
+  num_iters: 25
+  # A TARGET, not an exact count. `sample_pairs` draws m // max_grasps = 100
+  # scenes and rolls out EVERY bin each can reach, so the iteration lands near
+  # 259 (the mean is 2.59 bins per scene). Drawing a scene's directions TOGETHER
+  # is the point: rollouts differing only in the command are the only data that
+  # can teach the network the command matters, and independent draws would spread
+  # that contrast across the whole run.
+  # 100 SCENES per iteration. max_grasps is 4 here, and
+  # `sample_pairs` draws m // max_grasps scenes, so this is
+  # 400 // 4 = 100.
+  episodes_per_iter: 400
+  max_steps: 50
+  scene_sampling: random
+  seed: 0
+
+  # 1.0 -> 0.75 linearly over the 20 iterations. Iteration 1 is therefore PURE
+  # EXPERT (see the header): a data-augmentation round, with the distribution
+  # shift starting at iteration 2. Run 1 and Phase-4 run 16 both held 0.75
+  # constant, so the late iterations here match them and the early ones are
+  # gentler.
+  # 0.9 -> 0.75 linearly over the 25 iterations. NO pure-expert round: the
+  # distribution shift starts at iteration 1, and by the end a QUARTER of every
+  # trajectory is the learner's own actions.
+  #
+  # 0.75 is the floor Phase-4 run 16 (0.80, the best run in the project) and
+  # regrasp run 1 both held CONSTANT, so the late iterations here sit exactly
+  # where those runs sat and the early ones are gentler. That makes this schedule
+  # a strict interpolation between known-good settings rather than an
+  # extrapolation past them — which 0.5 would have been, at double run 16's
+  # on-policy fraction and beyond anything measured on this task.
+  beta_schedule: linear
+  beta_start: 0.9
+  beta_end: 0.75
+  beta_mid: 0.5          # unused by `linear`; kept so a switch to `piecewise`
+  beta_knee: 0.66        # needs no other edit
+  beta_p: 0.7
+
+  close_pos_thresh: 0.02
+  close_rot_thresh: 0.34
+  stop_on_close_label: true
+  stop_on_policy_close: false
+
+  ee_step: 0.04
+  # 5, not 10: the divergence profile between a scene's demonstrations was
+  # measured FLAT (0.89x) over the tail, so a longer commit buys no extra
+  # contrast and starves the free approach where obstacle avoidance is learned.
+  reach_tail: 5
+  min_free: 1
+  max_horizon: 40
+  first_horizon: null
+
+  reach_commit_dist: 0.05
+  reach_skip_eps: 0.01
+  expert_after_commit: true
+
+  # DART ON BOTH BANDS, at Phase-4 run 16's magnitudes verbatim. `dart_ratio`
+  # covers the FREE approach (with dart_max_dist: 10.0 the distance gate never
+  # bites, so it fires anywhere before the commit) and `dart_reach_ratio` the
+  # committed REACH TAIL, where the jolt is smaller (0.012 m) and clearance-tested
+  # because the gripper is already inside the object's neighbourhood. Not
+  # re-tuned: these were derived for this reach geometry and DART is not the
+  # variable under test.
+  dart_ratio: 0.3
+  dart_max_dist: 10.0
+  dart_pos_mag: 0.04
+  dart_rot_mag: 0.3
+  dart_reach_ratio: 0.3
+  dart_reach_pos_mag: 0.01202
+  dart_reach_rot_mag: 0.3
+  dart_reach_max_tries: 5
+  dart_reach_clearance: 0.01
+  dart_reach_path_steps: 4
+
+  # ── THE SHIELD — the only change against run 9 ──────────────────────────────
+  # See the header. `shield: false` (the default) reproduces run 9 exactly,
+  # including its RNG stream, so this key is the whole experiment.
+  shield: true
+  # Metres. Matched to `dart_reach_clearance` deliberately: the reach jolt has
+  # been judged at 1 cm since Phase-4 run 12 and refuses ~30% of its draws there,
+  # which is a working operating point rather than a guess. The bar is relative,
+  # so this is the floor that applies only when the expert had room to spare.
+  shield_clearance: 0.01
+  # Interpolation samples along the step being tested. 4 matches
+  # `dart_reach_path_steps`; the endpoint alone would miss a step that cuts
+  # through the object and arrives clear on the far side.
+  shield_path_steps: 4
+  # Redraws before a free-approach jolt is abandoned. Matched to
+  # `dart_reach_max_tries`. If `shield_jolt_reject` approaches 5x `dart`, the
+  # jolt magnitude is too large for the geometry and jolts are being skipped
+  # rather than shielded — the same reading `dart_reject` gets.
+  shield_jolt_max_tries: 5
+
+  # Collection outcomes on the evaluator's taxonomy, so `c_success_rate` is
+  # comparable with `success_rate` (mixture-driven, not policy-only) and the
+  # per-bin collection counters have a `success` column meaning the same thing.
+  outcome_check: true
+
+TRAIN:
+  # ── CHANGE 2 OF 2: THE LABEL SOURCE, AND THE NOISE OFF ────────────────────
+  #
+  # bc_regrasp_run9.yaml = bc_regrasp_run4.yaml (`d_noise_deg` 12 -> 0) plus
+  # `DATA.d_source: d_grasp_world`. The label becomes the approach axis the
+  # expert actually flew instead of the direction the episode was commanded —
+  # a relabelling of shards already on disk, not a re-collection.
+  #
+  # THE NOISE HAS TO GO WITH IT. `d_noise_deg` existed to blur an exact command
+  # so the policy would tolerate the ~18 deg gap between the bin axis and its
+  # demonstration. Under a grasp-axis label that gap is zero by construction:
+  # the label IS the demonstration. Perturbing it would only smear a command
+  # that is now precise, which is the opposite of what the run is testing.
+  #
+  # The aux head stays on, as in run 2 — under direction conditioning it does
+  # not predict its own input, so `aux_pos_mm` still separates "the features
+  # have it and the action head ignores it" from "the observation cannot
+  # support it".
+  train_cfg: examples/configs/bc_regrasp_run9.yaml
+  # Empty => PointNet++ initialised RANDOMLY. Iteration 0 only; every later
+  # iteration warm-starts the WHOLE network from the previous last.pt and never
+  # reads this.
+  pc_pretrained:
+  # `${REGRASP_DATA}` defaults to `output` and is set to $SCRATCH_ROOT/output
+  # by the sbatch scripts. Only the two HDF5 shards move: together they are
+  # ~1.1 GB against /home's HARD 30 GB quota, which fills SILENTLY and kills
+  # the job with exit code 6 and no traceback. The JSON tables above stay in
+  # the repo — a few MB, they are INPUTS rather than outputs, and /scratch is
+  # purged by age.
+  base_train_h5: ${REGRASP_DATA}/bc_dataset/train_regrasp.h5
+  val_h5: ${REGRASP_DATA}/bc_dataset/val_regrasp.h5
+  base_run: null
+  # 50. The measured val minimum on run 1's base fit was epoch 16 (val_total
+  # 0.1851, degrading to 0.239 by 99 with a 4.9x train/val gap), so 40 already
+  # cleared it; 50 is margin against a differently-seeded init bottoming later,
+  # and iteration 0 now has ~1.47x the data. Harmless either way — the epoch that
+  # matters is whichever `last.pt` ends on.
+  base_epochs: 50
+  # 15 epochs, and under `train_from_scratch: true` below this is a COMPLETE
+  # refit budget — the model starts from a random PointNet++ every iteration and
+  # has 15 epochs over the whole aggregate to get back.
+  #
+  # THE BUDGET IS TIGHT EARLY AND COMFORTABLE LATE, because epochs are over a
+  # GROWING D. In gradient steps (batch 64):
+  #     iteration 0   50 epochs x  86k steps  =  67k steps
+  #     iteration 1   15 epochs x  95k steps  =  22k steps   <- a third of it
+  #     iteration 25  15 epochs x ~530k steps = 125k steps   <- twice it
+  # So expect the early iterations to sit BELOW the base fit and recover as D
+  # grows. That dip is a property of this schedule, not a failure.
+  #
+  # 15 from random is known to be enough for a working policy: regrasp3_fast1's
+  # base fit was exactly that (15 epochs, empty pc_pretrained, 86k steps) and
+  # scored success 0.406 / bin_diag 0.406 at iteration 0.
+  iter_epochs: 15
+  # TRUE — paper-faithful Follow-The-Leader (Ross et al.): every iteration refits
+  # from the initialisation on the whole aggregate, discarding the previous
+  # iteration's weights. Phase-4 run 16, the best run in the project at 0.80,
+  # did this.
+  #
+  # WITH `pc_pretrained` EMPTY THAT MEANS A RANDOM PointNet++ EVERY ITERATION,
+  # not just at iteration 0. That is deliberate here — regrasp does not borrow
+  # the CVPR2023 encoder — but it is the thing to check first if the run
+  # underperforms: see the gradient-step table above, and compare
+  # `success_rate` at iterations 1-3 against iteration 0. A run that never gets
+  # back above its base fit is telling you 15 epochs from random is not enough
+  # on this aggregate, and the fix is `pc_pretrained` or more epochs, not more
+  # iterations.
+  #
+  # Costs nothing extra in wall clock: train_on_aggregate fits the whole D for
+  # `iter_epochs` either way, so warm start and from-scratch differ only in the
+  # starting weights.
+  train_from_scratch: true
+  # Inert while train_from_scratch is true (nothing is loaded from the previous
+  # iteration). Kept so flipping that flag back needs no other edit.
+  init_ckpt: best
+  # 8, not 2. These are DataLoader workers for the REFIT, and during the refit
+  # all 20 collection workers are idle — the node has 22 CPUs and two were
+  # feeding the loader. Each sample is a 1024x8 float array read from HDF5, so
+  # the loader is plausibly the bottleneck on an aggregate this size. Costs
+  # nothing and cannot change results.
+  num_workers: 8
+  device: cuda
+
+EVAL:
+  # IN THE LOOP. ~16 min an iteration at 100 scenes x 2.59 directions; that is
+  # 5.5 h on a ~20 h run, and it is what makes `ckpt`/`select_on` able to select
+  # at all — with the split job the metrics arrived after the next iteration had
+  # already started. Set to 2 if the queue makes the shorter job worth it.
+  every: 1
+  # 100 scenes -> ~259 episodes, ~65 per live bin. NOT randomly drawn: an
+  # np.linspace over the usable scene ids, so the SAME 100 scenes are scored
+  # every iteration and consecutive points are a paired comparison rather than
+  # two independent samples. That is what makes a trend readable at n=65/bin,
+  # where a single point's binomial standard error is ~0.05.
+  num_scenes: 100
+  # FALSE, as in run 1: the eval scenes are also collected on, so these are
+  # TRAIN-SET rates and optimistic. Kept false deliberately — the curves are a
+  # clean read of "is it learning what it is taught", and the held-out number
+  # comes from examples/eval_regrasp_testset.py on the s0 TEST split afterwards.
+  holdout: false
+  max_steps: 50
+  # LAST. Also picks the policy that collects the next iteration (train_regrasp
+  # hands this same string to the workers), so one set of weights per iteration.
+  # BEST. Selected on the lowest val loss of the fit; also picks the policy that
+  # collects the next iteration, so one set of weights per iteration either way.
+  #
+  # THE HONEST CAVEAT, MEASURED. The val set is collected ONCE at beta=1 from
+  # expert demonstrations and never changes, while D grows toward majority
+  # on-policy states (53% by iteration 8 of regrasp_fast1). So val loss measures
+  # the fit to a distribution that is a SHRINKING minority of the training data,
+  # and it rises monotonically while success rises: corr(val_loss, success) =
+  # +0.71 and +0.83 on the two fast runs, corr(on-policy share, val_loss) = +0.85
+  # and +0.96. Selecting on it is therefore selecting on a drifting target.
+  #
+  # WHY IT IS STILL DEFENSIBLE HERE: at these epoch budgets `best` and `last` are
+  # nearly the same checkpoint. Measured val gap between them is +0.000 to +0.001
+  # at iter_epochs 6 and +0.002 to +0.005 at 15 — far below anything that moves
+  # success. The choice is close to free in both directions.
+  #
+  # THE SELECTION THAT ACTUALLY MATTERS is `select_on: success_rate` below, which
+  # picks the best ITERATION on rollouts, where the differences (0.30 -> 0.48
+  # across a run) are much larger than the eval noise.
+  ckpt: best
+  success_mode: stable_grasp
+  hold_steps: 3
+  select_on: success_rate
+  verbose: false
+
+  box_check: true
+  box:
+    min_frac: 0.50
+    open_thresh: 0.8
+    half_x: 0.0088
+    z_lo: 0.0946
+    z_hi: 0.1122
+    inset: 0.002
+    grid_x: 7
+    grid_z: 7

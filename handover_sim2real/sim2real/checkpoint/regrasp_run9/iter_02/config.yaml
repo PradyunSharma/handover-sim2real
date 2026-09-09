@@ -1,0 +1,53 @@
+DATA:
+  train_h5:
+  - /home/pradyunsharma/h2r-runs/output/bc_dataset/train_regrasp.h5
+  - /home/pradyunsharma/h2r-runs/output/dagger_runs/regrasp_run9/data/dagger_iter_01.h5
+  - /home/pradyunsharma/h2r-runs/output/dagger_runs/regrasp_run9/data/dagger_iter_02.h5
+  val_h5: /home/pradyunsharma/h2r-runs/output/bc_dataset/val_regrasp.h5
+  pc_channels: 7
+  d_source: d_grasp_world
+  d_noise_deg: 0.0
+  robot_state_dim: 32
+  action_dim: 7
+  reach_tail_weight: 2.5
+  reach_tail: 5
+MODEL:
+  feature_dim: 256
+  robot_hidden: 128
+  policy_hidden:
+  - 256
+  - 256
+  pointnet_scale: 1
+  pointnet_radius: 0.02
+  pointnet_nclusters: 32
+  use_prev_act: false
+  drop_joint_state: true
+  joint_state_dim: 18
+  direction_cond: true
+  aux_head: true
+  aux_dim: 7
+  aux_hidden:
+  - 256
+  - 256
+  pc_pretrained: null
+  freeze_pc: false
+OPTIM:
+  kind: adamw
+  lr: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+LOSS:
+  gripper_weight: 1.0
+  pose_loss: pm
+  pm_weight: 7.0
+  aux_weight: 1.0
+TRAIN:
+  batch_size: 64
+  num_epochs: 15
+  num_workers: 8
+  device: cuda
+  mixed_precision: false
+  val_every: 1
+  save_every: 5
+  grad_clip: 1.0
+  seed: 2
