@@ -1,170 +1,132 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# DelftBlue SLURM job — score a finished Regrasp run on the HELD-OUT s0 TEST
-# split (examples/eval_regrasp_testset.py). STEP 5, after training.
+# SCORE A FINISHED REGRASP RUN ON A HELD-OUT SPLIT, every iteration.
 #
-#   START HERE — a few iterations, independent + the chained ladder (~2 h). ITERS
-#   must be quoted, or sbatch parses the commas as more --export assignments:
-#     sbatch --export=ALL,RUN=regrasp_run2,CHAINED=1,"ITERS=0,5,10,15,20" \
-#         examples/slurm/eval_regrasp_testset.sbatch
-#   The final policy only (~20 min):
-#     sbatch --export=ALL,RUN=regrasp_run2,CHAINED=1,ITERS=20 \
-#         examples/slurm/eval_regrasp_testset.sbatch
-#   Every iteration, independent only (~7.5 h) — a full test-split curve:
-#     sbatch --export=ALL,RUN=regrasp_run2 examples/slurm/eval_regrasp_testset.sbatch
-#   Watch:  tail -f slurm_logs/regrasp_test_%j.out
+#     RUN=regrasp_run9 sbatch examples/slurm/eval_regrasp_testset.sbatch
 #
-# RESUMABLE AND INCREMENTAL. Iterations already in test_eval_log.csv are skipped,
-# so scoring five now and the rest later costs nothing extra, and the figure is
-# re-rendered from whatever the CSV holds. --plot-only re-renders without the
-# simulator at all, which runs fine on a laptop.
+# Knobs, all optional, all read from the environment so one file serves every
+# run (`--export` them or put them inline as above):
 #
-# WHY THIS IS NOT THE IN-LOOP NUMBER. The training curves run with
-# `EVAL.holdout: false` on the TRAIN split, so their scenes are also collected
-# on — by design, because that makes them a clean read of "is the policy getting
-# better at what it is being taught". This job scores the benchmark's own test
-# split, which the run has never seen in any form. Expect lower numbers, and do
-# NOT read the difference as a regression.
+#     RUN       run NAME under $OUT_ROOT           (default regrasp_run9)
+#     RUN_DIR   full path, overrides RUN           (default $OUT_ROOT/$RUN)
+#     SPLIT     test | val | train                 (default test)
+#     ITERS     all | 0,5,10,...                    (default all)
+#     CKPT      last | best                        (default last)
+#     CHAINED   1 to add true chained retry        (default off)
 #
-# COST, AND WHY ITERS IS THE FIRST THING TO SET. s0/test is 8 subjects x 20
-# sequences x 2 hands = 160 scenes, 144 after the two skipped objects, of which
-# ~124 plan. At the measured 2.59 reachable bins per scene that is ~320 episodes
-# an iteration at ~4 s each: ~21 min independent, ~35 min chained. All 21
-# iterations is 7.5 h / 12 h. The test curve does not need every point — five
-# iterations spread across the run show the trend for a tenth of the cost.
+# ── WHY 3 h AND NOT 12 ────────────────────────────────────────────────────────
+# MEASURED, on this split, on this cluster: iteration 23 of run 9 scored 340
+# episodes in 1497 s -> 4.4 s per episode, 25 min per iteration.
 #
-# PREREQUISITE — the test split needs its own tables, and that is a GPU sim pass:
-#     sbatch --export=ALL,SPLIT=test,OUT=output/direction_table_test.json \
-#         examples/slurm/build_direction_table.sbatch
-#     python examples/assign_direction_demos.py --table output/direction_table_test.json \
-#         --out output/regrasp_pins_test --mode per-bin \
-#         --drop-bins='-z_beneath,-x_over_fingers'
-# There is deliberately NO demo_ok_table on test: nothing is collected there, so
-# the pin table itself is the feasibility statement.
+#     129 test scenes x 2.64 slots = 340 episodes per iteration
+#     340 x 4.4 s                  = ~25 min per iteration
+#     x 26 iterations              = ~10.8 h total
 #
-# ONE GPU, FEW CORES: a serial loop over test scenes with no worker pool. It is
-# off every critical path, so its own latency does not matter.
+# An earlier estimate here said 7.4 h, derived from the in-loop `eval_s` divided
+# by what was read as an 8-worker pool. That 8 was `TRAIN.num_workers`, the
+# DATALOADER worker count; the eval pool is `--num-workers` on train_regrasp.py
+# and was larger. The measured number above supersedes it — do not re-derive.
+#
+# `--chained` adds up to `--max-attempts` rollouts per scene plus rewind replay,
+# roughly 2.5x the above.
+#
+# THE SWEEP IS RESUMABLE PER ITERATION. `write_log` rewrites the CSV after every
+# iteration and `read_done` skips rows already in it, so a wall-clock kill costs
+# at most the ~25 min iteration in flight — nothing else. Short chained jobs are
+# therefore strictly better than one long one: DelftBlue backfills short jobs
+# ahead of long ones, and the downside of being killed is 25 minutes.
+#
+#     J=$(sbatch --parsable examples/slurm/eval_regrasp_testset.sbatch)
+#     for i in 1 2 3; do
+#       J=$(sbatch --parsable --dependency=afterany:$J \
+#              examples/slurm/eval_regrasp_testset.sbatch)
+#     done
+#
+# FOUR 3 h passes = 12 h of capacity for 10.8 h of work, ~7 iterations a pass. A
+# pass that finds every iteration already scored prints "nothing to score" and
+# exits in seconds, so a spare tail job costs a queue slot and nothing else.
+#
+# ── ONE PREREQUISITE ────────────────────────────────────────────────────────
+# The SPLIT's pin table must exist: `output/regrasp_pins_<split>.json` and
+# `output/regrasp_pins_<split>_excluded.json`. Nothing here builds them, and the
+# script exits with the two commands that would. Check before submitting:
+#
+#     ls -la output/regrasp_pins_test.json output/regrasp_pins_test_excluded.json
+#
+# Note `regrasp_pins_test.json` carries no `d_rule` in its `_meta`, so it reads
+# as `approach_axis` — which is what runs 1-9 used. Scoring a `grasp_offset` run
+# (10+) on test needs a test table rebuilt under that rule, and
+# `resolve_d_rule` will refuse the run rather than mis-caption the bins.
 # ─────────────────────────────────────────────────────────────────────────────
-#SBATCH --job-name=h2r-regrasp-test
+#SBATCH --job-name=h2r-testeval
 #SBATCH --partition=gpu-v100
 #SBATCH --account=education-me-msc-ro
 #SBATCH --qos=normal
-#SBATCH --time=13:00:00
+#SBATCH --time=03:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gpus-per-task=1
 #SBATCH --mem-per-cpu=4G
-#SBATCH --output=slurm_logs/regrasp_test_%j.out
-#SBATCH --error=slurm_logs/regrasp_test_%j.err
+#SBATCH --output=slurm_logs/testeval_%j.out
+#SBATCH --error=slurm_logs/testeval_%j.err
 
-set -euo pipefail
+set -uo pipefail
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+
+module load 2023r1 || true
+module load cuda/11.7 || true
+source "${CONDA_SH:-$HOME/anaconda3/etc/profile.d/conda.sh}"
+conda activate "${CONDA_ENV:-pch2r_dev}"
+export PYTHONUNBUFFERED=1
+export GADDPG_DIR="${GADDPG_DIR:-$PWD/GA-DDPG}"
+# `env_setup` imports OMG at module scope even though evaluation never plans, so
+# the variable has to be set or the import fails before the first rollout.
+export OMG_PLANNER_DIR="${OMG_PLANNER_DIR:-$PWD/OMG-Planner}"
+
+export SCRATCH_ROOT="${SCRATCH_ROOT:-$HOME/h2r-runs}"
+export REGRASP_DATA="${REGRASP_DATA:-$SCRATCH_ROOT/output}"
+OUT_ROOT="${OUT_ROOT:-$SCRATCH_ROOT/output/dagger_runs}"
 mkdir -p slurm_logs
 
-# ── environment (identical to collect_demos.sbatch — keep in sync) ──────────
-module load miniconda3 2>/dev/null || true
-source "$(conda info --base 2>/dev/null || echo /apps/generic/miniforge3/25.11.0)/etc/profile.d/conda.sh"
-conda activate pch2r_dev
-# DO NOT TRUST AN INHERITED VALUE. `${VAR:-default}` only fires when VAR is
-# UNSET, and sbatch --export=ALL carries the submitting shell's environment onto
-# the compute node — so an OMG_PLANNER_DIR exported from some other directory in
-# that login session silently wins over the $PWD default and travels with the
-# job. add_sys_path_from_env (utils.py:10) then asserts only that the variable
-# EXISTS and appends it verbatim, so the run gets as far as printing its config
-# banner and dies at `import omg` inside gym.make() with
-# "ModuleNotFoundError: No module named 'omg'" — a message that names a
-# dependency when the real problem is a path. Validate, then fall back.
-for _v in OMG_PLANNER_DIR:omg GADDPG_DIR:core; do
-    _name="${_v%%:*}"; _pkg="${_v##*:}"
-    _cur="$(eval echo "\${${_name}:-}")"
-    _def="$PWD/$( [ "$_name" = OMG_PLANNER_DIR ] && echo OMG-Planner || echo GA-DDPG )"
-    if [ -n "${_cur}" ] && [ ! -d "${_cur}/${_pkg}" ]; then
-        echo "WARNING: inherited ${_name}=${_cur} has no ${_pkg}/ — using ${_def}" >&2
-        _cur=""
-    fi
-    export "${_name}=${_cur:-${_def}}"
-    _res="$(eval echo "\${${_name}}")"
-    if [ ! -d "${_res}/${_pkg}" ]; then
-        echo "ERROR: ${_name}=${_res} has no ${_pkg}/ package." >&2
-        echo "  If the directory is empty this is an unpopulated git submodule:" >&2
-        echo "    git submodule update --init --recursive" >&2
-        exit 1
-    fi
-    echo "${_name}=${_res}  (${_pkg}/ present)"
-done
-export PYTHONPATH="$PWD:$PWD/handover-sim:$PWD/handover-sim/mano_pybullet:${PYTHONPATH:-}"
-export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$PWD/OMG-Planner/orocos_kinematics_dynamics/orocos_kdl/release/lib:${LD_LIBRARY_PATH:-}"
-export TORCH_CUDA_ARCH_LIST="7.0"
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-# Unbuffered: a 24 h run must show progress live, and a crash must leave a log
-# that stops where it actually failed rather than at an arbitrary buffer edge.
-export PYTHONUNBUFFERED=1
-
-# ── parameters (override via sbatch --export=ALL,...) ───────────────────────
-RUN="${RUN:?set RUN=<run name>, e.g. --export=ALL,RUN=regrasp_run2}"
-# Same SCRATCH_ROOT knob as train_regrasp.sbatch — pass the SAME value the
-# trainer was submitted with, or this job looks for the run in the repo and exits
-# with "config.yaml not found". Empty default = unchanged in-repo behaviour.
-SCRATCH_ROOT="${SCRATCH_ROOT:-}"
-if [ -n "${SCRATCH_ROOT}" ]; then
-    OUT_ROOT="${OUT_ROOT:-${SCRATCH_ROOT}/output/dagger_runs}"
-else
-    OUT_ROOT="${OUT_ROOT:-output/dagger_runs}"
-fi
-RUN_DIR="${RUN_DIR:-${OUT_ROOT}/${RUN}}"
-
-# ── REGRASP_DATA: the HDF5 shards follow the run onto /scratch ───────────────
-# The configs name their shards as `${REGRASP_DATA}/bc_dataset/...`, which
-# expands at config load (handover_sim2real/regrasp/setup.py) and defaults to the
-# in-repo `output/`. Pointing it at scratch alongside OUT_ROOT is what keeps the
-# ~1.1 GB base set off /home's HARD 30 GB quota — a quota that fills SILENTLY and
-# kills the job with exit code 6 and no traceback, because Python cannot write
-# one to a full disk. The small JSON tables stay in the repo on purpose: they are
-# inputs, they are worth version-controlling, and /scratch is purged by age.
-export REGRASP_DATA="${REGRASP_DATA:-${SCRATCH_ROOT:+${SCRATCH_ROOT}/output}}"
-export REGRASP_DATA="${REGRASP_DATA:-output}"
-mkdir -p "${REGRASP_DATA}/bc_dataset"
-echo "REGRASP_DATA=${REGRASP_DATA}"
-
+RUN="${RUN:-regrasp_run9}"
+RUN_DIR="${RUN_DIR:-$OUT_ROOT/$RUN}"
 SPLIT="${SPLIT:-test}"
 ITERS="${ITERS:-all}"
-CKPT="${CKPT:-last}"                  # matches EVAL.ckpt from run 2 on
-CHAINED="${CHAINED:-0}"               # 1 = also run the retry ladder
-REWIND="${REWIND:-0.30}"
-MAXATT="${MAXATT:-4}"
-EXTRA="${EXTRA:-}"
+CKPT="${CKPT:-last}"
 
-if [ ! -f "${RUN_DIR}/config.yaml" ]; then
-    echo "ERROR: ${RUN_DIR}/config.yaml not found — is that a Regrasp run dir?" >&2
-    exit 1
+# THE RUN DIR IS THE ONE THING THIS CANNOT GUESS. Older campaigns wrote into the
+# repo's own `output/`, later ones into $SCRATCH_ROOT. Try both rather than
+# failing on a path the user never chose.
+if [ ! -f "$RUN_DIR/config.yaml" ] && [ -f "output/dagger_runs/$RUN/config.yaml" ]; then
+    echo "[note] $RUN_DIR has no config.yaml; using ./output/dagger_runs/$RUN"
+    RUN_DIR="output/dagger_runs/$RUN"
 fi
-# ── derive the split's pin table if the direction table is there ─────────────
-# `assign_direction_demos.py` is pure combinatorics over the direction table —
-# seconds, no simulator — so a missing pin table is not a reason to fail a job
-# that has already waited in the queue. The DIRECTION table is the real
-# prerequisite, because building that needs the planner and a GPU pass.
-DIR_TABLE="${DIR_TABLE:-output/direction_table_${SPLIT}.json}"
-PINS="output/regrasp_pins_${SPLIT}.json"
-if [ ! -f "${PINS}" ]; then
-    if [ ! -f "${DIR_TABLE}" ]; then
-        echo "ERROR: neither ${PINS} nor ${DIR_TABLE} exists." >&2
-        echo "  Build the ${SPLIT}-split direction table first (a GPU sim pass):" >&2
-        echo "    sbatch --export=ALL,SPLIT=${SPLIT},OUT=${DIR_TABLE} \\" >&2
-        echo "        examples/slurm/build_direction_table.sbatch" >&2
-        exit 1
-    fi
-    echo "[prep] ${PINS} missing — assigning it from ${DIR_TABLE}"
-    python examples/assign_direction_demos.py --table "${DIR_TABLE}" \
-        --out "output/regrasp_pins_${SPLIT}" --mode per-bin \
-        --drop-bins='-z_beneath,-x_over_fingers'
+if [ ! -f "$RUN_DIR/config.yaml" ]; then
+    echo "FAIL: no config.yaml under $RUN_DIR — set RUN_DIR explicitly." >&2
+    exit 2
 fi
 
-ARGS=(--run-dir "${RUN_DIR}" --split "${SPLIT}" --iters "${ITERS}" --ckpt "${CKPT}")
-[ "${CHAINED}" = "1" ] && ARGS+=(--chained --rewind-frac "${REWIND}" --max-attempts "${MAXATT}")
+EXTRA=""
+[ "${CHAINED:-0}" = "1" ] && EXTRA="--chained"
 
-echo "host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
-echo "run-dir=${RUN_DIR}  split=${SPLIT}  iters=${ITERS}  ckpt=${CKPT}  chained=${CHAINED}"
+echo "host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo none)"
+echo "run_dir=$RUN_DIR  split=$SPLIT  iters=$ITERS  ckpt=$CKPT  chained=${CHAINED:-0}"
+echo "already scored: $(tail -n +2 "$RUN_DIR/${SPLIT}_log.csv" 2>/dev/null | wc -l) iteration(s)"
+df -h "$HOME" | tail -1
 
-srun python examples/eval_regrasp_testset.py "${ARGS[@]}" ${EXTRA}
+python examples/eval_regrasp_testset.py \
+    --run-dir "$RUN_DIR" \
+    --split "$SPLIT" --ckpt "$CKPT" --iters "$ITERS" $EXTRA
+rc=$?
+
+# Re-render the figure from whatever the CSV holds, even if the sweep was cut
+# short — a partial curve is worth looking at and costs seconds.
+echo
+echo "=== plotting from $RUN_DIR/${SPLIT}_log.csv ==="
+python examples/eval_regrasp_testset.py \
+    --run-dir "$RUN_DIR" --split "$SPLIT" --plot-only || true
+
+echo
+echo "scored: $(tail -n +2 "$RUN_DIR/${SPLIT}_log.csv" 2>/dev/null | wc -l) iteration(s)"
+exit $rc
