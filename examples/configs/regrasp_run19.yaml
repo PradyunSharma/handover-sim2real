@@ -1,12 +1,29 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# REGRASP RUN 19 — RUN 9 WITH A PER-STEP COLLISION SHIELD.
+# REGRASP RUN 19 — RUN 9 WITH A PER-STEP COLLISION SHIELD, AND A LONGER REFIT.
 #
-# ONE change against regrasp_run9.yaml: `DAGGER.shield: true` and its three
-# knobs. Everything else — the per-bin table, `command_deploy: bin_centroid`,
-# `bc_regrasp_run9.yaml`, `d_source: d_grasp_world`, `d_noise_deg: 0`, the
-# 0.9 -> 0.75 beta ramp, `train_from_scratch: true`, 25 iterations, and every
-# DART magnitude — is byte-identical. It reuses run 9's direction table, pin
-# table, demo-ok table and base shards unchanged, so there is NOTHING to rebuild.
+# TWO changes against regrasp_run9.yaml — NOT A CLEAN ABLATION, and the run
+# index says so too:
+#
+#   DAGGER.shield        false -> true   (+ its three knobs)   COLLECTION
+#   TRAIN.iter_epochs    15    -> 20                           FITTING
+#
+# They act on different halves of the loop — one changes WHICH STATES get
+# collected, the other HOW HARD the aggregate is fitted — so a gain cannot be
+# attributed to either without a third run. That is a deliberate trade of
+# attribution for wall clock, and the two single-variable runs that would settle
+# it are `run 9 + shield only` and `run 9 + iter_epochs 20 only`. If run 19 beats
+# run 9, run one of those before believing either mechanism.
+#
+# Everything else — the per-bin table, `command_deploy: bin_centroid`,
+# `bc_regrasp_run9.yaml`, `d_source: d_grasp_world`, `d_noise_deg: 0`,
+# `base_epochs: 50`, the 0.9 -> 0.75 beta ramp, `train_from_scratch: true`, 25
+# iterations, and every DART magnitude — is byte-identical. It reuses run 9's
+# direction table, pin table, demo-ok table and base shards unchanged, so there
+# is NOTHING to rebuild.
+#
+# WALL CLOCK: run 9 measured 13.4 h over 26 iterations. The shield is free
+# (one numpy sweep per step) and +5 epochs is +33% on the training half, so
+# budget ~16-17 h.
 #
 # ── WHY ──────────────────────────────────────────────────────────────────────
 #
@@ -271,22 +288,39 @@ TRAIN:
   # and iteration 0 now has ~1.47x the data. Harmless either way — the epoch that
   # matters is whichever `last.pt` ends on.
   base_epochs: 50
-  # 15 epochs, and under `train_from_scratch: true` below this is a COMPLETE
-  # refit budget — the model starts from a random PointNet++ every iteration and
-  # has 15 epochs over the whole aggregate to get back.
+  # ── 20, NOT RUN 9's 15 — THE SECOND CHANGE IN THIS RUN ─────────────────────
+  # Under `train_from_scratch: true` below this is a COMPLETE refit budget: the
+  # model starts from a random PointNet++ every iteration and has this many
+  # epochs over the whole aggregate to get back. 15 was never argued for on this
+  # aggregate; it was inherited from run 2.
+  #
+  # WHY 20. Phase-4 run 16 and run 19 — the two runs that transfer best to the
+  # real robot, and the best in the project at 0.80 — are also FTL from scratch
+  # and give each refit **25** epochs on a **100**-epoch base fit, against run
+  # 9's 15 on 50. Run 9's curve then goes flat from iteration 14 (mean 0.504, sd
+  # 0.053, trend +0.47 pp/iter over iters 14-25) while D grows 5174 -> 7968
+  # episodes, which is the signature of a refit that cannot absorb the data it is
+  # given. 20 moves a third of the way to Phase 4 without also changing the base
+  # fit, which would be a third variable.
   #
   # THE BUDGET IS TIGHT EARLY AND COMFORTABLE LATE, because epochs are over a
   # GROWING D. In gradient steps (batch 64):
   #     iteration 0   50 epochs x  86k steps  =  67k steps
-  #     iteration 1   15 epochs x  95k steps  =  22k steps   <- a third of it
-  #     iteration 25  15 epochs x ~530k steps = 125k steps   <- twice it
+  #     iteration 1   20 epochs x  95k steps  =  30k steps   <- 1.36x run 9's
+  #     iteration 25  20 epochs x ~530k steps = 166k steps   <- 2.5x it
   # So expect the early iterations to sit BELOW the base fit and recover as D
-  # grows. That dip is a property of this schedule, not a failure.
+  # grows. That dip is a property of this schedule, not a failure — and 20
+  # shortens it, which is half the point.
   #
-  # 15 from random is known to be enough for a working policy: regrasp3_fast1's
-  # base fit was exactly that (15 epochs, empty pc_pretrained, 86k steps) and
-  # scored success 0.406 / bin_diag 0.406 at iteration 0.
-  iter_epochs: 15
+  # 15 from random was already known to be ENOUGH FOR A WORKING POLICY —
+  # regrasp3_fast1's base fit was exactly that (15 epochs, empty pc_pretrained,
+  # 86k steps) for success 0.406 / bin_diag 0.406 at iteration 0 — so this is not
+  # a fix for a broken budget. It is a test of whether "enough to work" is also
+  # "enough to keep improving" on an aggregate 6x that size.
+  #
+  # COST: +33% on the training half of every iteration. Run 9 measured 13.4 h
+  # over 26 iterations, so budget ~16-17 h rather than ~14.
+  iter_epochs: 20
   # TRUE — paper-faithful Follow-The-Leader (Ross et al.): every iteration refits
   # from the initialisation on the whole aggregate, discarding the previous
   # iteration's weights. Phase-4 run 16, the best run in the project at 0.80,
@@ -297,9 +331,10 @@ TRAIN:
   # the CVPR2023 encoder — but it is the thing to check first if the run
   # underperforms: see the gradient-step table above, and compare
   # `success_rate` at iterations 1-3 against iteration 0. A run that never gets
-  # back above its base fit is telling you 15 epochs from random is not enough
-  # on this aggregate, and the fix is `pc_pretrained` or more epochs, not more
-  # iterations.
+  # back above its base fit is telling you the refit budget from random is not
+  # enough on this aggregate, and the fix is `pc_pretrained` or more epochs, not
+  # more iterations. THIS RUN TAKES THE "MORE EPOCHS" HALF OF THAT (15 -> 20),
+  # so the iteration-1-to-3 recovery is one of the two things to read here.
   #
   # Costs nothing extra in wall clock: train_on_aggregate fits the whole D for
   # `iter_epochs` either way, so warm start and from-scratch differ only in the
@@ -350,7 +385,10 @@ EVAL:
   # WHY IT IS STILL DEFENSIBLE HERE: at these epoch budgets `best` and `last` are
   # nearly the same checkpoint. Measured val gap between them is +0.000 to +0.001
   # at iter_epochs 6 and +0.002 to +0.005 at 15 — far below anything that moves
-  # success. The choice is close to free in both directions.
+  # success. The choice is close to free in both directions. NOTE those numbers
+  # were measured at 15 and this run fits 20, so the gap will be somewhat wider;
+  # the trend is monotone in the budget and 20 is not far enough out to change
+  # the conclusion, but it is an extrapolation rather than a measurement.
   #
   # THE SELECTION THAT ACTUALLY MATTERS is `select_on: success_rate` below, which
   # picks the best ITERATION on rollouts, where the differences (0.30 -> 0.48
