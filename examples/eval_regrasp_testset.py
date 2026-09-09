@@ -138,7 +138,7 @@ def parse_args() -> argparse.Namespace:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run-dir", required=True, help="output/dagger_runs/<name>")
     p.add_argument("--out", default=None,
-                   help="default <split>_eval_log.csv, so a train sweep cannot "
+                   help="default <split>_log.csv, so a train sweep cannot "
                         "silently overwrite a test one")
     p.add_argument("--iters", default="all",
                    help="'all' or a comma list, e.g. 0,5,10,15,20")
@@ -236,11 +236,26 @@ def run_chained(ctx, runner, scenes, *, rewind_frac: float, max_attempts: int):
 
 
 def plot(run_root: Path, log_path: Path, args) -> None:
-    """The training_curve.png layout, on test, plus a conditioning row.
+    """`<split>_eval.png` — the conditioning figure plus the per-bin diagnostics.
 
-    The PANELS are imported from plot_regrasp_run rather than reimplemented. A
-    test figure that draws its rates slightly differently from the training one
-    is a figure you cannot hold up next to it, which is the only thing it is for.
+    LAYOUT. Two blocks, stacked:
+
+      rows 0-1   the SIX panels of `curves_regrasp.png`, drawn by
+                 `plot_regrasp_run.draw_conditioning` — the same function the
+                 training figure calls, so the two are comparable panel for
+                 panel. On this figure the retry panel additionally carries the
+                 CHAINED curves, which only this script produces.
+      rows 2..   one row per commanded bin, three panels wide:
+                   success stages        close -> near -> grasp -> success
+                   chance vs conversion  did it get a chance, did it take it
+                   approach error        how near the EE actually came
+
+    The panels are IMPORTED, never reimplemented. A test figure that draws its
+    rates even slightly differently from the training one is a figure you cannot
+    hold up next to it, which is the only thing it is for.
+
+    Every axis title is prefixed with the split, because the whole hazard of this
+    figure is someone reading a full-TRAIN number as a held-out one.
     """
     import matplotlib.pyplot as plt
     import plot_regrasp_run as P
@@ -253,82 +268,34 @@ def plot(run_root: Path, log_path: Path, args) -> None:
     it = num("iter")
     ctx = P._Ctx(num, it, args, "grasp")
     bins = P._bins_to_plot(num)
-    cols = [P._BIN_COLOURS_BY_BIN[b] for b in bins]
-    # Panel titles carry the split, because the whole hazard of this figure is
-    # someone reading a full-TRAIN number as a held-out one. "TRAIN" on every
-    # axis is cheap insurance against that.
-    TAG = args.split.upper()
+    TAG = f"{args.split.upper()}: "
 
-    nrow = max(len(bins), 1) + 1                 # + the conditioning row
-    fig, ax = plt.subplots(nrow, 3, figsize=(17, 3.7 * nrow), squeeze=False)
+    nrow = 2 + max(len(bins), 1)
+    fig, ax = plt.subplots(nrow, 3, figsize=(19, 3.7 * nrow), squeeze=False)
+
+    # ---- rows 0-1: the conditioning block, identical to curves_regrasp -----
+    P.draw_conditioning({"retry": ax[0][0], "ended": ax[0][1], "side": ax[0][2],
+                         "succ":  ax[1][0], "track": ax[1][1],
+                         "succ_all": ax[1][2]},
+                        ctx, num, it, bins, tag=TAG)
+
+    # ---- rows 2..: the per-bin diagnostics from training_curve.png ---------
     for r, b in enumerate(bins):
         sfx, name = f"_b{b}", P._bin_title(b)
-        P._panel_nested(ax[r][0], ctx, sfx, title=f"{name} — success stages")
-        P._panel_opportunity(ax[r][1], ctx, sfx, title=f"{name} — chance vs conversion")
-        P._panel_approach(ax[r][2], ctx, sfx, title=f"{name} — approach error")
-
-    # ---- the conditioning row ----------------------------------------------
-    # Told to come in from bin b, how often did the gripper END there. This is
-    # the diagonal of the confusion matrix per commanded bin, against a chance
-    # level of 1/4 — the one number that says whether the command reached the
-    # ACTION rather than merely reaching the network.
-    a = ax[nrow - 1][0]
-    for b, col in zip(bins, cols):
-        ys = ctx.get(f"bin_diag_rate_b{b}")
-        if P._finite(ys):
-            P._plot(a, it, ys, "-", marker="o", ms=3, lw=1.8, color=col,
-                    label=_D.BIN_SHORT[b])
-    a.axhline(0.25, color="0.6", ls=":", lw=1.0)
-    a.text(0.01, 0.235, "chance (4 live bins)", fontsize=7, color="0.4",
-           va="top", transform=a.get_yaxis_transform())
-    a.set_ylim(-0.02, 1.02)
-    P._note_empty(a)
-    P._grid(a, f"{TAG}: ended in the COMMANDED bin (per bin)",
-            ylabel="fraction of that bin's episodes")
-    P._legend(a, loc="upper left", ncol=2)
-
-    # ...and WHICH SIDE it came from, which fails independently of which way it
-    # pointed: a gripper can be correctly oriented on the wrong side.
-    a = ax[nrow - 1][1]
-    for b, col in zip(bins, cols):
-        ys = ctx.get(f"bin_hit_rate_b{b}")
-        if P._finite(ys):
-            P._plot(a, it, ys, "-", marker="o", ms=3, lw=1.8, color=col,
-                    label=_D.BIN_SHORT[b])
-    a.axhline(0.25, color="0.6", ls=":", lw=1.0)
-    a.set_ylim(-0.02, 1.02)
-    P._note_empty(a)
-    P._grid(a, f"{TAG}: arrived from the COMMANDED side (per bin)",
-            ylabel="fraction of that bin's episodes")
-    P._legend(a, loc="upper left", ncol=2)
-
-    # retry@k, independent (solid) against chained (dashed). The gap IS the cost
-    # of a failed attempt: the independent curve assumes attempt 2 starts from
-    # home with the world untouched, the chained one starts it from where
-    # attempt 1 actually left the arm.
-    a = ax[nrow - 1][2]
-    for k, col in zip(range(1, 5), ("tab:blue", "tab:green", "tab:orange", "tab:red")):
-        rung = P._rung(num, k)
-        ys = num(f"retry_at_{k}")
-        if P._finite(ys):
-            P._plot(a, it, ys, "-", marker="o", ms=3, lw=1.4 + 0.2 * k, color=col,
-                    label=f"independent @ {k}{rung}")
-        yc = num(f"chained_retry_at_{k}")
-        if P._finite(yc):
-            P._plot(a, it, yc, "--", marker="s", ms=3, lw=1.4, color=col,
-                    label=f"chained @ {k}{rung}")
-    a.set_ylim(-0.02, 1.02)
-    P._note_empty(a)
-    P._grid(a, f"{TAG}: regrasping — success with k tries",
-            ylabel=f"fraction of {args.split} scenes")
-    P._legend(a, loc="lower right", ncol=2)
+        P._panel_nested(ax[2 + r][0], ctx, sfx,
+                        title=f"{TAG}{name} — success stages")
+        P._panel_opportunity(ax[2 + r][1], ctx, sfx,
+                             title=f"{TAG}{name} — chance vs conversion")
+        P._panel_approach(ax[2 + r][2], ctx, sfx,
+                          title=f"{TAG}{name} — approach error to the grasp")
 
     P._fix_x(fig, it)
     held = "HELD-OUT " if args.split != "train" else "FULL "
-    fig.suptitle(f"Regrasp on the {held}{args.split} split — {run_root.name}",
+    fig.suptitle(f"Regrasp on the {held}{args.split} split — {run_root.name}"
+                 f"   [{int(num('num_scenes')[-1]) if P._finite(num('num_scenes')) else '?'} scenes]",
                  fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 1 - 0.03 / nrow * 2])
-    out = run_root / f"{args.split}_set_evaluation.png"
+    out = run_root / f"{args.split}_eval.png"
     fig.savefig(out, dpi=140)
     print(f"wrote {out}")
 
@@ -336,7 +303,16 @@ def plot(run_root: Path, log_path: Path, args) -> None:
 def main() -> None:
     args = parse_args()
     run_root = Path(args.run_dir)
-    log_path = run_root / (args.out or f"{args.split}_eval_log.csv")
+    # `<split>_log.csv` / `<split>_eval.png`. The earlier names were
+    # `<split>_eval_log.csv` / `<split>_set_evaluation.png`; an existing CSV
+    # under the old name is ADOPTED rather than ignored, so a part-finished
+    # sweep is not re-run from scratch after the rename.
+    log_path = run_root / (args.out or f"{args.split}_log.csv")
+    if args.out is None and not log_path.exists():
+        legacy = run_root / f"{args.split}_eval_log.csv"
+        if legacy.exists():
+            print(f"[compat] adopting {legacy.name} -> {log_path.name}")
+            log_path = legacy
     if args.plot_only:
         plot(run_root, log_path, args)
         return

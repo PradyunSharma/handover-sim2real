@@ -648,7 +648,7 @@ iteration 1's collection curves are not comparable with later ones.
 **Figures.** `curves.png` → `training_curve.png` (4×3, one row per direction),
 plus `debug_dagger.png`, `media_curves.png`, a 2×3 `curves_regrasp.png` carrying
 *ended in the commanded bin* per bin, and — after the run —
-`test_set_evaluation.png` from the test-split script, which also reports the
+`test_eval.png` from the test-split script, which also reports the
 **chained** retry ladder beside the independent `retry@k`. See
 [`README_REGRASP.md`](../README_REGRASP.md) steps 8–9.
 

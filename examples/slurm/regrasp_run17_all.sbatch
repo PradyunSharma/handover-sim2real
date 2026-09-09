@@ -4,36 +4,66 @@
 #
 #     sbatch examples/slurm/regrasp_run17_all.sbatch
 #
-# IT WILL NOT FINISH IN ONE 24 h ALLOCATION, and that is not a bug in the
-# script. Measured from run 11's own `wall_s` (fit `wall(i) = 0.78*i + 6.6 min`)
-# and scaled for run 16's ~7x larger eval:
+# IT WILL NOT FINISH IN ONE ALLOCATION, and that is not a bug in the script.
+# Measured from run 11's own `wall_s` (fit `wall(i) = 0.78*i + 6.6 min`) and
+# scaled for the ~7x larger eval:
 #
-#     direction table train    1.5 h
-#     direction table val      0.2 h
-#     collect train            5.0 h
-#     collect val              0.3 h
-#     train, 25 iterations    16.1 h
-#     ------------------------------
-#     TOTAL                   23.1 h        DelftBlue hard maximum: 24 h
+#     STAGE                          work     indivisible?
+#     1a direction table train        1.5 h   yes
+#     1b direction table val          0.2 h   yes
+#     2  assign per-bin demos        ~0.0 h   yes (seconds)
+#     3a collect train                5.0 h   YES - see below
+#     3b collect val                  0.3 h   YES
+#     4  audit the base shard        ~0.1 h   yes
+#     5  train, 25 iterations        16.1 h   no, resumable PER ITERATION
+#     -------------------------------------
+#        phases 1-4                   7.1 h
+#        phase 5                     16.1 h
 #
-# 0.9 h of margin on a 23 h estimate is not margin. So this script is IDEMPOTENT
-# instead: every stage is skipped when its output already exists, and
-# `train_regrasp.py` resumes from `state.json`. Submit it twice, chained, and
-# pass 2 picks up wherever pass 1 was killed:
+# ── DO NOT REQUEST 24 h ──────────────────────────────────────────────────────
+# DelftBlue's scheduler backfills SHORT jobs ahead of long ones, so a 24 h
+# request queues behind almost everything while a 7-9 h request starts far
+# sooner. Total wall clock is dominated by queue time, not compute, so asking
+# for what a phase actually needs is the single biggest lever available.
 #
-#     J1=$(sbatch --parsable examples/slurm/regrasp_run17_all.sbatch)
-#     sbatch --dependency=afterany:$J1 examples/slurm/regrasp_run17_all.sbatch
+# `#SBATCH --time` below is 9 h: enough for phases 1-4 in one job (7.1 h of work,
+# 27% buffer). Phase 5 is resumable per iteration, so it goes in SHORTER chained
+# jobs rather than one long one. Override on the command line:
 #
-# `afterany`, NOT `afterok`: pass 1 is EXPECTED to die on the wall clock, which
-# is a non-zero exit. Under `afterok` pass 2 would never start.
+#     # phases 1-4, one job
+#     J=$(sbatch --parsable examples/slurm/regrasp_run17_all.sbatch)
+#     # phase 5, three chained passes of 7 h
+#     for i in 1 2 3; do
+#       J=$(sbatch --parsable --time=07:00:00 --dependency=afterany:$J \
+#              examples/slurm/regrasp_run17_all.sbatch)
+#     done
 #
-# WHY ONE JOB IS WORSE THAN FOUR, in case the trade is ever revisited. Each stage
+# `afterany`, NOT `afterok`: a pass that hits its wall clock exits non-zero,
+# which is EXPECTED, and under `afterok` the next pass would never start. A pass
+# that finds all 25 iterations already done exits in seconds, so an unneeded
+# tail job costs a queue slot and nothing else.
+#
+# ── WHAT MAKES SHORT JOBS SAFE ──────────────────────────────────────────────
+# Every stage is skipped when its output already exists, and `train_regrasp.py`
+# resumes from `state.json`, so a wall-clock kill in phase 5 costs only the
+# iteration in flight.
+#
+# THE COLLECTION STAGES ARE THE EXCEPTION and are why `.partial` exists. The
+# collector writes one HDF5 group per episode as it goes, so a job killed
+# mid-collection leaves a real, openable, INCOMPLETE shard — and a bare
+# `[ ! -f "$h5" ]` check would call it finished. Every later stage would then
+# train on a truncated shard silently. Both collections and both table builds
+# therefore write to `<out>.partial` and rename only after a zero exit. A killed
+# collection re-runs from scratch; it never half-succeeds.
+#
+# WHY ONE JOB RATHER THAN FIVE, in case the trade is ever revisited. Each stage
 # wants different resources — the table build is one GPU and 4 cores, collection
-# is CPU-wide, training is GPU plus workers — so a single allocation has to ask
-# for the maximum any stage needs and waste the rest for the other 80% of the
-# time. The staged version in the run-16 section of docs/run_index.md also fails
-# cheaper: a bad direction table costs 1.5 h there and 6.5 h here, because here
-# it is only discovered after collection has already run against it.
+# is CPU-wide, training is GPU plus workers — so a single allocation asks for the
+# maximum any stage needs and wastes the rest. Against that: five submissions
+# means five queue waits, and the phase split above already recovers most of the
+# benefit. The staged version in the run-16 section of docs/run_index.md also
+# fails cheaper: a bad direction table costs 1.5 h there and 6.5 h here, because
+# here it is only discovered after collection has run against it.
 #
 # ── EVERYTHING ON /home ──────────────────────────────────────────────────────
 # `SCRATCH_ROOT` is a misnomer inherited from train_regrasp.sbatch: it sets both
@@ -57,7 +87,7 @@
 #SBATCH --partition=gpu-v100
 #SBATCH --account=education-me-msc-ro
 #SBATCH --qos=normal
-#SBATCH --time=24:00:00
+#SBATCH --time=09:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
@@ -115,16 +145,20 @@ stage () { echo; echo "=== [$(date +%H:%M:%S)] $* ==="; }
 # table, so a mismatch fails immediately rather than after the collection.
 if [ ! -f "$DT_TRAIN" ]; then
     stage "1a  direction table (train)  ~1.5 h"
+    rm -f "$DT_TRAIN.partial"
     python examples/build_direction_table.py --cfg-file "$SIM_CFG" \
-        --split train --out "$DT_TRAIN" $D_ARGS
+        --split train --out "$DT_TRAIN.partial" $D_ARGS
+    mv "$DT_TRAIN.partial" "$DT_TRAIN"
 else
     echo "[skip] $DT_TRAIN exists"
 fi
 
 if [ ! -f "$DT_VAL" ]; then
     stage "1b  direction table (val)  ~0.2 h"
+    rm -f "$DT_VAL.partial"
     python examples/build_direction_table.py --cfg-file "$SIM_CFG" \
-        --split val --out "$DT_VAL" $D_ARGS
+        --split val --out "$DT_VAL.partial" $D_ARGS
+    mv "$DT_VAL.partial" "$DT_VAL"
 else
     echo "[skip] $DT_VAL exists"
 fi
@@ -156,10 +190,20 @@ for sp in train val; do
         # `--d-rule`/`--d-point-depth` default to the pin table's `_meta`, but
         # they are passed explicitly: the shard's captions are what training
         # reads, and a silent default is the one thing that must not decide them.
+        # ---- WRITE ASIDE, RENAME ON SUCCESS -------------------------------
+        # The collector creates one HDF5 group PER EPISODE as it goes, so a job
+        # killed on the wall clock leaves a real, openable, INCOMPLETE file --
+        # and the `[ ! -f "$h5" ]` check above would treat it as finished. Every
+        # later stage would then train on a truncated shard with no warning.
+        # Collecting into `.partial` and renaming only after a zero exit makes
+        # the check honest, which is what allows this script to be submitted
+        # with a time limit shorter than the whole pipeline.
+        rm -f "$h5.partial"
         python examples/collect_regrasp_demos.py --cfg-file "$SIM_CFG" \
-            --split "$sp" --output "$h5" --grasp-pin-table "$pin" \
+            --split "$sp" --output "$h5.partial" --grasp-pin-table "$pin" \
             --d-rule location_extent --d-point-depth 0.1034 --anchor-hand-ref base \
             --valid-grasp-dict examples/valid_grasp_dict_005.pkl
+        mv "$h5.partial" "$h5"
     else
         echo "[skip] $h5 exists"
     fi

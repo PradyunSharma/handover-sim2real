@@ -171,38 +171,65 @@ inputs, and config-vs-table consistency. Expected on a first run:
 **Do not submit if `[1/4]` or `[2/4]` fails.** A `[4/4]` MISMATCH means a stale
 table exists at the run's paths — see §5.3.
 
-### 3.2 Submit
+### 3.2 Submit — request per PHASE, never 24 h
 
-The job **will not finish in one 24 h allocation** and that is not a bug.
-Measured from run 11's own `wall_s` (`wall(i) = 0.78·i + 6.6 min`) and scaled
-for the ~7× larger eval:
+**DelftBlue backfills short jobs ahead of long ones.** Total wall clock here is
+dominated by queue time, not compute, so asking for what a phase actually needs
+is the biggest lever available. A 24 h request queues behind almost everything;
+a 7–9 h request starts far sooner. **Do not request 24 h for any of these jobs.**
 
-```
-direction table train    1.5 h
-direction table val      0.2 h
-collect train            5.0 h
-collect val              0.3 h
-train, 25 iterations    16.1 h
-------------------------------
-TOTAL                   23.1 h      DelftBlue hard maximum: 24 h
-```
+Measured stage costs, from run 11's own `wall_s` (`wall(i) = 0.78·i + 6.6 min`)
+scaled for the ~7× larger eval:
 
-0.9 h of margin on a 23 h estimate is not margin, so the script is **idempotent**
-instead: every stage is skipped when its output exists, and `train_regrasp.py`
-resumes from `state.json`. Submit twice, chained:
+| stage | work | resumable? |
+|---|---|---|
+| 1a direction table, train | 1.5 h | no |
+| 1b direction table, val | 0.2 h | no |
+| 2 assign per-bin demos | seconds | no |
+| 3a **collect train** | **5.0 h** | **no — indivisible** |
+| 3b collect val | 0.3 h | no |
+| 4 audit the base shard | ~5 min | no |
+| **phases 1–4 total** | **7.1 h** | |
+| 5 train, 25 iterations | 16.1 h | **yes, per iteration** |
+
+Phase 5 is the only resumable stage (`state.json` records the last completed
+iteration), so it is the only one worth splitting. Phases 1–4 go in one job
+because stage 3a cannot be interrupted — see §5.7.
 
 ```bash
-J1=$(sbatch --parsable examples/slurm/regrasp_run18_all.sbatch)
-echo "pass 1 = $J1"
-J2=$(sbatch --parsable --dependency=afterany:$J1 examples/slurm/regrasp_run18_all.sbatch)
-echo "pass 2 = $J2"
+# ---- phase 1-4: tables, assignment, collection, audit --------------------
+# 7.1 h of work. The script's own #SBATCH --time is already 09:00:00 (27%
+# buffer), so no override is needed here.
+JA=$(sbatch --parsable examples/slurm/regrasp_run18_all.sbatch)
+echo "phases 1-4 = $JA"
+
+# ---- phase 5: training, three chained passes of 7 h ---------------------
+# 16.1 h of work against 21 h of capacity. Each pass re-runs the skip checks
+# in seconds, then resumes training from state.json.
+J=$JA
+for i in 1 2 3; do
+    J=$(sbatch --parsable --time=07:00:00 --dependency=afterany:$J \
+            examples/slurm/regrasp_run18_all.sbatch)
+    echo "training pass $i = $J"
+done
 ```
 
-**`afterany`, not `afterok`.** Pass 1 is *expected* to die on the wall clock,
-which is a non-zero exit; under `afterok` pass 2 would never start.
+**`afterany`, not `afterok`.** A pass that hits its wall clock exits non-zero,
+which is expected; under `afterok` the next pass would never start.
 
-If 25 iterations are still not done after pass 2, submit a third the same way
-with `--dependency=afterany:$J2`.
+A pass that finds all 25 iterations already done exits in seconds, so a spare
+tail job costs a queue slot and nothing else. If training finishes early, cancel
+what is left rather than leaving it queued:
+
+```bash
+squeue -u $USER -o "%.10i %.12j %.8T %.10l %R"
+scancel <jobid>          # any still-pending pass that is no longer needed
+```
+
+**Sizing rule if you change anything.** Give a phase its measured work plus
+~25%, rounded up to the half hour. Never round up to 24 h "to be safe" — the
+queue penalty is larger than the risk, and every stage here is either idempotent
+or `.partial`-guarded, so a kill costs re-work rather than corruption.
 
 ### 3.3 Monitor
 
@@ -357,9 +384,15 @@ procedure, three substitutions:
 
 ```bash
 bash examples/slurm/preflight_regrasp.sh regrasp_run17
-J1=$(sbatch --parsable examples/slurm/regrasp_run17_all.sbatch)
-sbatch --parsable --dependency=afterany:$J1 examples/slurm/regrasp_run17_all.sbatch
+JA=$(sbatch --parsable examples/slurm/regrasp_run17_all.sbatch)     # phases 1-4, 9 h
+J=$JA
+for i in 1 2 3; do
+    J=$(sbatch --parsable --time=07:00:00 --dependency=afterany:$J \
+            examples/slurm/regrasp_run17_all.sbatch)
+done
 ```
+
+Same phase costs — run 17's stages are the same work, only the `d_rule` differs.
 
 ### Two differences in the gates
 
@@ -440,7 +473,31 @@ the table's `_meta` and compared at load.
 Only collection and the table build need OMG. The sbatch exports it; an
 interactive check does not. Export it (§1) and retry.
 
-### 5.6 Iteration count stalls across a chained pass
+### 5.6 A stage re-runs that should have been skipped
+
+Both collections and both table builds write to `<out>.partial` and rename only
+on a zero exit, so a killed stage leaves the `.partial` behind and re-runs from
+scratch next pass. That is correct. A leftover `.partial` is safe to delete and
+is not read by anything:
+
+```bash
+ls -la output/*_bframe.json.partial $REGRASP_DATA/bc_dataset/*_bframe.h5.partial 2>/dev/null
+```
+
+### 5.7 A collection was killed mid-flight
+
+Stage 3a takes 5 h and **cannot resume** — the collector replays OMG plans scene
+by scene and keeps no cursor. A killed collection re-runs in full. This is why
+phases 1–4 share one 9 h job rather than being split further: a 4 h request would
+kill stage 3a every time and never make progress.
+
+If the run keeps dying inside stage 3a, check the wall clock actually granted:
+
+```bash
+sacct -j <jobid> --format=JobID,JobName%14,State,ExitCode,Timelimit,Elapsed
+```
+
+### 5.8 Iteration count stalls across a chained pass
 
 Check that pass 2 actually started and that `state.json` advanced:
 
@@ -460,15 +517,21 @@ source ~/anaconda3/etc/profile.d/conda.sh && conda activate pch2r_dev
 export GADDPG_DIR=$PWD/GA-DDPG OMG_PLANNER_DIR=$PWD/OMG-Planner
 export SCRATCH_ROOT=$HOME/h2r-runs REGRASP_DATA=$SCRATCH_ROOT/output
 
-# run 18
+# run 18 — phases 1-4 (9 h, the script default), then 3 training passes of 7 h
 bash examples/slurm/preflight_regrasp.sh regrasp_run18
-J1=$(sbatch --parsable examples/slurm/regrasp_run18_all.sbatch)
-sbatch --dependency=afterany:$J1 examples/slurm/regrasp_run18_all.sbatch
+J=$(sbatch --parsable examples/slurm/regrasp_run18_all.sbatch)
+for i in 1 2 3; do
+    J=$(sbatch --parsable --time=07:00:00 --dependency=afterany:$J \
+            examples/slurm/regrasp_run18_all.sbatch)
+done
 
-# run 17, after run 18 has results
+# run 17, after run 18 has results — identical shape
 bash examples/slurm/preflight_regrasp.sh regrasp_run17
-J1=$(sbatch --parsable examples/slurm/regrasp_run17_all.sbatch)
-sbatch --dependency=afterany:$J1 examples/slurm/regrasp_run17_all.sbatch
+J=$(sbatch --parsable examples/slurm/regrasp_run17_all.sbatch)
+for i in 1 2 3; do
+    J=$(sbatch --parsable --time=07:00:00 --dependency=afterany:$J \
+            examples/slurm/regrasp_run17_all.sbatch)
+done
 
 # progress, plots
 squeue -u $USER
@@ -477,3 +540,41 @@ python examples/plot_regrasp_run.py $SCRATCH_ROOT/output/dagger_runs/regrasp_run
 
 **The number that matters is `success_rate_in_table`, not `success_rate`.**
 Run 11's 0.6186 @ it22 is the bar.
+
+---
+
+## 7. Scoring a finished run on the held-out test split
+
+Separate from the two runs above, and cheap — no collection, no training, just
+rollouts of checkpoints that already exist. `examples/eval_regrasp_testset.py`
+scores **every iteration** of a finished run on a whole split and writes
+`<split>_log.csv` plus `<split>_eval.png`.
+
+```bash
+# every iteration of run 9 on the held-out s0 TEST split (130 scenes)
+python examples/eval_regrasp_testset.py \
+    --run-dir output/dagger_runs/regrasp_run9 \
+    --split test --ckpt last --iters all
+```
+
+Add `--chained` to also run true chained retry (the rewind machinery, attempt 2
+starting where attempt 1 left the arm) — it roughly doubles the runtime and adds
+the dashed `CHAINED @ k` curves to the retry panel.
+
+Budget ~130 scenes x live bins x iterations rollouts. For run 9 (26 iterations,
+4 live bins) that is ~13.5k episodes; at run 11's eval rate expect **6-9 h**, so
+request **`--time=09:00:00`** and use `--iters 0,5,10,15,20,25` for a first pass
+if you want a curve shape in ~2 h. The script resumes: rows already in the CSV
+are skipped unless `--force`.
+
+`test_eval.png` carries, per iteration:
+
+- rows 0-1: the six `curves_regrasp` panels, drawn by the same
+  `plot_regrasp_run.draw_conditioning` the training figure uses
+- rows 2+: one row per bin — success stages, chance vs conversion, approach
+  error to the grasp
+
+**Run 9 predates `EVAL.full_bin_coverage`**, so its `succ_bin_all_*` columns are
+empty and the *ALL scenes* panel correctly renders the "coverage was off" note
+instead of a misleading blank grid. The *DEMONSTRATED scenes* panel is the real
+per-bin curve for that run.
