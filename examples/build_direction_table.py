@@ -62,7 +62,8 @@ sys.path.insert(0, _HERE)
 
 from handover_sim2real.regrasp import anchor as A                  # noqa: E402
 from handover_sim2real.regrasp import directions as D              # noqa: E402
-from handover_sim2real.regrasp.channels import object_centroid     # noqa: E402
+from handover_sim2real.regrasp.channels import (object_centroid,      # noqa: E402
+                                                hand_centroid)
 from handover_sim2real.regrasp.env_setup import (                  # noqa: E402
     build_sim_cfg, build_sim_context, preflight,
 )
@@ -87,6 +88,29 @@ def parse_args() -> argparse.Namespace:
                         "its axis (45 = the Voronoi half-angle at k=6, so every "
                         "grasp lands in exactly one bin)")
     p.add_argument("--valid-grasp-dict", default="examples/valid_grasp_dict_005.pkl")
+    # ---- WHICH FRAME THE BINS ARE NAMED IN. ---------------------------------
+    # THIS FLAG EXISTS BECAUSE RUN 16 SHIPPED WITHOUT IT. The builder hardcoded
+    # the MANO wrist while the run's collector and evaluator used
+    # `anchor_hand_ref: hand_centroid`, so the table captioned bins in one frame
+    # and the rollouts realised them in another: `bin_assigned == bin_realized`
+    # fell from 99% to 40%, the dataset's miscaption filter discarded 44% of
+    # every DAgger shard on top of the 22% it already dropped, and training saw
+    # 19% of what it was collecting. Nothing in the pipeline said a word. The
+    # value is written into `_meta` and `setup.resolve_anchor` now refuses a run
+    # whose config disagrees with it.
+    p.add_argument("--anchor-hand-ref", default="wrist",
+                   choices=list(A.ANCHOR_HAND_REFS),
+                   help="what the anchor's azimuth is measured FROM. wrist "
+                        "(runs 1-15): the MANO wrist joint, exact and "
+                        "sim-only. hand_centroid (run 16): the segmented hand "
+                        "cloud's centroid, deployable but DEGENERATE — it sits "
+                        "on the object it is holding, so the lever arm is 9.2 "
+                        "cm falling to 7.7 cm by the close and the frame "
+                        "rotates a median 10.65 deg (15.8%% past 90 deg) "
+                        "during an episode. base (runs 17-18): no hand at all, "
+                        "x = horizontal(p_base - c), lever arm 61.3 cm with a "
+                        "41.8 cm floor and 1.49 deg of live drift. MUST match "
+                        "SIM.anchor_hand_ref in the run config.")
     p.add_argument("--members-per-bin", type=int, default=5,
                    help="how many goal-set grasps to RECORD per bin, closest to "
                         "the bin axis first (run 2 recorded 1). Recording more "
@@ -192,6 +216,9 @@ def main() -> None:
         "max_angle_deg": float(args.max_angle),
         "valid_grasp_dict_path": args.valid_grasp_dict,
         "centroid_source": "observed point cloud (ycb channel), EE frame -> world",
+        # READ BY `setup.resolve_anchor`. A run whose SIM.anchor_hand_ref
+        # differs from this is scored against bins drawn in another frame.
+        "anchor_hand_ref": str(args.anchor_hand_ref),
         "built": time.strftime("%Y-%m-%d %H:%M:%S"),
         **rule.as_meta(),
     }}
@@ -208,6 +235,7 @@ def main() -> None:
     print(f"Regrasp direction table   split={args.split}  scenes {lo}..{hi - 1}")
     print(f"  k={args.k}  max_angle={args.max_angle} deg  -> {out}")
     print(f"  d = {rule.describe()}")
+    print(f"  anchor azimuth from: {args.anchor_hand_ref}")
     print("=" * 74)
 
     for idx in range(lo, hi):
@@ -241,7 +269,20 @@ def main() -> None:
             pc, obs, sim.panda_base_inv_tf, cfg.ENV.PANDA_BASE_POSITION,
             cfg.ENV.PANDA_BASE_ORIENTATION) if rule.needs_points() else None)
 
-        R, meta = A.anchor_rotation(c_world, wrist, base, A.AnchorState())
+        # THE SAME CALL THE COLLECTOR AND EVALUATOR MAKE, with the same
+        # reference, so the bins this file names are the bins they realise.
+        # Under `base` the hand is not read at all and `wrist` above is recorded
+        # for diagnostics only.
+        if args.anchor_hand_ref == "hand_centroid":
+            h_ee = hand_centroid(pc)
+            ref = (wrist if h_ee is None else A.centroid_to_world(
+                h_ee, obs, sim.panda_base_inv_tf,
+                cfg.ENV.PANDA_BASE_POSITION, cfg.ENV.PANDA_BASE_ORIENTATION))
+        else:
+            ref = wrist
+        R, meta = A.anchor_rotation(
+            c_world, ref, base, A.AnchorState(),
+            reference=("base" if args.anchor_hand_ref == "base" else "hand"))
         modes[meta["mode"]] += 1
         if meta["mode"] == "base":
             n_fallback += 1

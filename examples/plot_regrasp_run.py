@@ -455,6 +455,50 @@ def _panel_nested(a, c: _Ctx, sfx="", title=None):
     _legend(a, loc="upper left")
 
 
+def _panel_nested_intab(a, c: _Ctx, b, title=None):
+    """`_panel_nested` over the scenes that DEMONSTRATE this bin.
+
+    THE POPULATION `*_b{b}` USED TO MEAN. Those columns filter on `bin_idx` and
+    nothing else, so under `EVAL.full_bin_coverage` they became the all-scenes
+    population at run 16 while keeping their old names. This panel carries what
+    runs 1-15 plotted, so the two columns of `training_curve.png` can be read
+    against each other and against every earlier run.
+
+    THE SUCCESS LINE IS RECONSTRUCTABLE ON RUNS THAT NEVER LOGGED IT.
+    `succ_bin_{b}` is exactly "success on the scenes demonstrating b" and has
+    been logged since run 1, so run 16 gets its success curve here with no
+    re-run. `close`/`near`/`grasp` have no such twin — only the all-scenes
+    version was ever written — so on run 16 they are simply absent and the panel
+    draws success alone. Runs 17+ log `*_intab_b{b}` and fill it in.
+    """
+    drew = False
+    for key, label, style in (("close_rate", "close", ":"),
+                              ("near_rate", "near (pose ok)", "-."),
+                              ("grasp_rate", "grasp", "--")):
+        ys = c.get(f"{key}_intab_b{b}")
+        if _finite(ys):
+            _plot(a, c.it, ys, style, marker="o", ms=3, label=label, lw=1.2)
+            drew = True
+    ys = c.get(f"succ_bin_{b}")
+    if _finite(ys):
+        _plot(a, c.it, ys, "-", marker="o", ms=3, label="success", lw=2)
+        drew = True
+    # The all-scenes success, faint, for the gap. Same panel rather than a
+    # cross-column eyeball, and greyed so it cannot be mistaken for a stage.
+    alls = c.get(f"succ_bin_all_{b}")
+    if _finite(alls) and drew:
+        _plot(a, c.it, alls, "-", color="0.55", lw=1.0, alpha=0.8,
+              label="success (all scenes)")
+    a.set_ylim(-0.02, 1.02)
+    if not drew:
+        a.text(0.5, 0.5, "no demonstrated-only columns in this run's log",
+               ha="center", va="center", transform=a.transAxes,
+               fontsize=8, color="0.45")
+    _grid(a, title or "success stages — demonstrated scenes",
+          ylabel="fraction of episodes")
+    _legend(a, loc="upper left")
+
+
 def _panel_opportunity(a, c: _Ctx, sfx="", title=None, lean=False):
     """Did it get a chance, and did it take it.
 
@@ -847,10 +891,28 @@ def main() -> None:
     # column is blank for every bin) the reader is paying 20% of the figure for
     # a sentence. The note still fires when a column has data for SOME bins and
     # not others, which is the case worth flagging in place.
+    # WAS `EVAL.full_bin_coverage` ON. Without it there is only ONE population —
+    # `*_b{b}` and the demonstrated subset are the same rows — so the second
+    # column would be a pixel-for-pixel copy of the first. Runs 1-15 therefore
+    # render exactly as they always did.
+    _full_cov = any(_finite(ctx.get(f"succ_bin_all_{b}")) for b in bins)
     COLS = [
         (lambda a, b, sfx, first: _panel_nested(
-             a, ctx, sfx, title=f"{_bin_title(b)} — success stages"),
+             a, ctx, sfx,
+             title=f"{_bin_title(b)} — success stages"
+                   + (", ALL scenes" if _full_cov else "")),
          ["close_rate", "near_rate", "grasp_rate", "success_rate"]),
+        # ...and the same stages over the scenes that DEMONSTRATE the bin, which
+        # is what `*_b{b}` meant before `EVAL.full_bin_coverage` existed. Kept
+        # adjacent so the pair is one saccade apart. `succ_bin_{b}` is in the
+        # liveness keys because it is the one series this column can always
+        # draw — including on run 16, which logged no `*_intab_b{b}`.
+    ] + ([
+        (lambda a, b, sfx, first: _panel_nested_intab(
+             a, ctx, b,
+             title=f"{_bin_title(b)} — success stages, DEMONSTRATED scenes"),
+         ["succ_bin", "close_rate_intab", "near_rate_intab", "grasp_rate_intab"]),
+    ] if _full_cov else []) + [
         (lambda a, b, sfx, first: _panel_opportunity(
              a, ctx, sfx, title=f"{_bin_title(b)} — chance vs conversion"),
          ["box_chance_rate", "box_taken_rate", "mean_box_frac"]),
@@ -867,8 +929,14 @@ def main() -> None:
              title=f"{_bin_title(b)} — EVAL outcomes (policy alone, beta=0)"),
          [k for k, _, _ in _OUTCOMES]),
     ]
+    def _has(k, b):
+        # `succ_bin_{b}` is named without the `_b` infix every other per-bin
+        # column uses, so the liveness probe has to try both spellings rather
+        # than assume the suffix pattern.
+        return _finite(ctx.get(f"{k}_b{b}")) or _finite(ctx.get(f"{k}_{b}"))
+
     live = [(fn, keys) for fn, keys in COLS
-            if any(_finite(ctx.get(f"{k}_b{b}")) for k in keys for b in bins)]
+            if any(_has(k, b) for k in keys for b in bins)]
     dropped = len(COLS) - len(live)
     ncol = max(len(live), 1)
     fig, ax = plt.subplots(nrow, ncol, figsize=(5.6 * ncol, 3.7 * nrow),
@@ -1043,11 +1111,40 @@ def main() -> None:
     # the expert itself is failing on these scenes and the labels are the problem.
     a = bx[1][3]
     cs, es, bt = num("c_success_rate"), num("success_rate"), num("beta")
+    # ---- THE EVAL LINE IS TWO LINES ONCE FULL COVERAGE IS ON ----------------
+    # `success_rate` averages EVERY evaluated row, and under
+    # `EVAL.full_bin_coverage` ~80% of those command a bin the scene never
+    # demonstrates — so plotting it alone against runs 1-15 compares different
+    # populations. `success_rate_in_table` is the comparable one.
+    #
+    # RECONSTRUCTED WHEN ABSENT, which is what makes run 16 readable without
+    # re-running it: the per-bin numerators and denominators (`succ_bin_{b}`,
+    # `n_bin_{b}`) have been logged since run 1, and
+    # sum_b succ_bin_b * n_bin_b / sum_b n_bin_b is that rate exactly. Every
+    # in-table row carries a bin, so nothing is missed by the sum.
+    eit = num("success_rate_in_table")
+    if not _finite(eit):
+        num_, den_ = None, None
+        for b in range(len(_D.BINS)):
+            sb, nb = num(f"succ_bin_{b}"), num(f"n_bin_{b}")
+            if not (_finite(sb) and _finite(nb)):
+                continue
+            prod = np.asarray(sb, float) * np.asarray(nb, float)
+            num_ = prod if num_ is None else np.nansum([num_, prod], axis=0)
+            den_ = (np.asarray(nb, float) if den_ is None
+                    else np.nansum([den_, np.asarray(nb, float)], axis=0))
+        if num_ is not None:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                eit = np.where(den_ > 0, num_ / np.maximum(den_, 1e-9), np.nan)
     if _finite(cs):
         _plot(a, it, cs, "-o", ms=3, color="tab:blue",
               label="collection (beta mixture)")
     if _finite(es):
-        _plot(a, it, es, "-s", ms=3, color="tab:green", label="eval (policy alone)")
+        _plot(a, it, es, "-s", ms=3, color="tab:green",
+              label="eval — all commanded bins")
+    if _finite(eit):
+        _plot(a, it, eit, "--^", ms=3.5, color="tab:red",
+              label="eval — demonstrated bins (runs 1-15 comparable)")
     if _finite(bt):
         _plot(a, it, bt, ":", color="tab:gray", label="beta (expert share)")
     a.set_ylim(0, 1)
@@ -1308,15 +1405,30 @@ def main() -> None:
                 # bin can succeed because the policy ignored it and did the easy thing;
                 # that shows up as a high success rate on the left with a dir_track here
                 # no better than the bins it is beating.
+            # ---- THE DEMONSTRATED SUBSET, and it must NOT be `success_rate_b*`.
+            # `success_rate_b{b}` comes out of the generic per-bin block, which
+            # filters rows by `bin_idx` and NOTHING ELSE — so under
+            # `EVAL.full_bin_coverage` it silently includes the off-table rows
+            # and is numerically IDENTICAL to `succ_bin_all_{b}`. Measured on run
+            # 16 it 19: success_rate_b0 = succ_bin_all_0 = 0.4717 to every digit,
+            # while succ_bin_0 (the demonstrated scenes) is 0.5263. Plotting the
+            # former here drew the same series as the `succ_all` panel beside it
+            # and the in-table number appeared nowhere but a faint dotted
+            # overlay. `succ_bin_{b}` is the one that carries the in-table
+            # filter, and on runs 1-15 — which have no off-table rows — the two
+            # are equal, so preferring it changes no historical curve.
             a = axes.get("succ")
             if a is not None:
                 for b, col in zip(bins, _BIN_COLOURS):
-                    ys = c_get(f"success_rate_b{b}")       # falls back to run 1's succ_bin_
+                    ys = c_get(f"succ_bin_{b}")
+                    if not _finite(ys):
+                        ys = c_get(f"success_rate_b{b}")   # pre-`succ_bin_*` runs
                     if _finite(ys):
                         _plot(a, it, ys, "-", marker="o", ms=3, lw=1.6, color=col,
                               label=_D.BIN_SHORT[b])
                 a.set_ylim(-0.02, 1.02)
-                _grid(a, "success per commanded direction",
+                _grid(a, "success per commanded direction — DEMONSTRATED scenes\n"
+                         "(scenes that carry a demo for that bin; runs 1-15 comparable)",
                       ylabel="fraction of that bin's episodes")
                 _legend(a, loc="upper left", ncol=2)
             # ...and the SAME BIN COMMANDED ON EVERY EVALUATED SCENE, not only
@@ -1338,28 +1450,56 @@ def main() -> None:
             # which is the finding that would make `k` NOT a test-time knob.
             a = axes.get("succ_all")
             if a is not None:
-                drew = False
+                # DECIDE BEFORE DRAWING. Without an all-scenes series there is
+                # nothing here to compare the demonstrated subset AGAINST, and
+                # drawing it alone would duplicate the panel to the left and then
+                # print "coverage was off" across the top of it — which is what
+                # runs 1-15 rendered as. Either both series or neither.
+                drew = any(_finite(c_get(f"succ_bin_all_{b}")) for b in bins)
+                drew_sub = False
                 for b, col in zip(bins, _BIN_COLOURS):
+                    if not drew:
+                        break
                     ys = c_get(f"succ_bin_all_{b}")
                     if _finite(ys):
                         _plot(a, it, ys, "-", marker="o", ms=3, lw=1.8,
                               color=col, label=_D.BIN_SHORT[b])
-                        drew = True
+                    # The demonstrated subset, over the top, so the vertical gap
+                    # IS the generalisation cost. Heavier than it was: at lw 1.2
+                    # / alpha 0.65 six dotted lines under six solid ones were not
+                    # readable, which is how the in-table series came to look
+                    # absent from both panels.
                     sub = c_get(f"succ_bin_{b}")
                     if _finite(sub):
-                        _plot(a, it, sub, ":", lw=1.2, color=col, alpha=0.65)
+                        _plot(a, it, sub, ":", lw=2.0, color=col, alpha=0.9,
+                              marker="^", ms=3.5, mfc="none")
+                        drew_sub = True
                 a.set_ylim(-0.02, 1.02)
                 if not drew:
                     # Runs 1-15 have no `succ_bin_all_*`, so say why the panel is
                     # empty rather than leaving a blank grid that reads as zero.
                     a.text(0.5, 0.5, "EVAL.full_bin_coverage was off\n"
-                                     "(no off-table bins were commanded)",
+                                     "(no off-table bins were commanded —\n"
+                                     "see the DEMONSTRATED panel for per-bin success)",
                            ha="center", va="center", transform=a.transAxes,
                            fontsize=9, color="0.45")
                 _grid(a, "success per commanded direction — ALL scenes\n"
-                         "(solid = every scene, dotted = scenes that demo it)",
+                         "(solid o = every scene, dotted ^ = scenes that demo it)",
                       ylabel="fraction of that bin's episodes")
-                _legend(a, loc="upper left", ncol=2)
+                # The bin colours go in the legend once; solid-vs-dotted is a
+                # SECOND dimension and gets its own two entries, in neutral grey
+                # so it cannot be mistaken for a seventh bin.
+                if drew and drew_sub:
+                    from matplotlib.lines import Line2D
+                    h, l = a.get_legend_handles_labels()
+                    h += [Line2D([], [], color="0.35", ls="-", marker="o", ms=3),
+                          Line2D([], [], color="0.35", ls=":", lw=2.0,
+                                 marker="^", ms=3.5, mfc="none")]
+                    l += ["all scenes", "demo'd only"]
+                    a.legend(h, l, loc="upper left", ncol=2, fontsize=7,
+                             framealpha=0.85)
+                else:
+                    _legend(a, loc="upper left", ncol=2)
             a = axes.get("track")
             if a is not None:
                 for b, col in zip(bins, _BIN_COLOURS):

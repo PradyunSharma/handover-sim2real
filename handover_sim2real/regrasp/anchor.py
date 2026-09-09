@@ -110,7 +110,8 @@ def horizontal(v) -> np.ndarray:
 
 
 def anchor_rotation(centroid, wrist, robot_base, state: AnchorState | None = None,
-                    params: AnchorParams | None = None):
+                    params: AnchorParams | None = None, *,
+                    reference: str = "hand"):
     """(R_anchor [3,3], meta) — columns are the anchor x, y, z in WORLD coords.
 
     `R_anchor @ v_anchor` gives world; `R_anchor.T @ v_world` gives anchor. Pass
@@ -119,12 +120,61 @@ def anchor_rotation(centroid, wrist, robot_base, state: AnchorState | None = Non
     `wrist` may be None (no hand in the scene) — the fallback engages and `meta`
     says so, rather than raising, because an episode with no visible giver is a
     real situation and a crash there loses the whole rollout.
+
+    `reference="base"` DROPS THE HAND FROM THE DEFINITION ENTIRELY and takes the
+    azimuth from the robot instead:
+
+        x = normalize(horizontal(p_base - c))       # object -> robot
+
+    `wrist` is then unread, the hysteresis never runs, and `meta["mode"]` is
+    "base_primary" -- distinct from "base", which means the HAND reference
+    collapsed and the fallback caught it. Measured over 2208 run-11 episodes:
+
+        reference        lever arm ||horiz||    1 cm centroid error moves x by
+        robot base       61.3 cm  (min 41.8)          0.65 deg  (p95 1.03)
+        MANO wrist       15.7 cm  (min  6.4)          2.53 deg  (p95 4.11)
+        hand centroid     9.2 cm -> 7.7 cm at close   ~5 deg
+
+    The object is always well out in front of the robot -- it has to be, or the
+    arm could not reach it -- so `||horizontal(p_base - c)||` has a HARD FLOOR
+    five times the `enter` threshold and the degenerate case is not rare, it is
+    impossible. That is why the latch is SKIPPED rather than merely unlikely to
+    fire. Under `anchor_update: live` the frame then rotates a median 1.49 deg
+    over a whole episode (p99 7.67, 0.02% past 90 deg), against 10.65 deg median
+    and 15.8% past 90 deg for the hand centroid -- i.e. live re-anchoring costs
+    nothing here, which it does not under either hand reference.
+
+    SIGN: `p_base - c`, not `c - p_base`. The robot and the giver face each
+    other, so this points roughly where `horizontal(c - p_wrist)` did and the bin
+    LABELS stay comparable with runs 1-16 -- measured, 7.7% of grasps change bin
+    under this sign against 78.6% under the other. The `mode: "base"` FALLBACK
+    keeps its own opposite convention (`c - base`); it is a different code path,
+    reached only when the hand reference dies, and changing it would silently
+    re-label every historical fallback episode.
     """
     params = params or AnchorParams()
     state = state if state is not None else AnchorState()
 
     c = np.asarray(centroid, dtype=np.float64)
     base = np.asarray(robot_base, dtype=np.float64)
+
+    # ---- the hand-free frame: no reference to the giver, so no latch ---------
+    if str(reference) == "base":
+        h = horizontal(base - c)
+        hn = float(np.linalg.norm(h))
+        state.history.append(hn)
+        x = normalize(h)
+        degenerate = float(np.linalg.norm(x)) < 0.5
+        if degenerate:
+            # The object is directly over the robot base. Unreachable in this
+            # workspace (measured floor 41.8 cm), but a zero x would make the
+            # frame singular, so fail the same deterministic way the hand path
+            # does rather than emitting a silent NaN.
+            x = np.array([1.0, 0.0, 0.0])
+        y = normalize(np.cross(WORLD_UP, x))
+        return np.stack([x, y, WORLD_UP], axis=1), {
+            "mode": "base_primary", "horiz_norm": hn, "switched": False,
+            "switches": 0, "degenerate": degenerate}
 
     if wrist is None:
         h, hn = np.zeros(3), 0.0
@@ -291,7 +341,21 @@ ANCHOR_UPDATES = ("latched", "live")
 # part at that. `wrist` therefore makes the simulator compute an azimuth the
 # robot cannot reproduce — a sim2real gap in the definition of the frame itself,
 # not in the perception feeding it.
-ANCHOR_HAND_REFS = ("wrist", "hand_centroid")
+#   base           NO HAND AT ALL: x = normalize(horizontal(p_base - c)), the
+#                  object -> robot azimuth. The only reference whose lever arm
+#                  cannot collapse (61.3 cm median, 41.8 cm floor), so `live`
+#                  re-anchoring rotates the frame 1.49 deg over an episode
+#                  instead of the hand centroid's 10.65 deg median / 15.8%
+#                  past 90 deg. It also needs nothing the real rig lacks --
+#                  no wrist detector, no hand segmentation -- which is why it
+#                  is the deployable choice as well as the stable one. Cost:
+#                  "+x" stops meaning "away from the giver's fingers" and
+#                  starts meaning "the side facing the robot"; the frame is
+#                  then nearly scene-invariant (azimuth std 7.4 deg vs the
+#                  wrist's 18.4). That costs nothing the POLICY sees -- the
+#                  anchor never enters a network input, see the module
+#                  docstring -- it only changes what a bin is NAMED.
+ANCHOR_HAND_REFS = ("wrist", "hand_centroid", "base")
 
 
 def anchor_from_cloud(pc5, obs, env, panda_base_inv_tf, cfg,
@@ -333,7 +397,12 @@ def anchor_from_cloud(pc5, obs, env, panda_base_inv_tf, cfg,
     # changes and neither is ground truth — which is the situation on hardware.
     # Falls back to the wrist only when the cloud carries no hand points at all;
     # `anchor_rotation` then engages its own base fallback if that is None too.
-    if str(hand_ref) == "hand_centroid":
+    # `base` reads NO hand: not the MANO link, not the cloud's hand channel. The
+    # `env` argument goes unused on this path, which is the point -- it is the
+    # only reference the real rig can reproduce exactly.
+    if str(hand_ref) == "base":
+        wrist = None
+    elif str(hand_ref) == "hand_centroid":
         h_ee = _channels.hand_centroid(pc5)
         wrist = (wrist_world(env) if h_ee is None else centroid_to_world(
             h_ee, obs, panda_base_inv_tf,
@@ -341,7 +410,8 @@ def anchor_from_cloud(pc5, obs, env, panda_base_inv_tf, cfg,
     elif wrist is None:
         wrist = wrist_world(env)
     R, meta = anchor_rotation(
-        c_world, wrist, np.asarray(cfg.ENV.PANDA_BASE_POSITION), state)
+        c_world, wrist, np.asarray(cfg.ENV.PANDA_BASE_POSITION), state,
+        reference=("base" if str(hand_ref) == "base" else "hand"))
     meta["no_centroid"] = False
     meta["hand_ref"] = str(hand_ref)
     return R, c_world, meta

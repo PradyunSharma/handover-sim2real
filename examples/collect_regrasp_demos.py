@@ -200,7 +200,8 @@ def _point_cloud(obs, point_listener, panda_base_inv_tf):
 
 def collect_episode(env, point_listener, cfg, scene_idx,
                     panda_base_inv_tf, steps_action_repeat, pin_table=None,
-                    grasp_idx=0, command_axes="BINS", d_rule=None):
+                    grasp_idx=0, command_axes="BINS", d_rule=None,
+                    anchor_hand_ref="wrist"):
     """
     Run one episode and return a dict of arrays, or None if it could not be run.
 
@@ -285,9 +286,30 @@ def collect_episode(env, point_listener, cfg, scene_idx,
                 c_w = _rg_anchor.centroid_to_world(
                     c_ee, obs, panda_base_inv_tf,
                     cfg.ENV.PANDA_BASE_POSITION, cfg.ENV.PANDA_BASE_ORIENTATION)
+                # WHICH REFERENCE. Must match the direction table's, or the
+                # bin this episode is CAPTIONED with and the bin it is later
+                # measured to have REALISED are named in different frames —
+                # run 16's failure, see `setup.resolve_anchor_ref`.
+                #
+                # Still step-0 only, i.e. latched, and under `base` that is no
+                # longer an approximation worth worrying about: the base frame
+                # rotates a median 1.49 deg across a whole episode and re-bins
+                # 1.3% of grasps, against the hand centroid's 10.65 deg and 60%.
+                # So a latched base shard and a live-anchored DAgger shard agree
+                # to within the noise, which is not true of either hand ref.
+                if anchor_hand_ref == "hand_centroid":
+                    _h_ee = _rg_channels.hand_centroid(pc5)
+                    _ref = (wrist if _h_ee is None else
+                            _rg_anchor.centroid_to_world(
+                                _h_ee, obs, panda_base_inv_tf,
+                                cfg.ENV.PANDA_BASE_POSITION,
+                                cfg.ENV.PANDA_BASE_ORIENTATION))
+                else:
+                    _ref = wrist
                 anchor_R, _am = _rg_anchor.anchor_rotation(
-                    c_w, wrist, np.asarray(cfg.ENV.PANDA_BASE_POSITION),
-                    _rg_anchor.AnchorState())
+                    c_w, _ref, np.asarray(cfg.ENV.PANDA_BASE_POSITION),
+                    _rg_anchor.AnchorState(),
+                    reference=("base" if anchor_hand_ref == "base" else "hand"))
                 anchor_mode = _am["mode"]
                 # ---- THE COMMAND, WHICHEVER RULE `--command` NAMES -----------
                 # It has to be computed HERE and not above, because the anchor
@@ -445,6 +467,14 @@ def parse_args():
                         "recorded rule.")
     p.add_argument("--d-point-depth", type=float, default=None,
                    help="grasp_offset only; default: the table's, else 0.1122")
+    p.add_argument("--anchor-hand-ref", default=None,
+                   choices=list(_rg_anchor.ANCHOR_HAND_REFS),
+                   help="what the anchor's azimuth is measured FROM. DEFAULT: "
+                        "read from the pin table's `_meta`, which is what you "
+                        "want — the table's bins are NAMED in that frame and "
+                        "captioning this shard in another turns most episodes "
+                        "into miscaptions the dataset then drops. Pass it only "
+                        "to override a table with no recorded reference.")
     p.add_argument("--command", default="bin_axis",
                    choices=["bin_axis", "bin_centroid", "grasp_axis"],
                    help="which rule writes the `d_world` CAPTION on each episode. "
@@ -580,6 +610,20 @@ def main():
     # `d_rule=` so the centroids keep their magnitude under `location_extent`
     # and `bin_axis` is refused there rather than silently issuing |d| = 1.
     command_axes = resolve_command_axes(pin_table, args.command, d_rule=d_rule)
+    # THE TABLE IS AUTHORITATIVE, same argument as `d_rule` above.
+    anchor_hand_ref = str(args.anchor_hand_ref
+                          if args.anchor_hand_ref is not None
+                          else _m.get("anchor_hand_ref", "wrist"))
+    if (args.anchor_hand_ref is not None
+            and "anchor_hand_ref" in _m
+            and str(_m["anchor_hand_ref"]) != anchor_hand_ref):
+        raise SystemExit(
+            f"[cfg] --anchor-hand-ref {anchor_hand_ref!r} but the pin table was "
+            f"built with {_m['anchor_hand_ref']!r}. Rebuild the table with "
+            f"`build_direction_table.py --anchor-hand-ref {anchor_hand_ref}`, "
+            f"or drop the flag and inherit the table's.")
+    print(f"[anchor] azimuth reference: {anchor_hand_ref}"
+          + ("  (from the pin table)" if args.anchor_hand_ref is None else ""))
 
     # The work list: every (scene, slot) the table offers, scene-major, so a
     # partial run still covers whole scenes and `--num-episodes` stays readable.
@@ -658,6 +702,10 @@ def main():
         # shard cannot be trained on under a config that assumes a different one
         # without the mismatch being answerable after the fact.
         f.attrs["command_rule"] = str(args.command)
+        # ...and WHICH FRAME the bins on every episode are named in. Run 16's
+        # shards carry no such attr, which is precisely why the mismatch that
+        # cost it two thirds of its DAgger data was unanswerable from the files.
+        f.attrs["anchor_hand_ref"] = str(anchor_hand_ref)
         # ...and what `d` itself was derived from. A shard collected under one
         # `d_rule` and trained under a config expecting the other is captioned
         # by a different question entirely; recorded so it is answerable.
@@ -669,6 +717,7 @@ def main():
                 env, point_listener, cfg, scene_idx,
                 panda_base_inv_tf, steps_action_repeat, pin_table=pin_table,
                 grasp_idx=grasp_idx, command_axes=command_axes, d_rule=d_rule,
+                anchor_hand_ref=anchor_hand_ref,
             )
 
             if episode is None:

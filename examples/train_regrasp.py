@@ -98,7 +98,9 @@ from handover_sim2real.regrasp import (
     load_policy_runner,
     policy_kind,
 )
-from handover_sim2real.regrasp.directions import BINS as _rg_dirs_BINS  # noqa: E402
+from handover_sim2real.regrasp.directions import (               # noqa: E402
+    BINS as _rg_dirs_BINS, RETRY_LADDER as _RETRY_LADDER, D_ZERO_EPS,
+)
 from handover_sim2real.regrasp import reach as _rg_reach          # noqa: E402
 from handover_sim2real.regrasp import anchor as _rg_anchor       # noqa: E402
 from handover_sim2real.regrasp.evaluator import (               # noqa: E402
@@ -671,6 +673,11 @@ LOG_FIELDS = [
     # the policy goes the same way whatever it is told.
     "dir_err", "dir_err_median", "dir_track", "sector_err",
     "bin_hit_rate", "bin_diag_rate", "cond_sep",
+    # `success_rate` above is over EVERY evaluated row; under
+    # `EVAL.full_bin_coverage` that is ~80% bins the scene never demonstrated.
+    # This is the same reduction over the population runs 1-15 reported, and it
+    # is the column to plot against them.
+    "success_rate_in_table", "n_in_table",
     # HOW MANY EPISODES THE DIRECTION METRICS ABOVE ARE OVER. Under
     # `grasp_offset` with `EVAL.dir_drop_short: true` a short chord leaves the
     # confusion matrix entirely, so `bin_diag_rate` can move because its
@@ -693,7 +700,9 @@ LOG_FIELDS = [
     # share. A share well under 1.0 means the ladder is not a fixed direction
     # sequence and the retry curve must not be read as "then it tried +y".
     "retry_bin_1", "retry_bin_2", "retry_bin_3", "retry_bin_4",
+    "retry_bin_5", "retry_bin_6",
     "retry_bin_frac_1", "retry_bin_frac_2", "retry_bin_frac_3", "retry_bin_frac_4",
+    "retry_bin_frac_5", "retry_bin_frac_6",
     "succ_bin_0", "succ_bin_1", "succ_bin_2",
     "succ_bin_3", "succ_bin_4", "succ_bin_5",
     "n_bin_0", "n_bin_1", "n_bin_2", "n_bin_3", "n_bin_4", "n_bin_5",
@@ -763,6 +772,14 @@ BIN_EVAL_KEYS = (
     "eval_min_pos", "eval_min_rot", "mean_pos_err", "mean_rot_err",  # approach
     "dir_err", "dir_track", "sector_err", "bin_hit_rate", "bin_diag_rate",
 )
+# THE SAME NESTED STAGES, DEMONSTRATED SCENES ONLY. `*_b{b}` above filters on
+# `bin_idx` and nothing else, so under `EVAL.full_bin_coverage` it is the
+# ALL-SCENES population — which is not what runs 1-15 plotted under those names.
+# These carry the population every earlier run reported, so `training_curve.png`
+# can show both side by side. `success_rate` is absent on purpose: `succ_bin_{b}`
+# is already exactly that number and duplicating it could only introduce a
+# disagreement. See `aggregate_eval_rows`.
+BIN_EVAL_INTAB_KEYS = ("close_rate", "near_rate", "grasp_rate")
 BIN_COLLECT_KEYS = ("episodes", "reached_standoff", "reached_grasp",
                     "policy_closed", "success")
 # Per-bin collection MEANS rather than counts, so they are floats and blank when
@@ -778,6 +795,7 @@ def bin_eval_fields() -> list[str]:
     out = []
     for b in range(N_BINS):
         out += [f"{k}_b{b}" for k in BIN_EVAL_KEYS]
+        out += [f"{k}_intab_b{b}" for k in BIN_EVAL_INTAB_KEYS]
         out += [f"{c}_b{b}" for c in EVAL_REASONS.values()]
         out += [f"{c}_b{b}" for c in EVAL_FAIL_REASONS.values()]
     return out
@@ -848,7 +866,13 @@ def eval_columns(m: dict | None) -> dict:
     if not m:
         return {}
     out = {k: _r(m.get(k)) for k in (
-        "success_rate", "grasp_rate", "near_rate", "close_rate",
+        # `success_rate` is over EVERY evaluated row. Under
+        # `EVAL.full_bin_coverage` ~80% of those command a bin the scene never
+        # demonstrates, so it is NOT the number runs 1-15 reported;
+        # `success_rate_in_table` is. Both are logged so neither has to be
+        # reconstructed, and `n_in_table` is the denominator of the second.
+        "success_rate", "success_rate_in_table", "n_in_table",
+        "grasp_rate", "near_rate", "close_rate",
         "close_success_rate", "chance_rate", "missed_rate", "miss_given_chance",
         "box_chance_rate", "box_taken_rate", "box_missed_rate", "miss_given_box",
         "mean_box_steps", "mean_box_frac",
@@ -859,11 +883,17 @@ def eval_columns(m: dict | None) -> dict:
         # unvisited direction does not read as a genuine zero success rate.
         "dir_err", "dir_err_median", "dir_track", "sector_err",
         "bin_hit_rate", "bin_diag_rate", "cond_sep",
+        "dir_n", "dir_n_short",
         "retry_at_1", "retry_at_2", "retry_at_3", "retry_at_4",
+        "retry_at_5", "retry_at_6",
+        "retry_n_1", "retry_n_2", "retry_n_3",
+        "retry_n_4", "retry_n_5", "retry_n_6",
         "retry_at_1_deep", "retry_at_2_deep", "retry_at_3_deep",
-        "retry_at_4_deep",
+        "retry_at_4_deep", "retry_at_5_deep", "retry_at_6_deep",
         "retry_bin_frac_1", "retry_bin_frac_2", "retry_bin_frac_3",
-        "retry_bin_frac_4",
+        "retry_bin_frac_4", "retry_bin_frac_5", "retry_bin_frac_6",
+        "n_bin_all_0", "n_bin_all_1", "n_bin_all_2",
+        "n_bin_all_3", "n_bin_all_4", "n_bin_all_5",
         "succ_bin_0", "succ_bin_1", "succ_bin_2",
         "succ_bin_3", "succ_bin_4", "succ_bin_5",
         "succ_bin_all_0", "succ_bin_all_1", "succ_bin_all_2",
@@ -872,7 +902,7 @@ def eval_columns(m: dict | None) -> dict:
         "succ_g0", "succ_g1")}
     # The modal bin of each rung is an INDEX, not a rate — blank when the rung
     # collected nothing, never 0, since 0 is a real bin (`+x`).
-    for k in range(1, 5):
+    for k in range(1, len(_RETRY_LADDER) + 1):
         v = m.get(f"retry_bin_{k}")
         out[f"retry_bin_{k}"] = "" if v is None else int(v)
     out.update(reason_columns(m.get("reasons"), EVAL_REASONS, denom=m.get("n") or None))
@@ -886,6 +916,8 @@ def eval_columns(m: dict | None) -> dict:
         out[f"n_b{b}"] = int(m.get(f"n_b{b}", 0) or 0)
         for k in BIN_EVAL_KEYS[1:]:
             out[f"{k}_b{b}"] = _r(m.get(f"{k}_b{b}"))
+        for k in BIN_EVAL_INTAB_KEYS:
+            out[f"{k}_intab_b{b}"] = _r(m.get(f"{k}_intab_b{b}"))
         # A bin with no episodes gets BLANKS, not the zeros `reason_columns`
         # returns when handed no denominator — a stacked area reading 0.0 across
         # every category says "nothing failed", which is the opposite of "nothing
@@ -984,7 +1016,22 @@ def dataset_size(files: list[str], filt: dict | None = None) -> tuple[int, int]:
     what the fit actually saw — without it the columns count episodes the loader
     drops, which under the reach filter is ~30% of the base shard and would make
     the logged aggregate a number that describes no artifact in the run.
+
+    `DROP_STATUSES` IS NOT THE WHOLE FILTER, and run 16 is what that cost.
+    `BCDataset` drops a SECOND class after `episode_status` passes: an episode
+    whose `DATA.d_source` attr is the zero vector carries no direction to
+    condition on, and is discarded with its own `n_dir_zero` counter. Counting
+    only `DROP_STATUSES` here made `D_episodes` report 87.3 episodes per DAgger
+    iteration for run 16 when the fit saw 36.4 — a 58% overstatement, on the one
+    column whose entire purpose is to say what the fit saw. Run 11 hid it: its
+    zero-`d` rate is 1.1%, so the two numbers agreed to within noise.
+
+    `d_source` rides in `filt` and is popped rather than forwarded, because
+    `episode_status` does not take it.
     """
+    filt = dict(filt or {})
+    d_source = filt.pop("d_source", "d_world")
+    want_dir = bool(filt.get("direction_cond", True))
     n_ep = n_steps = 0
     for path in files:
         if not path or not os.path.exists(path):
@@ -995,6 +1042,11 @@ def dataset_size(files: list[str], filt: dict | None = None) -> tuple[int, int]:
                 if isinstance(grp, h5py.Group) and "num_steps" in grp.attrs:
                     if filt and episode_status(grp, **filt) in DROP_STATUSES:
                         continue
+                    if want_dir:
+                        dw = grp.attrs.get(d_source)
+                        if dw is None or float(np.linalg.norm(
+                                np.asarray(dw, dtype=np.float64))) < D_ZERO_EPS:
+                            continue
                     n_ep += 1
                     n_steps += int(grp.attrs["num_steps"])
     return n_ep, n_steps
@@ -1310,6 +1362,10 @@ def main() -> None:
             "direction_cond", True)),
         "reach_filter": reach_filter,
         "reach_pos_thresh": reach_pos, "reach_rot_thresh": reach_rot,
+        # WHICH attr the loader reads for `d`, so `dataset_size` applies the
+        # same zero-vector drop `BCDataset` does. Popped there, not forwarded to
+        # `episode_status`.
+        "d_source": str(train_cfg.get("DATA", {}).get("d_source", "d_world")),
     }
     # TRAIN.pc_pretrained overrides MODEL.pc_pretrained in the train config. Same
     # mechanism examples/train_bc.py exposes as `--pc-pretrained none`: an empty

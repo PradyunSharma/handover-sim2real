@@ -102,6 +102,46 @@ def expand_config_paths(cfg):
 COMMAND_MODES = ("bin_axis", "bin_centroid", "grasp_axis")
 
 
+def resolve_anchor_ref(pin_table, anchor_hand_ref: str) -> None:
+    """Refuse a run whose anchor reference differs from the table's.
+
+    THE SAME CLASS OF BUG `resolve_d_rule` CATCHES, one axis over, and run 16 is
+    the worked example of what it costs to be missing.
+
+    `build_direction_table.py` names every bin in ONE frame. Run 16 set
+    `SIM.anchor_hand_ref: hand_centroid` but the builder had no such flag and
+    hardcoded the MANO wrist, so the table said "this grasp is +x" in the wrist
+    frame while the collector and evaluator asked "is it +x?" in the
+    hand-centroid frame. Those two frames are roughly ANTI-ALIGNED — the robot
+    and the giver face each other — so the answer was usually no:
+
+        bin_assigned == bin_realized      99%  (run 11)  ->  40%  (run 16)
+        DAgger episodes reaching training  57%           ->  19%
+
+    Nothing raised. The run completed 20 iterations, produced plausible curves,
+    and never beat its own iteration 0. That is the failure mode this guard
+    exists for: not a crash, a quiet 3x cut in the training set.
+
+    A table with no recorded reference predates the flag and is `wrist` by
+    construction, which is what runs 1-16 used.
+    """
+    meta = (getattr(pin_table, "meta", {}) or {}) if pin_table is not None else {}
+    from_table = str(meta.get("anchor_hand_ref", "wrist"))
+    if pin_table is None or from_table == str(anchor_hand_ref):
+        return
+    raise SystemExit(
+        f"[cfg] SIM.anchor_hand_ref: {anchor_hand_ref!r} but "
+        f"{getattr(pin_table, 'path', 'the pin table')} was built with "
+        f"{from_table!r}. The table's bins are NAMED in that frame; deriving "
+        f"`bin_realized` in yours would disagree with `bin_assigned` on most "
+        f"episodes and the miscaption filter would silently discard them "
+        f"(measured on run 16: 99% agreement -> 40%, and 57% of each DAgger "
+        f"shard reaching training -> 19%). Rebuild with "
+        f"`build_direction_table.py --anchor-hand-ref {anchor_hand_ref}` "
+        f"(then re-assign, re-collect, re-audit), or set "
+        f"SIM.anchor_hand_ref: {from_table}.")
+
+
 def resolve_command_axes(pin_table, mode: str = "bin_axis", *,
                          verbose: bool = True, d_rule=None):
     """`SIM.command_deploy` -> the [k, 3] axis set, or None for `grasp_axis`.
@@ -394,6 +434,7 @@ def build_regrasp_context(cfg4: dict, *, seed: int = 0,
         raise SystemExit(
             f"[cfg] SIM.anchor_hand_ref must be one of "
             f"{_rg_anchor.ANCHOR_HAND_REFS}, got {anchor_hand_ref!r}")
+    resolve_anchor_ref(pin_table, anchor_hand_ref)
     dir_drop_short = bool(ev.get("dir_drop_short", True))
     if verbose:
         print(f"[anchor] {anchor_update}: the frame is "

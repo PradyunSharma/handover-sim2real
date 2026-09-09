@@ -1,11 +1,20 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # REGRASP RUN 17 — `d` BECOMES A LOCATION COMMAND, EXTENT-NORMALIZED.
 #
-# Run 16 with ONE change: `SIM.d_rule: grasp_offset -> location_extent`. The
-# live anchor frame, the hand-cloud azimuth, the 0.1034 m fingertip point, the
-# 30%-per-bin stratified eval with full bin coverage, and the measured (not
-# dropped) short chords all carry over unchanged, so run 17 against run 16 is a
-# single-variable test of what `d` MEANS.
+# Run 16 with TWO changes:
+#
+#   SIM.d_rule:         grasp_offset  -> location_extent
+#   SIM.anchor_hand_ref: hand_centroid -> base
+#
+# The second is not a variable under test, it is a REPAIR: run 16's
+# hand-cloud azimuth cost it two thirds of its DAgger data (see the
+# `anchor_hand_ref` note below and docs/run_index.md). Run 18 is run 16 with
+# that repair and NOTHING else, so run 17 against RUN 18 — not against run 16 —
+# is the single-variable test of what `d` MEANS. Read the pair that way.
+#
+# The live anchor frame, the 0.1034 m fingertip point, the 30%-per-bin
+# stratified eval with full bin coverage, and the measured (not dropped) short
+# chords all carry over from run 16 unchanged.
 #
 # ── WHAT CHANGES, AND WHY IT IS THE RIGHT QUANTITY TO COMMAND ────────────────
 #
@@ -222,27 +231,50 @@ SIM:
   # scored under another would report nothing unusual.
   anchor_update: live
 
-  # ── CHANGE 4 OF 4: MEASURE THE AZIMUTH FROM THE HAND CLOUD, NOT THE JOINT ──
+  # ── DROP THE HAND FROM THE FRAME ENTIRELY ─────────────────────────────────
   #
-  # The anchor's x axis is `horizontal(c_object - p_giver)`, and `p_giver` was
-  # `mano.body.link_state[0, 7]` — the MANO WRIST JOINT. That is a simulator-only
-  # quantity: the real rig has no joints to read, and
-  # `my_regrasp_policy_runner._set_direction` uses `class_centroid(hand_xyz)`,
-  # the centroid of the segmented hand POINT CLOUD.
+  # Run 16 set this to `hand_centroid` and it was the single largest cause of
+  # that run's collapse. The anchor's x axis was `horizontal(c_object - p_giver)`
+  # and `p_giver` became the centroid of the segmented hand cloud — which sits ON
+  # the object the hand is holding. Measured over run 16's own shards:
   #
-  # THOSE ARE DIFFERENT POINTS, so runs 1-15 defined the frame one way in
-  # simulation and another way on hardware. The wrist joint sits at the base of
-  # the palm; the cloud centroid sits out in the visible middle of the hand — and
-  # only the VISIBLE part, so it moves with the view exactly as the object
-  # centroid does. `hand_centroid` makes both references come from the same
-  # cloud, which is the situation a deployment is in.
+  #     reference        lever arm at step 0 -> at the close    frame drift/episode
+  #     MANO wrist       15.7 cm -> 14.9 cm                     5.74 deg med
+  #     hand centroid     9.2 cm ->  7.7 cm                    10.65 deg med, p90 145
+  #     robot base       61.3 cm -> 61.3 cm (floor 41.8)        1.49 deg med, p90 3.9
   #
-  # It costs exactness: the reference is now observation-dependent and noisy
-  # rather than ground truth. That is the point — the policy should be trained
-  # against the frame it will actually be given. Falls back to the wrist only
-  # when the cloud carries no hand points at all, and `anchor_rotation`'s own
-  # base fallback still catches the case where that is missing too.
-  anchor_hand_ref: hand_centroid
+  # At the close 55% of episodes had the hand reference inside the 8 cm
+  # hysteresis band, so the frame latched into the base fallback on 13-23% of
+  # episodes and flipped past 90 deg on 19%.
+  #
+  # `base` removes the giver from the definition:
+  #
+  #     x = normalize(horizontal(p_base - c))       object -> robot
+  #
+  # Three things follow. (1) The degenerate case becomes impossible, not rare —
+  # the object is always well out in front or the arm could not reach it, so the
+  # lever arm has a hard 41.8 cm floor and the hysteresis never runs. (2) `live`
+  # re-anchoring becomes free: 1.49 deg of rotation across a whole episode, and
+  # the same grasp bins identically at step 0 and at the close 98.7% of the time.
+  # (3) It is the ONLY deployable reference — no wrist detector, no hand
+  # segmentation, just the robot's own kinematics and the object centroid, which
+  # retires the sim2real dependency Phase 5's grasp proposer was traded for.
+  #
+  # THE SIGN IS `p_base - c`, NOT `c - p_base`. The robot and the giver face each
+  # other, so this points roughly where the wrist-anchored axis did: measured,
+  # 7.7% of grasps change bin label under this sign against 78.6% under the
+  # other. `succ_bin_+x` therefore stays broadly comparable with runs 1-16 and
+  # the retry ladder's ordering carries over.
+  #
+  # WHAT IT COSTS. "+x" stops meaning "away from the giver's fingers" and starts
+  # meaning "the side facing the robot", and the frame becomes nearly
+  # scene-invariant (azimuth std 7.4 deg against the wrist's 18.4). That costs
+  # the POLICY nothing — the anchor never enters a network input, the two
+  # conditioning channels are EE-frame dot products — it only changes what a bin
+  # is NAMED. The bin census barely moves: +x 23.1% / -x 20.4% / +y 21.1% /
+  # -y 13.7% / +z 9.3% / -z 12.5%, against the wrist frame's 24.9/20.2/20.2/
+  # 13.3/9.2/12.2.
+  anchor_hand_ref: base
 
   exclude_scenes: output/regrasp_pins_train_loc_excluded.json
   demo_ok_table: output/regrasp_demos_train_loc_ok.json

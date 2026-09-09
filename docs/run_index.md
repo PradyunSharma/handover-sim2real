@@ -481,7 +481,9 @@ with different `init`. Phase-4 run 16, for reference, was 100 / 25 from scratch.
 | **regrasp_run13** | `regrasp_run13.yaml` | run 9 | wrist+right | 25 (planned) | 400 → ~259 | 50 | **1–4 (one per bin)** | orientation (`−R[:,2]`) | **dequantized** (continuous) | train: grasp axis `−R[:,2]` / deploy: BIN CENTROID | per-point ×2 | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | no (FTL) | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | `dart_noise` — add (α 0.35→0.18, ratio 0.3) | **~1.4–1.8 cm / 0.05–0.07 rad → reach 0.4–0.5 / same** at it 1, ×0.72 by it 25 (α **0.35→0.18**, recalibrated to run 9's own anchor 0.0287 after run 12). Fires on **27%** of steps (`dart_noise_ratio` **0.3**), matched to the jolt's 26%. | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 9 + run 12's DART change at the **corrected** dose. `reach_filter: false` to stay comparable to its baseline. See below. |
 | **regrasp_run14** | `regrasp_run14.yaml` | run 13 | wrist+right | 25 (planned) | 400 → ~259 | 50 | **1–4 (one per bin)** | orientation (`−R[:,2]`) | **dequantized** (continuous) | train: grasp axis `−R[:,2]` / deploy: BIN CENTROID | per-point ×2 | **0° (OFF)** | **warm start (last.pt)**, PointNet++ random at iter 0 only | **yes** (last.pt) | 50 / **20** | **linear 0.9→0.75** | 0.3 | 0.3 | `dart_noise` — add (α 0.35→0.18, ratio 0.3) | **~1.4–1.8 cm / 0.05–0.07 rad → reach 0.4–0.5 / same** at it 1, ×0.72 by it 25 (α **0.35→0.18**, recalibrated to run 9's own anchor 0.0287 after run 12). Fires on **27%** of steps (`dart_noise_ratio` **0.3**), matched to the jolt's 26%. | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 13 + warm-started chain on `last.pt`, `iter_epochs` 20. Run 8 already answered this **"no effect"** at one demo/bin. See below. |
 | **regrasp_run15** | `regrasp_run15.yaml` | run 12 | wrist+right | 25 (planned) | 600 → ~187 | 50 | **1–6 (one per bin, ALL SIX LIVE)** | **direction** (centroid→tips) | **dequantized** (continuous) | **grasp's own `d`** (continuous), deploy on the **bin centroid** | per-point ×2 | **0° (OFF)** | **warm start (last.pt)**, PointNet++ random at iter 0 only | **yes** (last.pt) | 50 / **20** | **linear 0.9→0.75** | 0.3 | 0.3 | `dart_noise` — add (α 0.25→0.12, ratio 0.3) | **~1.4–1.8 cm / 0.05–0.07 rad → reach 0.4–0.5 / same** at it 1, ×0.69 by it 25 (α **0.25→0.12**, anchored to the `_off` stack's own 0.0408 — NOT run 14's 0.35, which would run 1.4× hot here). Fires on **27%** of steps (`dart_noise_ratio` **0.3**). | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 12's substrate + corrected dose **and** warm start. Two axes, so it settles neither alone — its value is **pairing with run 14**. See below. |
-| **regrasp_run16** | `regrasp_run16.yaml` | run 11 | wrist+right | 25 (planned) | 600 → ~187 | 50 | **1–6 (one per bin, ALL SIX LIVE)** | **direction** (centroid→tips, **pad MIDPOINT 0.1034**) | **dequantized** (continuous) | **grasp's own `d`** (continuous), deploy on the **bin centroid**; frame **LIVE** every step, azimuth from the **hand cloud** | per-point ×2 | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | no (FTL) | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | `jolt` — replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 11, **six changes**: live anchor frame, azimuth from the hand CLOUD not the MANO wrist joint, `d` measured to the pad MIDPOINT (0.1122 → 0.1034), short chords measured not dropped, eval stratified at 30% per bin, and every bin commanded on every evaluated scene. The first three change what `d` IS and force an upstream rebuild; the last three change only what is measured. See below. |
+| **regrasp_run16** | `regrasp_run16.yaml` | run 11 | wrist+right | **20 of 25** | 600 → ~187 | 50 | **1–6 (one per bin, ALL SIX LIVE)** | **direction** (centroid→tips, **pad MIDPOINT 0.1034**) | **dequantized** (continuous) | **grasp's own `d`** (continuous), deploy on the **bin centroid**; frame **LIVE** every step, azimuth from the **hand cloud** | per-point ×2 | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | no (FTL) | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | `jolt` — replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | **0.4419 @it15** (in-table 0.5207 @it0) | 0.3306 (in-table 0.4172) | **RAN, AND FAILED — see the post-mortem below.** = run 11, **six changes**: live anchor frame, azimuth from the hand CLOUD not the MANO wrist joint, `d` measured to the pad MIDPOINT (0.1122 → 0.1034), short chords measured not dropped, eval stratified at 30% per bin, and every bin commanded on every evaluated scene. **The headline is not comparable to runs 1–15**: `full_bin_coverage` grew eval from 194 episodes to 1464, 80% of them commanding a bin the scene never demonstrates, so read the in-table figures. The real regression is −12 pp at matched iterations, and it is DAgger, not the fit — iteration 0 (base BC only) scored 0.5207 in-table against run 11's 0.5000, and no later iteration beat it. Cause: `anchor_hand_ref: hand_centroid` put the frame's azimuth reference on the object it is measuring from, so 81% of every DAgger shard was discarded before training (run 11: 43%). Superseded by **run 18**, which is this run with `anchor_hand_ref: base` and nothing else. |
+| **regrasp_run17** | `regrasp_run17.yaml` | run 16 (read against **run 18**) | wrist+right | 25 (planned) | 600 → ~187 | 50 | **1–6 (one per bin, ALL SIX LIVE)** | **location** (`d = m·u`, extent-normalized, **NOT a unit vector**) | **dequantized** (continuous) | **grasp's own `d`** (continuous), deploy on the **bin centroid**; frame **LIVE** every step, azimuth from the **ROBOT BASE** (no hand in the frame) | per-point ×2 | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | no (FTL) | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | `jolt` — replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 16, **two changes**: `SIM.d_rule: grasp_offset → location_extent` and `SIM.anchor_hand_ref: hand_centroid → base`. The second is not a variable under test, it is run 18's repair carried forward — so **run 17 against run 18** is the single-variable test of what `d` MEANS, and run 17 against run 16 is not. `d = m·u` where `u = normalize(grasp_point − c)`, `m = clip(|v| / percentile((obj−c)·u, 95), 0, 1)`: a LOCATION on the object rather than a direction, normalized by the object's extent along that direction so `m = 1` is reachable laterally as well as longitudinally (isotropic normalization caps a 6:1 object's lateral command at 0.17). `d_m_min: 0.15` sends less eccentric grasps to the null bin. Full upstream rebuild (`_loc` paths). **Inherits run 18's unfixed short-chord loss and is more exposed to it** — `location_extent` shares `v = grasp_point − c`, and there a shrinking chord silently shrinks `m` rather than dropping the episode. |
+| **regrasp_run18** | `regrasp_run18.yaml` | run 16 | wrist+right | 25 (planned) | 600 → ~187 | 50 | **1–6 (one per bin, ALL SIX LIVE)** | **direction** (centroid→tips, **pad MIDPOINT 0.1034**) | **dequantized** (continuous) | **grasp's own `d`** (continuous), deploy on the **bin centroid**; frame **LIVE** every step, azimuth from the **ROBOT BASE** (no hand in the frame) | per-point ×2 | **0° (OFF)** | **scratch (FTL)**, PointNet++ random every iter | no (FTL) | 50 / 15 | **linear 0.9→0.75** | 0.3 | 0.3 | `jolt` — replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | yes (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | not yet run | not yet run | = run 16, **ONE change**: `SIM.anchor_hand_ref: hand_centroid → base`. The anchor's x becomes `horizontal(p_base − c)`, dropping the giver from the frame entirely. Measured on run 16's own 4490 episodes, the lever arm goes 9.2→7.7 cm (hand cloud) to a flat 61.3 cm with a 41.8 cm floor, so the 0.04/0.08 m hysteresis becomes unreachable and is skipped; live re-anchoring drifts 1.49° per episode instead of 10.65° median / 15.8% past 90°, and the same grasp bins identically at step 0 and at the close 98.7% of the time. Sign is `p_base − c`, not `c − p_base`: the robot and the giver face each other, so only **7.7%** of grasps change bin label versus the wrist frame (78.6% under the other sign) and `succ_bin_*` stays broadly comparable with runs 1–16. Also the only **deployable** reference — no wrist detector, no hand segmentation. Full upstream rebuild (`_bframe` paths). **Does not fix the 22% of episodes that lose `d` to the short-chord rule** — that is `grasp_offset` measuring a 3.83 cm chord against a live centroid that migrates 3.42 cm, a property of the rule not the frame, left out deliberately so the frame is tested alone. |
 | **regrasp_fast1** | `regrasp_run2_fast.yaml` | run 2 | wrist+right | **8 of 8** | 126 → 138 | 50 | **1–4 (one per bin)** | orientation (`−R[:,2]`) | quantized (bin axis) | **bin axis** | per-point ×2 | 12° | warm-start (**last**.pt), PointNet++ from scratch | **yes** (last.pt) | **20 / 6** | **linear 1.0→0.75** | 0.3 | 0.3 | `jolt` — replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | **yes** (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | 8 (`success 0.457`) | `success 0.457`, `dir_track 0.611`, `bin_diag 0.771` | Run 2's method at ⅕ the compute, on the laptop. **First run in which DAgger moved anything.** Ended \|D\| 2624 eps. See below. |
 | **regrasp3_fast1** | `regrasp_run3_fast.yaml` | fast1 | wrist+right | **6 of 6** | 368 → 356 | 50 | **3 per bin** (7.42/scene) | orientation (`−R[:,2]`) | quantized (bin axis) | **bin axis** | per-point ×2 | 12° | warm-start (**last**.pt), PointNet++ from scratch | **yes** (last.pt) | **15 / 15** | **linear 1.0→0.75** | 0.3 | 0.3 | `jolt` — replace | 2.31 cm / 0.173 rad → 0.69 / 0.173 | **yes** (w=1.0) | pm (w=7) | nojoint, reach-tail ×2.5 (window 5), **direction_cond**, head [256,256] | **4** (`success 0.565`) | `success 0.500`, `dir_track 0.687`, `bin_diag 0.855` | Three demos per bin on the laptop. **Past fast1's FINAL numbers from iteration 1 on.** Ended \|D\| 6730 eps. See below. |
 
@@ -854,7 +856,7 @@ arriving as the aggregate turns majority on-policy.
 
 ---
 
-### regrasp_run16 — the frame as a robot would compute it, and an eval that covers the bins, not yet run
+### regrasp_run16 — the frame as a robot would compute it, and an eval that covers the bins — RAN, AND FAILED
 
 `= run 11` plus six keys. Three change **what `d` is** and require the direction
 table, the assignment, the base shard and the audit to be rebuilt
@@ -868,6 +870,161 @@ table, the assignment, the base shard and the audit to be rebuilt
 | `EVAL.dir_drop_short` | *(absent)* `true` | `false` | no |
 | `EVAL.scene_select` | *(absent)* `linspace` | `per_bin_frac`, `bin_frac 0.3` | no |
 | `EVAL.full_bin_coverage` | *(absent)* `false` | `true` | no |
+
+#### RESULT: post-mortem
+
+20 of 25 iterations, then read against run 11. Headline `success_rate` peaked at
+**0.4419 @it15** and ended at **0.3306**, against run 11's **0.6186 @it22**. Three
+separate things are inside that gap and only one of them is a policy regression.
+
+**1 — about 9 pp of it is the metric, not the policy.** `full_bin_coverage: true`
+grew the eval set from run 11's 194 episodes to **1464**, of which **1174 (80%)
+command a bin the scene has no demonstration for. `success_rate` averages all of
+them.** Restricted to the in-table population every earlier run reported, it19 is
+**0.4172**, not 0.3306. Nothing in run 16's headline row is comparable to runs
+1–15; `succ_bin_*` and the weighted in-table rate are.
+
+**2 — the real regression is −12 pp, and it is DAgger, not the fit.** At
+iteration 0 — base BC only, no DAgger data yet — run 16 scores **0.5207** in-table
+against run 11's **0.5000**, so the base shard rebuilt at 0.1034 m is healthy and
+the depth change is exonerated. What fails is everything after it. Smoothing the
+refit noise by comparing the first five iterations against the last five, run 11
+gained **+13.8 pp** (0.406 → 0.544); run 16 gained **+2.7 pp** (0.368 → 0.395) and
+never beat its own iteration 0.
+
+**3 — the cause is that 81% of every DAgger shard is discarded before training.**
+Running `regrasp_bc.dataset.episode_status` over both runs' shards:
+
+| | KEPT | `miscaptioned` | `no_reach` | `dir_zero` |
+|---|---|---|---|---|
+| run 11 | **0.571** | 0.006 | 0.414 | 0.009 |
+| run 16 | **0.188** | 0.444 | 0.148 | 0.220 |
+
+Neither new drop category is a data-quality problem. Both are artifacts.
+
+**Fault A — the hand-cloud centroid is a degenerate azimuth reference.** The
+visible hand points sit *on the object the hand is holding*, so the lever arm
+`‖horiz(c − ref)‖` is half the wrist's and shrinks as the gripper closes:
+
+| reference | step 0 | close | below 4 cm (latch in) | below 8 cm (latch out) |
+|---|---|---|---|---|
+| MANO wrist joint | 15.7 cm | 14.9 cm | 0.0% | 2.2% |
+| hand cloud centroid | 9.2 cm | **7.7 cm** | **10.5%** | **55%** |
+
+The 0.04/0.08 m thresholds were calibrated for a 15 cm reference. Against a
+7.7 cm one, **55% of episodes end inside the hysteresis band**, the base fallback
+fires on **13–23%** (run 11: 0.0%), the frame rotates **12.6° median within one
+episode with p90 = 152° and 19% flipping past 90°**, and even when it does not
+fall back the azimuth sits 8.4° median / 27.8° p90 off the wrist azimuth.
+
+**Fault B — `live` and `grasp_offset` are structurally incompatible.**
+`grasp_offset` is `normalize(grasp_point − c)`, a **3.83 cm** chord. With a live
+`c` from an eye-in-hand camera the observed centroid migrates onto the face the
+fingers are on, so the chord collapses: latched, 4.18 cm at step 0 and at the
+close with **1.6%** under `d_min_offset`; live, 3.83 → 3.34 cm with **24.0%**
+under it. That is the `dir_zero` column exactly. **The wrist+right fusion is not
+the problem and more cameras will not fix it** — the fused cloud is healthy (RMS
+radius shrinks only 27%, far-side extent holds at 6.65 → 6.36 cm, unique object
+points *rise* 489 → 896, 2.3 mm typical step-to-step centroid jitter). The signal
+is simply the same size as the noise: a 3.8 cm chord against 3.4 cm of drift.
+Freezing the centroid the `d`-rule measures from takes the 24% to **0.0%**.
+
+**Fault C — the direction table was never told about the new anchor.**
+`build_direction_table.py` hardcoded `A.wrist_world(env)` with a fresh
+`AnchorState()` and had **no flag** to say otherwise, and the sbatch passed none.
+So the pin table's bins and `command_axes.json` were named in the **wrist-latched**
+frame while collection and evaluation ran in the **hand_centroid-live** one. Those
+two frames are roughly *anti-aligned* — the robot and the giver face each other —
+so among measurable episodes `bin_assigned == bin_realized` fell from **99% to
+40%**, which is the `miscaptioned` column. The base shard, collected by
+`collect_regrasp_demos.py` with its own wrist default, was in a third frame again.
+
+**Net effect on the command.** `demo_off_deg`, the angle between the direction the
+policy is *told* and the direction the expert actually flies, rose from **22.5°
+median (p90 37°)** in run 11 to **57–66° median (p90 114–135°)**. On a tenth of
+episodes the command points at the opposite side of the object. Both the DAgger
+rollouts and the evaluation were conditioned on that.
+
+**What was fixed, and where.** Fault A and Fault C are addressed in **run 18**
+(`anchor_hand_ref: base`, plus `--anchor-hand-ref` on the table builder and the
+collector, plus `setup.resolve_anchor_ref`, which refuses a config/table
+disagreement at load — the guard that would have caught this on the first
+iteration instead of after twenty). **Fault B is deliberately left open in run 18**
+so the frame is tested alone; expect the keep-rate to recover to roughly 45%
+against run 11's 57%, with the remaining gap being the short-chord loss.
+
+**A CSV gap found while reading the log, unrelated to the result.**
+`LOG_COLUMNS` declares `dir_n`, `dir_n_short`, `retry_n_*`, `n_bin_all_*`,
+`retry_at_5/6` and the `_deep` rungs, but `train_regrasp.eval_columns` never
+populates them, so 25 header columns are blank in every row. The values are all
+in `state.json` and the plotter reads none of them, so nothing broke — but
+anything that does read the CSV will find holes.
+
+---
+
+### regrasp_run18 — run 16 with the anchor frame repaired, and nothing else
+
+One key: `SIM.anchor_hand_ref: hand_centroid → base`. The anchor's x axis becomes
+
+```
+x = normalize(horizontal(p_base - c))        object -> robot
+y = z x x,   z = world up                    origin = live object centroid
+```
+
+**Why it cannot degenerate.** The object is always well out in front of the robot
+— it has to be, or the arm could not reach it — so the horizontal lever arm has a
+measured **floor of 41.8 cm** (median 61.3), five times the `enter` threshold.
+`anchor_rotation` therefore skips the hysteresis entirely on this path and reports
+`mode: base_primary`, distinct from the wrist path's `base` fallback.
+
+**Why `live` becomes free.** Intra-episode frame rotation, over 4490 run-16
+episodes, re-deriving each reference from the same step-0 and closing centroids:
+
+| reference | median | p90 | p99 | flips >90° |
+|---|---|---|---|---|
+| hand cloud centroid (run 16) | 10.65° | 144.80° | 176.10° | **15.8%** |
+| MANO wrist joint (run 11) | 5.74° | 16.93° | 39.36° | 0.04% |
+| **robot base** | **1.49°** | **3.94°** | **7.67°** | **0.02%** |
+
+A 1 cm centroid error moves this azimuth **0.65°** (p95 1.03) against the wrist's
+2.53 and the hand centroid's ~5, and the same grasp bins identically at step 0 and
+at the close **98.7%** of the time (wrist 94.7%, run 16 as actually run ~40%). It
+also makes the latched base shard and the live DAgger shards agree to within
+noise, which was never true of either hand reference.
+
+**The sign matters and is measured.** `p_base − c`, not `c − p_base`. Re-binning
+run 11's 2208 grasps:
+
+| bin | wrist frame (runs 1–16) | `x = c − base` | `x = base − c` |
+|---|---|---|---|
+| +x | 24.9% | 20.4% | 23.1% |
+| −x | 20.2% | 23.1% | 20.4% |
+| +y | 20.2% | 13.7% | 21.1% |
+| −y | 13.3% | 21.1% | 13.7% |
+| +z | 9.2% | 9.3% | 9.3% |
+| −z | 12.2% | 12.5% | 12.5% |
+| **grasps changing bin** | — | **78.6%** | **7.7%** |
+
+`base − c` keeps `succ_bin_*` broadly comparable with every earlier run and lets
+`RETRY_LADDER`'s measured ordering carry over.
+
+**What it costs.** `+x` stops meaning "away from the giver's fingers" and starts
+meaning "the side facing the robot", and the frame becomes nearly scene-invariant
+(azimuth std 7.4° against the wrist's 18.4). The policy does not notice: **the
+anchor never enters a network input** — the two conditioning channels are
+`d · n_i` and `d · normalize(p_i − c)`, dot products in the EE frame — so this
+changes only what a bin is *named*. The hand's geometry remains fully available to
+the network as channel 4 of the cloud.
+
+**What it buys at deployment.** No wrist detector and no hand segmentation, only
+the robot's own kinematics and an object centroid. This retires the sim2real
+dependency Phase 5's grasp proposer was traded for rather than swapping it for
+another one.
+
+**What it does not fix.** Fault B above: ~22% of episodes still lose `d` to the
+short-chord rule. Left open on purpose so run 18 against run 16 is a clean
+single-variable test of the frame.
+
 
 **`d` is measured to the middle of the pads, not their far edge.** The Panda
 finger pads span local z ∈ [0.0946, 0.1122]; runs 10–15 used the distal edge.
@@ -2183,6 +2340,8 @@ Configs without a numbered run file were shared across several runs.
 | `regrasp_run12.yaml` | regrasp_run12 — = run 11 + DART as the paper writes it (`DAGGER.dart_mode: dart_noise`). **Ran and regressed** (0.562 vs run 11's 0.619): `dart_noise_ratio: 1.0` perturbed 90% of steps and the reach never committed. Do not copy its DART block. |
 | `regrasp_run15.yaml` | regrasp_run15 — = run 12 + corrected DART dose (ratio 0.3, α 0.25→0.12) + warm-started chain; pairs with run 14 |
 | `regrasp_run16.yaml` | regrasp_run16 — = run 11 + live anchor frame, azimuth from the hand cloud, `d` to the pad midpoint (0.1034), short chords measured, eval stratified 30%/bin with every bin commanded on every scene |
+| `regrasp_run17.yaml` | regrasp_run17 — = run 16 + `d_rule: location_extent` + `anchor_hand_ref: base`; read against run 18, not run 16 |
+| `regrasp_run18.yaml` | regrasp_run18 — = run 16 + `anchor_hand_ref: base` and nothing else; the repair for run 16's frame collapse |
 | `regrasp_run14.yaml` | regrasp_run14 — = run 13 + warm-started chain (`train_from_scratch: false`, `init_ckpt: last`) and `iter_epochs` 15→20 |
 | `regrasp_run13.yaml` | regrasp_run13 — = run 9 + the same DART change with the **dose corrected after run 12** (ratio 0.3, α 0.35→0.18), `reach_filter: false` to stay comparable |
 | `regrasp_smoke.yaml` | Regrasp shakedown — 2 iters, m=8, 3 eval scenes |

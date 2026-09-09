@@ -774,6 +774,34 @@ def aggregate_eval_rows(rows, params, num_grasps) -> dict:
         rs = [r for r in rows if int(r.get("bin_idx", -1)) == b]
         for k, v in _rate_block(rs, params).items():
             out[f"{k}_b{b}"] = v
+    # ---- AND THE STAGE RATES AGAIN, DEMONSTRATED SCENES ONLY ---------------
+    # `*_b{b}` above filters on `bin_idx` AND NOTHING ELSE, so under
+    # `EVAL.full_bin_coverage` it silently includes the off-table rows and
+    # `success_rate_b{b}` becomes identical to `succ_bin_all_{b}`. Measured on
+    # run 16 it 19: both read 0.4717 while the demonstrated scenes read 0.5263.
+    # Runs 1-15 had no off-table rows, so their `*_b{b}` WAS the demonstrated
+    # population — which means the column quietly changed meaning at run 16 and
+    # the training curves stopped being comparable without anyone being told.
+    #
+    # Rather than redefine `*_b{b}` (run 16's log is already written under the
+    # new meaning, and redefining it would make two runs' identically-named
+    # columns mean different things), the demonstrated population gets its own
+    # `_intab_` names and BOTH are plotted. `success_rate` is deliberately NOT
+    # duplicated here: `succ_bin_{b}` in `_regrasp_metrics` already is that
+    # number, over the identical filter, and a second copy could only ever
+    # disagree with it.
+    intab = [r for r in rows if int(r.get("in_table", 1)) == 1]
+    out["n_in_table"] = len(intab)
+    # THE HEADLINE, ON THE POPULATION RUNS 1-15 REPORTED. `success_rate` above
+    # is over every row, so under full coverage it is ~80% bins the scene never
+    # demonstrates and is not comparable with any earlier run.
+    out["success_rate_in_table"] = _rate_block(intab, params).get(
+        "success_rate", float("nan"))
+    for b in range(len(_rg_dirs.BINS)):
+        rs = [r for r in intab if int(r.get("bin_idx", -1)) == b]
+        blk = _rate_block(rs, params)
+        for k in ("close_rate", "near_rate", "grasp_rate"):
+            out[f"{k}_intab_b{b}"] = blk.get(k, float("nan"))
     return out
 
 

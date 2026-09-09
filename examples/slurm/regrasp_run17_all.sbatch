@@ -1,8 +1,8 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# RUN 16, EVERY STAGE, IN ONE JOB — and everything on /home, not /scratch.
+# RUN 17, EVERY STAGE, IN ONE JOB — and everything on /home, not /scratch.
 #
-#     sbatch examples/slurm/regrasp_run16_all.sbatch
+#     sbatch examples/slurm/regrasp_run17_all.sbatch
 #
 # IT WILL NOT FINISH IN ONE 24 h ALLOCATION, and that is not a bug in the
 # script. Measured from run 11's own `wall_s` (fit `wall(i) = 0.78*i + 6.6 min`)
@@ -21,8 +21,8 @@
 # `train_regrasp.py` resumes from `state.json`. Submit it twice, chained, and
 # pass 2 picks up wherever pass 1 was killed:
 #
-#     J1=$(sbatch --parsable examples/slurm/regrasp_run16_all.sbatch)
-#     sbatch --dependency=afterany:$J1 examples/slurm/regrasp_run16_all.sbatch
+#     J1=$(sbatch --parsable examples/slurm/regrasp_run17_all.sbatch)
+#     sbatch --dependency=afterany:$J1 examples/slurm/regrasp_run17_all.sbatch
 #
 # `afterany`, NOT `afterok`: pass 1 is EXPECTED to die on the wall clock, which
 # is a non-zero exit. Under `afterok` pass 2 would never start.
@@ -42,18 +42,18 @@
 #
 # ⚠ /home IS A HARD 30 GB QUOTA THAT FILLS SILENTLY. There is no ENOSPC
 # traceback — Python cannot write one to a full disk — so the job dies with exit
-# code 6 and an empty error file. Run 16 needs about 5 GB:
+# code 6 and an empty error file. Run 17 needs about 5 GB:
 #
 #     base shards (train 570 MB + val 23 MB)          ~0.6 GB
 #     run dir: data/ (25 DAgger shards)               ~3.1 GB
 #     run dir: iters/ (per-iteration checkpoints)     ~1.2 GB
 #     direction + pin tables                          ~0.003 GB
 #
-# `preflight_regrasp.sh regrasp_run16` checks the quota BEFORE any of this starts. Do not skip
+# `preflight_regrasp.sh regrasp_run17` checks the quota BEFORE any of this starts. Do not skip
 # it: losing 6 h of collection to a full disk is the single most expensive
 # failure available here, and it is the one that reports nothing.
 # ─────────────────────────────────────────────────────────────────────────────
-#SBATCH --job-name=h2r-rg16
+#SBATCH --job-name=h2r-rg17
 #SBATCH --partition=gpu-v100
 #SBATCH --account=education-me-msc-ro
 #SBATCH --qos=normal
@@ -63,8 +63,8 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --gpus-per-task=1
 #SBATCH --mem-per-cpu=4G
-#SBATCH --output=slurm_logs/rg16_%j.out
-#SBATCH --error=slurm_logs/rg16_%j.err
+#SBATCH --output=slurm_logs/rg17_%j.out
+#SBATCH --error=slurm_logs/rg17_%j.err
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
@@ -85,21 +85,21 @@ export REGRASP_DATA="${REGRASP_DATA:-$SCRATCH_ROOT/output}"
 export OUT_ROOT="${OUT_ROOT:-$SCRATCH_ROOT/output/dagger_runs}"
 mkdir -p "$REGRASP_DATA/bc_dataset" "$OUT_ROOT" slurm_logs output
 
-RUN=regrasp_run16
-CFG=examples/configs/regrasp_run16.yaml
+RUN=regrasp_run17
+CFG=examples/configs/regrasp_run17.yaml
 SIM_CFG=examples/pretrain_multicam_wr.yaml
 
-# `d_rule` and the DEPTH are what make run 16's tables incompatible with run
-# 11's. `resolve_d_rule` refuses the run if the config and the table disagree on
-# either, so these three values must match the config exactly.
-D_ARGS="--d-rule grasp_offset --d-point-depth 0.1034 --d-min-offset 0.02"
+# `d_rule`, its two `location_extent` parameters, the DEPTH and THE ANCHOR
+# REFERENCE all have to match examples/configs/regrasp_run17.yaml exactly, or
+# `resolve_d_rule` / `resolve_anchor_ref` refuse the run.
+D_ARGS="--d-rule location_extent --d-point-depth 0.1034 --d-min-offset 0.02 --d-m-min 0.15 --d-extent-pct 95.0 --anchor-hand-ref base"
 
-DT_TRAIN=output/direction_table_train_off1034.json
-DT_VAL=output/direction_table_val_off1034.json
-PIN_TRAIN=output/regrasp_pins_train_off1034.json
-PIN_VAL=output/regrasp_pins_val_off1034.json
-H5_TRAIN="$REGRASP_DATA/bc_dataset/train_regrasp_off1034.h5"
-H5_VAL="$REGRASP_DATA/bc_dataset/val_regrasp_off1034.h5"
+DT_TRAIN=output/direction_table_train_loc.json
+DT_VAL=output/direction_table_val_loc.json
+PIN_TRAIN=output/regrasp_pins_train_loc.json
+PIN_VAL=output/regrasp_pins_val_loc.json
+H5_TRAIN="$REGRASP_DATA/bc_dataset/train_regrasp_loc.h5"
+H5_VAL="$REGRASP_DATA/bc_dataset/val_regrasp_loc.h5"
 
 echo "host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo none)"
 echo "SCRATCH_ROOT=$SCRATCH_ROOT   REGRASP_DATA=$REGRASP_DATA"
@@ -108,9 +108,11 @@ df -h "$HOME" | tail -1
 stage () { echo; echo "=== [$(date +%H:%M:%S)] $* ==="; }
 
 # ── 1. direction tables ─────────────────────────────────────────────────────
-# The ONLY reason this stage exists is the depth change. Measured on run 11's
-# table, 0.1122 -> 0.1034 turns `d` a median 9.9 deg and re-bins 8.0% of grasps,
-# so run 11's tables caption the wrong bins for run 16.
+# Run 17 changes BOTH `d_rule` (grasp_offset -> location_extent) and the anchor
+# reference (hand_centroid -> base), so nothing upstream of run 16 or run 18 is
+# reusable. `d_rule` decides which grasp each bin gets and the frame decides what
+# the bins ARE; `resolve_d_rule` and `resolve_anchor_ref` both refuse a stale
+# table, so a mismatch fails immediately rather than after the collection.
 if [ ! -f "$DT_TRAIN" ]; then
     stage "1a  direction table (train)  ~1.5 h"
     python examples/build_direction_table.py --cfg-file "$SIM_CFG" \
@@ -156,7 +158,7 @@ for sp in train val; do
         # reads, and a silent default is the one thing that must not decide them.
         python examples/collect_regrasp_demos.py --cfg-file "$SIM_CFG" \
             --split "$sp" --output "$h5" --grasp-pin-table "$pin" \
-            --d-rule grasp_offset --d-point-depth 0.1034 \
+            --d-rule location_extent --d-point-depth 0.1034 --anchor-hand-ref base \
             --valid-grasp-dict examples/valid_grasp_dict_005.pkl
     else
         echo "[skip] $h5 exists"
@@ -168,7 +170,7 @@ done
 # reached its grasp. train_regrasp.sbatch derives this itself when absent, but
 # doing it here keeps the gate visible in the log rather than buried in the
 # training job's preamble.
-OK=output/regrasp_demos_train_off1034_ok.json
+OK=output/regrasp_demos_train_loc_ok.json
 if [ ! -f "$OK" ]; then
     stage "4  audit the base shard -> $OK"
     python examples/audit_regrasp_demos.py --demos "$H5_TRAIN" --write-ok "$OK"

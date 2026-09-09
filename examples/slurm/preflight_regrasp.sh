@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# WILL RUN 16 START, OR WILL IT DIE SIX HOURS IN? Run this on a DelftBlue LOGIN
-# node before submitting anything. It touches no GPU and finishes in seconds.
+# WILL THIS RUN START, OR WILL IT DIE SIX HOURS IN? Run this on a DelftBlue
+# LOGIN node before submitting anything. It touches no GPU, finishes in seconds.
 #
-#     bash examples/slurm/preflight_run16.sh
+#     bash examples/slurm/preflight_regrasp.sh regrasp_run18
+#     bash examples/slurm/preflight_regrasp.sh regrasp_run17
 #
 # It checks the four things that kill this run, in the order they would kill it:
 #
@@ -19,17 +20,32 @@
 #      disagree with what the job will open. Missing inputs are EXPECTED on a
 #      first run — the sbatch builds them — so they are reported as a plan, not
 #      as an error.
-#   4. CONSISTENCY. `d_point_depth` in the config against the pin table's
-#      `_meta`, when the table exists. This is the one that produces a
-#      plausible, wrong result rather than a crash: 0.1122 vs 0.1034 re-bins 8%
-#      of grasps, and until recently `resolve_d_rule` compared only the rule
-#      NAME and would have let it through.
+#   4. CONSISTENCY. `d_rule`, `d_point_depth` AND `anchor_hand_ref` in the
+#      config against the pin table's `_meta`, when the table exists. These are
+#      the ones that produce a plausible, wrong result rather than a crash.
+#      0.1122 vs 0.1034 re-bins 8% of grasps. The anchor reference is worse:
+#      run 16 set `hand_centroid` while `build_direction_table.py` hardcoded the
+#      MANO wrist, and since those two frames are roughly ANTI-ALIGNED,
+#      `bin_assigned == bin_realized` fell 99% -> 40%, the miscaption filter ate
+#      44% of every DAgger shard, and training saw 19% of what was collected.
+#      Twenty iterations, plausible curves, never beat iteration 0.
+#      `setup.resolve_anchor_ref` now refuses this at load; the check is here so
+#      it is caught before the queue wait rather than after it.
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
-RUN=regrasp_run16
-CFG=examples/configs/regrasp_run16.yaml
+RUN="${1:-}"
+if [ -z "$RUN" ]; then
+    echo "usage: bash examples/slurm/preflight_regrasp.sh <run-name>" >&2
+    echo "   e.g. bash examples/slurm/preflight_regrasp.sh regrasp_run18" >&2
+    exit 2
+fi
+CFG="examples/configs/${RUN}.yaml"
+if [ ! -f "$CFG" ]; then
+    echo "no such config: $CFG" >&2
+    exit 2
+fi
 export SCRATCH_ROOT="${SCRATCH_ROOT:-$HOME/h2r-runs}"
 export REGRASP_DATA="${REGRASP_DATA:-$SCRATCH_ROOT/output}"
 NEED_GB=5
@@ -39,7 +55,7 @@ ok()   { printf '  \033[32mOK\033[0m    %s\n' "$*"; }
 bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fail=1; }
 warn() { printf '  \033[33mNOTE\033[0m  %s\n' "$*"; }
 
-echo "preflight: $RUN"
+echo "preflight: $RUN   ($CFG)"
 echo "  REGRASP_DATA = $REGRASP_DATA"
 echo "  OUT_ROOT     = $SCRATCH_ROOT/output/dagger_runs"
 echo
@@ -103,19 +119,35 @@ python - "$CFG" <<'PY'
 import json, os, sys, yaml
 cfg = yaml.safe_load(open(sys.argv[1]))["SIM"]
 pin = cfg["grasp_pin_table"]
-want = (cfg.get("d_rule", "approach_axis"),
-        float(cfg.get("d_point_depth", 0.1122)))
 if not os.path.exists(pin):
     print(f"        {pin} not built yet — nothing to compare (fine)")
     raise SystemExit(0)
 m = (json.load(open(pin)).get("_meta") or {})
-got = (m.get("d_rule", "approach_axis"), float(m.get("d_point_depth", 0.1122)))
-if want == got:
-    print(f"        config and table agree: {got[0]} @ {got[1]}")
-else:
-    print(f"        MISMATCH  config={want}  table={got}")
-    print("        Rebuild the table at the config's depth, or the run is scored")
-    print("        against bins captioned by a different definition of `d`.")
+# (config value, table value, label). Defaults are what a table PREDATING each
+# key was built with, so an old table compares equal instead of failing.
+checks = [
+    ("d_rule",          cfg.get("d_rule", "approach_axis"),
+                        m.get("d_rule", "approach_axis")),
+    ("d_point_depth",   float(cfg.get("d_point_depth", 0.1122)),
+                        float(m.get("d_point_depth", 0.1122))),
+    ("anchor_hand_ref", cfg.get("anchor_hand_ref", "wrist"),
+                        m.get("anchor_hand_ref", "wrist")),
+]
+if str(cfg.get("d_rule")) == "location_extent":
+    checks += [
+        ("d_m_min",     float(cfg.get("d_m_min", 0.15)),
+                        float(m.get("d_m_min", 0.15))),
+        ("d_extent_pct", float(cfg.get("d_extent_pct", 95.0)),
+                         float(m.get("d_extent_pct", 95.0))),
+    ]
+bad = [(k, a, b) for k, a, b in checks if a != b]
+for k, a, b in checks:
+    print(f"        {'MISMATCH' if (k, a, b) in bad else 'agree   '}  "
+          f"{k:16s} config={a!r:20s} table={b!r}")
+if bad:
+    print("        The table's bins were NAMED under its values. Rebuild it with")
+    print("        the config's, or the run is scored against a different frame")
+    print("        and/or a different definition of `d` than it collected under.")
     raise SystemExit(1)
 PY
 [ $? -eq 0 ] && ok "no depth/rule mismatch" || bad "config and pin table disagree"
@@ -123,8 +155,8 @@ PY
 echo
 if [ "$fail" -eq 0 ]; then
     printf '\033[32mPREFLIGHT PASSED\033[0m — submit with:\n'
-    echo "  J1=\$(sbatch --parsable examples/slurm/regrasp_run16_all.sbatch)"
-    echo "  sbatch --dependency=afterany:\$J1 examples/slurm/regrasp_run16_all.sbatch"
+    echo "  J1=\$(sbatch --parsable examples/slurm/${RUN}_all.sbatch)"
+    echo "  sbatch --dependency=afterany:\$J1 examples/slurm/${RUN}_all.sbatch"
 else
     printf '\033[31mPREFLIGHT FAILED\033[0m — fix the FAIL lines above before submitting.\n'
     exit 1
