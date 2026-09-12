@@ -13,7 +13,12 @@
 #   DAGGER.plane_gate        false -> true    only the expert enters the reach
 #   DAGGER.max_steps         50 -> 80         horizon
 #   EVAL.max_steps           50 -> 80         scored to match
+#   DAGGER.num_iters         25 -> 35         AND the beta ramp with it
 #   SIM.cfg_file             wrist+right -> RIGHT ONLY
+#
+# `num_iters` is the denominator of the linear beta schedule, so 35 stretches the
+# 0.9 -> 0.75 handover across 35 iterations instead of appending ten at the
+# floor. beta(25) is now 0.794 — roughly where run 19 sat at its iteration 16.
 #
 # ── WHY THE WHOLE PIPELINE AND NOT JUST THE TRAINER ─────────────────────────
 #
@@ -44,16 +49,21 @@
 #     collect base train       5.0 h
 #     collect base val         0.3 h
 #     audit                    minutes
-#     train, 25 iterations    17-20 h        run 19 measured ~16 h at 50 steps;
-#     -------------------------------        max_steps 50 -> 80 lengthens only
-#     TOTAL                   24-27 h        the episodes that were hitting the
-#                                            cap (13.9% in run 19), while the
-#                                            pool fix REMOVES ~18% of collection
-#                                            that was going to unreachable pairs
+#     train, 35 iterations    25-28 h        run 19 measured ~16 h for 25 iters,
+#     -------------------------------        but per-iteration cost RISES with
+#     TOTAL                   32-35 h        |D| (run 9: 30.9 min mean, 52.6 min
+#                                            by iter 26), so iters 26-35 add ~10 h
+#                                            rather than 40% of 16. max_steps
+#                                            50 -> 80 lengthens only the episodes
+#                                            that were hitting the cap (13.9% in
+#                                            run 19), while the pool fix REMOVES
+#                                            ~18% of collection that was going to
+#                                            unreachable pairs.
 #
 # 24 h is DelftBlue's hard maximum, so nothing fits. THIS SCRIPT IS IDEMPOTENT:
 # every stage is skipped when its output exists and `train_regrasp.py` resumes
-# from `state.json`. RESUBMIT THE IDENTICAL COMMAND — expect two or three passes.
+# from `state.json`. RESUBMIT THE IDENTICAL COMMAND — expect THREE passes at
+# --time=20:00:00, or two if the queue lets you ask for longer.
 #
 # ── WHY --time=20:00:00 AND NOT 24 ───────────────────────────────────────────
 # A 24 h request is the maximum, so the scheduler can never backfill it into a
@@ -268,7 +278,7 @@ fi
 # ── 5. the run ──────────────────────────────────────────────────────────────
 # Resumable: `state.json` records the last completed iteration, so a wall-clock
 # kill costs only the iteration in flight. This is the stage pass 2 continues.
-stage "5  train (25 iterations)  ~17-20 h"
+stage "5  train (35 iterations)  ~25-28 h"
 python examples/train_regrasp.py --cfg-file "$CFG" --run-name "$RUN" \
     --out-root "$OUT_ROOT" \
     --num-workers "$(( SLURM_CPUS_PER_TASK - 2 ))"

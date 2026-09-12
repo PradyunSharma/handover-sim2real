@@ -11,7 +11,7 @@ account, and this file. Follow it top to bottom.
 
 ## 0. What run 21 is
 
-Run 19 plus six changes. Two are bug fixes, three are new behaviour, one is the
+Run 19 plus seven changes. Two are bug fixes, four are new behaviour, one is the
 rig:
 
 | # | change | where | kind |
@@ -22,6 +22,36 @@ rig:
 | 4 | `DAGGER.max_steps: 50 → 80` | config | new — horizon |
 | 5 | `EVAL.max_steps: 50 → 80` | config | new — scored to match |
 | 6 | `SIM.cfg_file: pretrain_right.yaml` | config | new — **right camera only, no wrist** |
+| 7 | `DAGGER.num_iters: 25 → 35` | config | new — **and the beta ramp with it** |
+
+### Change 7 moves beta, not just the iteration count
+
+`num_iters` is the **denominator of the linear beta schedule**:
+
+```
+beta(i) = beta_start + (beta_end - beta_start) * (i - 1) / (num_iters - 1)
+```
+
+So 35 does not append ten iterations at the floor — it **stretches the handover**.
+The endpoints are unchanged (0.900 → 0.750); what changes is where you are along
+the way:
+
+| iteration | run 21 beta | run 19 beta |
+|---|---|---|
+| 1  | 0.900 | 0.900 |
+| 10 | 0.860 | 0.844 |
+| 20 | 0.816 | 0.781 |
+| 25 | 0.794 | **0.750** (its last) |
+| 35 | **0.750** | — |
+
+The learner takes over more slowly throughout, reaching run 19's final beta only
+at iteration 35. **Do not compare run 21's iteration N against run 19's iteration
+N** — at equal iteration index they are at different betas.
+
+The reason for going to 35: run 19 was still rising when it stopped. Its best
+iteration was its **last** (0.743 @ it25) and iters 14–20 averaged 0.648, so 25
+was a stopping point rather than a plateau. Run 9, by contrast, went flat from
+iteration 14.
 
 **This is not a clean ablation and is not meant to be.** Neither was run 19,
 which moved the shield and `iter_epochs` together. If run 21 beats run 19 the
@@ -111,10 +141,14 @@ when its output exists and `train_regrasp.py` resumes from `state.json`.
   collect base train       5.0 h
   collect base val         0.3 h
   audit                    minutes
-  train, 25 iterations    17-20 h
+  train, 35 iterations    25-28 h
   -------------------------------
-  TOTAL                   24-27 h
+  TOTAL                   32-35 h
 ```
+
+Run 19 measured ~16 h for 25 iterations, but per-iteration cost **rises with
+|D|** — run 9 logged 30.9 min mean against 52.6 min by iteration 26 — so
+iterations 26–35 add roughly 10 h, not 40% of 16.
 
 24 h is DelftBlue's hard maximum, so nothing fits. **Resubmit the identical
 command** and pass 2 picks up where pass 1 was killed. Expect two or three
@@ -122,7 +156,8 @@ passes. To chain them without waiting:
 
 ```bash
 J1=$(sbatch --parsable examples/slurm/regrasp_run21_all.sbatch)
-sbatch --dependency=afterany:$J1 examples/slurm/regrasp_run21_all.sbatch
+J2=$(sbatch --parsable --dependency=afterany:$J1 examples/slurm/regrasp_run21_all.sbatch)
+sbatch --dependency=afterany:$J2 examples/slurm/regrasp_run21_all.sbatch
 ```
 
 `afterany`, not `afterok` — pass 1 being killed on the wall clock is the
@@ -184,7 +219,7 @@ change 1 will not move the headline.
 
 ### Gate 4 — `reached_grasp / episodes`
 
-Run 19 averaged **0.604** over iterations 1–25. This should rise toward **~0.69
+Run 19 averaged **0.604** over iterations 1–25 (at its own beta schedule). This should rise toward **~0.69
 on arithmetic alone** — the pool fix removes the 18% of episodes that were
 failing 77% of the time.
 
@@ -197,6 +232,11 @@ failing 77% of the time.
 `success_rate` is **not comparable with runs 1–20**. This run scores at 80 steps;
 they scored at 50. Compare the held-out test-set number instead, and pass it a
 matching `--max-steps`.
+
+**Beta differs at equal iteration index** (see change 7), so an iteration-by-
+iteration overlay against run 19 compares two different on-policy fractions. The
+comparable points are the ENDPOINTS — run 19 it25 and run 21 it35 are both at
+beta 0.750.
 
 The **noise floor is 0.088** — an identical rerun of run 7's iteration 0 scored
 0.282 vs 0.370. Run 19 peaked at **0.743 (it25)**, mean **0.648** over iters

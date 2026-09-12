@@ -17,13 +17,20 @@
 # something neither number can report on its own. If run 21 beats run 19, the
 # two counters below say which mechanism moved.
 #
+#   DAGGER.num_iters          25 -> 35    (and WITH IT the beta ramp length)
+#
 # Everything else is byte-identical to run 19: the per-bin table, the shield and
 # its three knobs, `iter_epochs: 20`, `command_deploy: bin_centroid`,
-# `d_source: d_grasp_world`, the 0.9 -> 0.75 beta ramp, `train_from_scratch`,
-# 25 iterations and every DART magnitude. It reuses run 9/19's direction table,
+# `d_source: d_grasp_world`, `train_from_scratch` and every DART magnitude. The
+# beta ENDPOINTS are unchanged at 0.9 -> 0.75; what changes is that the ramp now
+# spans 35 iterations, so 0.75 is reached at iteration 35 rather than 25 and the
+# handover to the learner is slower throughout. It reuses run 9/19's direction table,
 # pin table, demo-ok table and base shards unchanged — NOTHING to rebuild.
 #
-# WALL CLOCK: run 19 measured ~16 h. `replan_after_pin` adds one
+# WALL CLOCK: ~25-28 h of training plus ~7 h of upstream rebuild. Run 19
+# measured ~16 h for 25 iterations, but per-iteration cost RISES with |D| (run 9:
+# 30.9 min mean, 52.6 min by iteration 26), so iterations 26-35 are the expensive
+# ones and add ~10 h rather than 40% of 16. `replan_after_pin` adds one
 # `run_omg_planner` call at step 0 of each episode (~1/28th of the planner calls
 # in an episode, so ~4% on the collection half); the pool fix REMOVES ~18% of
 # collection by not spending it on unreachable pairs. Net: at or below run 19.
@@ -166,9 +173,24 @@ SIM:
   command_deploy: bin_centroid
 
 DAGGER:
-  # 25, planned — the same count run 2 carries. Resumable, so a 24 h timeout at
-  # iteration ~19 costs only the queue wait: resubmit the identical command.
-  num_iters: 25
+  # 35, up from run 19's 25. THIS KEY ALSO SETS THE BETA RAMP, which is the
+  # reason to change it here rather than with `--num-iters` on the command line:
+  # `beta_at` computes `linear` as
+  #
+  #     beta(i) = beta_start + (beta_end - beta_start) * (i - 1) / (num_iters - 1)
+  #
+  # so `num_iters` IS the ramp length. At 35 the schedule reaches beta_end = 0.75
+  # exactly at iteration 35 instead of at 25, which stretches the handover rather
+  # than appending ten iterations at the floor. Iteration 25 now sits at 0.794 —
+  # where run 19 was around its iteration 16.
+  #
+  # WHY: run 19 was still rising when it stopped. Its best iteration was its LAST
+  # (0.743 @ it25) and iters 14-20 averaged 0.648, so 25 was a stopping point, not
+  # a plateau. Run 9 by contrast went flat from iteration 14.
+  #
+  # Resumable — `state.json` records the last completed iteration, so a wall-clock
+  # kill costs only the iteration in flight. Resubmit the identical command.
+  num_iters: 35
   # A TARGET, not an exact count. `sample_pairs` draws m // max_grasps = 100
   # scenes and rolls out EVERY bin each can reach, so the iteration lands near
   # 259 (the mean is 2.59 bins per scene). Drawing a scene's directions TOGETHER
@@ -203,6 +225,11 @@ DAGGER:
   # a strict interpolation between known-good settings rather than an
   # extrapolation past them — which 0.5 would have been, at double run 16's
   # on-policy fraction and beyond anything measured on this task.
+  #
+  # THE RAMP IS 35 ITERATIONS LONG, NOT 25 — see `num_iters` above, which is the
+  # denominator in the linear schedule. beta(1) = 0.900, beta(35) = 0.750. The
+  # learner therefore takes over MORE SLOWLY than in run 19, reaching run 19's
+  # iteration-25 beta only at iteration 35.
   beta_schedule: linear
   beta_start: 0.9
   beta_end: 0.75
