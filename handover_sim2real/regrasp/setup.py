@@ -30,6 +30,7 @@ from handover_sim2real.regrasp.evaluator import EvalParams
 from handover_sim2real.regrasp.grasp_box import build_box_params
 from handover_sim2real.regrasp.grasp_pin import load_grasp_pin_table
 from handover_sim2real.regrasp.pregrasp import forward_dist_default
+from handover_sim2real.regrasp import reach as _rg_reach
 
 
 # ── WHERE THE BIG FILES LIVE ────────────────────────────────────────────────
@@ -333,6 +334,11 @@ class RegraspContext:
     # GraspPinTable.keep_only — how many (scene, bin) pairs base collection
     # actually demonstrated, and which scenes it emptied.
     demo_ok: dict | None = None
+    # None when SIM.reach_filter is off; otherwise the prune report for the
+    # SECOND filter -- the (scene, bin) pairs whose base demonstration actually
+    # arrived at its grasp. Reported separately from `demo_ok` because the two
+    # ask different questions and pass at very different rates (98.7% vs 69.9%).
+    reach_ok: dict | None = None
     # [k, 3] the axis set every command is built from, or None for the grasp-axis
     # rule. Mirrored onto `eval_params` so a worker that only receives params
     # still commands the same thing; kept here too because the collector's params
@@ -401,6 +407,51 @@ def build_regrasp_context(cfg4: dict, *, seed: int = 0,
             raw_ok = json.load(f)
         demo_ok_report = pin_table.keep_only(
             raw_ok.get("ok", raw_ok), verbose=verbose)
+
+    # ---- (scene, BIN) pairs whose demonstration REACHED its grasp -----------
+    # THE SECOND PRUNE, AND IT MUST HAPPEN HERE TOO. `keep_only` RENUMBERS
+    # SLOTS, so a table that has had one prune and not the other disagrees with
+    # its peer about what every slot index MEANS, not merely about which pairs
+    # exist. train_regrasp.py applies both to the MANAGER's copy and ships the
+    # pool only `(scene, slot)` -- so while this function applied only the first,
+    # the manager emitted slots against a 1097-slot table and each worker
+    # resolved them against a 1576-slot one.
+    #
+    # MEASURED ON RUN 19, which ran with the mismatch: 246 of 1097 manager slots
+    # (22.4%) named a DIFFERENT bin in the worker, and 898 of 4883 collected
+    # episodes (18.4%) landed on pairs this filter had excluded. Those pairs
+    # failed `reached()` 77.1% of the time against 31.1% for pairs that belonged
+    # in the pool, so they account for 692 of the run's 1933 dropped episodes --
+    # 36% of the collection waste. `eval_jobs` ships slots the same way, so the
+    # per-bin scoring was mis-attributed on the same ~22% of slots.
+    #
+    # DERIVED FROM THE SHARD rather than read from a file, for the reason the
+    # manager derives it: a second ok-list on disk is one more artifact to
+    # rebuild whenever the shard changes, and one more chance for two filters to
+    # disagree. Cost is one attrs-only pass (no point clouds) per worker.
+    #
+    # SPLIT-DEPENDENT, exactly like `demo_ok_table` -- it names pairs in the
+    # TRAIN pin table. eval_regrasp_testset.py turns it off alongside that one.
+    reach_ok_report = None
+    if bool(sim_cfg_d.get("reach_filter", True)) and pin_table is not None:
+        base_h5 = (cfg4.get("TRAIN") or {}).get("base_train_h5")
+        if not base_h5 or not os.path.exists(base_h5):
+            raise SystemExit(
+                f"[reach-filter] SIM.reach_filter is on but TRAIN.base_train_h5 "
+                f"({base_h5!r}) does not exist, so the pair filter cannot be "
+                f"derived.\nApplying it in the manager and not here is what made "
+                f"run 19 collect 18% of its episodes on excluded pairs, so this "
+                f"refuses rather than\nsilently building a differently-numbered "
+                f"table. Either point TRAIN.base_train_h5 at the base shard or "
+                f"set SIM.reach_filter: false.")
+        reach_ok_report = pin_table.keep_only(
+            _rg_reach.reach_ok_pairs(
+                base_h5,
+                float(sim_cfg_d.get("reach_pos_thresh",
+                                    _rg_reach.DEFAULT_POS_THRESH)),
+                float(sim_cfg_d.get("reach_rot_thresh",
+                                    _rg_reach.DEFAULT_ROT_THRESH)))[0],
+            verbose=verbose)
 
     usable = set(pin_table.entries) if pin_table is not None else None
 
@@ -510,6 +561,7 @@ def build_regrasp_context(cfg4: dict, *, seed: int = 0,
         select_on=str(ev.get("select_on", "success_rate")),
         n_excluded=n_excluded, usable=usable,
         demo_ok=demo_ok_report,
+        reach_ok=reach_ok_report,
         command_axes=command_axes, command_mode=command_mode, d_rule=d_rule,
         anchor_update=anchor_update, anchor_hand_ref=anchor_hand_ref,
         dir_drop_short=dir_drop_short)

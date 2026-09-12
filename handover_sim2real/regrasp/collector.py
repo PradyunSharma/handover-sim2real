@@ -149,6 +149,7 @@ from collect_bc_dataset import (  # noqa: E402
     ROBOT_STATE_DIM,
 )
 from rollout_bc_policy import action_to_target_joint  # noqa: E402
+from core.utils import tf_quat, unpack_pose  # noqa: E402
 
 from handover_sim2real.regrasp import anchor as _rg_anchor        # noqa: E402
 from handover_sim2real.regrasp import channels as _rg_channels   # noqa: E402
@@ -388,6 +389,34 @@ class CollectParams:
     # `chance_rate` stays 0, the takeover is manufacturing labels the policy
     # cannot use, and the honest conclusion is that the reach itself is unlearned.
     expert_after_commit: bool = False
+    # ----- REPLAN AFTER PINNING (run 21) ---------------------------------------
+    # THE STEP-0 LABEL AIMED AT THE WRONG GRASP. The loop plans, sets
+    # `expert_target_jp = plan[0]`, and only THEN prunes the goal set to the
+    # pinned grasp. The pin updates `grasp_pose`, `standoff_pose` and `d_world`
+    # — but nothing recomputes the label, so step 0 of every DAgger episode is
+    # the first waypoint toward OMG's OWN free pick while the episode's caption,
+    # its conditioning and every later label refer to the pinned grasp.
+    #
+    # `collect_regrasp_demos.py` has always done it the other way — plan, pin,
+    # REPLAN with `reset_scene=False`, then replay — which is why base demos and
+    # DAgger episodes disagree on their very first action from an identical
+    # state. Measured on scene 95 / grasp_idx 2 (bin 3, a lateral grasp needing a
+    # wide arc): base's step-0 label is 120.8 deg off the straight line to the
+    # grasp and moves 4 cm AWAY from it to set up the approach, while DAgger's is
+    # 61.0 deg and closes monotonically. Identical start state (0.00000 m apart),
+    # identical grasp (0.0000 m, 0.0 deg), and OMG is deterministic — eight
+    # episodes from iterations 1-19 produced bit-identical step-0 labels, 0.0 deg
+    # pairwise spread. The planner was simply asked a different question.
+    #
+    # The damage is not one label in fifteen. Step 0 is also EXECUTED, so the
+    # episode starts displaced toward a grasp it is not aiming at, and the pair
+    # is recorded and trained on. It is invisible in any median, which is why the
+    # population off-axis and detour statistics came back null.
+    #
+    # OFF BY DEFAULT so runs 1-20 keep their behaviour AND their RNG stream: the
+    # extra `run_omg_planner` call consumes nothing from `rng`, but the corrected
+    # label changes what is executed and therefore every state after it.
+    replan_after_pin: bool = False
     reach_skip_eps: float = 0.01
     # ----- DART (see the module docstring) -----
     # Per-step probability of replacing the executed action with a random jump,
@@ -549,6 +578,30 @@ class CollectParams:
     shield_clearance: float = 0.01       # metres, same units as dart_reach_clearance
     shield_path_steps: int = 4           # interpolation samples along the step
     shield_jolt_max_tries: int = 5       # redraws before the jolt is abandoned
+
+    # ---- THE STANDOFF PLANE: only the expert may enter the reach corridor ----
+    # A plane AT the standoff pose, normal along the gripper's +z at the
+    # pre-grasp (the approach axis). The free approach is on one side, the reach
+    # tail on the other. With `plane_gate` on, a DART jolt that would put the
+    # hand across it is REDRAWN (up to `shield_jolt_max_tries`, the same budget
+    # the shield uses) and a policy step that would cross is replaced by the
+    # expert action — the same two remedies, on a different predicate.
+    #
+    # WHY A HARD GATE RATHER THAN A COST. Past this plane the trajectory is not
+    # something a planner can repair: `goal_set_projection` pins the last
+    # `reach_tail_length` waypoints to the IK'd straight-line reach, so the
+    # obstacle gradient there is projected out by construction. Arriving in that
+    # corridor off-axis is therefore unrecoverable by the expert, which is the
+    # one thing DAgger relies on being able to do.
+    #
+    # SCOPED TO THE FREE APPROACH. Once `committed_reach` exists the episode is
+    # legitimately inside the corridor and the reach-band DART operates there
+    # under its own clearance check; gating then would fight the reach itself.
+    plane_gate: bool = False
+    # Metres of slack before a step counts as crossing. 0.0 is the plane itself;
+    # a positive value lets the hand dip slightly in, a negative one holds it
+    # back short of the standoff.
+    plane_gate_margin: float = 0.0
 
     # ---- what the LEARNER is commanded during the rollout (SIM.command_deploy)
     # [k, 3] axis set, or None for run 1's grasp-axis rule. The default is the
@@ -769,6 +822,84 @@ def _jolt_is_safe(pc, jolt_delta, recover_delta, *, clearance: float,
     return jolted >= min(float(clearance), nominal)
 
 
+# ── WHO DROVE EACH STEP ──────────────────────────────────────────────────────
+#
+# Written per step as `step_drivers` [T] int8, aligned with `expert_actions`.
+# PURELY DIAGNOSTIC — nothing in collection, training or evaluation reads it.
+# It exists because the driver split was previously only recoverable in
+# AGGREGATE, from `expert_steps` / `n_dart` / `episodes` in dagger_log.csv, which
+# cannot answer "was THIS step, in THIS episode, the policy or a jolt?" — the
+# question every visualisation of a weird trajectory ends up asking.
+#
+# The overrides are kept distinct from plain expert steps on purpose: a shielded
+# or plane-gated step EXECUTES pi*(s), but it got there because the learner
+# proposed something refused, which is a different event from beta selecting the
+# expert. Collapse 0/4/5 to get "expert-driven" (that is exactly what
+# `last_exec_expert` means downstream).
+STEP_DRIVER = {
+    "none":         -1,   # a label was recorded but the episode ended before acting
+    "expert":        0,   # beta picked pi*, or a forced expert (commit / settle)
+    "policy":        1,   # the learner's action executed as proposed
+    "dart_free":     2,   # free-approach jolt: a random task-space jump
+    "dart_reach":    3,   # reach-band jolt inside the committed corridor
+    "shield":        4,   # policy REFUSED by the collision shield -> pi* executed
+    "plane_gate":    5,   # policy REFUSED at the standoff plane  -> pi* executed
+}
+
+
+def _ee_mat(obs) -> np.ndarray:
+    """4x4 world pose of the hand link. Same two link_state reads (and the same
+    xyzw -> wxyz `tf_quat`) that `action_to_target_joint` uses, so a delta tested
+    against this frame is tested against the frame it will actually execute in."""
+    ls = obs["panda_body"].link_state[0, obs["panda_link_ind_hand"]]
+    return unpack_pose(np.hstack((np.asarray(ls[0:3]), tf_quat(np.asarray(ls[3:7])))))
+
+
+def _standoff_plane_depth(obs, standoff_pose, delta) -> float:
+    """Signed depth of the post-`delta` hand origin past the STANDOFF PLANE.
+
+    The plane sits AT the standoff, with its normal along the gripper's own +z
+    at the pre-grasp — the approach axis, pointing INTO the object. So:
+
+        depth < 0   the free-approach side
+        depth > 0   the reach-tail side, i.e. inside the final 6.4 cm corridor
+
+    `delta` is an EE-FRAME task-space step (the same 6-vector every other
+    predicate here takes), and `action_to_target_joint` applies it by RIGHT
+    multiplication — `T_ee @ unpack_action(delta)` — so the next hand origin is
+    `p_ee + R_ee @ delta[:3]` and the test is done in world, where the plane
+    lives. Rotation does not enter: the plane constrains where the hand ORIGIN
+    goes, not how it is turned.
+    """
+    T = _ee_mat(obs)
+    p_next = T[:3, 3] + T[:3, :3] @ np.asarray(delta[:3], dtype=np.float64)
+    q = np.asarray(standoff_pose[:3, 3], dtype=np.float64)
+    n = np.asarray(standoff_pose[:3, 2], dtype=np.float64)
+    n = n / max(float(np.linalg.norm(n)), 1e-12)
+    return float((p_next - q) @ n)
+
+
+def _crosses_standoff_plane(obs, standoff_pose, delta, margin: float) -> bool:
+    """THE GATE: does this step put the hand into the reach-tail zone?
+
+    Only the EXPERT is allowed to cross. A DART jolt that would cross is redrawn;
+    a policy step that would cross is replaced by the expert action. The reason
+    is that everything past this plane is the committed endgame — a straight
+    6.4 cm slide down the approach axis whose waypoints OMG cannot even optimise
+    (`goal_set_projection` pins the last `reach_tail_length` waypoints as a hard
+    constraint, so the obstacle gradient there is projected out). A learner or a
+    jolt that wanders into that corridor early arrives off-axis, and the only
+    thing that can recover is the planner.
+
+    Returns False when there is no standoff to measure against, which is the
+    honest answer: with no plan there is no plane, and an ungated step is what
+    every run before this one did anyway.
+    """
+    if standoff_pose is None:
+        return False
+    return _standoff_plane_depth(obs, standoff_pose, delta) > float(margin)
+
+
 def _step_is_safe(pc, cand_delta, ref_delta, *, clearance: float,
                   path_steps: int) -> bool:
     """Would executing `cand_delta` from HERE stay as clear as `ref_delta` would?
@@ -955,6 +1086,19 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     n_shield_jolt_reject = 0
     n_shield_policy = 0
     n_shield_blind = 0
+    # `replan_after_pin`. `n_pin_goal_moved` is the one that measures the bug:
+    # the goal INDEX differing across the pin means the pre-pin plan really was
+    # aiming somewhere else, so the old step-0 label was wrong on that episode.
+    n_replan_pin = 0
+    # `plane_gate`. `n_plane_policy` is the one that says whether the learner was
+    # actually trying to barge into the reach corridor; `n_plane_jolt_reject`
+    # counts REDRAWS, so like `n_shield_jolt_reject` it can exceed `n_dart`.
+    n_plane_jolt_reject = 0
+    n_plane_policy = 0
+    # Per-step record of WHO drove: see `STEP_DRIVER` for the codes. Logging
+    # only — nothing reads it during collection.
+    step_drivers: list[int] = []
+    n_pin_goal_moved = 0
     last_exec_dart = False
     # Per-episode OUTCOME (params.outcome_check). `reason` above stays the loop's
     # terminal cause; these are the handover's result, on the evaluator's taxonomy.
@@ -1189,6 +1333,31 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                     s_ = _standoff_for(grasp_pose)
                     if s_ is not None:
                         standoff_pose = s_
+                    # ---- RECOMPUTE THE LABEL AGAINST THE PINNED GRASP --------
+                    # `expert_target_jp` above is plan[0] of the UNPINNED plan.
+                    # Everything else in this block has just been re-read against
+                    # the pin; the label has not. Replan and take its first
+                    # waypoint, which is exactly what the base collector does
+                    # (`collect_regrasp_demos.py`: plan -> apply -> replan ->
+                    # replay). `reset_scene=False` is load-bearing — pruning
+                    # renumbers the goal set, and resetting the scene would
+                    # rebuild it and undo the pin.
+                    if params.replan_after_pin and pinned:
+                        plan_p, _ = env.run_omg_planner(
+                            horizon, scene_idx, reset_scene=False)
+                        if plan_p is not None:
+                            n_replan_pin += 1
+                            expert_target_jp = plan_p[0]
+                            gi_p = env.get_omg_goal_idx()
+                            if goal_idx_prev is not None and gi_p != goal_idx_prev:
+                                n_pin_goal_moved += 1
+                            goal_idx_prev = gi_p
+                            g_p = env.get_omg_goal_grasp_pose()
+                            if g_p is not None:
+                                grasp_pose = g_p
+                            s_p = _standoff_for(grasp_pose)
+                            if s_p is not None:
+                                standoff_pose = s_p
                     # ---- THE COMMAND IS THE BIN AXIS, NOT THE GRASP ----------
                     # Run 1 conditioned on `-R_grasp[:,2]` — the approach axis of
                     # the pose the expert actually flew to. That is a different
@@ -1437,27 +1606,43 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # no jolt to take and the step must fall back to the ordinary beta
         # mixture, which is exactly what `dart_ratio` not firing would have done.
         #
-        # THE RNG STREAM IS UNCHANGED when `shield` is off. `dart` and the beta
+        # THE RNG STREAM IS UNCHANGED when `shield` AND `plane_gate` are off. `dart` and the beta
         # coin are mutually exclusive — `use_expert` starts with `not dart`, so
         # Python short-circuits the beta draw on a jolt step — and the reach band
         # requires `committed_reach is not None` while this one requires None. So
         # the same numbers come out in the same order as every run before 19.
         dart_delta = None
         shielded = False
+        plane_gated = False
         if dart:
-            tries = int(params.shield_jolt_max_tries) if params.shield else 1
+            # ONE budget for BOTH refusals. Gating this on `shield` alone left
+            # `plane_gate` with a single attempt, so a jolt refused at the plane
+            # could never be replaced and `dart` was cleared instead.
+            tries = (int(params.shield_jolt_max_tries)
+                     if (params.shield or params.plane_gate) else 1)
             for _ in range(max(tries, 1)):
                 cand = np.concatenate([
                     rng.uniform(-params.dart_pos_mag, params.dart_pos_mag, size=3),
                     rng.uniform(-params.dart_rot_mag, params.dart_rot_mag, size=3),
                 ]).astype(np.float32)
-                if not params.shield or _step_is_safe(
-                        pc, cand, expert_delta,
-                        clearance=params.shield_clearance,
-                        path_steps=params.shield_path_steps):
+                _unsafe = params.shield and not _step_is_safe(
+                    pc, cand, expert_delta,
+                    clearance=params.shield_clearance,
+                    path_steps=params.shield_path_steps)
+                # THE PLANE GATE, checked on the same redraw budget. A jolt is
+                # refused if it is unsafe OR if it would cross into the reach
+                # corridor; the two counters stay separate so a run can tell a
+                # cluttered scene from one where the standoff is simply close.
+                _crosses = params.plane_gate and committed_reach is None and \
+                    _crosses_standoff_plane(obs, standoff_pose, cand,
+                                            params.plane_gate_margin)
+                if not (_unsafe or _crosses):
                     dart_delta = cand
                     break
-                n_shield_jolt_reject += 1
+                if _unsafe:
+                    n_shield_jolt_reject += 1
+                if _crosses:
+                    n_plane_jolt_reject += 1
             if dart_delta is None:
                 dart = False
 
@@ -1592,12 +1777,28 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
             # DAgger wants, and the one that teaches "do not go there". Only the
             # EXECUTED action changes. What the run gives up is the states
             # DOWNSTREAM of a collision, which it never visits.
-            if (params.shield and expert_target_jp is not None
-                    and not _step_is_safe(
-                        pc, exec_delta, expert_delta,
-                        clearance=params.shield_clearance,
-                        path_steps=params.shield_path_steps)):
-                n_shield_policy += 1
+            _blocked_shield = (params.shield and expert_target_jp is not None
+                               and not _step_is_safe(
+                                   pc, exec_delta, expert_delta,
+                                   clearance=params.shield_clearance,
+                                   path_steps=params.shield_path_steps))
+            # THE PLANE GATE on the learner. Same remedy as the shield — execute
+            # pi*(s) instead — for the same reason: the RECORDED LABEL is
+            # untouched, so the pair still teaches "from here, do this", and only
+            # the state the next step starts from changes. Needs an expert action
+            # to fall back to, so like the shield it is a no-op when the replan
+            # failed.
+            _blocked_plane = (params.plane_gate and expert_target_jp is not None
+                              and committed_reach is None
+                              and _crosses_standoff_plane(
+                                  obs, standoff_pose, exec_delta,
+                                  params.plane_gate_margin))
+            if _blocked_shield or _blocked_plane:
+                if _blocked_shield:
+                    n_shield_policy += 1
+                if _blocked_plane:
+                    n_plane_policy += 1
+                plane_gated = bool(_blocked_plane and not _blocked_shield)
                 shielded = True
                 target_jp = expert_target_jp
                 exec_delta = expert_delta
@@ -1615,6 +1816,23 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # popped. Reporting a shielded step as learner-driven would keep it.
         last_exec_expert = bool(use_expert or shielded)
         last_exec_dart = bool(dart or dart_reach_delta is not None)
+
+        # LOGGING ONLY. Appended only when this step also recorded a pair, so the
+        # array stays index-aligned with `expert_actions`; steps that break out
+        # before acting are padded with `none` after the loop.
+        if recorded:
+            if dart_reach_delta is not None:
+                step_drivers.append(STEP_DRIVER["dart_reach"])
+            elif dart:
+                step_drivers.append(STEP_DRIVER["dart_free"])
+            elif plane_gated:
+                step_drivers.append(STEP_DRIVER["plane_gate"])
+            elif shielded:
+                step_drivers.append(STEP_DRIVER["shield"])
+            elif use_expert:
+                step_drivers.append(STEP_DRIVER["expert"])
+            else:
+                step_drivers.append(STEP_DRIVER["policy"])
 
         prev_act6d = np.asarray(exec_delta, dtype=np.float32).copy()
 
@@ -1696,7 +1914,11 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                       "n_dart_reject": int(n_dart_reject),
                       "n_shield_policy": int(n_shield_policy),
                       "n_shield_jolt_reject": int(n_shield_jolt_reject),
-                      "n_shield_blind": int(n_shield_blind)}
+                      "n_shield_blind": int(n_shield_blind),
+                      "n_replan_pin": int(n_replan_pin),
+                      "n_pin_goal_moved": int(n_pin_goal_moved),
+                      "n_plane_policy": int(n_plane_policy),
+                      "n_plane_jolt_reject": int(n_plane_jolt_reject)}
 
     # What the expert's grasp means UNDER THE RUN'S RULE, computed once here so
     # `d_grasp_world`, `demo_off_deg` and `bin_realized` cannot disagree about
@@ -1717,10 +1939,20 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     d_grasp, d_m, d_u, _dinfo = params.d_rule.decompose(
         grasp_pose, centroid_world, obj_world)
 
+    # A step that recorded its pair and then broke out (CLOSE_LABEL with
+    # `stop_on_close_label`, POLICY_CLOSE) never reached the driver append, so
+    # pad rather than letting the arrays drift out of alignment.
+    while len(step_drivers) < len(expert_actions):
+        step_drivers.append(STEP_DRIVER["none"])
+
     episode = {
         "point_clouds": np.asarray(point_clouds, dtype=np.float32),
         "robot_states": np.asarray(robot_states, dtype=np.float32),
         "expert_actions": np.asarray(expert_actions, dtype=np.float32),
+        # [T] int8, see STEP_DRIVER. Diagnostic; no reader depends on it, and a
+        # shard written before this existed simply has no such dataset.
+        "step_drivers": np.asarray(step_drivers[:len(expert_actions)],
+                                   dtype=np.int8),
         "scene_idx": int(scene_idx),
         # The slot the sampler asked for, and the pose the episode ACTUALLY flew
         # to. Carried on the episode so no table lookup can ever disagree with it.
@@ -1891,6 +2123,13 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         "n_shield_policy": int(n_shield_policy),
         "n_shield_jolt_reject": int(n_shield_jolt_reject),
         "n_shield_blind": int(n_shield_blind),
+        "n_replan_pin": int(n_replan_pin),
+        "n_pin_goal_moved": int(n_pin_goal_moved),
+        # The standoff plane. `n_plane_policy` against the learner-driven step
+        # count says how often the learner tried to barge into the reach
+        # corridor; `n_plane_jolt_reject` counts REDRAWS and can exceed n_dart.
+        "n_plane_policy": int(n_plane_policy),
+        "n_plane_jolt_reject": int(n_plane_jolt_reject),
         "min_pos": min_pos,
         "min_rot": min_rot,
         # Approach-label scale. `n_tiny_labels` counts labels the policy cannot
@@ -1973,8 +2212,10 @@ class DaggerHDF5Writer:
                    "d_m", "d_u"):
             if _k in episode:
                 grp.attrs[_k] = episode[_k]
-        for name in ("point_clouds", "robot_states", "expert_actions"):
-            grp.create_dataset(name, data=episode[name], compression="gzip")
+        for name in ("point_clouds", "robot_states", "expert_actions",
+                     "step_drivers"):
+            if name in episode:
+                grp.create_dataset(name, data=episode[name], compression="gzip")
         self._n += 1
         self._f.attrs["num_episodes"] = self._n
         self._f.flush()
@@ -2058,6 +2299,8 @@ def collect_iteration(sim, runner, pairs, out_path, *, rng,
            "n_dart": 0, "n_dart_env_done": 0,
            "n_dart_reach": 0, "n_dart_reject": 0,
            "n_shield_policy": 0, "n_shield_jolt_reject": 0, "n_shield_blind": 0,
+           "n_replan_pin": 0, "n_pin_goal_moved": 0,
+           "n_plane_policy": 0, "n_plane_jolt_reject": 0,
            "n_close_labels": 0, "n_approach_labels": 0, "sum_label_pos": 0.0,
            "n_settle_steps": 0,
            "n_tiny_labels": 0, "n_revisits": 0, "n_grasp_mismatch": 0,
@@ -2132,6 +2375,9 @@ def collect_iteration(sim, runner, pairs, out_path, *, rng,
         "dart_reach_pos_mag": float(params.dart_reach_pos_mag),
         "dart_reach_rot_mag": float(params.dart_reach_rot_mag),
         "dart_reach_clearance": float(params.dart_reach_clearance),
+        "replan_after_pin": bool(params.replan_after_pin),
+        "plane_gate": bool(params.plane_gate),
+        "plane_gate_margin": float(params.plane_gate_margin),
         "shield": bool(params.shield),
         "shield_clearance": float(params.shield_clearance),
         "shield_path_steps": int(params.shield_path_steps),
@@ -2217,6 +2463,10 @@ def collect_iteration(sim, runner, pairs, out_path, *, rng,
                 agg["n_shield_policy"] += st.get("n_shield_policy", 0)
                 agg["n_shield_jolt_reject"] += st.get("n_shield_jolt_reject", 0)
                 agg["n_shield_blind"] += st.get("n_shield_blind", 0)
+                agg["n_replan_pin"] += st.get("n_replan_pin", 0)
+                agg["n_pin_goal_moved"] += st.get("n_pin_goal_moved", 0)
+                agg["n_plane_policy"] += st.get("n_plane_policy", 0)
+                agg["n_plane_jolt_reject"] += st.get("n_plane_jolt_reject", 0)
                 agg["n_close_labels"] += st["n_close_labels"]
                 agg["n_approach_labels"] += st["n_approach_labels"]
                 agg["sum_label_pos"] += st["sum_label_pos"]

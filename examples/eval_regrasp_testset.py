@@ -356,6 +356,20 @@ def main() -> None:
         # else: whatever the run's own config carried, which is the right default
     else:
         sim.pop("demo_ok_table", None)
+
+    # `reach_filter` IS SPLIT-DEPENDENT FOR THE SAME REASON, and it is the other
+    # half of the same prune: `demo_ok_table` asks whether the base caption was
+    # honest, this asks whether the base demonstration reached its grasp. Both
+    # name pairs in the TRAIN pin table, so on test/val -- where nothing was
+    # collected -- neither has anything to say and applying either would score
+    # the split against an unrelated run's collection outcome.
+    #
+    # It must be popped EXPLICITLY: build_regrasp_context defaults it ON, and
+    # would otherwise try to prune the TEST table with TRAIN reach pairs (or
+    # refuse outright when the base shard is not reachable from here).
+    if args.split != "train":
+        sim["reach_filter"] = False
+
     for path_key in ("grasp_pin_table", "exclude_scenes"):
         if not Path(sim[path_key]).exists():
             raise SystemExit(

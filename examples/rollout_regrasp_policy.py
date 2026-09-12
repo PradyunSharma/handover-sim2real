@@ -1010,6 +1010,41 @@ def main():
         if int(args.bin) in have:
             return have[int(args.bin)], None
 
+        # ---- ABSENT FROM THE TABLE: there is no anchor frame ---------------
+        # TWO DIFFERENT CONDITIONS REACH THIS POINT and only one of them is
+        # recoverable, so they must not share a branch. A scene that IS in the
+        # table but never demonstrates this bin still has an `anchor_R` in
+        # `scene_meta`, so `to_world(axes[b], anchor_R)` is well defined and the
+        # UNDEMONSTRATED block below is right to issue it unpinned. A scene that
+        # is ABSENT from the table has no `scene_meta` entry at all, hence no
+        # anchor, hence nothing to rotate the bin vector by: `command_direction`
+        # returns None and `rollout` raises. Both cases give `have == {}`, and
+        # taking the recoverable branch for both is how this came to print
+        # 'Commanding it anyway, UNPINNED' and then refuse twenty lines later,
+        # after the GUI had already opened. Refuse HERE, before the promise.
+        if (pin_table.scene_meta.get(int(scene_idx), {}).get('anchor_R')
+                is None):
+            # The benchmark SKIPS such a scene rather than dying on it -- it
+            # already skips every `bo is not None` return, and a scene missing
+            # from the table is as much a property of the population as a bin
+            # the scene cannot reach. Only the single-scene viewer, where the
+            # user named this scene deliberately, gets the refusal.
+            if quiet:
+                return None, int(args.bin)
+            near = [s for s in sorted(pin_table.scene_meta)
+                    if abs(s - int(scene_idx)) <= 12
+                    and pin_table.bin_of(s, 0) is not None][:10]
+            raise SystemExit(
+                f"scene {scene_idx} is NOT IN the pin table, so it has no anchor "
+                f"frame.\nThe command is `to_world(axes[bin], anchor_R)` and "
+                f"`anchor_R` is a property of the\nSCENE (it lives in "
+                f"`scene_meta`, built from the giver's wrist and the object "
+                f"centroid),\nnot of any grasp -- so with no entry there is "
+                f"nothing to rotate the bin vector by.\nThis is NOT the "
+                f"'undemonstrated bin' case, which IS commandable.\n"
+                + (f"\nNearby scenes that are in the table: "
+                   f"{', '.join(str(s) for s in near)}" if near else ""))
+
         # ---- UNDEMONSTRATED ON THIS SCENE: command it anyway ----------------
         # This used to be a SystemExit, and refusing was wrong. A rollout is a
         # VIEWER, not a scored evaluation: the command is well defined without a

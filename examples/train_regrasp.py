@@ -612,6 +612,15 @@ LOG_FIELDS = [
     # `shield_jolt_reject` is the free-approach analogue of `dart_reject`;
     # `shield_blind` counts unsafe steps with no expert action to substitute.
     "shield_policy", "shield_jolt_reject", "shield_blind",
+    # `replan_after_pin` (run 21). `pin_goal_moved` MEASURES THE BUG IT FIXES:
+    # episodes where the goal index changed across the pin, i.e. where the
+    # pre-pin plan really was aiming at a different grasp and the old step-0
+    # label was wrong. Read it against `episodes`.
+    "replan_pin", "pin_goal_moved",
+    # `plane_gate` (run 21). `plane_policy` against the learner-driven step count
+    # is how often the learner tried to cross into the reach corridor;
+    # `plane_jolt_reject` counts jolt REDRAWS and can exceed `dart`.
+    "plane_policy", "plane_jolt_reject",
     # DART-paper noise (DAGGER.dart_mode: dart_noise). `dart_sigma_trace` is
     # tr(Sigma_hat), the measured learner-supervisor error, and is logged in BOTH
     # modes — in a jolt run it is the counterfactual "what the noise would have
@@ -965,6 +974,10 @@ def collect_columns(c: dict) -> dict:
         "shield_policy": c.get("n_shield_policy", -1),
         "shield_jolt_reject": c.get("n_shield_jolt_reject", -1),
         "shield_blind": c.get("n_shield_blind", -1),
+        "replan_pin": c.get("n_replan_pin", -1),
+        "pin_goal_moved": c.get("n_pin_goal_moved", -1),
+        "plane_policy": c.get("n_plane_policy", -1),
+        "plane_jolt_reject": c.get("n_plane_jolt_reject", -1),
         "dart_sigma_trace": _r(c.get("dart_sigma_trace"), 6),
         "dart_noise_steps": c.get("n_dart_noise", -1),
         "dart_alpha": _r(c.get("dart_alpha"), 4),
@@ -1520,6 +1533,14 @@ def main() -> None:
         dart_reach_path_steps=int(dag.get("dart_reach_path_steps", 4)),
         # THE SHIELD (run 19). Off unless the config asks, so every earlier run
         # keeps its behaviour and its RNG stream — see CollectParams.shield.
+        # RUN 21: recompute the step-0 expert label after the goal set is pinned.
+        # Off by default, so runs 1-20 keep their behaviour. See
+        # CollectParams.replan_after_pin.
+        replan_after_pin=bool(dag.get("replan_after_pin", False)),
+        # The standoff plane: only the expert enters the reach corridor.
+        # See CollectParams.plane_gate.
+        plane_gate=bool(dag.get("plane_gate", False)),
+        plane_gate_margin=float(dag.get("plane_gate_margin", 0.0)),
         shield=bool(dag.get("shield", False)),
         shield_clearance=float(dag.get("shield_clearance", 0.01)),
         shield_path_steps=int(dag.get("shield_path_steps", 4)),

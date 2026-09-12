@@ -132,6 +132,15 @@ checks = [
                         float(m.get("d_point_depth", 0.1122))),
     ("anchor_hand_ref", cfg.get("anchor_hand_ref", "wrist"),
                         m.get("anchor_hand_ref", "wrist")),
+    # THE CAMERA SET, and until run 21 NOTHING checked it anywhere in the repo.
+    # `centroid_world` in the direction table is the OBSERVED cloud's centroid
+    # (build_direction_table.py's own docstring says so), so dropping or adding a
+    # camera moves it by centimetres, moves the anchor frame with it, and re-bins
+    # grasps -- silently, because the shards record `cameras` in their attrs and
+    # no loader compares them. Run 21 is the first run to change cameras, and
+    # this is the check that stops it reusing run 9/19's wrist+right tables.
+    ("cfg_file",        cfg.get("cfg_file", "examples/pretrain_multicam_wr.yaml"),
+                        m.get("cfg_file", "examples/pretrain_multicam_wr.yaml")),
 ]
 if str(cfg.get("d_rule")) == "location_extent":
     checks += [
