@@ -621,6 +621,9 @@ LOG_FIELDS = [
     # is how often the learner tried to cross into the reach corridor;
     # `plane_jolt_reject` counts jolt REDRAWS and can exceed `dart`.
     "plane_policy", "plane_jolt_reject",
+    # Mean magnitude scale applied to the free jolts that actually executed.
+    # 1.0 = the taper never bit; the floor = every jolt fired at the standoff.
+    "dart_scale",
     # DART-paper noise (DAGGER.dart_mode: dart_noise). `dart_sigma_trace` is
     # tr(Sigma_hat), the measured learner-supervisor error, and is logged in BOTH
     # modes — in a jolt run it is the counterfactual "what the noise would have
@@ -978,6 +981,8 @@ def collect_columns(c: dict) -> dict:
         "pin_goal_moved": c.get("n_pin_goal_moved", -1),
         "plane_policy": c.get("n_plane_policy", -1),
         "plane_jolt_reject": c.get("n_plane_jolt_reject", -1),
+        "dart_scale": (round(c["sum_dart_scale"] / c["n_dart"], 4)
+                       if c.get("n_dart") else -1),
         "dart_sigma_trace": _r(c.get("dart_sigma_trace"), 6),
         "dart_noise_steps": c.get("n_dart_noise", -1),
         "dart_alpha": _r(c.get("dart_alpha"), 4),
@@ -1541,6 +1546,10 @@ def main() -> None:
         # See CollectParams.plane_gate.
         plane_gate=bool(dag.get("plane_gate", False)),
         plane_gate_margin=float(dag.get("plane_gate_margin", 0.0)),
+        # Taper the free-band jolt toward the standoff. 1.0 = off (runs 1-22).
+        dart_taper_floor=float(dag.get("dart_taper_floor", 1.0)),
+        dart_taper_near=float(dag.get("dart_taper_near", 0.05)),
+        dart_taper_far=float(dag.get("dart_taper_far", 0.20)),
         shield=bool(dag.get("shield", False)),
         shield_clearance=float(dag.get("shield_clearance", 0.01)),
         shield_path_steps=int(dag.get("shield_path_steps", 4)),

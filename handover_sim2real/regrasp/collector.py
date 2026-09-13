@@ -431,6 +431,29 @@ class CollectParams:
     # steps, which is where off-plan coverage is missing and where the recovery
     # is still short enough to fit in the remaining step budget.
     dart_max_dist: float = 0.20
+
+    # ---- TAPER THE FREE-BAND JOLT AS THE STANDOFF IS APPROACHED -------------
+    # A jolt is drawn at a FIXED magnitude anywhere in the free approach, which
+    # is wrong at both ends of it: 4 cm and 0.3 rad is a mild nudge 40 cm out and
+    # a catastrophe 5 cm from the standoff, where the reach band's own jolt is
+    # only 1.2 cm. `dart_taper_floor` scales BOTH magnitudes by a factor that
+    # falls linearly from 1.0 at `dart_taper_far` to the floor at
+    # `dart_taper_near`, so the free band hands over to the reach band smoothly
+    # instead of stepping down by 3.3x at the commit.
+    #
+    # BOTH MAGNITUDES, AND THE ROTATION IS THE IMPORTANT ONE. Measured on run 21
+    # (`episode_00048`, scene 4): a jolt translates the hand 3.0 cm but rotates it
+    # 13.1 deg, and the object sits ~0.58 m from the EE ORIGIN in the EE frame, so
+    # the rotation alone sweeps the observed cloud 13 cm (r*dtheta = 0.132 m
+    # against a measured 0.114 m). Tapering position and leaving rotation at full
+    # size would scale the small term and keep the large one.
+    #
+    # 1.0 IS OFF and reproduces runs 1-22 exactly. The RNG stream is unchanged
+    # either way: scaling the bounds of `rng.uniform(-a, a, size=3)` draws the
+    # same three numbers.
+    dart_taper_floor: float = 1.0   # scale at/inside `near`; 1.0 disables
+    dart_taper_near: float = 0.05   # m to the standoff at which the floor applies
+    dart_taper_far: float = 0.20    # m to the standoff at/beyond which scale = 1
     # GA-DDPG's magnitudes (env/panda_scene.py random_perturb), kept deliberately:
     # 0.04 m is exactly `ee_step`, so one jolt displaces the EE by one step's
     # worth in a random direction — within what the policy could plausibly undo
@@ -879,6 +902,22 @@ def _standoff_plane_depth(obs, standoff_pose, delta) -> float:
     return float((p_next - q) @ n)
 
 
+def _dart_taper(d_standoff, *, floor: float, near: float, far: float) -> float:
+    """Magnitude scale for a free-band jolt at distance `d_standoff` from the
+    standoff. 1.0 far out, `floor` at/inside `near`, linear between.
+
+    Returns 1.0 when the taper is off or the distance is unknown — the same
+    magnitude every run before 23 used, so an absent distance cannot silently
+    shrink the noise.
+    """
+    if floor >= 1.0 or d_standoff is None:
+        return 1.0
+    if far <= near:
+        return float(floor)
+    t = (float(d_standoff) - near) / (far - near)
+    return float(floor + (1.0 - floor) * min(max(t, 0.0), 1.0))
+
+
 def _crosses_standoff_plane(obs, standoff_pose, delta, margin: float) -> bool:
     """THE GATE: does this step put the hand into the reach-tail zone?
 
@@ -1094,6 +1133,7 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
     # actually trying to barge into the reach corridor; `n_plane_jolt_reject`
     # counts REDRAWS, so like `n_shield_jolt_reject` it can exceed `n_dart`.
     n_plane_jolt_reject = 0
+    sum_dart_scale = 0.0   # mean taper over EXECUTED free jolts, / n_dart
     n_plane_policy = 0
     # Per-step record of WHO drove: see `STEP_DRIVER` for the codes. Logging
     # only — nothing reads it during collection.
@@ -1620,10 +1660,20 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
             # could never be replaced and `dart` was cleared instead.
             tries = (int(params.shield_jolt_max_tries)
                      if (params.shield or params.plane_gate) else 1)
+            # ONE scale per STEP, not per redraw: a redraw is meant to find a
+            # different DIRECTION, not a quieter jolt, and recomputing it inside
+            # the loop would make the accepted magnitude depend on how many
+            # proposals were refused.
+            _taper = _dart_taper(d_standoff,
+                                 floor=params.dart_taper_floor,
+                                 near=params.dart_taper_near,
+                                 far=params.dart_taper_far)
+            _pmag = params.dart_pos_mag * _taper
+            _rmag = params.dart_rot_mag * _taper
             for _ in range(max(tries, 1)):
                 cand = np.concatenate([
-                    rng.uniform(-params.dart_pos_mag, params.dart_pos_mag, size=3),
-                    rng.uniform(-params.dart_rot_mag, params.dart_rot_mag, size=3),
+                    rng.uniform(-_pmag, _pmag, size=3),
+                    rng.uniform(-_rmag, _rmag, size=3),
                 ]).astype(np.float32)
                 _unsafe = params.shield and not _step_is_safe(
                     pc, cand, expert_delta,
@@ -1678,6 +1728,7 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                 exec_delta = dart_reach_delta
             else:
                 n_dart += 1
+                sum_dart_scale += _taper
                 exec_delta = dart_delta
             target_jp = action_to_target_joint(
                 np.concatenate([exec_delta, [1.0]]).astype(np.float32), obs)
@@ -1918,7 +1969,8 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
                       "n_replan_pin": int(n_replan_pin),
                       "n_pin_goal_moved": int(n_pin_goal_moved),
                       "n_plane_policy": int(n_plane_policy),
-                      "n_plane_jolt_reject": int(n_plane_jolt_reject)}
+                      "n_plane_jolt_reject": int(n_plane_jolt_reject),
+                      "sum_dart_scale": float(sum_dart_scale)}
 
     # What the expert's grasp means UNDER THE RUN'S RULE, computed once here so
     # `d_grasp_world`, `demo_off_deg` and `bin_realized` cannot disagree about
@@ -2130,6 +2182,9 @@ def collect_dagger_episode(sim, runner, scene_idx, *, rng,
         # corridor; `n_plane_jolt_reject` counts REDRAWS and can exceed n_dart.
         "n_plane_policy": int(n_plane_policy),
         "n_plane_jolt_reject": int(n_plane_jolt_reject),
+        # Mean taper applied to executed free jolts; divided by n_dart in the
+        # log. 1.0 means it never bit (off, or every jolt fired far out).
+        "sum_dart_scale": float(sum_dart_scale),
         "min_pos": min_pos,
         "min_rot": min_rot,
         # Approach-label scale. `n_tiny_labels` counts labels the policy cannot
@@ -2300,7 +2355,7 @@ def collect_iteration(sim, runner, pairs, out_path, *, rng,
            "n_dart_reach": 0, "n_dart_reject": 0,
            "n_shield_policy": 0, "n_shield_jolt_reject": 0, "n_shield_blind": 0,
            "n_replan_pin": 0, "n_pin_goal_moved": 0,
-           "n_plane_policy": 0, "n_plane_jolt_reject": 0,
+           "n_plane_policy": 0, "n_plane_jolt_reject": 0, "sum_dart_scale": 0.0,
            "n_close_labels": 0, "n_approach_labels": 0, "sum_label_pos": 0.0,
            "n_settle_steps": 0,
            "n_tiny_labels": 0, "n_revisits": 0, "n_grasp_mismatch": 0,
@@ -2378,6 +2433,9 @@ def collect_iteration(sim, runner, pairs, out_path, *, rng,
         "replan_after_pin": bool(params.replan_after_pin),
         "plane_gate": bool(params.plane_gate),
         "plane_gate_margin": float(params.plane_gate_margin),
+        "dart_taper_floor": float(params.dart_taper_floor),
+        "dart_taper_near": float(params.dart_taper_near),
+        "dart_taper_far": float(params.dart_taper_far),
         "shield": bool(params.shield),
         "shield_clearance": float(params.shield_clearance),
         "shield_path_steps": int(params.shield_path_steps),
@@ -2467,6 +2525,7 @@ def collect_iteration(sim, runner, pairs, out_path, *, rng,
                 agg["n_pin_goal_moved"] += st.get("n_pin_goal_moved", 0)
                 agg["n_plane_policy"] += st.get("n_plane_policy", 0)
                 agg["n_plane_jolt_reject"] += st.get("n_plane_jolt_reject", 0)
+                agg["sum_dart_scale"] += st.get("sum_dart_scale", 0.0)
                 agg["n_close_labels"] += st["n_close_labels"]
                 agg["n_approach_labels"] += st["n_approach_labels"]
                 agg["sum_label_pos"] += st["sum_label_pos"]
