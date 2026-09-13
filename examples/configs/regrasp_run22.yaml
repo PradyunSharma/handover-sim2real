@@ -1,0 +1,517 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRASP RUN 22 — RUN 19 PLUS TWO BUG FIXES AND THE STANDOFF GATE. NOTHING ELSE.
+#
+# THIS IS THE CONTROLLED RUN. Run 21 moved seven things at once (these three, plus
+# the camera, the horizon, the iteration count and the beta ramp) and its results
+# are correspondingly unreadable against run 19. Run 22 changes THREE, all of them
+# on the EXPERT side of the loop, and holds everything else byte-identical:
+#
+#   DAGGER.replan_after_pin   (absent, = false) -> true     step-0 label
+#   (no config key)                                         worker/manager pin table
+#   DAGGER.plane_gate         (absent, = false) -> true     reach-corridor gate
+#
+# IDENTICAL TO RUN 19: `cfg_file` (wrist + right), `max_steps: 50` on both bands,
+# `num_iters: 25` and therefore the beta ramp (0.900 -> 0.750 across 25), the
+# per-bin table, the shield and its three knobs, `iter_epochs: 20`,
+# `command_deploy: bin_centroid`, `d_source: d_grasp_world`, `train_from_scratch`
+# and every DART magnitude.
+#
+# NOTHING TO REBUILD. Same cameras means run 9/19's direction table, pin table,
+# demo-ok table and base shards are reused unchanged -- so this is a single
+# `train_regrasp.sbatch` submission, not the seven-stage pipeline run 21 needs.
+#
+# ── WHY THIS RUN EXISTS ──────────────────────────────────────────────────────
+#
+# Run 21 at iteration 18 of 35: eval success mean 0.424 against run 19's 0.550
+# over the same iterations, `dir_track` rising normally (0.423 -> 0.745), and
+# `reached_grasp/episode` 0.907 against 0.610. Not one of those numbers is
+# attributable, because the camera, the horizon, the iteration count and the beta
+# schedule all moved with the three changes under test. The reach gain in
+# particular is mostly the horizon: cap-hit fell 12.8% -> 0.2%.
+#
+# RUN 22 AGAINST RUN 19 IS THE COMPARISON THAT ISOLATES THE THREE. And run 21
+# against run 22 then isolates the other four, which is a second, separate
+# question worth having.
+#
+# ── FIX 1: THE STEP-0 LABEL POINTED AT THE WRONG GRASP ───────────────────────
+#
+# The collector took `expert_target_jp = plan[0]` from the UNPINNED plan, THEN
+# pinned the goal set and updated `grasp_pose`, `standoff_pose` and `d_world` to
+# the pinned grasp -- and never recomputed the label. So at step 0 the caption,
+# the command and the expert action could refer to DIFFERENT grasps.
+# `collect_regrasp_demos.py` has always done it correctly: plan, pin, REPLAN with
+# `reset_scene=False`, then replay.
+#
+# MEASURED on scene 95 grasp 2, where the base and DAgger starts are identical to
+# 0.00000 m and the grasps to 0.0000 m / 0.0 deg: the base step-0 label is
+# 120.8 deg off-axis and moves 4 cm AWAY from the grasp (the lateral arc the
+# scene needs), while DAgger's is 61.0 deg and closes monotonically -- straight
+# in, which is what hit the object. OMG is deterministic here: 8 episodes from
+# iterations 1-19 gave bit-identical step-0 labels, 0.0 deg spread.
+#
+# ⚠ `pin_goal_moved` READ 0 IN ALL 18 OF RUN 21'S ITERATIONS AND THAT NUMBER IS
+# VACUOUS -- the counter compared the goal index against a value re-baselined
+# from the same post-pin read, and after pinning the goal set holds one element,
+# so it could never fire. `replan_pin` ~= `episodes` confirms the FIX itself runs
+# every episode. The counter is being repaired to compare the LABEL (plan[0] vs
+# plan_p[0]) instead; until then, treat incidence as UNMEASURED, not as zero.
+#
+# ── FIX 2: THE WORKERS HELD A DIFFERENT PIN TABLE FROM THE MANAGER ───────────
+#
+# Two prunes narrow the collection pool. `demo_ok_table` is a FILE, so manager and
+# workers read the same one. The reach prune is DERIVED from the base shard and
+# lived only in train_regrasp.py -- `build_regrasp_context` never applied it. And
+# `keep_only` RENUMBERS SLOTS, so the two tables disagreed about what every slot
+# index MEANS, not merely about which pairs exist, while the pool is shipped
+# `(scene, slot)` and not the table.
+#
+# MEASURED ON RUN 19: 246 of 1097 manager slots (22.4%) named a different bin in
+# the worker. 898 of 4883 episodes (18.4%) landed on pairs the reach filter had
+# excluded; those failed `reached()` 77.1% of the time against 31.1% for pairs
+# that belonged in the pool -- 692 of the run's 1933 dropped episodes, 36% of all
+# the collection waste. `eval_jobs` ships slots the same way, so per-bin scoring
+# was mis-attributed on the same ~22% of slots.
+#
+# SCENE 79 IS THE WHOLE BUG IN ONE SCENE. Its base demo for bin 0 (+x) stopped
+# 3.55 cm short; its bin 4 (+z) demo reached to 0.46 cm. Over 25 iterations run 19
+# collected bin 0 three times and bin 4 ZERO times -- the manager's table holds one
+# slot for scene 79 (bin 4) so it only ever emits slot 0, and slot 0 in the
+# worker's two-slot table is bin 0. Bin 4 sat at an index the manager could never
+# emit.
+#
+# NO CONFIG KEY: the fix is in handover_sim2real/regrasp/setup.py and applies to
+# any run with `SIM.reach_filter` on, which is the default. RUN 19'S OWN NUMBERS
+# ARE NOT REPRODUCIBLE ON THIS CODE -- that is the point. Expect ~18% fewer
+# episodes per iteration (run 21 measured 159 vs run 19's 194) on a pool that is
+# entirely reachable.
+#
+# ── THE PLANE GATE, AND WHAT RUN 21 REVEALED ABOUT IT ────────────────────────
+#
+# A plane AT the standoff, normal along the gripper's +z at the pre-grasp. A DART
+# jolt that would cross is redrawn; a policy step that would cross is replaced by
+# the expert action. See `plane_gate` below for the geometry argument.
+#
+# RUN 21 MEASURED IT AND ONE HALF BEHAVES, THE OTHER DOES NOT:
+#
+#   plane_policy / learner-driven steps    7.0% -> 8.7%      as designed
+#   plane jolt refusals                    54% of proposals  MUCH larger
+#   dart / steps                           0.268 -> 0.209    22% of DART LOST
+#
+# The jolt half is not merely filtering: the 5-redraw budget runs out and `dart`
+# is cleared, so a fifth of all DART disappears, and the survivors are uniform
+# CONDITIONED ON NOT CROSSING -- a different noise distribution, biased away from
+# the object, removing exactly the recovery states nearest the goal. The cause is
+# geometric: `dart_rot_mag: 0.3` acts on a ~0.58 m lever arm from the EE origin to
+# the object, so a rotational jolt swings the gripper's control points ~13 cm and
+# near the standoff that crosses the plane almost every time.
+#
+# KEPT AS-IS HERE ANYWAY, because run 22 exists to measure these three changes as
+# specified and because run 21's plane numbers come with four confounds. `dart`,
+# `plane_jolt_reject` and `plane_policy` are the columns that decide whether the
+# next run gates only the policy, or clamps a crossing jolt to the plane instead
+# of redrawing it.
+#
+# ── WALL CLOCK ───────────────────────────────────────────────────────────────
+# Run 19 measured ~16 h for these 25 iterations. `replan_after_pin` adds one
+# `run_omg_planner` at step 0 of each episode (~4% of the collection half); the
+# plane gate costs a dot product per candidate; the pool fix REMOVES ~18% of
+# collection. Net: at or slightly below run 19. Budget 15-17 h, request 20 h.
+#
+# ── WHAT TO READ ─────────────────────────────────────────────────────────────
+#
+#   success_rate        DIRECTLY comparable with run 19 iteration for iteration:
+#                       same eval horizon, same camera, same beta at every index.
+#                       Run 19: mean 0.550 over iters 1-18, peak 0.743 @it25.
+#                       NOISE FLOOR 0.088 -- only a gain past ~0.09 is readable.
+#   reached_grasp/eps   run 19 = 0.610. The pool fix alone should lift this to
+#                       ~0.69 ON ARITHMETIC (it removes episodes that were failing
+#                       77% of the time). That part is BOOKKEEPING, NOT LEARNING.
+#   dir_track           run 19 reached 0.793 @it18. Watch for a regression: the
+#                       plane gate reshapes DART, which is where recovery is
+#                       learned.
+#   plane_policy, dart  see above. If `dart/steps` drops ~20% again, the jolt half
+#                       of the gate is the first thing to change next.
+#
+# EVAL.holdout is still false, so the eval scenes are collected on. Optimistic,
+# train-set numbers -- comparable to run 9/19/21 and to nothing outside them.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SIM:
+  # WRIST + RIGHT, exactly as run 19. `CAMERAS: ["wrist", "right"]`.
+  #
+  # UNCHANGED FROM RUN 19, AND THAT IS THE POINT. Run 21 dropped the wrist camera
+  # and paid for it with a full upstream rebuild, because the direction table's
+  # `centroid_world` is the OBSERVED cloud's centroid and a camera change moves it
+  # and re-bins grasps. Keeping wrist+right here means run 22 REUSES run 9/19's
+  # direction table, pin table, demo-ok table and base shards byte-for-byte --
+  # NOTHING TO REBUILD -- and, more importantly, makes run 22 vs run 19 a clean
+  # three-variable comparison instead of a seven-variable one.
+  cfg_file: examples/pretrain_multicam_wr.yaml   # wrist + right
+
+  split: train
+  egl: false
+
+  # The paper's offline hand-collision-filtered grasp dict. Must be on
+  # cfg.omg_config BEFORE the env is built. Keeps ~623/720 scenes planning,
+  # against ~351 for the runtime 0.08 m filter — which is why that stays off.
+  valid_grasp_dict_path: examples/valid_grasp_dict_005.pkl
+  hand_collision_filter: false
+  hand_collision_thresh: 0.08
+  hand_points_radius: 0.35
+
+  use_standoff: true
+  standoff_dist: 0.08
+
+  # PER-BIN: one grasp for every direction the scene can reach, each the goal-set
+  # grasp CLOSEST TO THAT BIN'S AXIS — which is the vector the policy is
+  # commanded with, so the demonstration is as close as the goal set allows to
+  # the instruction. Built by assign_direction_demos.py --mode per-bin.
+  #
+  # Scenes carry 1 to 4 grasps, so `GraspPinTable.num_grasps` (a MIN) reads 1 and
+  # is the WRONG accessor; `max_grasps` (4) sizes arrays and `num_grasps_for`
+  # iterates. `episodes_per_iter` is divided by max_grasps to get the scene count.
+  grasp_pin_table: output/regrasp_pins_train.json
+  grasp_pin_match_tol: 0.02
+
+  # Scenes with no feasible bin at all (6 of 623). Subtracted from BOTH pools.
+  exclude_scenes: output/regrasp_pins_train_excluded.json
+
+  # The (scene, BIN) pairs base collection actually demonstrated. Written by
+  # audit_regrasp_demos.py --write-ok. `exclude_scenes` is scene-granular and
+  # cannot say "this scene is fine for +x and +z but OMG could not plan -y"; this
+  # can, and without it a per-bin planner failure trains on three directions and
+  # scores four. Applied by pruning the pin table, so the collection pool, the
+  # eval loop and `bin_of` cannot disagree about which pairs exist.
+  demo_ok_table: output/regrasp_demos_train_ok.json
+
+  # ── CHANGE 1 OF 2: WHAT THE POLICY IS COMMANDED WHENEVER IT ACTS ───────────
+  #
+  # `bin_centroid` = the unit mean of every `d_anchor` this bin was assigned,
+  # taken over the table AFTER `demo_ok_table` prunes it — so it summarises the
+  # demonstrations the run is actually trained on, not the ones that were hoped
+  # for. Six vectors, no grasp needed, computable on the robot exactly as `BINS`
+  # is. The resolved values are written to `<run>/command_axes.json`.
+  #
+  # ONE KEY BECAUSE FIVE THINGS MUST AGREE: DAgger rollouts, in-loop eval, the
+  # retry ladder, the test set and the rollout viewer. A run in which any two of
+  # them disagree reports nothing unusual — it simply tells the policy one thing
+  # and scores it on another, and `dir_err` measures against the shifted target
+  # too.
+  #
+  # `bin_axis` (the default, runs 2-8) and `grasp_axis` (run 1, not deployable)
+  # are the other settings.
+  command_deploy: bin_centroid
+
+DAGGER:
+  # 25, exactly run 19's count -- which also puts the BETA RAMP back on run 19's
+  # schedule, since `num_iters` is the denominator in
+  # `beta(i) = beta_start + (beta_end-beta_start)*(i-1)/(num_iters-1)`.
+  # beta(1) = 0.900, beta(25) = 0.750, identical to run 19 at every iteration.
+  # That is required for the comparison: run 21 stretched the ramp to 35 and is
+  # therefore at a different on-policy fraction at every index.
+  num_iters: 25
+  # A TARGET, not an exact count. `sample_pairs` draws m // max_grasps = 100
+  # scenes and rolls out EVERY bin each can reach, so the iteration lands near
+  # 259 (the mean is 2.59 bins per scene). Drawing a scene's directions TOGETHER
+  # is the point: rollouts differing only in the command are the only data that
+  # can teach the network the command matters, and independent draws would spread
+  # that contrast across the whole run.
+  # 100 SCENES per iteration. max_grasps is 4 here, and
+  # `sample_pairs` draws m // max_grasps scenes, so this is
+  # 400 // 4 = 100.
+  episodes_per_iter: 400
+  # 50, run 19's value. Run 21 raised this to 80 and the effect was large --
+  # episodes hitting the cap fell 12.8% -> 0.2% and `reached_grasp/episode` rose
+  # 0.610 -> 0.907 -- which is exactly why it does NOT belong in this run. That
+  # single change dominates the reach statistics and would mask whatever the two
+  # fixes and the plane gate do. Run 21 measures it; run 22 holds it fixed.
+  max_steps: 50
+  scene_sampling: random
+  seed: 0
+
+  # 1.0 -> 0.75 linearly over the 20 iterations. Iteration 1 is therefore PURE
+  # EXPERT (see the header): a data-augmentation round, with the distribution
+  # shift starting at iteration 2. Run 1 and Phase-4 run 16 both held 0.75
+  # constant, so the late iterations here match them and the early ones are
+  # gentler.
+  # 0.9 -> 0.75 linearly over the 25 iterations. NO pure-expert round: the
+  # distribution shift starts at iteration 1, and by the end a QUARTER of every
+  # trajectory is the learner's own actions.
+  #
+  # 0.75 is the floor Phase-4 run 16 (0.80, the best run in the project) and
+  # regrasp run 1 both held CONSTANT, so the late iterations here sit exactly
+  # where those runs sat and the early ones are gentler. That makes this schedule
+  # a strict interpolation between known-good settings rather than an
+  # extrapolation past them — which 0.5 would have been, at double run 16's
+  # on-policy fraction and beyond anything measured on this task.
+  beta_schedule: linear
+  beta_start: 0.9
+  beta_end: 0.75
+  beta_mid: 0.5          # unused by `linear`; kept so a switch to `piecewise`
+  beta_knee: 0.66        # needs no other edit
+  beta_p: 0.7
+
+  close_pos_thresh: 0.02
+  close_rot_thresh: 0.34
+  stop_on_close_label: true
+  stop_on_policy_close: false
+
+  ee_step: 0.04
+  # 5, not 10: the divergence profile between a scene's demonstrations was
+  # measured FLAT (0.89x) over the tail, so a longer commit buys no extra
+  # contrast and starves the free approach where obstacle avoidance is learned.
+  reach_tail: 5
+  min_free: 1
+  max_horizon: 40
+  first_horizon: null
+
+  reach_commit_dist: 0.05
+  reach_skip_eps: 0.01
+  expert_after_commit: true
+
+  # ---- RECOMPUTE THE STEP-0 LABEL AGAINST THE PINNED GRASP ----------------
+  # THE ONE CONFIG CHANGE AGAINST RUN 19. See "FIX 1" in the header.
+  #
+  # `false` (the default, and what runs 1-20 did) keeps `expert_target_jp =
+  # plan[0]` from the plan made BEFORE `pin_table.apply`, so at step 0 the
+  # expert action can aim at a different grasp than the one the caption and the
+  # command name. `true` re-runs the planner after the pin with
+  # `reset_scene=False` — resetting would rebuild the goal set and undo the pin
+  # — and takes the label, the grasp pose and the standoff from that plan.
+  #
+  # Costs one extra `run_omg_planner` per episode (step 0 only) and draws no
+  # RNG. It is NOT retrofittable to run 19's shards: the corrected label changes
+  # what gets executed and therefore every state after it.
+  replan_after_pin: true
+
+  # ---- THE STANDOFF PLANE: only the expert enters the reach corridor -------
+  # A plane AT the standoff, normal along the gripper's +z at the pre-grasp (the
+  # approach axis). Free approach on one side, reach tail on the other. A DART
+  # jolt that would cross is REDRAWN (same `shield_jolt_max_tries` budget); a
+  # policy step that would cross is replaced by the expert action, exactly as
+  # the collision shield does, and with the RECORDED LABEL untouched either way.
+  #
+  # WHY A HARD GATE. Past this plane nothing can repair the trajectory:
+  # `goal_set_projection` pins the last `reach_tail_length` waypoints to the
+  # IK'd straight-line reach, so the obstacle gradient there is projected out by
+  # construction. Arriving in that corridor off-axis is unrecoverable BY THE
+  # EXPERT, which is the one thing DAgger depends on being able to do. Scene 79
+  # and scene 6 both show the signature: the hand swings past the standoff on a
+  # wrist-pivot arc and then has to climb back onto it.
+  #
+  # Scoped to the free approach — once `committed_reach` exists the episode is
+  # legitimately inside the corridor and the reach-band DART runs there under
+  # its own clearance check.
+  #
+  # READ `plane_policy / (episodes * steps)` in dagger_log.csv. If it is large
+  # the learner is being overridden constantly and the EFFECTIVE beta is well
+  # above the configured one, which is the same caveat `shield_policy` carries.
+  plane_gate: true
+  plane_gate_margin: 0.0
+
+  # DART ON BOTH BANDS, at Phase-4 run 16's magnitudes verbatim. `dart_ratio`
+  # covers the FREE approach (with dart_max_dist: 10.0 the distance gate never
+  # bites, so it fires anywhere before the commit) and `dart_reach_ratio` the
+  # committed REACH TAIL, where the jolt is smaller (0.012 m) and clearance-tested
+  # because the gripper is already inside the object's neighbourhood. Not
+  # re-tuned: these were derived for this reach geometry and DART is not the
+  # variable under test.
+  dart_ratio: 0.3
+  dart_max_dist: 10.0
+  dart_pos_mag: 0.04
+  dart_rot_mag: 0.3
+  dart_reach_ratio: 0.3
+  dart_reach_pos_mag: 0.01202
+  dart_reach_rot_mag: 0.3
+  dart_reach_max_tries: 5
+  dart_reach_clearance: 0.01
+  dart_reach_path_steps: 4
+
+  # ── THE SHIELD — the only change against run 9 ──────────────────────────────
+  # See the header. `shield: false` (the default) reproduces run 9 exactly,
+  # including its RNG stream, so this key is the whole experiment.
+  shield: true
+  # Metres. Matched to `dart_reach_clearance` deliberately: the reach jolt has
+  # been judged at 1 cm since Phase-4 run 12 and refuses ~30% of its draws there,
+  # which is a working operating point rather than a guess. The bar is relative,
+  # so this is the floor that applies only when the expert had room to spare.
+  shield_clearance: 0.01
+  # Interpolation samples along the step being tested. 4 matches
+  # `dart_reach_path_steps`; the endpoint alone would miss a step that cuts
+  # through the object and arrives clear on the far side.
+  shield_path_steps: 4
+  # Redraws before a free-approach jolt is abandoned. Matched to
+  # `dart_reach_max_tries`. If `shield_jolt_reject` approaches 5x `dart`, the
+  # jolt magnitude is too large for the geometry and jolts are being skipped
+  # rather than shielded — the same reading `dart_reject` gets.
+  shield_jolt_max_tries: 5
+
+  # Collection outcomes on the evaluator's taxonomy, so `c_success_rate` is
+  # comparable with `success_rate` (mixture-driven, not policy-only) and the
+  # per-bin collection counters have a `success` column meaning the same thing.
+  outcome_check: true
+
+TRAIN:
+  # ── CHANGE 2 OF 2: THE LABEL SOURCE, AND THE NOISE OFF ────────────────────
+  #
+  # bc_regrasp_run9.yaml = bc_regrasp_run4.yaml (`d_noise_deg` 12 -> 0) plus
+  # `DATA.d_source: d_grasp_world`. The label becomes the approach axis the
+  # expert actually flew instead of the direction the episode was commanded —
+  # a relabelling of shards already on disk, not a re-collection.
+  #
+  # THE NOISE HAS TO GO WITH IT. `d_noise_deg` existed to blur an exact command
+  # so the policy would tolerate the ~18 deg gap between the bin axis and its
+  # demonstration. Under a grasp-axis label that gap is zero by construction:
+  # the label IS the demonstration. Perturbing it would only smear a command
+  # that is now precise, which is the opposite of what the run is testing.
+  #
+  # The aux head stays on, as in run 2 — under direction conditioning it does
+  # not predict its own input, so `aux_pos_mm` still separates "the features
+  # have it and the action head ignores it" from "the observation cannot
+  # support it".
+  train_cfg: examples/configs/bc_regrasp_run9.yaml
+  # Empty => PointNet++ initialised RANDOMLY. Iteration 0 only; every later
+  # iteration warm-starts the WHOLE network from the previous last.pt and never
+  # reads this.
+  pc_pretrained:
+  # `${REGRASP_DATA}` defaults to `output` and is set to $SCRATCH_ROOT/output
+  # by the sbatch scripts. Only the two HDF5 shards move: together they are
+  # ~1.1 GB against /home's HARD 30 GB quota, which fills SILENTLY and kills
+  # the job with exit code 6 and no traceback. The JSON tables above stay in
+  # the repo — a few MB, they are INPUTS rather than outputs, and /scratch is
+  # purged by age.
+  # RUN 9/19'S OWN SHARDS, unsuffixed and unmodified. Same cameras, same tables.
+  base_train_h5: ${REGRASP_DATA}/bc_dataset/train_regrasp.h5
+  val_h5: ${REGRASP_DATA}/bc_dataset/val_regrasp.h5
+  base_run: null
+  # 50. The measured val minimum on run 1's base fit was epoch 16 (val_total
+  # 0.1851, degrading to 0.239 by 99 with a 4.9x train/val gap), so 40 already
+  # cleared it; 50 is margin against a differently-seeded init bottoming later,
+  # and iteration 0 now has ~1.47x the data. Harmless either way — the epoch that
+  # matters is whichever `last.pt` ends on.
+  base_epochs: 50
+  # ── 20, NOT RUN 9's 15 — THE SECOND CHANGE IN THIS RUN ─────────────────────
+  # Under `train_from_scratch: true` below this is a COMPLETE refit budget: the
+  # model starts from a random PointNet++ every iteration and has this many
+  # epochs over the whole aggregate to get back. 15 was never argued for on this
+  # aggregate; it was inherited from run 2.
+  #
+  # WHY 20. Phase-4 run 16 and run 19 — the two runs that transfer best to the
+  # real robot, and the best in the project at 0.80 — are also FTL from scratch
+  # and give each refit **25** epochs on a **100**-epoch base fit, against run
+  # 9's 15 on 50. Run 9's curve then goes flat from iteration 14 (mean 0.504, sd
+  # 0.053, trend +0.47 pp/iter over iters 14-25) while D grows 5174 -> 7968
+  # episodes, which is the signature of a refit that cannot absorb the data it is
+  # given. 20 moves a third of the way to Phase 4 without also changing the base
+  # fit, which would be a third variable.
+  #
+  # THE BUDGET IS TIGHT EARLY AND COMFORTABLE LATE, because epochs are over a
+  # GROWING D. In gradient steps (batch 64):
+  #     iteration 0   50 epochs x  86k steps  =  67k steps
+  #     iteration 1   20 epochs x  95k steps  =  30k steps   <- 1.36x run 9's
+  #     iteration 25  20 epochs x ~530k steps = 166k steps   <- 2.5x it
+  # So expect the early iterations to sit BELOW the base fit and recover as D
+  # grows. That dip is a property of this schedule, not a failure — and 20
+  # shortens it, which is half the point.
+  #
+  # 15 from random was already known to be ENOUGH FOR A WORKING POLICY —
+  # regrasp3_fast1's base fit was exactly that (15 epochs, empty pc_pretrained,
+  # 86k steps) for success 0.406 / bin_diag 0.406 at iteration 0 — so this is not
+  # a fix for a broken budget. It is a test of whether "enough to work" is also
+  # "enough to keep improving" on an aggregate 6x that size.
+  #
+  # COST: +33% on the training half of every iteration. Run 9 measured 13.4 h
+  # over 26 iterations, so budget ~16-17 h rather than ~14.
+  iter_epochs: 20
+  # TRUE — paper-faithful Follow-The-Leader (Ross et al.): every iteration refits
+  # from the initialisation on the whole aggregate, discarding the previous
+  # iteration's weights. Phase-4 run 16, the best run in the project at 0.80,
+  # did this.
+  #
+  # WITH `pc_pretrained` EMPTY THAT MEANS A RANDOM PointNet++ EVERY ITERATION,
+  # not just at iteration 0. That is deliberate here — regrasp does not borrow
+  # the CVPR2023 encoder — but it is the thing to check first if the run
+  # underperforms: see the gradient-step table above, and compare
+  # `success_rate` at iterations 1-3 against iteration 0. A run that never gets
+  # back above its base fit is telling you the refit budget from random is not
+  # enough on this aggregate, and the fix is `pc_pretrained` or more epochs, not
+  # more iterations. THIS RUN TAKES THE "MORE EPOCHS" HALF OF THAT (15 -> 20),
+  # so the iteration-1-to-3 recovery is one of the two things to read here.
+  #
+  # Costs nothing extra in wall clock: train_on_aggregate fits the whole D for
+  # `iter_epochs` either way, so warm start and from-scratch differ only in the
+  # starting weights.
+  train_from_scratch: true
+  # Inert while train_from_scratch is true (nothing is loaded from the previous
+  # iteration). Kept so flipping that flag back needs no other edit.
+  init_ckpt: best
+  # 8, not 2. These are DataLoader workers for the REFIT, and during the refit
+  # all 20 collection workers are idle — the node has 22 CPUs and two were
+  # feeding the loader. Each sample is a 1024x8 float array read from HDF5, so
+  # the loader is plausibly the bottleneck on an aggregate this size. Costs
+  # nothing and cannot change results.
+  num_workers: 8
+  device: cuda
+
+EVAL:
+  # IN THE LOOP. ~16 min an iteration at 100 scenes x 2.59 directions; that is
+  # 5.5 h on a ~20 h run, and it is what makes `ckpt`/`select_on` able to select
+  # at all — with the split job the metrics arrived after the next iteration had
+  # already started. Set to 2 if the queue makes the shorter job worth it.
+  every: 1
+  # 100 scenes -> ~259 episodes, ~65 per live bin. NOT randomly drawn: an
+  # np.linspace over the usable scene ids, so the SAME 100 scenes are scored
+  # every iteration and consecutive points are a paired comparison rather than
+  # two independent samples. That is what makes a trend readable at n=65/bin,
+  # where a single point's binomial standard error is ~0.05.
+  num_scenes: 100
+  # FALSE, as in run 1: the eval scenes are also collected on, so these are
+  # TRAIN-SET rates and optimistic. Kept false deliberately — the curves are a
+  # clean read of "is it learning what it is taught", and the held-out number
+  # comes from examples/eval_regrasp_testset.py on the s0 TEST split afterwards.
+  holdout: false
+  # 50, matching collection and matching runs 1-20. `success_rate` here IS
+  # directly comparable with run 19's, iteration for iteration -- same horizon,
+  # same camera, same beta at every index. That comparability is the entire
+  # design of this run, and it is what run 21 gave up.
+  max_steps: 50
+  # LAST. Also picks the policy that collects the next iteration (train_regrasp
+  # hands this same string to the workers), so one set of weights per iteration.
+  # BEST. Selected on the lowest val loss of the fit; also picks the policy that
+  # collects the next iteration, so one set of weights per iteration either way.
+  #
+  # THE HONEST CAVEAT, MEASURED. The val set is collected ONCE at beta=1 from
+  # expert demonstrations and never changes, while D grows toward majority
+  # on-policy states (53% by iteration 8 of regrasp_fast1). So val loss measures
+  # the fit to a distribution that is a SHRINKING minority of the training data,
+  # and it rises monotonically while success rises: corr(val_loss, success) =
+  # +0.71 and +0.83 on the two fast runs, corr(on-policy share, val_loss) = +0.85
+  # and +0.96. Selecting on it is therefore selecting on a drifting target.
+  #
+  # WHY IT IS STILL DEFENSIBLE HERE: at these epoch budgets `best` and `last` are
+  # nearly the same checkpoint. Measured val gap between them is +0.000 to +0.001
+  # at iter_epochs 6 and +0.002 to +0.005 at 15 — far below anything that moves
+  # success. The choice is close to free in both directions. NOTE those numbers
+  # were measured at 15 and this run fits 20, so the gap will be somewhat wider;
+  # the trend is monotone in the budget and 20 is not far enough out to change
+  # the conclusion, but it is an extrapolation rather than a measurement.
+  #
+  # THE SELECTION THAT ACTUALLY MATTERS is `select_on: success_rate` below, which
+  # picks the best ITERATION on rollouts, where the differences (0.30 -> 0.48
+  # across a run) are much larger than the eval noise.
+  ckpt: best
+  success_mode: stable_grasp
+  hold_steps: 3
+  select_on: success_rate
+  verbose: false
+
+  box_check: true
+  box:
+    min_frac: 0.50
+    open_thresh: 0.8
+    half_x: 0.0088
+    z_lo: 0.0946
+    z_hi: 0.1122
+    inset: 0.002
+    grid_x: 7
+    grid_z: 7
