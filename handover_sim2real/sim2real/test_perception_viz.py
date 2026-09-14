@@ -426,7 +426,7 @@ def main() -> None:
         print(f"drag mode: {window.rotate_mode_label}")
         print("  left-drag orbits, scroll zooms; 'z'/'x' tilt the horizon, which "
               "is the one thing the turntable cannot do.")
-        print(f"  'r' cycles: {' -> '.join(m[0] for m in ROTATE_MODES)}\n")
+        print(f"  'm' cycles: {' -> '.join(m[0] for m in ROTATE_MODES)}\n")
 
         # PERCEPTION RUNS OFF THE GUI THREAD. This is the whole reason the window
         # is usable. One pass — two camera grabs, a segmentation forward, the
@@ -563,7 +563,7 @@ def main() -> None:
                         print(f"white scene cloud "
                               f"{'on' if window.show_context else 'off'}")
                         last_draw = 0.0
-                    elif k == "r":
+                    elif k == "m":
                         window.cycle_rotate_mode()
                     elif k == "n":
                         # Re-prompt the tracker. This harness has no episodes,

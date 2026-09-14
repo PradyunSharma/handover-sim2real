@@ -322,7 +322,13 @@ HOME_REFINE_PASSES = 6      # backstop; the refine exits as soon as it is inside
 # CLOSE command returns well before the fingers have stopped — and short enough
 # that the run does not stall waiting for a human. It is a deadline the main
 # loop watches, never a sleep, so every key stays live throughout.
-AUTO_HOME_DELAY_S = 5.0
+#
+# 3.0 and not the 5.0 this started at. The fingers are the thing being waited
+# for and they are quick: GRASP_SPEED is 0.05 m/s over at most ~40 mm of travel
+# per finger, so under a second even from fully open. The rest was margin for
+# watching the grasp hold, and in --exp-mode that margin is paid once per
+# attempt with the operator already watching.
+AUTO_HOME_DELAY_S = 3.0
 
 HOME_REFINE_TOL_M = 0.020   # --home-tol
 HOME_WAY_TOL_M = 0.008      # intermediate waypoints are a path, not a target
@@ -343,8 +349,18 @@ HOME_WAY_TOL_M = 0.008      # intermediate waypoints are a path, not a target
 # spacing then follows from the publish rate. That is the right way round — it
 # means changing the rate changes only smoothness, never how fast the arm moves
 # across the room.
-HOME_SPEED_M_S = 0.08       # Cartesian speed of the streamed path
-HOME_STREAM_DT_S = 0.05     # publish period; spacing = speed * this = 4 mm
+#
+# 0.12 m/s and not the 0.08 this started at. A streamed path is followed with a
+# standing lag of roughly speed * tau, and tau on this controller is ~0.12 s, so
+# going half again as fast puts the arm ~14 mm behind the commanded equilibrium
+# instead of ~10 mm. That is a pull, not an error that accumulates:
+# clamp_command_lead in the stream loop bounds the equilibrium to
+# MAX_COMMAND_LEAD_M (100 mm) from the measured pose, so an arm that cannot keep
+# up is left behind rather than yanked. The refine pass that follows is a static
+# target and unaffected, which is why "how fast it crosses the room" and "where
+# it ends up" stay separate questions.
+HOME_SPEED_M_S = 0.12       # Cartesian speed of the streamed path
+HOME_STREAM_DT_S = 0.05     # publish period; spacing = speed * this = 6 mm
 
 # Fallback z offset from panda_hand to whatever frame /cartesian_pose publishes,
 # used ONLY when the robot does not publish F_T_EE. `measure_ee_offset_z` reads
@@ -808,7 +824,13 @@ MAX_LEAD_TRAVEL_RATIO = 1.25
 LEAD_STALL_ALLOWANCE_M = 0.020
 TRAVEL_LEAD_MIN_M = 0.005    # moves shorter than this do not inform the estimate
 
-MAX_POLICY_STEPS = 50   # dagger/evaluator.py EvalParams.max_steps
+# 80 and not the evaluator's 50 (dagger/evaluator.py EvalParams.max_steps).
+# The real arm needs more of them for the same motion: it executes a fraction
+# of each commanded step — measured 0.3 of the rotation and 0.4-0.8 of the
+# translation under --control rate — where sim executes all of it, so an
+# approach that converges in 30 sim steps has been taking 40-60 here and
+# timing out at 50 with the gripper still short of the object.
+MAX_POLICY_STEPS = 80
 
 # handover_sim2real/config.py: POLICY.TIME_ACTION_REPEAT = 0.15 against
 # SIM.TIME_STEP = 0.001, i.e. 150 substeps per policy step. That is the rate the
@@ -843,6 +865,47 @@ RATE_STUCK_M = 0.0005
 # between consecutive policy steps. A sign test alone does not catch it — the
 # samples that do the damage are small and POSITIVE.
 RATE_ALIGN_FRAC = 0.5
+
+# HOW MUCH LEAD THE FIXED-RATE LOOP MAY USE. Unlike settle's cap this is a
+# stability condition, not a sanity bound, and it is what stops the arm buzzing
+# once the gripper is close to the object.
+#
+# settle() can afford a generous lead because it checks arrival: an over-led
+# first command is walked back by the creep nudges inside the same move. The
+# fixed-rate loop has no arrival test at all, by design. It is therefore a bare
+# proportional loop — each tick commands (target - now) * (1 + r), the arm
+# executes a fraction g of that within the dwell, and the error left over scales
+# by
+#
+#     e_next / e = 1 - g * (1 + r)
+#
+# every tick. Measured on this arm, g spans 0.44 to 0.85 depending on direction
+# and load. Evaluated across that band:
+#
+#   r = 1.25  (MAX_LEAD_TRAVEL_RATIO)   -0.91 at g = 0.85 — the error flips sign
+#             every tick and sheds only 9% of itself per flip, which at 6.7 Hz
+#             is about a second of visible oscillation per correction. Near the
+#             object the policy re-injects error faster than that, so it never
+#             dies down. This is the shaking, and nothing about it needs a bug:
+#             it is what this cap does against a well-behaved arm.
+#   r = 5.25  what a 5 mm travel gets once `s` has grown, because the cap's
+#             fixed LEAD_STALL_ALLOWANCE_M term stops shrinking with the move:
+#             1.25*5mm + 20mm. -1.75 to -4.31, i.e. divergent — the equilibrium
+#             slams from one side to the other against clamp_command_lead.
+#   r = 0.5   -0.27 to +0.34: the error at least halves every tick at BOTH ends
+#             of the measured band. Both bounds are tight, so this is the middle
+#             of the usable interval and not a value tuned to one run.
+#
+# The stall allowance is dropped here for the same reason. It exists because a
+# STATIC target sits behind this controller's ~17 mm standing droop, so a small
+# absolute command moves the arm not at all. The rate loop does not command
+# static targets: every tick rebuilds the target as a delta off a freshly
+# measured pose, so the droop is in the anchor and the measurement alike and
+# cancels. What is left is the dwell-limited lag, which is multiplicative. A
+# genuine stall — stiction, a blocked joint — is still covered, by break-away in
+# RateCommander.command, which fires on the arm not moving and clears the moment
+# it does, instead of being paid on every step whether or not it is needed.
+RATE_MAX_LEAD_RATIO = 0.5
 
 # How long each step-mode iteration idles pumping the 3D window's events before
 # recomputing perception. One iteration of perception + policy is ~50 ms
@@ -1627,8 +1690,17 @@ class DroopCompensator:
         """Fraction of a commanded displacement this arm actually executes."""
         return self.g if self.enabled else 1.0
 
-    def lead_for(self, travel: np.ndarray) -> np.ndarray:
+    def lead_for(self, travel: np.ndarray,
+                 max_ratio: float = MAX_LEAD_TRAVEL_RATIO,
+                 stall_allowance: bool = True) -> np.ndarray:
         """The lead for the FIRST command of a move covering `travel`.
+
+        `max_ratio` and `stall_allowance` are the caller's, because the two
+        callers are not asking the same question. settle() wants the biggest
+        lead that is not absurd and corrects the rest; the fixed-rate loop has
+        no correction pass, so its cap has to keep the closed loop damped and
+        its allowance has to be zero — see RATE_MAX_LEAD_RATIO. The defaults are
+        settle's, so this reads unchanged there.
 
         A magnitude along the direction of travel, learned from what previous
         first commands needed. It is a magnitude and not a gain because a gain
@@ -1666,7 +1738,8 @@ class DroopCompensator:
         mag = self.s
         if self.s_scale > 1e-9:
             mag *= min(1.0, n / self.s_scale)
-        mag = min(mag, MAX_LEAD_TRAVEL_RATIO * n + LEAD_STALL_ALLOWANCE_M)
+        mag = min(mag, max_ratio * n
+                  + (LEAD_STALL_ALLOWANCE_M if stall_allowance else 0.0))
         return mag * (np.asarray(travel, dtype=np.float64) / n)
 
     def observe_move(self, commanded0: float, shortfall: np.ndarray,
@@ -2124,7 +2197,26 @@ class RateCommander:
             # overcome, does not care which way the arm is going — an arm that
             # moved at all has already broken away. So the norm is not merely
             # safer here, it is the quantity the mechanism was always about.
-            if moved < RATE_STUCK_M:
+            # AND A TICK NOBODY ASKED TO MOVE IS NOT A STALL EITHER, which is
+            # the other half of the same confusion and the one that survives
+            # every fix above. `moved` alone cannot tell an arm that REFUSED to
+            # go from an arm that has ARRIVED and was asked for nothing — and
+            # near the object the policy's deltas are fractions of a
+            # millimetre, so every arrival reads as a stall.
+            #
+            # Traced in simulation once the lead was damped enough for the arm
+            # to converge at all: 60 mm closed to 0.03 mm in three ticks, the
+            # fourth asked for 0.03 mm, the arm delivered 0.035 mm, break-away
+            # called that a stall and added 10 mm — kicking the gripper 7.1 mm
+            # back off the object. Reconverge in two ticks, get kicked again:
+            # a +-7 mm limit cycle at 1.7 Hz that only ever appears at the end
+            # of an approach, which is exactly where the shaking was reported.
+            #
+            # Static friction is a thing that opposes a REQUESTED motion. If
+            # nothing was requested there is nothing to break away from, and
+            # the lead can only push the arm off a target it had reached. So
+            # the request has to clear the same floor the motion does.
+            if want > RATE_STUCK_M and moved < RATE_STUCK_M:
                 self._stuck_lead = min(self._stuck_lead + CREEP_BREAKAWAY_M,
                                        MAX_COMMAND_LEAD_M)
             else:
@@ -2133,8 +2225,11 @@ class RateCommander:
 
         target_xyz = T_base_ctrl_target[:3, 3]
         travel = target_xyz - T_now[:3, 3]
-        lead = (self.droop.lead_for(travel) if self.droop is not None
-                else np.zeros(3))
+        # Damped, and with no stall allowance: this loop never checks arrival,
+        # so its lead is the loop gain. See RATE_MAX_LEAD_RATIO.
+        lead = (self.droop.lead_for(travel, max_ratio=RATE_MAX_LEAD_RATIO,
+                                    stall_allowance=False)
+                if self.droop is not None else np.zeros(3))
         n_travel = float(np.linalg.norm(travel))
         if self._stuck_lead > 0.0 and n_travel > 1e-9:
             lead = lead + (travel / n_travel) * self._stuck_lead
@@ -2372,6 +2467,14 @@ class Phase4Policy:
 
     # ---- --exp-mode hooks ---------------------------------------------------
 
+    # DOES THIS POLICY TAKE A PER-ATTEMPT COMMAND? Read once, before any
+    # camera opens, to decide whether a session is a list of commands
+    # (--exp-bins) or just a count of attempts (--exp-attempts). Asking the
+    # class is better than calling set_command and catching the refusal: a
+    # SystemExit raised to be caught is a control flow nobody reading
+    # set_command would expect.
+    TAKES_COMMAND = False
+
     def set_command(self, label: str) -> None:
         """Point the policy at the next command in an --exp-mode sequence."""
         raise SystemExit(
@@ -2443,6 +2546,19 @@ class ExperimentSession:
 
     def __init__(self, labels, max_steps: int, recorder=None, adapter=None):
         self.labels = list(labels)
+        # A SESSION IS A LIST OF ATTEMPTS; A COMMAND PER ATTEMPT IS OPTIONAL.
+        #
+        # The regrasp policy takes a direction, so its session is one attempt
+        # per bin and the bin is what names each one. The plain Phase-4 policy
+        # takes nothing — it grasps a held object however it likes — so its
+        # session is just a count, `[None] * n`, and attempts are named by
+        # their number. Everything else about the sequencer is identical, which
+        # is why this is one label that may be None rather than two classes.
+        #
+        # Derived rather than passed so there is one source of truth: a caller
+        # that hands over labels has already said which kind of session it is.
+        self.commanded = any(l is not None for l in self.labels)
+        self.noun = "bin" if self.commanded else "attempt"
         self.max_steps = int(max_steps)
         self.recorder = recorder
         # Only ever asked for `record_outcome()`, once per attempt. The session
@@ -2470,6 +2586,26 @@ class ExperimentSession:
     @property
     def next_label(self) -> Optional[str]:
         return None if self.cursor >= len(self.labels) else self.labels[self.cursor]
+
+    @property
+    def has_next(self) -> bool:
+        """Is there an attempt left? NOT the same as `next_label is not None`.
+
+        In an uncommanded session every label IS None, so testing the label for
+        existence would report a finished session from the very first attempt.
+        The cursor is the only thing that knows.
+        """
+        return self.cursor < len(self.labels)
+
+    def tag(self, row: Optional[dict]) -> str:
+        """How one attempt is NAMED in the terminal: its command, or its number."""
+        if not row:
+            return "?"
+        return row.get("bin") or f"#{row.get('attempt')}"
+
+    def _next_tag(self) -> str:
+        """The same, for the attempt that has not started yet."""
+        return self.next_label if self.commanded else f"#{self.cursor + 1}"
 
     def elapsed(self) -> Optional[float]:
         if self.cur is None:
@@ -2538,13 +2674,15 @@ class ExperimentSession:
         if self.phase == "VERDICT":
             return "p = PASS   f = FAIL   (the arm is carrying it home)"
         if self.phase == "IDLE":
-            return f"s = start 1/{n}: {self.labels[0]}"
-        last = self.rows[-1]["bin"] if self.rows else None
+            return f"s = start 1/{n}" + (f": {self.labels[0]}"
+                                         if self.commanded else "")
+        last = self.rows[-1] if self.rows else None
         bits = []
-        if self.next_label:
-            bits.append(f"s = start {self.cursor + 1}/{n}: {self.next_label}")
+        if self.has_next:
+            bits.append(f"s = start {self.cursor + 1}/{n}"
+                        + (f": {self.next_label}" if self.commanded else ""))
         if last is not None and self._can_retry():
-            bits.append(f"r = retry {last}")
+            bits.append(f"r = retry {self.tag(last)}")
         if self.rows and self.rows[-1].get("froze"):
             bits.append("h = home first")
         bits.append("q = quit")
@@ -2582,52 +2720,61 @@ class ExperimentSession:
         """
         n = len(self.labels)
         if self.phase == "RUNNING":
-            self._say(f"RUNNING {self.cur['bin']} \u2014 nothing to retry yet",
+            self._say(f"RUNNING {self.tag(self.cur)} \u2014 nothing to retry yet",
                       "'f' records a failure, 't' voids the attempt; either "
                       "then offers 'r'.")
             return False
         if self.phase == "VERDICT":
-            self._say(f"VERDICT OWED for {self.cur['bin']}",
-                      "judge it first \u2014 a retry after 'f' re-offers the "
-                      "same bin.")
+            self._say(f"VERDICT OWED for {self.tag(self.cur)}",
+                      f"judge it first \u2014 a retry after 'f' re-offers the "
+                      f"same {self.noun}.")
             return False
         if not self.rows:
             self._say("NOTHING TO RETRY", "no attempt has finished yet.")
             return False
         last = self.rows[-1]
         if not self._can_retry():
-            self._say(f"{last['bin']} IS ALREADY NEXT",
-                      f"'t' does not consume an attempt, so {last['bin']} was "
-                      "never passed over.")
+            # Two ways to be here and the message has to fit both: a VOID never
+            # consumed the bin, and a retry already rolled the cursor back.
+            why = ("'t' does not consume an attempt"
+                   if last["verdict"] == "void" else "'r' already rolled back")
+            self._say(f"{self.tag(last)} IS ALREADY NEXT",
+                      f"{why}, so there is nothing further to re-offer.")
             return False
         self.cursor = int(last["attempt"]) - 1
         self.phase = "BETWEEN"
-        self._say(f"RETRY {last['bin']}  \u2014  attempt "
+        self._say(f"RETRY {self.tag(last)}  \u2014  attempt "
                   f"{self.cursor + 1}/{n}, try {int(last['try']) + 1}",
                   f"the {last['verdict']} just recorded is KEPT; this is an "
                   "extra attempt, not a replacement.")
         return True
 
-    def start_requested(self) -> Optional[str]:
-        """'s'. The label to command, or None with a printed reason.
+    def start_requested(self) -> bool:
+        """'s'. May the next attempt start? False, with a printed reason, if not.
+
+        A PREDICATE AND NOT THE LABEL, because None is a legal label: an
+        uncommanded session's every attempt is None, so returning the label and
+        testing it for None would refuse every 's' in such a session. The
+        caller reads `next_label` itself, and only calls set_command when there
+        is something to command.
 
         REFUSING IS AS MUCH OF THE MACHINE AS ACCEPTING. 's' during a verdict
-        wait would start the next command with the last one unjudged, and after
+        wait would start the next attempt with the last one unjudged, and after
         the final one it must do nothing at all — that is what ends a session
         rather than rolling it on.
         """
         if self.phase == "RUNNING":
-            self._say(f"ALREADY RUNNING {self.cur['bin']}")
-            return None
+            self._say(f"ALREADY RUNNING {self.tag(self.cur)}")
+            return False
         if self.phase == "VERDICT":
-            self._say(f"VERDICT OWED for {self.cur['bin']} "
+            self._say(f"VERDICT OWED for {self.tag(self.cur)} "
                       f"({self.cur['attempt']}/{len(self.labels)})")
-            return None
-        if self.next_label is None:
-            self._say(f"SESSION COMPLETE — {len(self.labels)} bins, "
+            return False
+        if not self.has_next:
+            self._say(f"SESSION COMPLETE — {len(self.labels)} {self.noun}s, "
                       f"{self.tally()}")
-            return None
-        return self.next_label
+            return False
+        return True
 
     def attempt_started(self, t_start: Optional[float] = None) -> str:
         label = self.labels[self.cursor]
@@ -2647,8 +2794,9 @@ class ExperimentSession:
         # attempt is running: during the verdict wait the same key is a verdict
         # and must not abort the arm carrying the object home.
         STOP_KEYS.add("f")
-        self._say(f"ATTEMPT {self.cur['attempt']}/{len(self.labels)} · "
-                  f"bin {label} · try {self._tries[self.cursor]}",
+        self._say(f"ATTEMPT {self.cur['attempt']}/{len(self.labels)}"
+                  + (f" · bin {label}" if label else "")
+                  + f" · try {self._tries[self.cursor]}",
                   f"clock running · max {self.max_steps} steps · {self.tally()}")
         if self.recorder is not None:
             self.recorder.on_attempt_start(dict(self.cur))
@@ -2687,21 +2835,21 @@ class ExperimentSession:
         landed = ""
         if rb:
             hit = self.cur.get("bin_hit")
-            landed = (f"commanded {self.cur['bin']}, landed {rb}"
+            landed = (f"commanded {self.tag(self.cur)}, landed {rb}"
                       + ("" if de is None else f" ({de:.0f}\u00b0 off)")
                       + ("" if hit is None else
                          ("  \u2713 bin hit" if hit else "  \u2717 wrong sector")))
         w = self.cur["grip_end_mm"]
         if verdict is None:
             self.phase = "VERDICT"
-            self._say(f"{self.cur['bin']} CLOSED · {self.cur['elapsed_s']:.1f}s "
+            self._say(f"{self.tag(self.cur)} CLOSED · {self.cur['elapsed_s']:.1f}s "
                       f"· {steps} steps",
                       landed,
                       "the arm is carrying the object home; a key pressed "
                       "during that move is read when it finishes")
         else:
             self._pending_head = (
-                f"{self.cur['bin']} {ending.upper()} · "
+                f"{self.tag(self.cur)} {ending.upper()} · "
                 f"{self.cur['elapsed_s']:.1f}s · {steps} steps"
                 + ("" if w is None else f" · jaws {w:.0f} mm"))
             self._pending_landed = landed
@@ -2732,9 +2880,10 @@ class ExperimentSession:
                else f", {at:.1f} mm at the verdict \u2014 it slipped"))
         # `attempt_ended` stashes these when it decides the verdict itself (a
         # timeout or an 'f'), so that ending gets ONE block rather than two.
+        # No verdict in the fallback head: `_say` appends it below, and
+        # "+x PASS ... -> PASS" reads like two different facts.
         head = getattr(self, "_pending_head", None) or (
-            f"{row['bin']} {verdict.upper()} · {row['elapsed_s']:.1f}s · "
-            f"{row['steps']} steps")
+            f"{self.tag(row)} · {row['elapsed_s']:.1f}s · {row['steps']} steps")
         landed = getattr(self, "_pending_landed", None) or ""
         self._pending_head = self._pending_landed = None
         self._say(f"{head}  \u2192  {verdict.upper()}",
@@ -2767,10 +2916,10 @@ class ExperimentSession:
         self.phase = "BETWEEN"                  # the cursor does NOT advance
         if self.recorder is not None:
             self.recorder.on_attempt_done(row)
-        self._say(f"{row['bin']} VOIDED by 't' · {row['elapsed_s']:.1f}s · "
+        self._say(f"{self.tag(row)} VOIDED by 't' · {row['elapsed_s']:.1f}s · "
                   f"{steps} steps",
-                  "a user stop is not a policy failure, so the bin is NOT "
-                  "consumed",
+                  f"a user stop is not a policy failure, so the {self.noun} is "
+                  "NOT consumed",
                   "ARM FROZEN where it stopped",
                   f"session so far: {self.tally()}")
 
@@ -2804,19 +2953,27 @@ class ExperimentSession:
         summary = {"session_id": self.session_id, "reason": reason,
                    "labels": list(self.labels), "rows": list(self.rows),
                    "attempted": self.cursor, "n_attempts": len(self.labels)}
+        # THE LABEL COLUMN ONLY EARNS ITS WIDTH IF THERE ARE LABELS. With no
+        # command it would hold "#2" against a row that already begins "2.2" —
+        # the same number twice, in a table whose whole job is to be read at a
+        # glance after a long session.
+        cmd = self.commanded
         print(f"\n{self.RULE}\n  SESSION {self.session_id} ENDED — {reason}\n"
-              f"    {self.cursor}/{len(self.labels)} bins · {self.tally()}\n"
-              f"  {'':2s}{'#':>4s} {'bin':>3s} {'ending':>11s} {'time':>6s} "
-              f"{'steps':>6s} {'jaws':>7s} {'landed':>7s}  verdict")
+              f"    {self.cursor}/{len(self.labels)} {self.noun}s · "
+              f"{self.tally()}\n"
+              f"  {'':2s}{'#':>4s} " + (f"{self.noun[:3]:>3s} " if cmd else "")
+              + f"{'ending':>11s} {'time':>6s} "
+              f"{'steps':>6s} {'jaws':>7s} {'land':>4s} {'off':>4s}  verdict")
         for r in self.rows:
             mn = r.get("grip_min_mm")
             rb = r.get("bin_realized") or "--"
             de = r.get("dir_err_deg")
-            print(f"  {'':2s}{r['attempt']}.{r['try']:<2d} {r['bin']:>3s} "
-                  f"{str(r['ending']):>11s} {r['elapsed_s']:5.1f}s "
+            print(f"  {'':2s}{r['attempt']}.{r['try']:<2d} "
+                  + (f"{self.tag(r):>3s} " if cmd else "")
+                  + f"{str(r['ending']):>11s} {r['elapsed_s']:5.1f}s "
                   f"{r['steps']:6d} "
                   f"{'     --' if mn is None else f'{mn:5.1f}mm'} "
-                  f"{rb:>3s}"
+                  f"{rb:>4s}"
                   f"{'    ' if de is None else f'{de:4.0f}'}  {r['verdict']}")
         if self.recorder is not None:
             self.recorder.on_session_end(summary)
@@ -2828,9 +2985,10 @@ class ExperimentSession:
                     auto_home_in: Optional[float] = None) -> str:
         n = len(self.labels)
         if self.phase == "IDLE":
-            return f"EXP 0/{n} — press 's' for 1/{n}: {self.next_label}"
+            return (f"EXP 0/{n} — press 's' for 1/{n}"
+                    + (f": {self.next_label}" if self.commanded else ""))
         if self.phase == "RUNNING":
-            return (f"RUNNING {self.cur['attempt']}/{n} {self.cur['bin']}   "
+            return (f"RUNNING {self.cur['attempt']}/{n} {self.tag(self.cur)}   "
                     f"t={self.elapsed():.1f}s   step {step}/{max_steps}")
         if self.phase == "VERDICT":
             # THE LIVE CLOSURE, so the verdict is a reading and not a guess.
@@ -2838,7 +2996,7 @@ class ExperimentSession:
             # met each other and the object is not in them, whatever it looked
             # like from across the room.
             mn = self._grip_min_mm()
-            s = (f"CLOSED {self.cur['attempt']}/{n} {self.cur['bin']} at "
+            s = (f"CLOSED {self.cur['attempt']}/{n} {self.tag(self.cur)} at "
                  f"{self.cur['elapsed_s']:.2f}s / {self.cur['steps']} steps"
                  + ("" if mn is None else f"   jaws {mn:.1f} mm")
                  + " — VERDICT? 'p'=pass 'f'=fail")
@@ -2849,11 +3007,12 @@ class ExperimentSession:
         last = self.rows[-1] if self.rows else {}
         head = ("FAILED" if last.get("verdict") == "fail" else
                 "VOIDED" if last.get("verdict") == "void" else "PASS")
-        return (f"{head} {last.get('attempt')}/{n} {last.get('bin')} "
+        return (f"{head} {last.get('attempt')}/{n} {self.tag(last)} "
                 f"({last.get('ending')}, {last.get('elapsed_s', 0.0):.2f}s)"
                 + ("  ARM FROZEN — 'h' to home, then" if last.get("froze")
                    else ".")
-                + f" 's' for {self.cursor + 1}/{n}: {self.next_label}   "
+                + f" 's' for {self.cursor + 1}/{n}"
+                + (f": {self.next_label}" if self.commanded else "") + "   "
                 f"[{self.tally()}]")
 
     def key_line(self) -> str:
@@ -2981,8 +3140,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "place, since the automatic move drags the arm out of "
                         "the pose you wanted to look at.")
     p.add_argument("--exp-mode", action="store_true",
-                   help="run a SESSION: an ordered sequence of attempts from "
-                        "--exp-bins, one per 's', each timed and recorded. "
+                   help="run a SESSION: a sequence of attempts, one per 's', "
+                        "each timed and recorded. A policy that takes a "
+                        "command wants --exp-bins; one that does not (this "
+                        "runner's) wants --exp-attempts, default 1. "
                         "Implies --home, --home-gripper and --enable-gripper. "
                         "'f' fails the running attempt and stops the arm where "
                         "it stands; after a close the arm carries the object "
@@ -2995,6 +3156,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "business — the regrasp runner takes directions and "
                         "refuses any its run has no demonstrations for, up "
                         "front, before a camera opens.")
+    p.add_argument("--exp-attempts", type=int, default=None, metavar="N",
+                   help="how many attempts this session is, when the policy "
+                        "takes no command (default 1 — one grasp per session). "
+                        "The sequencer, the timing, the recording, the verdict "
+                        "keys and 'r' to retry are the same either way; only "
+                        "what names an attempt differs. Mutually exclusive "
+                        "with --exp-bins, which says the same thing by "
+                        "listing the commands.")
     p.add_argument("--exp-out", type=str, default=None, metavar="DIR",
                    help="where the session's records go. A subdirectory named "
                         "for the session timestamp is created inside it. Only "
@@ -3206,18 +3375,45 @@ def main(adapter: "Phase4Policy | None" = None,
                 "--exp-mode homes after every close, carrying the object, and "
                 "waits for your verdict. --no-auto-home deletes exactly that "
                 "step. Use --auto-home-delay to change WHEN, not whether.")
-        if not exp_labels:
-            raise SystemExit("--exp-mode needs --exp-bins, e.g. "
-                             "--exp-bins +x,+y,+z,-y")
+        if exp_labels and args.exp_attempts is not None:
+            raise SystemExit(
+                f"--exp-bins ({len(exp_labels)}) and --exp-attempts "
+                f"({args.exp_attempts}) both say how long this session is. "
+                "Pass one.")
+        # A COMMANDED SESSION IS A LIST; AN UNCOMMANDED ONE IS A COUNT.
+        #
+        # Asked of the class rather than by calling set_command and catching
+        # its SystemExit. The refusal is still what an operator sees if they
+        # pass --exp-bins to a policy that takes no command — validate_commands
+        # below — because that message explains which runner they wanted,
+        # which a generic "this policy takes no command" would not.
+        if getattr(adapter, "TAKES_COMMAND", False):
+            if not exp_labels:
+                raise SystemExit("--exp-mode needs --exp-bins, e.g. "
+                                 "--exp-bins +x,+y,+z,-y")
+        elif exp_labels:
+            adapter.validate_commands(exp_labels)      # refuses, and says why
+        else:
+            n_att = 1 if args.exp_attempts is None else int(args.exp_attempts)
+            if n_att < 1:
+                raise SystemExit(f"--exp-attempts {n_att} is not a session.")
+            # None and not a placeholder string: `bin` is a column in
+            # attempts.csv, and a made-up label there would read like a command
+            # the policy was given. Empty is the truth.
+            exp_labels = [None] * n_att
         args.home = True             # home the ARM at startup
         args.home_gripper = True     # ... and CALIBRATE the fingers
         args.enable_gripper = True   # a close that does nothing is not an attempt
-        print(f"[exp] session of {len(exp_labels)} attempts: "
-              f"{', '.join(exp_labels)}\n"
-              "[exp] --home, --home-gripper and --enable-gripper are implied.")
-        adapter.validate_commands(exp_labels)   # BEFORE any camera or motion
-    elif exp_labels or args.exp_out is not None:
-        raise SystemExit("--exp-bins / --exp-out are only read under --exp-mode.")
+        print(f"[exp] session of {len(exp_labels)} attempt"
+              f"{'' if len(exp_labels) == 1 else 's'}"
+              + (f": {', '.join(exp_labels)}" if exp_labels[0] else "")
+              + "\n[exp] --home, --home-gripper and --enable-gripper are "
+                "implied.")
+        if exp_labels[0] is not None:
+            adapter.validate_commands(exp_labels)  # BEFORE any camera or motion
+    elif exp_labels or args.exp_out is not None or args.exp_attempts is not None:
+        raise SystemExit("--exp-bins / --exp-attempts / --exp-out are only "
+                         "read under --exp-mode.")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
@@ -4370,9 +4566,13 @@ def main(adapter: "Phase4Policy | None" = None,
             # the scene is ready.
             if "s" in pressed:
                 if exp is not None:
-                    label = exp.start_requested()   # None + a printed reason
-                    if label is not None:
-                        adapter.set_command(label)
+                    if exp.start_requested():       # False + a printed reason
+                        # None whenever the policy takes no command — see
+                        # ExperimentSession.__init__. Asking for it BEFORE
+                        # attempt_started, which is what advances past it.
+                        label = exp.next_label
+                        if label is not None:
+                            adapter.set_command(label)
                         # ALWAYS through start_episode(), never the bare
                         # `armed = True` path: adapter.act() runs on every
                         # iteration that has an observation, including before

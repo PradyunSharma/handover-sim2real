@@ -2363,6 +2363,27 @@ Configs without a numbered run file were shared across several runs.
 
 ## Standing conclusions
 
+**No number in this file is comparable with Christen et al. (CVPR 2023), and
+three separate things cause that.** The benchmark's `EpisodeStatus.SUCCESS`
+requires the hand to dwell inside a 15 cm ball at `GOAL_CENTER` for 0.1 s within
+13 s; our `stable_grasp` stops at "closed, held, object secured". Benchmark
+SUCCESS is a **strict subset** of ours, so every rate here is an upper bound on
+the benchmark number. On top of that, every config in this repo sets
+`YCB_MANO_START_FRAME: last` (the human frozen fully extended from t=0, where
+the benchmark default `first` plays the reach out and the object is a moving
+target) and `YCB_LOAD_MODE: grasp_only` (only the target loaded, where the
+benchmark loads the whole table). All three make our setting easier.
+
+`examples/eval_benchmark_protocol.py` closes all three — it adds the retreat,
+defaults to `first` and `all`, writes the official per-scene `.npz`, and then
+calls `handover.benchmark_evaluator.evaluate()` so the metrics are computed by
+*their* code. The three can be separated by holding `--start-frame last
+--ycb-load-mode grasp_only` (the carry alone), then relaxing one at a time.
+**Not yet run for any run.** Note the retry ladder is inexpressible under the
+protocol: one attempt is ~7.5 s of a 13 s budget, so `chained_retry_at_k` for
+k ≥ 2 stays a claim under our own protocol only.
+
+
 **Phase 4 has no held-out number, and `eval_dagger_run.py` cannot produce one.**
 It takes no `--split` — it rebuilds the run's own context from the run's own
 config, and every Phase-4 config carries `SIM.split: train` with

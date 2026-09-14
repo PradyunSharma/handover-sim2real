@@ -104,7 +104,7 @@ cancel the pending move, and `t` still interrupts it once it has started.
 | `--rate-hz N` | `6.67` | policy rate for `--control rate` (the paper's 0.15 s) |
 | `--rate-anchor {obs,now}` | `obs` | which pose the delta hangs off. `obs` matches sim; `now` re-reads it at publish time, ~120 ms later. See [Shaking near the object](#shaking-near-the-object-and-what-caused-it) |
 | `--step-mode` | off | preview each step, execute only on `SPACE` |
-| `--max-steps N` | `50` | episode length |
+| `--max-steps N` | `80` | episode length. Higher than the evaluator's 50 because the real arm executes only a fraction of each commanded step |
 | `--step-tol-frac F` | `0.6` | arrival tolerance as a fraction of the step |
 | `--settle-timeout S` | `3.0` | give up waiting for convergence |
 | `--no-creep` | off | old multi-pass step motion (3 commands/step) |
@@ -116,13 +116,14 @@ cancel the pending move, and `t` still interrupts it once it has started.
 |---|---|---|
 | `--home` | off | drive to the sim's episode-start pose first |
 | `--home-only` | off | home and exit |
-| `--home-speed N` | `0.08` | Cartesian speed of the streamed path, m/s |
+| `--home-speed N` | `0.12` | Cartesian speed of the streamed path, m/s. The arm lags a streamed equilibrium by about `speed * tau` with `tau ~= 0.12 s`, so this trails ~14 mm behind; `clamp_command_lead` bounds the pull if it cannot keep up |
 | `--home-tol N` | `0.02` | how close to home is close enough, m. Tighter than the arm can land makes the refine hunt |
 | `--home-stepwise` | off | old behaviour: settle on every 2 cm waypoint |
-| `--auto-home-delay SEC` | `5.0` | wait after a policy CLOSE before homing on its own |
+| `--auto-home-delay SEC` | `3.0` | wait after a policy CLOSE before homing on its own. The fingers need under a second of it; the rest is time to see the grasp hold |
 | `--no-auto-home` | off | never home on its own; wait for `h` |
 | `--exp-mode` | off | run a timed, recorded session of sequenced attempts |
-| `--exp-bins A,B,C` | — | the ordered sequence, one attempt each |
+| `--exp-bins A,B,C` | — | the ordered sequence, one attempt each. Only for a policy that takes a command — this runner's does not |
+| `--exp-attempts N` | `1` | how long the session is when there is no command to sequence. This is the one this runner wants |
 | `--exp-out DIR` | — | where the session is recorded; omit to record nothing |
 | `--exp-no-depth` | off | skip depth: ~15 MB/attempt instead of ~260 MB |
 | `--exp-video-fps N` | `--rate-hz` | nominal fps in the mp4 headers |
@@ -203,7 +204,9 @@ cancel the pending move, and `t` still interrupts it once it has started.
 | `c` | colour the cloud by class vs by source camera |
 | `w` | white raw-scene cloud on/off |
 | `z` / `x` | roll the view |
-| `r` | drag mode: turntable → arcball → rotate model |
+| `m` | drag mode: turntable → arcball → rotate model (was `r`) |
+| `r` | **retry the bin that just finished** (`--exp-mode` only) |
+| `p` / `f` | pass / fail the grasp at the verdict (`--exp-mode` only) |
 | `n` | re-seed the tracker (`test_perception_viz.py` only) |
 
 The last five need `--show-cloud`.
@@ -972,6 +975,89 @@ asserts the gain holds — *and* that a collinear under-travelling arm is still
 learned from, so the guard cannot degenerate into "never adapt". The 4 mm step
 against a 12 mm dead band still depends on break-away, and is still covered.
 
+#### The second cause: in `rate` mode the lead *is* the loop gain
+
+Guarding the estimator bounded how large the lead could get. It did not make the
+lead that remained *safe*, and hardware still showed a smaller oscillation in the
+same place. That one is not a bug in any predicate — it is what the cap does
+against a perfectly well-behaved arm.
+
+`--control rate` never checks arrival, by design. So it is a bare proportional
+loop: each tick commands `(target - now) * (1 + r)`, the arm executes a fraction
+`g` of that within the dwell, and the error left over scales by
+
+```
+e_next / e = 1 - g * (1 + r)
+```
+
+every tick. On this arm `g` measures 0.44–0.85 depending on direction and load.
+Evaluate the caps that were actually in force:
+
+| `r` | `g = 0.44` | `g = 0.71` | `g = 0.85` | |
+|---|---|---|---|---|
+| 1.25 | +0.01 | −0.60 | **−0.91** | `MAX_LEAD_TRAVEL_RATIO`, settle's cap |
+| 5.25 | −1.75 | −3.44 | **−4.31** | a 5 mm travel once `s` has grown: `1.25·5mm + 20mm` |
+| 0.50 | +0.34 | −0.06 | −0.27 | `RATE_MAX_LEAD_RATIO` |
+
+−0.91 is the error flipping sign every tick and shedding 9% of itself per flip:
+about a second of visible oscillation per correction at 6.7 Hz, and near the
+object the policy re-injects error faster than that, so it never dies down. The
+second row is worse than marginal — it is divergent, the equilibrium slamming
+from one side to the other against `MAX_COMMAND_LEAD_M`. It is reached because
+the cap's fixed `LEAD_STALL_ALLOWANCE_M` term does **not** shrink with the move,
+so the shorter the step the larger the effective ratio, which is exactly
+backwards near the object.
+
+So `rate` mode now caps its lead at `RATE_MAX_LEAD_RATIO = 0.5` of the travel and
+takes **no** stall allowance. Both bounds of the usable interval are tight — the
+error must at least halve per tick at `g = 0.85` (`r ≤ 0.76`) and must make
+progress at `g = 0.44` (`r ≥ 0.14`) — so 0.5 is the middle of that interval
+rather than a value tuned to one run.
+
+Dropping the allowance is safe because of *why* it exists: a **static** target
+sits behind this controller's ~17 mm standing droop, so a small absolute command
+moves the arm not at all. The rate loop never commands a static target — every
+tick rebuilds it as a delta off a freshly measured pose, so the droop is present
+in the anchor and the measurement alike and cancels. A genuine stall is still
+covered by `_stuck_lead`, which fires on the arm not moving and clears the moment
+it does, rather than being paid on every step whether or not it is needed.
+
+`settle` mode is untouched: it checks arrival and walks an over-led command back
+with creep nudges inside the same move, which is precisely the correction the
+rate loop does not have.
+
+#### The third cause: arriving is not stalling
+
+Damping the loop exposed the next one, which had been hiding behind it. Once the
+arm converged at all, it started being kicked back off the object.
+
+`_stuck_lead` tests whether the arm **moved**. That cannot distinguish an arm
+that *refused* to move from an arm that has *arrived and was asked for nothing* —
+and near the object the policy's deltas fall to fractions of a millimetre, well
+under the 0.5 mm `RATE_STUCK_M` floor. Traced in simulation:
+
+```
+  k  want_mm  moved_mm  stuck_mm   signed_err_mm
+  2    0.455     0.487       0.0           0.032   <- converged
+  3    0.032     7.170      10.0          -7.132   <- read as a stall, 10 mm added
+  4    7.137     7.639       0.0           0.501
+  5    0.501     0.536       0.0          -0.035
+  6    0.035     0.039       0.0           0.004   <- converged again
+  7    0.004     7.139      10.0          -6.545   <- kicked again
+```
+
+A ±7 mm limit cycle at 1.7 Hz that appears **only at the end of an approach**,
+which is exactly where the shaking was reported. The over-led loop had the same
+bug and it fired twice in 24 ticks instead of six times, for the unhelpful reason
+that an arm which never settles never asks for a sub-millimetre delta.
+
+Static friction is a thing that opposes a *requested* motion, so the request has
+to clear the same floor the motion does: break-away now needs `want >
+RATE_STUCK_M` as well as `moved < RATE_STUCK_M`. `_arrival_is_not_a_stall` pins
+both directions — an arm asked for 30 µm and free to deliver them accrues no
+lead, and a 4 mm step against a 12 mm dead band still breaks away, because
+"never break away" is a deadlock rather than a fix.
+
 #### The dead time, and `--rate-anchor`
 
 There is a third thing, and it is not a bug so much as a gap between sim and
@@ -1108,8 +1194,11 @@ python my_regrasp_policy_runner.py --regrasp-run 19 --direction +x \
     --enable-gripper --home-gripper --show-cloud
 
 # a whole session: one attempt per 's', timed, judged and recorded
-python my_regrasp_policy_runner.py --regrasp-run 19 \
-    --exp-mode --exp-bins +x,+y,+z,-y --exp-out output/real_experiments \
+python my_regrasp_policy_runner.py --regrasp-run 19     --exp-mode --exp-bins +x,+y,+z,-y --exp-out output/real_experiments     --cameras tripod --calib-session D455 --segmentation sam2     --seg-object-prompt "object in hand." --control rate --rate-anchor now
+
+# single reasp
+python my_policy_runner.py --exp-mode --exp-attempts 5 \
+    --exp-out output/real_experiments --run run19 \
     --cameras tripod --calib-session D455 --segmentation sam2 \
     --seg-object-prompt "object in hand." --control rate
 ```
@@ -1264,6 +1353,36 @@ python my_regrasp_policy_runner.py --exp-mode --exp-bins +x,+y,+z,-y \
     --seg-object-prompt "a brown cuboidal box." --control rate
 ```
 
+#### A session without commands
+
+`--exp-mode` is not a regrasp feature. The sequencer, the recorder, the timing,
+the verdict keys and `r` all live in `my_policy_runner.py` and work for either
+policy; the only thing that differs is whether an attempt has a **command**.
+
+The regrasp policy takes a direction, so its session is a list — one attempt per
+bin, named by the bin. The plain Phase-4 policy takes nothing, it grasps a held
+object however it likes, so its session is just a **count** and attempts are
+named by their number:
+
+```bash
+python my_policy_runner.py --exp-mode --exp-attempts 5 \
+    --exp-out output/real_experiments --run run19 \
+    --cameras tripod --calib-session D455 --segmentation sam2 \
+    --seg-object-prompt "object in hand." --control rate
+```
+
+`--exp-attempts` defaults to 1, so bare `--exp-mode` is one grasp per session,
+which is usually what you want here — there is no dimension to sweep. Everything
+else is identical: `s` starts, `f` fails and stops the arm, `t` voids without
+consuming the attempt, `p`/`f` judge after the carry home, `r` retries, and each
+attempt gets its own recorded directory.
+
+The two flags are mutually exclusive, since both say how long the session is,
+and each runner refuses the wrong one with a message naming the other. The `bin`
+column in `attempts.csv` is left **empty** for an uncommanded attempt rather than
+filled with a placeholder — a made-up label there would read like a command the
+policy was actually given.
+
 `--exp-mode` implies `--home`, `--home-gripper` and `--enable-gripper`: a session
 whose fingers were never homed reports an uncalibrated width for every attempt,
 which poisons `robot_state[25]` and the finger exclusion boxes silently. It
@@ -1272,7 +1391,8 @@ however long you took to press SPACE) and `--no-auto-home` (which deletes the
 carry-home the verdict depends on). Every command in the sequence is validated
 against the run's live bins **before a camera opens**, so a bad bin at position
 three cannot surface after two recorded attempts. Repeats are legal and mean run
-it again.
+it again. A commandless session skips that check because there is nothing to
+check.
 
 ### The keys
 
@@ -1314,7 +1434,11 @@ of the key flow. With it:
   attempts.csv       one row per attempt: bin, ending, verdict, elapsed,
                      steps, and the jaw closure in mm
   events.jsonl       append-only audit trail
-  attempt_000/
+  attempt_000/       numbered in the order attempts RAN, not by bin — a bin
+                     run twice ('r' retry, or 't' void, which does not consume
+                     it) gets a directory each, and every row names its own in
+                     `dir_name`. With no retries and no voids this is the bin
+                     index minus one, which is what it always was.
     steps.csv          one row per step: pose, action, per-camera counts, timings
     rgb_<cam>.mp4      mp4v (avc1 is not available in this OpenCV build)
     labels_<cam>/*.png lossless uint8, 0=background 1=hand 2=object

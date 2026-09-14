@@ -482,6 +482,10 @@ def main() -> None:
                             params=ctx.eval_params, pin_table=ctx.pin_table)
         rows = m.pop("rows", []) or []
         n_fail = sum(1 for r in rows if not r.get("success"))
+        n_ep = write_episodes(run_root / f"{_fig_stem(args)}_episodes.csv",
+                              rows, iteration=i)
+        print(f"  [episodes] appended {n_ep} rows to "
+              f"{_fig_stem(args)}_episodes.csv")
         del runner
         if args.device != "cpu":
             import torch
@@ -512,6 +516,37 @@ def main() -> None:
         plot(run_root, log_path, args)
     else:
         print("\nnothing scored — no completed iterations found in state.json")
+
+
+def write_episodes(path: Path, rows, *, iteration: int) -> int:
+    """One CSV row per EPISODE, appended per iteration — see the Regrasp twin.
+    Phase 4 has no bin, so this is the scene, the outcome, and the commit."""
+    cols = ["iter", "scene_idx", "success", "grasped", "closed", "reason",
+            "close_step", "box_chance", "box_taken", "pos_err", "rot_err"]
+    new = not path.exists()
+    n = 0
+    with path.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        if new:
+            w.writeheader()
+        for r in rows:
+            def _f(k):
+                v = r.get(k)
+                return "" if v is None or v != v else round(float(v), 5)
+            w.writerow({
+                "iter": iteration, "scene_idx": int(r["scene_idx"]),
+                "success": int(bool(r.get("success"))),
+                "grasped": int(bool(r.get("grasped"))),
+                "closed": int(bool(r.get("closed"))),
+                "reason": r.get("reason", ""),
+                "close_step": int(r.get("close_step", -1)),
+                "box_chance": int(bool(r.get("box_chance",
+                                             r.get("opportunity", 0)))),
+                "box_taken": int(bool(r.get("box_taken"))),
+                "pos_err": _f("pos_err"), "rot_err": _f("rot_err"),
+            })
+            n += 1
+    return n
 
 
 def _report_iteration(m, row, eval_s) -> None:
@@ -561,6 +596,27 @@ _FAILURES = (("ff_grasp_miss", "closed, not secured", "tab:olive"),
              ("ff_timeout", "never closed", "tab:gray"))
 
 
+def _fig_stem(args) -> str:
+    """The basename both figures are written under.
+
+    DERIVED FROM `--out`, NOT FROM `--split`, and that is a bug fix. The figures
+    used to be named `<split>_eval.png` / `<split>_summary.png` regardless, so a
+    sweep writing `--out test144_log.csv` silently overwrote the figures of the
+    earlier `test_log.csv` sweep — and the sbatch's `--plot-only` re-render then
+    read `test_log.csv` (the file it was NOT given) and overwrote them a second
+    time with the older data. Both happened on the 144-scene runs: the console
+    said "wrote test_eval.png" while the CSV in hand was `test144_log.csv`.
+    """
+    out = getattr(args, "out", None)
+    if not out:
+        return str(args.split)
+    stem = Path(out).name
+    for suffix in ("_log.csv", ".csv"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
+
 def plot(run_root: Path, log_path: Path, args) -> None:
     """`<split>_eval.png` — the rate family against DAgger iteration.
 
@@ -584,7 +640,7 @@ def plot(run_root: Path, log_path: Path, args) -> None:
     if n == 1:
         print(f"[plot] {log_path.name} has ONE iteration, so every curve panel "
               f"is a single point and the stacked-area ones render blank. "
-              f"{args.split}_summary.png is the figure to read.")
+              f"{_fig_stem(args)}_summary.png is the figure to read.")
     it = num("iter")
     TAG = f"{args.split.upper()}: "
 
@@ -674,7 +730,7 @@ def plot(run_root: Path, log_path: Path, args) -> None:
                  f"   [{int(ns[-1]) if P._finite(ns) else '?'} scenes]",
                  fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.93])
-    out = run_root / f"{args.split}_eval.png"
+    out = run_root / f"{_fig_stem(args)}_eval.png"
     fig.savefig(out, dpi=140)
     plt.close(fig)
     print(f"wrote {out}")
@@ -844,7 +900,7 @@ def plot_summary(run_root: Path, num, n, args) -> None:
                  f"ckpt {_csv_cell(run_root, args, ITER, 'ckpt') or '?'}]",
                  fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.91])
-    out = run_root / f"{args.split}_summary.png"
+    out = run_root / f"{_fig_stem(args)}_summary.png"
     fig.savefig(out, dpi=140)
     plt.close(fig)
     print(f"wrote {out}")

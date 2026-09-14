@@ -315,6 +315,11 @@ def class_centroid(xyz: np.ndarray) -> Optional[np.ndarray]:
 class RegraspPolicy(m.Phase4Policy):
     """The regrasp policy behind my_policy_runner's adapter interface."""
 
+    # This is the policy --exp-bins exists for: one attempt per commanded
+    # direction. The base class is False, and its sessions are a count of
+    # uncommanded grasps instead — see --exp-attempts.
+    TAKES_COMMAND = True
+
     # --run / --policy-dir / --ckpt name nothing here: this policy is named by
     # --regrasp-run and loaded by `load` below, which ignores all three. Saying
     # so keeps them out of the startup banner, where they read as the policy
@@ -1093,6 +1098,15 @@ def main() -> None:
     # Checked for EVERY command in a session, here, before a camera opens: a
     # bad bin at position 3 must not surface after two recorded attempts.
     live = live_directions(axes, axes_meta.get("bins"))
+    # `--exp-mode` with no `--exp-bins` reaches here before my_policy_runner's
+    # own refusal does, and `list(None)` is a TypeError and a traceback where a
+    # sentence belongs. This policy is the one --exp-bins exists for, so the
+    # requirement is stated here rather than deferred.
+    if args.exp_mode and not args.exp_bins:
+        raise SystemExit(
+            "--exp-mode needs --exp-bins: this policy takes a direction per "
+            f"attempt. Live directions in this run: {', '.join(live)}, e.g. "
+            f"--exp-bins {','.join(live[:4])}")
     wanted = list(args.exp_bins) if args.exp_mode else [args.direction]
     bad = [b for b in wanted if b not in live]
     if bad:

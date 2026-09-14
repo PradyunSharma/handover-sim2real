@@ -192,7 +192,8 @@ rc=$?
 echo
 echo "=== plotting from $RUN_DIR/${SPLIT}_log.csv ==="
 python examples/eval_regrasp_testset.py \
-    --run-dir "$RUN_DIR" --split "$SPLIT" --plot-only || true
+    --run-dir "$RUN_DIR" --split "$SPLIT" --plot-only \
+    ${OUT:+--out "$OUT"} || true
 
 echo
 echo "scored: $(tail -n +2 "$RUN_DIR/${SPLIT}_log.csv" 2>/dev/null | wc -l) iteration(s)"

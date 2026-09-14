@@ -223,6 +223,95 @@ def _round_trip_and_lengths(root: Path) -> None:
           "the base frame, labels and action aligned")
 
 
+def _a_retried_bin_keeps_both_recordings(root: Path) -> None:
+    """Running one bin four times must leave four recordings, not one.
+
+    ExperimentSession is deliberate that a retry never erases the attempt it
+    repeats — the failed row stays, with its own `try` number, so the session's
+    success rate is over attempts and not over whichever try the operator chose
+    to keep. That promise was only half kept. attempts.csv had every row; the
+    directory under them was named from the BIN index, so all four tries opened
+    the same files "wb" and only the last survived.
+
+    Seen on a real session before this was fixed: four tries of +x, four rows,
+    one directory. Both keys that re-offer a bin hit it — 'r' and the 't' void,
+    which by design does not consume the attempt.
+    """
+    names = ["tripod"]
+    rigs = [_rig("tripod")]
+    rng = np.random.default_rng(11)
+    perc, fused = _Perc(names, rng), _fused(rng, names)
+    fields, spec = R.adapter_spec(types.SimpleNamespace())
+    rec = R.ExpRecorder(root, rigs, extra_fields=fields, arrays_spec=spec,
+                        manifest=R.build_manifest(_args(), rigs, None, "T5"))
+    # One bin, four tries: the exact shape of the session that lost its data.
+    tries = (("timeout", "fail"), ("close", "pass"),
+             ("user_stop", "void"), ("close", "pass"))
+    for k, (ending, verdict) in enumerate(tries, start=1):
+        rec.on_attempt_start({"attempt": 1, "n_attempts": 1, "try": k,
+                              "bin": "+x", "t_start": time.time(),
+                              "max_steps": 80, "session_id": "T5"})
+        _drive(rec, perc, fused, rng, 3 + k, names, pause=0.02)
+        rec.on_attempt_done({"attempt": 1, "bin": "+x", "ending": ending,
+                             "verdict": verdict, "steps": 3 + k,
+                             "elapsed_s": 1.0, "session_id": "T5",
+                             "n_attempts": 1, "try": k, "t_start": 0.0,
+                             "t_end": 1.0, "froze": False, "max_steps": 80,
+                             "t_verdict": 1.0})
+    rec.on_session_end({"session_id": "T5", "attempted": 1, "reason": "test"})
+    rec.close()
+
+    session = RD.load_session(root)
+    rows = session["attempts"]
+    dirs = sorted(d.name for d in root.glob("attempt_*") if d.is_dir())
+    print(f"  4 tries of one bin -> {len(rows)} rows in {len(dirs)} dirs: "
+          + ", ".join(dirs))
+    assert len(dirs) == 4, (
+        f"four tries of +x left {len(dirs)} director(ies) {dirs} — the later "
+        "tries overwrote the earlier ones, so the rows in attempts.csv point "
+        "at recordings that are no longer theirs")
+    assert len(rows) == 4, f"{len(rows)} rows read back, expected 4"
+
+    # Each row must own its directory, and own the RIGHT one: the step count is
+    # unique per try here, so a crossed mapping cannot pass by coincidence.
+    seen = set()
+    for row in rows:
+        name = row["dir_name"]
+        assert name not in seen, f"{name} is claimed by two rows"
+        seen.add(name)
+        want = 3 + int(row["try"])
+        got = len(session["steps"][name])
+        assert got == want, (
+            f"try {row['try']} says {want} steps but {name} holds {got} — the "
+            "row and the recording under it are not the same attempt")
+    print("  every row owns its own directory, matched by step count")
+
+    # And a plain session still numbers the way every session on disk already
+    # does, or this fix silently renames history.
+    plain = root.parent / (root.name + "_plain")
+    rec = R.ExpRecorder(plain, rigs, extra_fields=fields, arrays_spec=spec,
+                        manifest=R.build_manifest(_args(), rigs, None, "T6"))
+    for i in (1, 2, 3):
+        rec.on_attempt_start({"attempt": i, "n_attempts": 3, "try": 1,
+                              "bin": "+x", "t_start": time.time(),
+                              "max_steps": 80, "session_id": "T6"})
+        _drive(rec, perc, fused, rng, 3, names, pause=0.02)
+        rec.on_attempt_done({"attempt": i, "bin": "+x", "ending": "close",
+                             "verdict": "pass", "steps": 3, "elapsed_s": 1.0,
+                             "session_id": "T6", "n_attempts": 3, "try": 1,
+                             "t_start": 0.0, "t_end": 1.0, "froze": False,
+                             "max_steps": 80, "t_verdict": 1.0})
+    rec.on_session_end({"session_id": "T6", "attempted": 3, "reason": "test"})
+    rec.close()
+    for row in RD.load_session(plain)["attempts"]:
+        n = int(row["attempt"])
+        assert row["dir_name"] == f"attempt_{n - 1:03d}", (
+            f"attempt {n} landed in {row['dir_name']} — with no retries "
+            "the numbering must still be the bin index minus one, or every "
+            "session already on disk is renamed by this change")
+    print("  a session with no retries numbers exactly as it always did")
+
+
 def _reader_refuses_a_torn_session(root: Path) -> None:
     """A killed attempt must not read back as a smaller, valid session."""
     names = ["tripod"]
@@ -433,6 +522,8 @@ def main() -> None:
         _round_trip_and_lengths(root / "s0")
         print("\nrecord strides")
         _pc_stride_is_five_and_enforced(root / "s4")
+        print("\nretried bin")
+        _a_retried_bin_keeps_both_recordings(root / "s5")
         print("\ntorn session")
         _reader_refuses_a_torn_session(root / "s3")
         print("\nbackpressure")

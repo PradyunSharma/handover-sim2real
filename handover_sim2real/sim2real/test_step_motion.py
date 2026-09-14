@@ -998,6 +998,191 @@ def _off_axis_motion_is_not_under_travel() -> None:
           f"(gain {on.g:.2f})")
 
 
+def _rate_lead_cannot_ring() -> None:
+    """In `--control rate` the lead IS the loop gain, so it has to leave it damped.
+
+    The two guards above bound how large the lead can GET. Neither makes the
+    lead that remains safe, and hardware still showed a smaller oscillation in
+    the same place afterwards. That one is not a bug in any predicate — it is
+    what settle's cap does against a perfectly well-behaved arm.
+
+    `--control rate` never checks arrival, by design, so it is a bare
+    proportional loop: each tick commands (target - now) * (1 + r), the arm
+    executes a fraction g of it within the dwell, and the error left over
+    scales by 1 - g*(1 + r) every tick. On this arm g measures 0.44 to 0.85.
+    At settle's r = 1.25 that is -0.91 for a GOOD arm: the error flips sign
+    every tick and sheds 9% of itself per flip, which at 6.7 Hz is a second of
+    visible oscillation per correction — and near the object the policy
+    re-injects error faster than that, so it never dies down.
+
+    The two halves are tested separately because they fail separately: the
+    arithmetic says the cap is in the damped interval at BOTH ends of the
+    measured gain band, and the simulation says the loop built on it actually
+    stops reversing. Neither implies the other — a cap can be in the interval
+    and still ring if something else adds lead on top.
+    """
+    print("\n-- fixed-rate lead is the loop gain -------------------------")
+
+    # --- 1. the interval, at both ends of the measured band ------------------
+    # Both bounds are tight, which is what makes this a derivation rather than
+    # a tuned constant: r must be small enough that a STIFF-reading arm does
+    # not overshoot (g = 0.85) and large enough that a slack one still makes
+    # progress (g = 0.44).
+    for g in (0.44, 0.71, 0.85):
+        for r, cap in ((m.RATE_MAX_LEAD_RATIO, "rate"),
+                       (m.MAX_LEAD_TRAVEL_RATIO, "settle")):
+            resid = 1.0 - g * (1.0 + r)
+            print(f"  g={g:.2f}  r={r:<5.2f} ({cap:6s}) -> e_next/e = {resid:+.2f}")
+        assert abs(1.0 - g * (1.0 + m.RATE_MAX_LEAD_RATIO)) <= 0.5, (
+            f"at g={g:.2f} the rate cap leaves the error at "
+            f"{1.0 - g * (1.0 + m.RATE_MAX_LEAD_RATIO):+.2f} of itself per tick "
+            "— it must at least halve, or the loop rings at the control rate")
+    assert abs(1.0 - 0.85 * (1.0 + m.MAX_LEAD_TRAVEL_RATIO)) > 0.5, (
+        "settle's cap is now inside the damped interval too, so this test is "
+        "asserting nothing — re-derive it against whatever MAX_LEAD_TRAVEL_RATIO "
+        "has become")
+
+    # A short step must not be handed a LARGER effective ratio than a long one,
+    # which is what the fixed stall allowance did: the shorter the move the more
+    # the constant term dominated, and near the object every move is short.
+    d = m.DroopCompensator(enabled=True)
+    d.s, d.s_scale = 0.171, 0.030          # the estimate hardware actually reached
+    for step_mm in (25, 10, 5, 2):
+        step = np.array([step_mm / 1000.0, 0.0, 0.0])
+        lead = float(np.linalg.norm(
+            d.lead_for(step, max_ratio=m.RATE_MAX_LEAD_RATIO,
+                       stall_allowance=False)))
+        was = float(np.linalg.norm(d.lead_for(step)))
+        print(f"  {step_mm:2d} mm step: lead {lead*1000:5.2f} mm "
+              f"(r={lead/(step_mm/1000.0):.2f})   was {was*1000:5.1f} mm "
+              f"(r={was/(step_mm/1000.0):.2f})")
+        assert lead <= m.RATE_MAX_LEAD_RATIO * step_mm / 1000.0 + 1e-12
+
+    # --- 2. the loop built on it -------------------------------------------
+    def approach(ratio: float) -> tuple[int, float]:
+        """Close on a stationary object with `ratio` as the lead cap.
+
+        Returns (reversals, final error). REVERSALS is the one that matters
+        here: an over-led loop still converges — the residual is under 1 in
+        magnitude, so it is stable — it just alternates its way in, and that
+        alternation at 6.7 Hz is what an operator calls shaking. The endpoint
+        cannot see it. (Leaving the object again once ARRIVED is a different
+        mechanism and is tested separately, in _arrival_is_not_a_stall.)
+        """
+        plant = Plant([0.45, 0.0, 0.50], gain=1.0, stall_m=0.0, seed=7)
+        h = Harness(plant)
+        real_time, m.time = m.time, h
+        was_ratio, m.RATE_MAX_LEAD_RATIO = m.RATE_MAX_LEAD_RATIO, ratio
+        axis = np.array([0.0, 0.0, -1.0])
+        obj = plant.p + axis * 0.060
+        try:
+            droop = m.DroopCompensator(enabled=True)
+            # The estimate hardware actually reached: 171 mm of lead learned at
+            # a 30 mm scale. Starting clean would hide the cap entirely, since
+            # an unpoisoned estimator never asks for enough lead to reach it.
+            droop.s, droop.s_scale = 0.171, 0.030
+            rc = m.RateCommander(h, m.RATE_CONTROL_HZ, droop)
+            seq = 0
+            for _ in range(24):
+                # What the policy does: a delta toward the object, clamped to
+                # one step. Near the object those deltas fall to fractions of a
+                # millimetre, which is the regime both bugs live in.
+                err = obj - plant.p
+                n = float(np.linalg.norm(err))
+                step = err if n <= m.MAX_STEP_TRANS_M else err / n * m.MAX_STEP_TRANS_M
+                seq, _ = rc.command(_pose(plant.p + step), seq)
+        finally:
+            m.time = real_time
+            m.RATE_MAX_LEAD_RATIO = was_ratio
+            m.current_msg = None
+        return (h.reversals(axis),
+                float(np.linalg.norm(obj - plant.p)))
+
+    rings, ring_err = approach(m.MAX_LEAD_TRAVEL_RATIO)
+    calm, calm_err = approach(m.RATE_MAX_LEAD_RATIO)
+    for name, r, rev, err in (("settle cap", m.MAX_LEAD_TRAVEL_RATIO,
+                               rings, ring_err),
+                              ("rate cap", m.RATE_MAX_LEAD_RATIO,
+                               calm, calm_err)):
+        print(f"  60 mm approach @ r={r:.2f} ({name:10s}): {rev:2d} reversals, "
+              f"{err*1000:5.2f} mm out")
+    assert rings >= 4, (
+        f"the old cap rang only {rings} times in simulation, so this test "
+        "cannot show the new one fixed anything — the plant is too forgiving "
+        "to model the arm")
+    assert calm <= 2, (
+        f"the arm reversed {calm} times closing on a stationary object, "
+        f"against {rings} for the old cap — the lead is still overshooting "
+        "enough to alternate, which is what the shaking looks like")
+    assert calm_err < 0.001, (
+        f"{calm_err*1000:.1f} mm short after 24 ticks — the cap traded an "
+        "oscillation for a loop that no longer closes")
+
+
+def _arrival_is_not_a_stall() -> None:
+    """Break-away must fire on an arm that REFUSED to move, not one that arrived.
+
+    `_reversal_is_not_a_stall` fixed one half of this predicate: "did it move"
+    is a distance, not a projection onto a stale heading. This is the other
+    half, and it survived that fix because it is about the other operand. An
+    arm sitting still because the policy asked it for 30 microns is
+    indistinguishable — to `moved` alone — from an arm sitting still because it
+    is jammed. The first needs nothing; the second needs 10 mm.
+
+    Getting it wrong is invisible until the loop is damped enough to converge,
+    which is why it only surfaced after RATE_MAX_LEAD_RATIO: an arm that never
+    settles never asks for a sub-millimetre delta, so the case never arises.
+    Once it does, every arrival earns a break-away and the gripper is kicked
+    7 mm back off the object, reconverges, and is kicked again.
+
+    Both directions are asserted, because the cheap fix — never break away — is
+    a deadlock, and _fixed_rate_tracks_and_never_deadlocks depends on the
+    opposite behaviour for its 4 mm step against a 12 mm dead band.
+    """
+    print("\n-- arrival vs stall -----------------------------------------")
+
+    def hold(target_mm: float, stall_mm: float) -> tuple[float, float]:
+        """Command the same `target_mm` step for 12 ticks. -> (lead, travelled)"""
+        plant = Plant([0.45, 0.0, 0.50], gain=0.9, stall_m=stall_mm / 1000.0,
+                      seed=3)
+        h = Harness(plant)
+        real_time, m.time = m.time, h
+        start = plant.p.copy()
+        try:
+            rc = m.RateCommander(h, m.RATE_CONTROL_HZ,
+                                 m.DroopCompensator(enabled=True))
+            axis = np.array([0.0, 0.0, -1.0])
+            seq = 0
+            for _ in range(12):
+                seq, _ = rc.command(_pose(plant.p + axis * (target_mm / 1000.0)),
+                                    seq)
+            return rc._stuck_lead, float(np.linalg.norm(plant.p - start))
+        finally:
+            m.time = real_time
+            m.current_msg = None
+
+    # Arrived: the policy is asking for less than the loop's own stall floor.
+    # Nothing was requested, so nothing was refused.
+    lead, moved = hold(0.03, 0.0)
+    print(f"  asked 0.03 mm, arm free       -> lead {lead*1000:5.1f} mm, "
+          f"drifted {moved*1000:.2f} mm")
+    assert lead == 0.0, (
+        f"break-away accrued {lead*1000:.0f} mm against an arm that was asked "
+        "for 30 microns and delivered them — an arrival was read as a stall, "
+        "which kicks the gripper off the object it had just reached")
+    assert moved < 0.002, (
+        f"the arm wandered {moved*1000:.1f} mm while being told to hold still")
+
+    # Jammed: a real request, genuinely refused. This is what break-away is for
+    # and it has to keep working, or the fix above is a deadlock.
+    lead, moved = hold(4.0, 12.0)
+    print(f"  asked 4.00 mm, 12 mm stall    -> lead {lead*1000:5.1f} mm, "
+          f"travelled {moved*1000:.2f} mm")
+    assert moved > 0.002, (
+        f"a 4 mm step against a 12 mm dead band moved {moved*1000:.2f} mm in "
+        "12 ticks — break-away no longer breaks away, which is a deadlock")
+
+
 def _homing_is_continuous() -> None:
     """Streamed homing must land, and must not stop on the way.
 
@@ -1307,19 +1492,19 @@ def _exp_session_walks_the_sequence() -> None:
     assert exp.phase == "IDLE" and exp.next_label == "+x"
 
     # 1/4 — the policy closes, the operator passes it.
-    assert exp.start_requested() == "+x"
+    assert exp.start_requested() and exp.next_label == "+x"
     exp.attempt_started(t_start=100.0)
     assert exp.phase == "RUNNING"
     assert "f" in m.STOP_KEYS, (
         "'f' must be a stop key while an attempt runs, or it cannot interrupt "
         "a settle() and 'stop the robot right there' is up to 3 s late")
-    assert exp.start_requested() is None, "'s' restarted a running attempt"
+    assert not exp.start_requested(), "'s' restarted a running attempt"
     exp.attempt_ended("close", steps=9, verdict=None, t_end=104.5)
     assert exp.phase == "VERDICT" and exp.cursor == 0
     assert "f" not in m.STOP_KEYS, (
         "'f' is still a stop key during the verdict wait — an 'f' verdict "
         "would abort the arm carrying the object home")
-    assert exp.start_requested() is None, "'s' skipped an owed verdict"
+    assert not exp.start_requested(), "'s' skipped an owed verdict"
     assert exp.verdict_given("pass") is True, (
         "a close must report the fingers as HOLDING, which is what gates the "
         "release")
@@ -1327,7 +1512,7 @@ def _exp_session_walks_the_sequence() -> None:
     assert exp.rows[-1]["elapsed_s"] == 4.5, exp.rows[-1]["elapsed_s"]
 
     # 2/4 — the operator fails it mid-flight. Frozen, and it counts.
-    assert exp.start_requested() == "+y"
+    assert exp.start_requested() and exp.next_label == "+y"
     exp.attempt_started(t_start=200.0)
     exp.attempt_ended("policy_fail", steps=7, verdict="fail", t_end=206.25,
                       froze=True)
@@ -1337,7 +1522,7 @@ def _exp_session_walks_the_sequence() -> None:
     assert r["elapsed_s"] == 6.25, r["elapsed_s"]
 
     # 3/4 — it runs out of steps without ever closing.
-    assert exp.start_requested() == "-y"
+    assert exp.start_requested() and exp.next_label == "-y"
     exp.attempt_started(t_start=300.0)
     exp.attempt_ended("timeout", steps=50, verdict="fail", t_end=330.0,
                       froze=True)
@@ -1345,7 +1530,7 @@ def _exp_session_walks_the_sequence() -> None:
     assert exp.rows[-1]["steps"] == 50
 
     # 4/4 — 't' VOIDS rather than fails, and the bin comes back.
-    assert exp.start_requested() == "+z"
+    assert exp.start_requested() and exp.next_label == "+z"
     # A void ends at wall-clock now(), so this one starts there too, or the
     # printed elapsed reads as fifty years.
     exp.attempt_started()
@@ -1354,7 +1539,8 @@ def _exp_session_walks_the_sequence() -> None:
         f"'t' consumed the attempt (cursor {exp.cursor}) — a user stop is not "
         "a policy failure and the bin must be re-offered")
     assert exp.next_label == "+z" and exp.rows[-1]["verdict"] == "void"
-    assert exp.start_requested() == "+z", "the voided bin was not re-offered"
+    assert exp.start_requested() and exp.next_label == "+z", (
+        "the voided bin was not re-offered")
     t = exp.attempt_started() and None
     assert exp.cur["try"] == 2, "the retry was not counted"
     exp.attempt_ended("close", steps=11, verdict=None,
@@ -1362,7 +1548,7 @@ def _exp_session_walks_the_sequence() -> None:
     exp.verdict_given("pass")
 
     assert exp.phase == "DONE", f"phase {exp.phase} after the last verdict"
-    assert exp.start_requested() is None, "'s' started something after DONE"
+    assert not exp.start_requested(), "'s' started something after DONE"
     assert exp.tally() == "2 pass / 2 fail / 1 void", exp.tally()
     assert len(exp.rows) == 5, f"{len(exp.rows)} rows for 4 bins and 1 retry"
     summary = exp.close("user quit")
@@ -1370,6 +1556,84 @@ def _exp_session_walks_the_sequence() -> None:
     assert "f" not in m.STOP_KEYS, "close() left 'f' armed as a stop key"
     print(f"  4 bins, 5 attempts, {exp.tally()}; every phase and cursor as "
           "specified")
+
+
+def _exp_session_without_commands() -> None:
+    """The same sequencer with NO command per attempt.
+
+    The plain Phase-4 policy grasps a held object however it likes, so its
+    session is a COUNT of attempts rather than a list of directions. Every
+    label is then None, and that is the thing to be careful about: `next_label`
+    cannot double as "is there another attempt", because it is None for a
+    session that has barely started as well as for one that is finished. A
+    session that reported DONE on its first 's' would be silent and useless.
+
+    Everything else has to be identical — the phases, the retry, the void not
+    consuming an attempt, the verdicts — because it IS the same code. What may
+    differ is only how an attempt is named in the terminal.
+    """
+    exp = m.ExperimentSession([None] * 3, max_steps=80)
+    assert not exp.commanded and exp.noun == "attempt"
+    assert exp.next_label is None and exp.has_next, (
+        "an uncommanded session must not look finished before it starts — "
+        "this is exactly what testing `next_label` for None would do")
+
+    # 1/3 closes and passes.
+    assert exp.start_requested(), "'s' was refused on a fresh session"
+    exp.attempt_started(t_start=100.0)
+    assert exp.phase == "RUNNING"
+    exp.attempt_ended("close", steps=12, t_end=104.0)
+    assert exp.phase == "VERDICT"
+    assert not exp.start_requested(), "'s' skipped an owed verdict"
+    exp.verdict_given("pass")
+    assert exp.phase == "BETWEEN" and exp.cursor == 1
+
+    # 2/3 times out, is retried, and the retry KEEPS the row it repeats.
+    assert exp.start_requested()
+    exp.attempt_started(t_start=110.0)
+    exp.attempt_ended("timeout", steps=80, verdict="fail", t_end=122.0)
+    assert exp.cursor == 2 and len(exp.rows) == 2
+    assert exp.retry_requested(), "'r' was refused after a fail"
+    assert exp.cursor == 1 and len(exp.rows) == 2, (
+        "the retry erased the attempt it repeats")
+
+    # 't' voids without consuming, exactly as in a commanded session.
+    assert exp.start_requested()
+    exp.attempt_started(t_start=130.0)
+    exp.attempt_voided(steps=4)
+    assert exp.cursor == 1, "a void consumed an attempt"
+    assert exp.start_requested()
+    exp.attempt_started(t_start=140.0)
+    exp.attempt_ended("close", steps=9, t_end=144.0)
+    exp.verdict_given("pass")
+
+    # 3/3, then the session ends.
+    assert exp.start_requested()
+    exp.attempt_started(t_start=150.0)
+    exp.attempt_ended("close", steps=7, t_end=153.0)
+    exp.verdict_given("pass")
+    assert exp.phase == "DONE" and not exp.has_next
+    assert not exp.start_requested(), "'s' started something after DONE"
+    assert exp.tally() == "3 pass / 1 fail / 1 void", exp.tally()
+
+    # The rows carry an EMPTY bin, not an invented one. attempts.csv has that
+    # column either way, and a placeholder there would read like a command the
+    # policy was actually given.
+    assert all(r["bin"] is None for r in exp.rows), (
+        "an uncommanded attempt was given a label — attempts.csv would claim "
+        "the policy was commanded")
+
+    # Nothing may crash on the None, and nothing may print it. Every operator
+    # string goes through _say/next_line/status_line, so walking them is the
+    # test: "None" reaching the terminal is the failure this catches.
+    texts = [exp.next_line(), exp.status_line(3, 80), exp.key_line(),
+             exp.tag(exp.rows[0]), exp._next_tag()]
+    for t in texts:
+        assert "None" not in str(t), f"a None label reached the operator: {t!r}"
+    summary = exp.close("user quit")
+    assert summary["attempted"] == 3 and len(summary["rows"]) == 5
+    print(f"  3 uncommanded attempts, 5 rows, {exp.tally()}; "
+          "None never reaches the terminal")
 
 
 def _exp_abandoned_attempt_is_still_written() -> None:
@@ -1498,6 +1762,92 @@ def _exp_records_the_jaw_closure() -> None:
             f"{k} is set on the row but missing from ATTEMPT_FIELDS, so "
             "csv.DictWriter would drop it without a word")
     print("  jaw closure recorded at the end, the verdict and as a running min")
+
+
+def _exp_retry_reoffers_without_erasing() -> None:
+    """'r' re-offers the bin that just finished, and keeps the row it repeats.
+
+    THE POINT OF A RETRY IS THAT IT COSTS AN ATTEMPT. A failed row that
+    disappeared when the operator pressed 'r' would turn the session's success
+    rate into a highlight reel: every bin would eventually read 1/1. So the
+    cursor rolls back, `try` increments, and BOTH rows survive — the same rule
+    't' already follows, for the same reason.
+
+    The refusals matter as much. 'r' during an attempt has nothing to retry
+    yet; 'r' with a verdict owed would advance past an unjudged grasp; and 'r'
+    after a VOID is a no-op, because 't' never consumed the bin in the first
+    place — offering it would be an action that does nothing.
+    """
+    exp = m.ExperimentSession(["+x", "+y"], max_steps=50)
+
+    assert exp.retry_requested() is False, "'r' retried a session with no rows"
+
+    exp.start_requested()
+    exp.attempt_started(t_start=100.0)
+    assert exp.retry_requested() is False, "'r' was accepted mid-attempt"
+    assert exp.phase == "RUNNING" and exp.cursor == 0
+
+    # A timeout self-judges, so the cursor has already advanced when 'r' lands.
+    exp.attempt_ended("timeout", steps=50, verdict="fail", t_end=130.0,
+                      froze=True)
+    assert exp.cursor == 1 and exp.next_label == "+y"
+    assert exp.retry_requested() is True
+    assert exp.cursor == 0 and exp.next_label == "+x", (
+        f"'r' left the cursor at {exp.cursor} — the next 's' would start +y")
+    assert len(exp.rows) == 1 and exp.rows[0]["verdict"] == "fail", (
+        "the failed attempt was erased by the retry")
+
+    exp.start_requested()
+    exp.attempt_started(t_start=200.0)
+    assert exp.cur["try"] == 2, f"retry ran as try {exp.cur['try']}"
+    # Now the 'f' path, which also self-judges.
+    exp.attempt_ended("policy_fail", steps=8, verdict="fail", t_end=204.0,
+                      froze=True)
+    assert exp.cursor == 1
+    assert exp.retry_requested() is True and exp.cursor == 0
+    assert len(exp.rows) == 2, "both attempts must survive two retries"
+
+    # A void already re-offers the bin, so 'r' must decline rather than pretend.
+    exp.start_requested()
+    exp.attempt_started()
+    exp.attempt_voided(steps=3)
+    assert exp.cursor == 0
+    assert exp.retry_requested() is False, (
+        "'r' after 't' claimed to do something; the bin was never consumed")
+    assert exp.cursor == 0
+
+    # A verdict owed outranks a retry.
+    exp.start_requested()
+    exp.attempt_started()
+    exp.attempt_ended("close", steps=9, verdict=None)
+    assert exp.phase == "VERDICT"
+    assert exp.retry_requested() is False, "'r' skipped an owed verdict"
+    assert exp.phase == "VERDICT" and exp.cursor == 0
+
+    # ... and after the session is DONE, 'r' still reopens the last bin.
+    exp.verdict_given("pass")
+    exp.start_requested(); exp.attempt_started()
+    exp.attempt_ended("timeout", steps=50, verdict="fail")
+    assert exp.phase == "DONE" and exp.next_label is None
+    assert exp.retry_requested() is True
+    assert exp.phase == "BETWEEN" and exp.next_label == "+y"
+
+    # The dispatch order is the other half: an "r s" batch must roll the cursor
+    # back BEFORE 's' reads which bin is next, or the retry starts the wrong one.
+    src = _src("my_policy_runner.py")
+    main = next(n for n in ast.walk(src)
+                if isinstance(n, ast.FunctionDef) and n.name == "main")
+    line = {}
+    for node in ast.walk(main):
+        if isinstance(node, ast.Compare) and isinstance(node.ops[0], ast.In):
+            lit = getattr(node.left, "value", None)
+            if lit in ("r", "s", "f", "p") and lit not in line:
+                line[lit] = node.lineno
+    assert line["r"] < line["s"], (
+        f"'r' is dispatched at line {line['r']}, after 's' at {line['s']} — an "
+        "'r s' batch would start the next bin instead of retrying")
+    print("  'r' re-offers the bin, keeps the row, and is refused when there "
+          "is nothing to retry")
 
 
 def _exp_keys_cannot_be_outranked() -> None:
@@ -1668,6 +2018,8 @@ def main() -> None:
     _fixed_rate_tracks_and_never_deadlocks()
     _reversal_is_not_a_stall()
     _off_axis_motion_is_not_under_travel()
+    _rate_lead_cannot_ring()
+    _arrival_is_not_a_stall()
     print("\nhoming motion")
     _homing_is_continuous()
     _second_home_does_not_hunt()
@@ -1677,8 +2029,10 @@ def main() -> None:
     _auto_home_cannot_outrank_a_key()
     print("\nexperiment mode")
     _exp_session_walks_the_sequence()
+    _exp_session_without_commands()
     _exp_abandoned_attempt_is_still_written()
     _exp_records_the_jaw_closure()
+    _exp_retry_reoffers_without_erasing()
     _exp_keys_cannot_be_outranked()
     if args.sweep:
         _sweep()

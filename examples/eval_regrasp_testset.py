@@ -206,6 +206,8 @@ TEST_FIELDS = (["iter", "run_dir", "ckpt", "split", "num_scenes", "num_episodes"
                # would silently break every comparison against runs 16-20.
                + [f"adaptive_retry_at_{k}" for k in range(1, len(_D.BINS) + 1)]
                + [f"adaptive_retry_n_{k}" for k in range(1, len(_D.BINS) + 1)]
+               + [f"adaptive_retry_all_at_{k}" for k in range(1, len(_D.BINS) + 1)]
+               + [f"adaptive_retry_all_n_{k}" for k in range(1, len(_D.BINS) + 1)]
                + ["rank_mode", "rank_order", "rank_order_idx",
                   "rank_seq_requested", "rank_stable_frac", "rank_reorders",
                   "mean_attempts_indep", "solved_rate_indep",
@@ -512,6 +514,76 @@ def run_independent(ctx, runner, scenes, *, ranker, allowed, full_coverage,
     return rows, ladders, attempts, global_orders
 
 
+def write_episodes(path: Path, rows, ladders, *, iteration: int,
+                   d_rule=None) -> int:
+    """One CSV row per EPISODE — the thing the aggregate cannot answer from.
+
+    `<stem>_episodes.csv`, appended per iteration. The aggregate log carries
+    per-bin fractions but not their cross-tabulation, so a question like "of the
+    scenes no direction solved, what were the failures" — 8 scenes, 32 episodes
+    on run 19's 143-scene sweep — could not be answered from what was saved, and
+    the rows that could answer it were discarded with `m.pop("rows")`. 572 rows
+    at ~15 fields is a few tens of kilobytes; there is no reason to throw them
+    away.
+
+    `dir_err` and `bin_realized` are derived here exactly as `_dir_block` derives
+    them (the row's own `d_achieved` first, the rule's recomputation second,
+    then `from_world` + `bin_of` in the row's anchor frame), so a per-episode
+    value and the per-bin mean it contributes to cannot disagree.
+    """
+    from handover_sim2real.regrasp import directions as _D2
+    cols = ["iter", "scene_idx", "bin", "bin_idx", "slot", "in_table",
+            "ladder_pos", "success", "grasped", "closed", "reason",
+            "close_step", "box_chance", "box_taken", "dir_err",
+            "bin_realized", "pos_err", "rot_err"]
+    new = not path.exists()
+    n = 0
+    with path.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        if new:
+            w.writeheader()
+        for r in rows:
+            sc, b = int(r["scene_idx"]), int(r.get("bin_idx", -1))
+            order = ladders.get(sc, [])
+            de, rb = float("nan"), -1
+            d_cmd, ee, c = r.get("d_world"), r.get("ee_final"), r.get("centroid_world")
+            if d_cmd is not None and ee is not None:
+                ach = r.get("d_achieved")
+                if ach is None and d_rule is not None:
+                    ach = d_rule.of(np.asarray(ee),
+                                    None if c is None else np.asarray(c))
+                if ach is not None and float(np.linalg.norm(ach)) >= _D2.D_ZERO_EPS:
+                    de = float(_D2.angle_between(d_cmd, np.asarray(ach)))
+                    R = r.get("anchor_R")
+                    if R is not None:
+                        rb = int(_D2.bin_of(_D2.from_world(np.asarray(ach),
+                                                            np.asarray(R))))
+            w.writerow({
+                "iter": iteration, "scene_idx": sc,
+                "bin": _D2.BIN_SHORT[b] if b >= 0 else "",
+                "bin_idx": b, "slot": int(r.get("grasp_idx", -1)),
+                "in_table": int(r.get("in_table", 1)),
+                "ladder_pos": (order.index(b) if b in order else -1),
+                "success": int(bool(r.get("success"))),
+                "grasped": int(bool(r.get("grasped"))),
+                "closed": int(bool(r.get("closed"))),
+                "reason": r.get("reason", ""),
+                "close_step": int(r.get("close_step", -1)),
+                "box_chance": int(bool(r.get("box_chance"))),
+                "box_taken": int(bool(r.get("box_taken"))),
+                "dir_err": "" if de != de else round(de, 3),
+                "bin_realized": rb,
+                "pos_err": ("" if r.get("pos_err") is None
+                            or r["pos_err"] != r["pos_err"]
+                            else round(float(r["pos_err"]), 5)),
+                "rot_err": ("" if r.get("rot_err") is None
+                            or r["rot_err"] != r["rot_err"]
+                            else round(float(r["rot_err"]), 4)),
+            })
+            n += 1
+    return n
+
+
 def adaptive_metrics(rows, ladders, attempts, *, ranker, stop_on_success,
                      global_orders=None):
     """`adaptive_retry_at_k` and friends — the ladder's own reduction.
@@ -539,11 +611,30 @@ def adaptive_metrics(rows, ladders, attempts, *, ranker, stop_on_success,
     scenes that went best. `adaptive_retry_n_k` carries how many scenes actually
     offered k rungs.
     """
-    by_scene = {}
-    for r in rows:
-        b = int(r.get("bin_idx", -1))
-        if b >= 0:
-            by_scene.setdefault(int(r["scene_idx"]), {})[b] = bool(r["success"])
+    # TWO POPULATIONS, AND MIXING THEM IS THE TRAP THIS GUARDS AGAINST.
+    # `_regrasp_metrics` computes `retry_at_k` over IN-TABLE rows only, so it is
+    # the 129 s0-test scenes that demonstrate at least one bin, and a scene
+    # lacking the ladder's k-th rung contributes a miss. Under
+    # `--full-bin-coverage` every scene carries all four bins, so an adaptive
+    # reduction over ALL rows gives each scene four real rungs while the fixed
+    # ladder still counts only demonstrated pairs — measured on the 143-scene
+    # run, `retry_n_k` 94/77/50/40 against 143/143/143/143. Reading those two
+    # curves against each other would credit the ranker with the coverage.
+    #
+    # So `adaptive_retry_at_k` is computed over the SAME in-table rows the fixed
+    # ladder uses, and the all-scenes version is reported separately under its
+    # own name. The comparison the figures draw is then like for like.
+    def _by_scene(rs):
+        out = {}
+        for r in rs:
+            b = int(r.get("bin_idx", -1))
+            if b >= 0:
+                out.setdefault(int(r["scene_idx"]), {})[b] = bool(r["success"])
+        return out
+
+    in_table = [r for r in rows if int(r.get("in_table", 1)) == 1]
+    by_scene_all = _by_scene(rows)
+    by_scene = _by_scene(in_table)
     n_scenes = max(len(by_scene), 1)
     out = {}
     for k in range(1, len(_D.BINS) + 1):
@@ -562,6 +653,15 @@ def adaptive_metrics(rows, ladders, attempts, *, ranker, stop_on_success,
                 hits += 1
         out[f"adaptive_retry_at_{k}"] = hits / n_scenes
         out[f"adaptive_retry_n_{k}"] = deep
+        # ...and the same over EVERY evaluated scene, off-table rows included.
+        # This is the deployment question — the ladder commands a direction
+        # BECAUSE the last one failed, not because a demo exists — and it is not
+        # comparable with `retry_at_k`, which is why it has its own name.
+        na = max(len(by_scene_all), 1)
+        ha = sum(1 for sc, per in by_scene_all.items()
+                 if any(per[b] for b in ladders.get(int(sc), [])[:k] if b in per))
+        out[f"adaptive_retry_all_at_{k}"] = ha / na
+        out[f"adaptive_retry_all_n_{k}"] = na
     # OVER THE UNRESTRICTED ORDER, not the per-scene one — see `run_independent`.
     # Falls back to the per-scene ladders only when a caller did not supply it,
     # which cannot happen from `main` and keeps the signature usable in a test.
@@ -711,6 +811,27 @@ def _report_iteration(m, adaptive, chained, args, *, eval_s, ranker, bins):
                          for k in range(1, args.max_attempts + 1)))
 
 
+def _fig_stem(args) -> str:
+    """The basename both figures are written under.
+
+    DERIVED FROM `--out`, NOT FROM `--split`, and that is a bug fix. The figures
+    used to be named `<split>_eval.png` / `<split>_summary.png` regardless, so a
+    sweep writing `--out test144_log.csv` silently overwrote the figures of the
+    earlier `test_log.csv` sweep — and the sbatch's `--plot-only` re-render then
+    read `test_log.csv` (the file it was NOT given) and overwrote them a second
+    time with the older data. Both happened on the 144-scene runs: the console
+    said "wrote test_eval.png" while the CSV in hand was `test144_log.csv`.
+    """
+    out = getattr(args, "out", None)
+    if not out:
+        return str(args.split)
+    stem = Path(out).name
+    for suffix in ("_log.csv", ".csv"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
+
 def plot(run_root: Path, log_path: Path, args) -> None:
     """`<split>_eval.png` — the conditioning figure plus the per-bin diagnostics.
 
@@ -760,7 +881,7 @@ def plot(run_root: Path, log_path: Path, args) -> None:
         # letting four blank panels imply it.
         print(f"[plot] {log_path.name} has ONE iteration, so every curve panel "
               f"is a single point and the stacked-area ones render blank. "
-              f"{args.split}_summary.png is the figure to read.")
+              f"{_fig_stem(args)}_summary.png is the figure to read.")
     it = num("iter")
     ctx = P._Ctx(num, it, args, "grasp")
     bins = P._bins_to_plot(num)
@@ -804,7 +925,7 @@ def plot(run_root: Path, log_path: Path, args) -> None:
                  f"   [{int(num('num_scenes')[-1]) if P._finite(num('num_scenes')) else '?'} scenes]",
                  fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 1 - 0.03 / nrow * 2])
-    out = run_root / f"{args.split}_eval.png"
+    out = run_root / f"{_fig_stem(args)}_eval.png"
     fig.savefig(out, dpi=140)
     plt.close(fig)
     print(f"wrote {out}")
@@ -1067,7 +1188,7 @@ def plot_summary(run_root: Path, num, n, args, bins) -> None:
         f"[{int(at('num_scenes', 0))} scenes, {int(at('num_episodes', 0))} "
         f"episodes]{ladder}", fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.93])
-    out = run_root / f"{args.split}_summary.png"
+    out = run_root / f"{_fig_stem(args)}_summary.png"
     fig.savefig(out, dpi=140)
     plt.close(fig)
     print(f"wrote {out}")
@@ -1368,6 +1489,11 @@ def main() -> None:
         m = aggregate_eval_rows(rows, ctx.eval_params,
                                 eval_num_grasps(ctx.pin_table))
         m.pop("rows", None)
+        n_ep = write_episodes(
+            run_root / f"{_fig_stem(args)}_episodes.csv", rows, ladders,
+            iteration=i, d_rule=getattr(ctx.eval_params, "d_rule", None))
+        print(f"  [episodes] appended {n_ep} rows to "
+              f"{_fig_stem(args)}_episodes.csv")
         adaptive = adaptive_metrics(rows, ladders, attempts, ranker=it_ranker,
                                     stop_on_success=args.stop_on_success,
                                     global_orders=gorders)

@@ -39,10 +39,26 @@ def load_session(root) -> dict:
     ap = root / "attempts.csv"
     if ap.exists():
         rows = list(csv.DictReader(ap.open()))
-    by_dir = {r["dir_name"]: r for r in rows if r.get("dir_name")}
+    # TWO ROWS POINTING AT ONE DIRECTORY IS DATA LOSS, NOT A DUPLICATE KEY.
+    # Built as a dict comprehension this silently kept the last row and dropped
+    # the others, so a session recorded before attempt directories were named by
+    # run order reads back as if the earlier tries never existed — which is
+    # exactly the case where you most want to be told. The recorder cannot
+    # produce this any more; sessions already on disk still can.
+    by_dir: dict[str, dict] = {}
+    collisions: dict[str, int] = {}
+    for r in rows:
+        name = r.get("dir_name")
+        if not name:
+            continue
+        if name in by_dir:
+            collisions[name] = collisions.get(name, 1) + 1
+        by_dir[name] = r
 
     dirs = sorted(d for d in root.glob("attempt_*") if d.is_dir())
-    problems = []
+    problems = [f"{name}: {n} attempts.csv rows name this one directory, so "
+                f"only the last of them still has its recording on disk"
+                for name, n in sorted(collisions.items())]
     for d in dirs:
         r = by_dir.get(d.name)
         if r is None:
@@ -55,9 +71,12 @@ def load_session(root) -> dict:
             problems.append(f"{d.name}: attempt.json says complete=false")
     if problems:
         raise SystemExit(
-            "this session is incomplete — the process was probably killed "
-            "mid-attempt:\n  " + "\n  ".join(problems)
-            + "\nDelete the offending attempt_* directories to read the rest.")
+            "this session does not hold what attempts.csv says it does — the "
+            "process was killed mid-attempt, or it predates attempt "
+            "directories being named by run order:\n  "
+            + "\n  ".join(problems)
+            + "\nDelete the offending attempt_* directories, or the rows that "
+              "no longer have one, to read the rest.")
     if not man.get("complete"):
         print(f"[warn] {root}/manifest.json says complete=false: the session "
               "never shut down cleanly. Everything already written is still "

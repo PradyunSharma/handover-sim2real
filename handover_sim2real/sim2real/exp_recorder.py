@@ -323,6 +323,9 @@ class _WriterThread(threading.Thread):
         self.bytes = 0
         self._sink: Optional[_Sink] = None
         self._prev_t: Optional[float] = None
+        # HOW MANY ATTEMPTS HAVE BEEN OPENED, which is what names their
+        # directories. See _start: the bin index cannot do this job.
+        self._n_started = 0
         # NOT `_stop`: threading.Thread already owns a `_stop()` that join()
         # calls, and shadowing it makes join() raise. It means ABANDON — the
         # ordinary flush is the CLOSE sentinel, which drains first.
@@ -375,7 +378,27 @@ class _WriterThread(threading.Thread):
         if self._sink is not None:
             self._sink.close()
         self._prev_t = None
-        d = self.root / f"attempt_{int(row['attempt']) - 1:03d}"
+        # NAMED BY THE ORDER IT RAN IN, NOT BY WHICH BIN IT WAS.
+        #
+        # This was `attempt_{row['attempt'] - 1:03d}`, and any bin run more
+        # than once then wrote into the directory of the previous try. Every
+        # handle here is opened "w"/"wb", so that is not a merge, it is a
+        # silent overwrite: attempts.csv kept all the rows — ExperimentSession
+        # is careful that a retry never erases the row it repeats — while the
+        # video, depth, labels and policy IO underneath them were replaced by
+        # whichever try happened last. Seen on a real session: four tries of
+        # +x, four rows, one directory, three tries of recording gone.
+        #
+        # A bin can be run again for two different reasons and BOTH hit it:
+        # 'r' (retry) and 't' (void, which by design does not consume the bin).
+        #
+        # The ordinal is the row's position in attempts.csv, so for a session
+        # with no retries and no voids it is exactly `attempt - 1` and the
+        # naming of every session recorded so far is unchanged. `dir_name` is
+        # written into the row either way, so the mapping is explicit on disk
+        # rather than a convention a reader has to re-derive.
+        d = self.root / f"attempt_{self._n_started:03d}"
+        self._n_started += 1
         self._sink = _Sink(d, self.camera_names, self.fields,
                            self.record_depth, self.video_fps, self.arrays_spec)
         _write_json(d / "attempt.json", dict(row, complete=False,

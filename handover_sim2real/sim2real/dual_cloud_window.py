@@ -51,7 +51,7 @@ from transforms import transform_points  # noqa: E402
 
 CONTEXT_COLOUR = (0.80, 0.80, 0.84)
 
-# Mouse-drag behaviour, cycled with 'r'. These are genuinely different controls,
+# Mouse-drag behaviour, cycled with 'm'. These are genuinely different controls,
 # not settings of one control, and the difference is what "I can revolve around a
 # point but cannot rotate the scene" means:
 #
@@ -91,7 +91,10 @@ ROTATE_MODES = [
 # and 'p' made that unacceptable: pressing 'f' on a failure and having the arm
 # carry on is the worst version of the bug. The cost of adding them is that
 # these letters no longer reach the SceneWidget, which navigates with the mouse.
-INTERACTIVE_KEYS = "cwrzxqtshfp"
+# 'r' is --exp-mode's RETRY and 'm' cycles the drag mode; both are
+# forwarded because the operator is looking at this window when either
+# decision is made.
+INTERACTIVE_KEYS = "cwmrzxqtshfp"
 
 
 def _fixed_size(xyz: np.ndarray, n: int) -> np.ndarray:
