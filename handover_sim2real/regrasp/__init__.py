@@ -144,4 +144,5 @@ __all__ = [
     "anchor",
     "normals",
     "channels",
+    "bin_ranker",
 ]

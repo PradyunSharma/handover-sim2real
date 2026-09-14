@@ -837,7 +837,8 @@ def draw_conditioning(axes, ctx: _Ctx, num, it, bins, *, tag="", _grid=_grid):
         side      arrived from the COMMANDED side, per bin  (saturated — see below)
         succ      success per bin, DEMONSTRATED scenes
         succ_all  success per bin, ALL scenes, with the demonstrated overlay
-        track     direction tracking per bin
+        track     direction tracking per bin (the 1 - err/90 index)
+        err       the same error RAW, in degrees, against the 30/45-deg marks
 
     `tag` prefixes every panel title, so a held-out figure says so on every axis
     rather than only in the suptitle. It is applied by SHADOWING `_grid` below
@@ -859,223 +860,255 @@ def draw_conditioning(axes, ctx: _Ctx, num, it, bins, *, tag="", _grid=_grid):
 
         _grid = _tagged_grid
 
-        # THE POOLED "is the policy USING the commanded direction?" PANEL IS
-        # GONE. It stacked `dir_track`, `bin_diag_rate`, `bin_hit_rate` and
-        # `cond_sep` on one axis against a hardcoded 1/4 chance line, and three
-        # of those four do not survive scrutiny: `cond_sep` measures the achieved
-        # direction under `approach_axis` whatever the run's rule is, and
-        # `bin_hit_rate` compares the commanded fingertip direction against the
-        # wrist direction under `grasp_offset` (perfect demos score 0.138). What
-        # remains of the question is asked PER BIN in the panels below, which is
-        # where it was actionable anyway — a pooled 0.50 is consistent with
-        # "follows all four commands half the time" and with "nails +x and
-        # ignores the rest", and only the second is a reason to change anything.
+    # THE POOLED "is the policy USING the commanded direction?" PANEL IS
+    # GONE. It stacked `dir_track`, `bin_diag_rate`, `bin_hit_rate` and
+    # `cond_sep` on one axis against a hardcoded 1/4 chance line, and three
+    # of those four do not survive scrutiny: `cond_sep` measures the achieved
+    # direction under `approach_axis` whatever the run's rule is, and
+    # `bin_hit_rate` compares the commanded fingertip direction against the
+    # wrist direction under `grasp_offset` (perfect demos score 0.138). What
+    # remains of the question is asked PER BIN in the panels below, which is
+    # where it was actionable anyway — a pooled 0.50 is consistent with
+    # "follows all four commands half the time" and with "nails +x and
+    # ignores the rest", and only the second is a reason to change anything.
 
-        # ---- COMMANDED BIN vs REALISED BIN, one curve per commanded bin ----
-        # THE literal question: told to come in from `+z`, what fraction of
-        # episodes actually ENDED with the gripper's approach axis in `+z`?
-        # `bin_diag_rate_b{b}` is the b-th diagonal entry of the confusion matrix
-        # normalised by that bin's episode count, so each curve is a per-bin
-        # accuracy against a chance level of 1/4.
-        #
-        # Reading it per bin rather than pooled is the point. A pooled 0.50
-        # is consistent with two very different policies: one that follows all
-        # four commands half the time, and one that nails `+x` (which is 31% of
-        # the eval episodes and the easiest direction) while ignoring the rest.
-        # Only the second is a reason to change the architecture, and only this
-        # panel tells them apart.
-        a = axes.get("retry")
-        if a is not None:
-            # SIX RUNGS, not four: `RETRY_LADDER` covers every bin, and the
-            # `_off` tables made all six live. Runs that only logged four
-            # simply draw four — `_finite` skips the missing columns.
-            for k, col in zip(range(1, 7),
-                              ("tab:blue", "tab:green", "tab:orange",
-                               "tab:red", "tab:purple", "tab:brown")):
-                ys = num(f"retry_at_{k}")
-                if _finite(ys):
-                    _plot(a, it, ys, "-", marker="o", ms=3, lw=1.4 + 0.15 * k,
-                          color=col, label=f"success @ {k} attempt(s){_rung(num, k)}")
-                # TRUE CHAINED RETRY, when the log has it. `retry_at_k` is
-                # derived from INDEPENDENT episodes and assumes attempt 2 starts
-                # from home with the world untouched; `chained_retry_at_k` (only
-                # `eval_regrasp_testset.py` produces it) starts attempt 2 where
-                # attempt 1 actually left the arm. The gap between the two IS
-                # the cost of a failed attempt, and reading the independent
-                # curve as if it were the chained one is the single easiest way
-                # to overstate what regrasping buys. Absent from every in-loop
-                # log, so `_finite` skips it and the training figure is
-                # unchanged.
-                yc = num(f"chained_retry_at_{k}")
-                if _finite(yc):
-                    _plot(a, it, yc, "--", marker="s", ms=3, lw=1.3, color=col,
-                          alpha=0.9, label=f"CHAINED @ {k}")
-            a.set_ylim(-0.02, 1.02)
-            _grid(a, "regrasping: success with k tries")
-            _legend(a, loc="lower right",
-                    ncol=2 if _finite(num("chained_retry_at_2")) else 1)
+    # ---- COMMANDED BIN vs REALISED BIN, one curve per commanded bin ----
+    # THE literal question: told to come in from `+z`, what fraction of
+    # episodes actually ENDED with the gripper's approach axis in `+z`?
+    # `bin_diag_rate_b{b}` is the b-th diagonal entry of the confusion matrix
+    # normalised by that bin's episode count, so each curve is a per-bin
+    # accuracy against a chance level of 1/4.
+    #
+    # Reading it per bin rather than pooled is the point. A pooled 0.50
+    # is consistent with two very different policies: one that follows all
+    # four commands half the time, and one that nails `+x` (which is 31% of
+    # the eval episodes and the easiest direction) while ignoring the rest.
+    # Only the second is a reason to change the architecture, and only this
+    # panel tells them apart.
+    a = axes.get("retry")
+    if a is not None:
+        # SIX RUNGS, not four: `RETRY_LADDER` covers every bin, and the
+        # `_off` tables made all six live. Runs that only logged four
+        # simply draw four — `_finite` skips the missing columns.
+        for k, col in zip(range(1, 7),
+                          ("tab:blue", "tab:green", "tab:orange",
+                           "tab:red", "tab:purple", "tab:brown")):
+            ys = num(f"retry_at_{k}")
+            if _finite(ys):
+                _plot(a, it, ys, "-", marker="o", ms=3, lw=1.4 + 0.15 * k,
+                      color=col, label=f"success @ {k} attempt(s){_rung(num, k)}")
+            # TRUE CHAINED RETRY, when the log has it. `retry_at_k` is
+            # derived from INDEPENDENT episodes and assumes attempt 2 starts
+            # from home with the world untouched; `chained_retry_at_k` (only
+            # `eval_regrasp_testset.py` produces it) starts attempt 2 where
+            # attempt 1 actually left the arm. The gap between the two IS
+            # the cost of a failed attempt, and reading the independent
+            # curve as if it were the chained one is the single easiest way
+            # to overstate what regrasping buys. Absent from every in-loop
+            # log, so `_finite` skips it and the training figure is
+            # unchanged.
+            yc = num(f"chained_retry_at_{k}")
+            if _finite(yc):
+                _plot(a, it, yc, "--", marker="s", ms=3, lw=1.3, color=col,
+                      alpha=0.9, label=f"CHAINED @ {k}")
+        a.set_ylim(-0.02, 1.02)
+        _grid(a, "regrasping: success with k tries")
+        _legend(a, loc="lower right",
+                ncol=2 if _finite(num("chained_retry_at_2")) else 1)
 
-            # ...and the same question about WHICH SIDE the gripper came from rather
-            # than which way it pointed. A gripper can be correctly oriented on the
-            # wrong side of the object and vice versa, so the two panels fail
-            # independently: orientation right / side wrong is what run 1 measured
-            # pooled (bin_diag ~0.50, bin_hit at chance), and per bin is where it
-            # becomes actionable.
-        a = axes.get("ended")
-        if a is not None:
-            for b, col in zip(bins, _BIN_COLOURS):
-                ys = c_get(f"bin_diag_rate_b{b}")
-                if _finite(ys):
-                    _plot(a, it, ys, "-", marker="o", ms=3, lw=1.8, color=col,
-                          label=_D.BIN_SHORT[b])
-            # NO CHANCE LINE. It was hardcoded at 0.25 = 1/4 and labelled "4 live
-            # bins", which is wrong for every run since 10 (six live bins -> 1/6),
-            # and 1/k is not the empirical floor even when k is right: the live bins
-            # are clustered, so shuffling the command on run 9's four bins still
-            # scores dir_track 0.218 and not 0. A single run-independent line
-            # therefore misleads in both directions. The floor is measurable per run
-            # by shuffling the command, and belongs in that run's notes.
-            a.set_ylim(-0.02, 1.02)
-            _note_empty(a)
-            _grid(a, "ended in the COMMANDED bin (per bin)",
-                  ylabel="fraction of that bin's episodes")
-            _legend(a, loc="upper left", ncol=2)
+        # ...and the same question about WHICH SIDE the gripper came from rather
+        # than which way it pointed. A gripper can be correctly oriented on the
+        # wrong side of the object and vice versa, so the two panels fail
+        # independently: orientation right / side wrong is what run 1 measured
+        # pooled (bin_diag ~0.50, bin_hit at chance), and per bin is where it
+        # becomes actionable.
+    a = axes.get("ended")
+    if a is not None:
+        for b, col in zip(bins, _BIN_COLOURS):
+            ys = c_get(f"bin_diag_rate_b{b}")
+            if _finite(ys):
+                _plot(a, it, ys, "-", marker="o", ms=3, lw=1.8, color=col,
+                      label=_D.BIN_SHORT[b])
+        # NO CHANCE LINE. It was hardcoded at 0.25 = 1/4 and labelled "4 live
+        # bins", which is wrong for every run since 10 (six live bins -> 1/6),
+        # and 1/k is not the empirical floor even when k is right: the live bins
+        # are clustered, so shuffling the command on run 9's four bins still
+        # scores dir_track 0.218 and not 0. A single run-independent line
+        # therefore misleads in both directions. The floor is measurable per run
+        # by shuffling the command, and belongs in that run's notes.
+        a.set_ylim(-0.02, 1.02)
+        _note_empty(a)
+        _grid(a, "ended in the COMMANDED bin (per bin)",
+              ylabel="fraction of that bin's episodes")
+        _legend(a, loc="upper left", ncol=2)
 
-            # Per-BIN success, not per-slot. Slot k means "this scene's k-th chosen
-            # direction" and is not comparable across scenes; bin k is a fixed
-            # physical direction and is. The spread between these curves is how much
-            # the direction matters — if `+x` and `+z` separate, the retry ladder has
-            # something to work with; if they sit on top of each other, retrying is
-            # just four draws from one distribution.
-        a = axes.get("side")
-        if a is not None:
-            for b, col in zip(bins, _BIN_COLOURS):
-                ys = c_get(f"bin_hit_rate_b{b}")
-                if _finite(ys):
-                    _plot(a, it, ys, "-", marker="o", ms=3, lw=1.8, color=col,
-                          label=_D.BIN_SHORT[b])
-            # No chance line here either, and this panel needs the warning more than
-            # the others: under `grasp_offset` it compares the commanded FINGERTIP
-            # direction against the WRIST direction, 12.9 cm apart, so demonstrations
-            # that arrived exactly at their grasp score 0.138 — below 1/6. For those
-            # runs the panel measures the gripper's length, not the policy.
-            a.set_ylim(-0.02, 1.02)
-            _note_empty(a)
-            _grid(a, "arrived from the COMMANDED side (per bin)",
-                  ylabel="fraction of that bin's episodes")
-            _legend(a, loc="upper left", ncol=2)
+        # Per-BIN success, not per-slot. Slot k means "this scene's k-th chosen
+        # direction" and is not comparable across scenes; bin k is a fixed
+        # physical direction and is. The spread between these curves is how much
+        # the direction matters — if `+x` and `+z` separate, the retry ladder has
+        # something to work with; if they sit on top of each other, retrying is
+        # just four draws from one distribution.
+    a = axes.get("side")
+    if a is not None:
+        for b, col in zip(bins, _BIN_COLOURS):
+            ys = c_get(f"bin_hit_rate_b{b}")
+            if _finite(ys):
+                _plot(a, it, ys, "-", marker="o", ms=3, lw=1.8, color=col,
+                      label=_D.BIN_SHORT[b])
+        # No chance line here either, and this panel needs the warning more than
+        # the others: under `grasp_offset` it compares the commanded FINGERTIP
+        # direction against the WRIST direction, 12.9 cm apart, so demonstrations
+        # that arrived exactly at their grasp score 0.138 — below 1/6. For those
+        # runs the panel measures the gripper's length, not the policy.
+        a.set_ylim(-0.02, 1.02)
+        _note_empty(a)
+        _grid(a, "arrived from the COMMANDED side (per bin)",
+              ylabel="fraction of that bin's episodes")
+        _legend(a, loc="upper left", ncol=2)
 
-            # ...and whether it FOLLOWED each direction, which is the other half. A
-            # bin can succeed because the policy ignored it and did the easy thing;
-            # that shows up as a high success rate on the left with a dir_track here
-            # no better than the bins it is beating.
-        # ---- THE DEMONSTRATED SUBSET, and it must NOT be `success_rate_b*`.
-        # `success_rate_b{b}` comes out of the generic per-bin block, which
-        # filters rows by `bin_idx` and NOTHING ELSE — so under
-        # `EVAL.full_bin_coverage` it silently includes the off-table rows
-        # and is numerically IDENTICAL to `succ_bin_all_{b}`. Measured on run
-        # 16 it 19: success_rate_b0 = succ_bin_all_0 = 0.4717 to every digit,
-        # while succ_bin_0 (the demonstrated scenes) is 0.5263. Plotting the
-        # former here drew the same series as the `succ_all` panel beside it
-        # and the in-table number appeared nowhere but a faint dotted
-        # overlay. `succ_bin_{b}` is the one that carries the in-table
-        # filter, and on runs 1-15 — which have no off-table rows — the two
-        # are equal, so preferring it changes no historical curve.
-        a = axes.get("succ")
-        if a is not None:
-            for b, col in zip(bins, _BIN_COLOURS):
-                ys = c_get(f"succ_bin_{b}")
-                if not _finite(ys):
-                    ys = c_get(f"success_rate_b{b}")   # pre-`succ_bin_*` runs
-                if _finite(ys):
-                    _plot(a, it, ys, "-", marker="o", ms=3, lw=1.6, color=col,
-                          label=_D.BIN_SHORT[b])
-            a.set_ylim(-0.02, 1.02)
-            _grid(a, "success per commanded direction — DEMONSTRATED scenes\n"
-                     "(scenes that carry a demo for that bin; runs 1-15 comparable)",
-                  ylabel="fraction of that bin's episodes")
-            _legend(a, loc="upper left", ncol=2)
-        # ...and the SAME BIN COMMANDED ON EVERY EVALUATED SCENE, not only
-        # the ones that demonstrate it (`EVAL.full_bin_coverage`).
-        #
-        # WHY THIS IS THE DEPLOYMENT NUMBER. The panel to the left scores a
-        # direction on the scenes that taught it — "did it learn the training
-        # distribution". The retry ladder does the opposite by construction:
-        # it commands a direction BECAUSE the previous one failed, so on the
-        # robot most commands are for directions that scene never
-        # demonstrated. No run before 16 measured one.
-        #
-        # BOTH SERIES IN ONE PANEL, same colour per bin: solid = all scenes,
-        # dotted = the demonstrated subset. The vertical gap between a bin's
-        # two lines IS the generalisation cost, and putting them side by side
-        # in separate panels would make it something you have to estimate by
-        # eye across axes. A bin with no gap generalises; a bin whose solid
-        # line sits far below its dotted one only works where it was taught,
-        # which is the finding that would make `k` NOT a test-time knob.
-        a = axes.get("succ_all")
-        if a is not None:
-            # DECIDE BEFORE DRAWING. Without an all-scenes series there is
-            # nothing here to compare the demonstrated subset AGAINST, and
-            # drawing it alone would duplicate the panel to the left and then
-            # print "coverage was off" across the top of it — which is what
-            # runs 1-15 rendered as. Either both series or neither.
-            drew = any(_finite(c_get(f"succ_bin_all_{b}")) for b in bins)
-            drew_sub = False
-            for b, col in zip(bins, _BIN_COLOURS):
-                if not drew:
-                    break
-                ys = c_get(f"succ_bin_all_{b}")
-                if _finite(ys):
-                    _plot(a, it, ys, "-", marker="o", ms=3, lw=1.8,
-                          color=col, label=_D.BIN_SHORT[b])
-                # The demonstrated subset, over the top, so the vertical gap
-                # IS the generalisation cost. Heavier than it was: at lw 1.2
-                # / alpha 0.65 six dotted lines under six solid ones were not
-                # readable, which is how the in-table series came to look
-                # absent from both panels.
-                sub = c_get(f"succ_bin_{b}")
-                if _finite(sub):
-                    _plot(a, it, sub, ":", lw=2.0, color=col, alpha=0.9,
-                          marker="^", ms=3.5, mfc="none")
-                    drew_sub = True
-            a.set_ylim(-0.02, 1.02)
+        # ...and whether it FOLLOWED each direction, which is the other half. A
+        # bin can succeed because the policy ignored it and did the easy thing;
+        # that shows up as a high success rate on the left with a dir_track here
+        # no better than the bins it is beating.
+    # ---- THE DEMONSTRATED SUBSET, and it must NOT be `success_rate_b*`.
+    # `success_rate_b{b}` comes out of the generic per-bin block, which
+    # filters rows by `bin_idx` and NOTHING ELSE — so under
+    # `EVAL.full_bin_coverage` it silently includes the off-table rows
+    # and is numerically IDENTICAL to `succ_bin_all_{b}`. Measured on run
+    # 16 it 19: success_rate_b0 = succ_bin_all_0 = 0.4717 to every digit,
+    # while succ_bin_0 (the demonstrated scenes) is 0.5263. Plotting the
+    # former here drew the same series as the `succ_all` panel beside it
+    # and the in-table number appeared nowhere but a faint dotted
+    # overlay. `succ_bin_{b}` is the one that carries the in-table
+    # filter, and on runs 1-15 — which have no off-table rows — the two
+    # are equal, so preferring it changes no historical curve.
+    a = axes.get("succ")
+    if a is not None:
+        for b, col in zip(bins, _BIN_COLOURS):
+            ys = c_get(f"succ_bin_{b}")
+            if not _finite(ys):
+                ys = c_get(f"success_rate_b{b}")   # pre-`succ_bin_*` runs
+            if _finite(ys):
+                _plot(a, it, ys, "-", marker="o", ms=3, lw=1.6, color=col,
+                      label=_D.BIN_SHORT[b])
+        a.set_ylim(-0.02, 1.02)
+        _grid(a, "success per commanded direction — DEMONSTRATED scenes\n"
+                 "(scenes that carry a demo for that bin; runs 1-15 comparable)",
+              ylabel="fraction of that bin's episodes")
+        _legend(a, loc="upper left", ncol=2)
+    # ...and the SAME BIN COMMANDED ON EVERY EVALUATED SCENE, not only
+    # the ones that demonstrate it (`EVAL.full_bin_coverage`).
+    #
+    # WHY THIS IS THE DEPLOYMENT NUMBER. The panel to the left scores a
+    # direction on the scenes that taught it — "did it learn the training
+    # distribution". The retry ladder does the opposite by construction:
+    # it commands a direction BECAUSE the previous one failed, so on the
+    # robot most commands are for directions that scene never
+    # demonstrated. No run before 16 measured one.
+    #
+    # BOTH SERIES IN ONE PANEL, same colour per bin: solid = all scenes,
+    # dotted = the demonstrated subset. The vertical gap between a bin's
+    # two lines IS the generalisation cost, and putting them side by side
+    # in separate panels would make it something you have to estimate by
+    # eye across axes. A bin with no gap generalises; a bin whose solid
+    # line sits far below its dotted one only works where it was taught,
+    # which is the finding that would make `k` NOT a test-time knob.
+    a = axes.get("succ_all")
+    if a is not None:
+        # DECIDE BEFORE DRAWING. Without an all-scenes series there is
+        # nothing here to compare the demonstrated subset AGAINST, and
+        # drawing it alone would duplicate the panel to the left and then
+        # print "coverage was off" across the top of it — which is what
+        # runs 1-15 rendered as. Either both series or neither.
+        drew = any(_finite(c_get(f"succ_bin_all_{b}")) for b in bins)
+        drew_sub = False
+        for b, col in zip(bins, _BIN_COLOURS):
             if not drew:
-                # Runs 1-15 have no `succ_bin_all_*`, so say why the panel is
-                # empty rather than leaving a blank grid that reads as zero.
-                a.text(0.5, 0.5, "EVAL.full_bin_coverage was off\n"
-                                 "(no off-table bins were commanded —\n"
-                                 "see the DEMONSTRATED panel for per-bin success)",
-                       ha="center", va="center", transform=a.transAxes,
-                       fontsize=9, color="0.45")
-            _grid(a, "success per commanded direction — ALL scenes\n"
-                     "(solid o = every scene, dotted ^ = scenes that demo it)",
-                  ylabel="fraction of that bin's episodes")
-            # The bin colours go in the legend once; solid-vs-dotted is a
-            # SECOND dimension and gets its own two entries, in neutral grey
-            # so it cannot be mistaken for a seventh bin.
-            if drew and drew_sub:
-                from matplotlib.lines import Line2D
-                h, l = a.get_legend_handles_labels()
-                h += [Line2D([], [], color="0.35", ls="-", marker="o", ms=3),
-                      Line2D([], [], color="0.35", ls=":", lw=2.0,
-                             marker="^", ms=3.5, mfc="none")]
-                l += ["all scenes", "demo'd only"]
-                a.legend(h, l, loc="upper left", ncol=2, fontsize=7,
-                         framealpha=0.85)
-            else:
-                _legend(a, loc="upper left", ncol=2)
-        a = axes.get("track")
-        if a is not None:
-            for b, col in zip(bins, _BIN_COLOURS):
-                ys = c_get(f"dir_track_b{b}")
-                if _finite(ys):
-                    _plot(a, it, ys, "-", marker="o", ms=3, lw=1.6, color=col,
-                          label=_D.BIN_SHORT[b])
-            a.set_ylim(-0.02, 1.02)
-            _note_empty(a)
-            _grid(a, "direction tracking per bin (1 - dir_err / 90 deg)",
-                  ylabel="ratio")
+                break
+            ys = c_get(f"succ_bin_all_{b}")
+            if _finite(ys):
+                _plot(a, it, ys, "-", marker="o", ms=3, lw=1.8,
+                      color=col, label=_D.BIN_SHORT[b])
+            # The demonstrated subset, over the top, so the vertical gap
+            # IS the generalisation cost. Heavier than it was: at lw 1.2
+            # / alpha 0.65 six dotted lines under six solid ones were not
+            # readable, which is how the in-table series came to look
+            # absent from both panels.
+            sub = c_get(f"succ_bin_{b}")
+            if _finite(sub):
+                _plot(a, it, sub, ":", lw=2.0, color=col, alpha=0.9,
+                      marker="^", ms=3.5, mfc="none")
+                drew_sub = True
+        a.set_ylim(-0.02, 1.02)
+        if not drew:
+            # Runs 1-15 have no `succ_bin_all_*`, so say why the panel is
+            # empty rather than leaving a blank grid that reads as zero.
+            a.text(0.5, 0.5, "EVAL.full_bin_coverage was off\n"
+                             "(no off-table bins were commanded —\n"
+                             "see the DEMONSTRATED panel for per-bin success)",
+                   ha="center", va="center", transform=a.transAxes,
+                   fontsize=9, color="0.45")
+        _grid(a, "success per commanded direction — ALL scenes\n"
+                 "(solid o = every scene, dotted ^ = scenes that demo it)",
+              ylabel="fraction of that bin's episodes")
+        # The bin colours go in the legend once; solid-vs-dotted is a
+        # SECOND dimension and gets its own two entries, in neutral grey
+        # so it cannot be mistaken for a seventh bin.
+        if drew and drew_sub:
+            from matplotlib.lines import Line2D
+            h, l = a.get_legend_handles_labels()
+            h += [Line2D([], [], color="0.35", ls="-", marker="o", ms=3),
+                  Line2D([], [], color="0.35", ls=":", lw=2.0,
+                         marker="^", ms=3.5, mfc="none")]
+            l += ["all scenes", "demo'd only"]
+            a.legend(h, l, loc="upper left", ncol=2, fontsize=7,
+                     framealpha=0.85)
+        else:
             _legend(a, loc="upper left", ncol=2)
+    a = axes.get("track")
+    if a is not None:
+        for b, col in zip(bins, _BIN_COLOURS):
+            ys = c_get(f"dir_track_b{b}")
+            if _finite(ys):
+                _plot(a, it, ys, "-", marker="o", ms=3, lw=1.6, color=col,
+                      label=_D.BIN_SHORT[b])
+        a.set_ylim(-0.02, 1.02)
+        _note_empty(a)
+        _grid(a, "direction tracking per bin (1 - dir_err / 90 deg)",
+              ylabel="ratio")
+        _legend(a, loc="upper left", ncol=2)
+
+    # ---- THE SAME NUMBER IN DEGREES, WHICH IS THE ONE TO QUOTE -------------
+    # `dir_track` is `1 - dir_err/90`, so it carries no information this panel
+    # does not — but it is a rescaled, unitless index, and an index is the wrong
+    # thing to put in front of someone asking "how far off was it". 0.75 tracking
+    # is 22.5 deg; whether that is good is a question about grippers and
+    # tolerances, and only the degree reading lets it be asked. Both are drawn
+    # because the ratio is what runs 1-20 reported and the degrees are what the
+    # next conversation will be about.
+    #
+    # THE REFERENCE LINES ARE NOT DECORATION. 45 deg is the octahedral Voronoi
+    # half-angle: above it the achieved direction is closer to some OTHER bin
+    # than to the one commanded, so the command has been inverted rather than
+    # merely tracked loosely. 30 deg is `directions.BIN_HIT_DEG`, the margin
+    # `bin_hit_rate` is counted at. A curve sitting above 45 is the falsification
+    # case for the whole conditioning claim on that bin.
+    a = axes.get("err")
+    if a is not None:
+        for b, col in zip(bins, _BIN_COLOURS):
+            ys = c_get(f"dir_err_b{b}")
+            if _finite(ys):
+                _plot(a, it, ys, "-", marker="o", ms=3, lw=1.6, color=col,
+                      label=_D.BIN_SHORT[b])
+        a.axhline(_D.BIN_HIT_DEG, color="0.45", ls=":", lw=1.1,
+                  label=f"{_D.BIN_HIT_DEG:.0f} deg (bin_hit margin)")
+        a.axhline(45.0, color="tab:red", ls="--", lw=1.1,
+                  label="45 deg (nearer another bin)")
+        a.set_ylim(bottom=0)
+        _note_empty(a)
+        _grid(a, "RAW direction error per bin (deg, lower is better)",
+              ylabel="mean angle to the commanded d")
+        _legend(a, loc="upper left", ncol=2)
 
 
 

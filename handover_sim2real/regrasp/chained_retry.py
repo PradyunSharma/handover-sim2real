@@ -412,7 +412,8 @@ def _run_attempt(sim, runner, scene_idx: int, *, grasp_pose, target_pose,
 
 def chained_retry_scene(sim, runner, scene_idx: int, pose_of_bin, *,
                         params: EvalParams, retry: RetryParams,
-                        anchor_R=None, feasible=None, viz=None) -> list:
+                        anchor_R=None, feasible=None, viz=None,
+                        prior=None) -> list:
     """Run the chain on one scene. Returns the attempts made, in order.
 
     THE SEQUENCE COMES FROM THE RETRY LADDER, NOT FROM A SLOT LIST. Phase 5 took
@@ -448,8 +449,14 @@ def chained_retry_scene(sim, runner, scene_idx: int, pose_of_bin, *,
     # the grasp-axis rule (which has no axis set) still orders the ladder
     # geometrically; only the vector handed to the policy differs, and that comes
     # from `_run_attempt`'s own `set_direction`.
+    # `prior` is an optional bin order (best first) that outranks the geometric
+    # `furthest_from` rule — see `retry.RetryParams.prior`. None keeps the
+    # maximum-contrast ladder every run through 23 used, so passing nothing
+    # changes no historical number.
     rp = _rg_retry.RetryParams(max_attempts=int(retry.max_attempts or 4),
-                               bins=params.command_axes)
+                               bins=params.command_axes,
+                               prior=None if prior is None
+                               else tuple(int(b) for b in prior))
     st = _rg_retry.RetryState()
 
     if viz is not None:
