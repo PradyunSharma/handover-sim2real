@@ -2363,6 +2363,39 @@ Configs without a numbered run file were shared across several runs.
 
 ## Standing conclusions
 
+**Phase 4 has no held-out number, and `eval_dagger_run.py` cannot produce one.**
+It takes no `--split` — it rebuilds the run's own context from the run's own
+config, and every Phase-4 config carries `SIM.split: train` with
+`EVAL.holdout: false` and `EVAL.num_scenes: 100`. So the in-loop curve and the
+standalone re-score are the SAME measurement: 100 of ~623 usable TRAIN scenes,
+all of them collected on. Every Phase-4 headline in this file, `dagger4_run19`'s
+included, is a train-set number on a sixth of the train set.
+`examples/eval_dagger_testset.py` is the fix — all 144 test scenes under the
+run's own saved config. Not yet run for any Phase-4 run.
+
+**The Phase-4 stage rates are not nested, and two places in the repo said they
+were.** `plot_dagger_run.py` titles them "the nested rates" and
+`dagger/evaluator.evaluate_policy`'s docstring describes a chain
+(close → near → grasp → success). In the code `success = held`
+(`grasp_held_after_hold`) and `grasped = env.grasped_active()` are independent
+predicates evaluated at the same instant, and `near` is a third — so an object
+can survive the hold while the contact query reads False. Measured on
+`dagger4_run19`: `success_rate > grasp_rate` in **17 of 26** iterations, with
+`near_rate` at 0.01–0.04 against `grasp_rate` 0.5–0.7. Read a gap between two of
+these bars as two different tests disagreeing, never as episodes lost between two
+stages. The genuinely conditional chain is `box_chance_rate` →
+`box_taken_rate` → `box_success_rate`.
+
+**A Phase-4 config does not record the pin rule.** There is no `grasp_pin_mode`
+key anywhere; `mode` (`omg` vs `furthest_from_hand`) lives only in the pin
+table's `_meta` and in its filename, and both rules exist in `output/` four
+characters apart. Any check of "was this table built like the run's" must
+therefore compare TABLE AGAINST TABLE — reading the rule from the config with the
+table's own value as a fallback compares a field against itself and passes
+unconditionally, which is how `grasp_pin_table_val.json` (`furthest_from_hand`)
+was waved through against run 19's `omg` in the first version of that guard.
+
+
 **The test-set command vector was being derived from the test set.** Runs 9 and
 19–23 set `SIM.command_deploy: bin_centroid`, which conditions the policy on the
 empirical mean of each bin's assigned `d_anchor` — and `resolve_command_axes`
