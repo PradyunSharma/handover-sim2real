@@ -328,6 +328,12 @@ FINGER_EXCLUSION_MODES = {
 FINGER_EXCLUSION = FINGER_EXCLUSION_MODES["split"]
 
 
+# The fewest points a class can have and still be worth anything downstream.
+# Three, because that is what a median needs (`class_centroid`), and every
+# consumer that reduces a class to a point goes through one.
+MIN_CLASS_POINTS = 3
+
+
 @dataclass(frozen=True)
 class GraspRegion:
     """The volume between the fingers, in the panda_hand frame.
@@ -813,15 +819,29 @@ class FusedObservation:
 
     @property
     def usable(self) -> bool:
-        """Both classes non-empty.
+        """Both classes big enough to mean anything.
 
         PointListener falls back to the object cloud alone when the hand class is
         empty, but that fallback exists for a simulator that still had a correct
         object cloud. Here an empty hand class means the segmenter found nothing,
         which also means the object class — defined relative to the hand centroid
         — is whatever happened to be in front of the camera. Better to hold.
+
+        THE FLOOR IS MIN_CLASS_POINTS AND NOT ONE, which cost a crash to learn.
+        This gate used to read `> 0`, so a class reduced to a sliver by the arm
+        filter cleared it — and then everything downstream that wants a centroid
+        needs three points, `class_centroid` included. The regrasp adapter
+        raised on exactly that and killed a recording session mid-run.
+
+        One or two points is never an object anyway. Passing them on means
+        `build_policy_cloud` tiling two points across 512 rows and handing the
+        network a cloud that looks perfectly well-formed, which is the silent
+        kind of wrong this file keeps choosing to avoid: holding the frame is
+        visible on the HUD, costs no step, and the next perception pass is a
+        fresh chance.
         """
-        return len(self.object_xyz) > 0 and len(self.hand_xyz) > 0
+        return (len(self.object_xyz) >= MIN_CLASS_POINTS
+                and len(self.hand_xyz) >= MIN_CLASS_POINTS)
 
     def summary(self) -> str:
         """e.g. `tripod:o517-284/h63` — 517 object points kept, 284 declustered.

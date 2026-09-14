@@ -68,6 +68,7 @@ import copy
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
@@ -315,6 +316,14 @@ HOME_REFINE_PASSES = 6      # backstop; the refine exits as soon as it is inside
 # it observes wherever the arm actually is and steps from there, so a couple of
 # centimetres at t=0 is a slightly different starting state, not an error that
 # accumulates. 2 cm is the operator's call on this rig.
+# HOW LONG AFTER A CLOSE THE ARM TAKES ITSELF HOME. Long enough for the fingers
+# to finish closing and for the grasp to be seen to hold before the object is
+# carried anywhere — franka_gripper's grasp action is asynchronous, so the
+# CLOSE command returns well before the fingers have stopped — and short enough
+# that the run does not stall waiting for a human. It is a deadline the main
+# loop watches, never a sleep, so every key stays live throughout.
+AUTO_HOME_DELAY_S = 5.0
+
 HOME_REFINE_TOL_M = 0.020   # --home-tol
 HOME_WAY_TOL_M = 0.008      # intermediate waypoints are a path, not a target
 
@@ -418,27 +427,62 @@ SETTLE_POLL_S = 0.02
 # loops poll for it themselves through `poll_stop()`.
 stop_requested = False
 _stop_poller: Optional[Callable[[], bool]] = None
-# Keys seen by the inner poller that were NOT the abort key. cv2.waitKey
+# WHICH key raised the stop, and WHEN. `stop_requested` stays the single
+# question every blocking loop asks — "should I stop?" — and all five of them
+# want the same answer for 't' and for --exp-mode's 'f'. What differs is only
+# what the MAIN LOOP does next: 't' is a user stop, 'f' is a RECORDED policy
+# failure, and a session whose log cannot tell those apart has no failure data.
+# `stop_at` is the PRESS time, which is the honest end of an attempt's clock —
+# the loop does not reach its dispatch again for another perception pass.
+stop_reason_key: Optional[str] = None
+stop_at: Optional[float] = None
+# Which keys may raise a stop from INSIDE a motion. 't' always. --exp-mode adds
+# 'f' for the duration of an attempt and removes it again, because during the
+# verdict wait the same key means "the grasp failed" and must NOT abort the arm
+# carrying the object home. Mutated by ExperimentSession, read on every poll.
+STOP_KEYS = {"t"}
+# Keys seen by the inner poller that were NOT a stop key. cv2.waitKey
 # consumes what it reads, so without this a SPACE or a 'q' pressed during a
 # motion would be swallowed by the poll rather than merely delayed by it.
 _swallowed_keys: list[str] = []
 
 
+def request_stop(key: str = "t", when: Optional[float] = None) -> None:
+    """Raise the abort, remembering why and when.
+
+    FIRST KEY WINS. A 't' pressed while the arm is still unwinding from an 'f'
+    must not rewrite why we stopped — the reason is what gets recorded, and the
+    first press is the one that describes what the operator saw.
+    """
+    global stop_requested, stop_reason_key, stop_at
+    if not stop_requested:
+        stop_reason_key = key
+        stop_at = time.time() if when is None else when
+    stop_requested = True
+
+
 def clear_stop() -> None:
     """Acknowledge an abort. Called only after the arm has actually been frozen."""
-    global stop_requested
+    global stop_requested, stop_reason_key, stop_at
     stop_requested = False
+    stop_reason_key = None
+    stop_at = None
 
 
 def poll_stop() -> bool:
-    """Has the abort key been pressed? Safe to call from inside a motion loop."""
-    global stop_requested
+    """Has a stop key been pressed? Safe to call from inside a motion loop."""
     if stop_requested:
         return True
     if _stop_poller is not None:
         try:
             if _stop_poller():
-                stop_requested = True
+                # BOTH CONTRACTS. The real poller raises through request_stop()
+                # itself, because only it knows which key was pressed and when.
+                # A poller that merely returns True — the older contract, and
+                # what the tests install — still stops the motion, defaulting to
+                # 't'. request_stop is first-key-wins, so this cannot overwrite
+                # a reason the poller already recorded.
+                request_stop("t")
         except Exception:
             pass                    # a viewer that has gone away must not abort
     return stop_requested
@@ -778,6 +822,28 @@ RATE_CONTROL_HZ = 1.0 / 0.15
 # "slow" rather than firing on both.
 RATE_STUCK_M = 0.0005
 
+# How much of a tick's motion has to lie ALONG the heading that was commanded
+# before that tick counts as a measurement of the controller's gain. cos >= 0.5
+# is 60 degrees, which is generous: real under-travel is collinear with the
+# command and only perpendicular drift eats into it.
+#
+# THIS IS THE GUARD THAT KEEPS THE LEAD FROM RUNNING AWAY, and the failure it
+# stops was measured on hardware, not imagined. `observe_move` reads
+# (achieved / commanded) as "the fraction of a commanded displacement this arm
+# executes". That is only what it means if the arm was trying to execute it.
+# Near the object the policy reverses constantly, so the arm spends a tick
+# unwinding the PREVIOUS heading: it travels 20 mm and projects 1.7 mm onto the
+# heading it was just given. Read as a gain that is 0.06, and the estimator
+# answers with a lead of fifteen times the step.
+#
+# It compounds, because a larger lead makes `commanded` larger while `achieved`
+# stays governed by the whipsaw, so the next sample is smaller still. Observed
+# in one 58-step episode: gain 0.78 -> 0.10 (the floor) and the lead 29 mm ->
+# 160 mm, with the arm overshooting its target by up to 7.4 mm and reversing
+# between consecutive policy steps. A sign test alone does not catch it — the
+# samples that do the damage are small and POSITIVE.
+RATE_ALIGN_FRAC = 0.5
+
 # How long each step-mode iteration idles pumping the 3D window's events before
 # recomputing perception. One iteration of perception + policy is ~50 ms
 # (measured: tripod get_frames 33 ms, hand segmentation 24 ms at 384 px overlapped
@@ -1046,6 +1112,51 @@ def clamp_target_pose(T: np.ndarray) -> np.ndarray:
 # 3 = ycb_flag, channel 4 = hand_flag.
 
 
+# HOW FAR THE OBJECT IS FROM THE GRIPPER, in the frame the policy sees.
+# Measured over run 19's own training clouds: the object centroid sits a median
+# 11 cm from the panda_hand origin, p95 23 cm of extent. That is the range every
+# head in the network was fitted on, and the gripper head in particular
+# saturates outside it — pushing a training cloud 10 cm further out takes its
+# logit from -3.8 to +17.6, which is the regime a real run reports when it will
+# not close. So this number decides between two completely different problems:
+# the arm has not arrived (large, and the refusal is CORRECT), or the cloud is
+# misplaced relative to the gripper (small in reality, large here).
+SIM_OBJECT_RANGE_M = 0.11
+
+
+# The other half of the shape. Run 19's close states have an object EXTENT of
+# 11 cm median, 23 cm at p95 — a YCB object. A 40 cm carton is outside that
+# whatever its distance, and distance alone cannot show it.
+SIM_OBJECT_EXTENT_M = 0.23
+
+
+def _range_txt(xyz, extent: bool = False) -> str:
+    if xyz is None or len(xyz) < 3:
+        return ""
+    a = np.asarray(xyz, np.float64)
+    d = float(np.linalg.norm(np.median(a, axis=0)))
+    out = f" @{d*100:4.1f}cm" + ("!" if d > 4.0 * SIM_OBJECT_RANGE_M else "")
+    if extent:
+        e = float(np.ptp(a, axis=0).max())
+        out += f" x{e*100:4.1f}cm" + ("!" if e > SIM_OBJECT_EXTENT_M else "")
+    return out
+
+
+def _grip_txt(adapter) -> str:
+    """The close decision as a NUMBER on the HUD, not just as a behaviour.
+
+    `grip` below 0 is a close. Reference points, measured on each policy's own
+    close-labelled training states: phase-4 run 19 sits at -1.5 when it means
+    it, regrasp run 19 at -3.8. So a reading hovering at -0.2 while the object
+    is between the fingers is a marginal decision, and +3 is a refusal — and
+    those want opposite fixes.
+    """
+    g = getattr(adapter, "grip_logit", None)
+    if g is None or g != g:                    # None or NaN
+        return ""
+    return f"  grip {g:+.2f}" + ("  CLOSE" if g < 0 else "")
+
+
 def build_robot_state(T_base_hand: np.ndarray, gripper_norm: float) -> np.ndarray:
     """The 32-D vector, with only the channels run 12 actually reads filled in.
 
@@ -1293,6 +1404,39 @@ class FrankaGripper:
                     pass
 
 
+class ObservationNotUsable(RuntimeError):
+    """The adapter cannot act on THIS frame, but the run is fine.
+
+    THE DIFFERENCE BETWEEN THIS AND A BUG IS THE WHOLE POINT. `fused.usable` is
+    "both classes non-empty" — one point clears it — while anything that wants a
+    centroid needs three, and the regrasp adapter needs one to anchor its
+    direction. A class that came out of `reject_arm_clusters` with two points
+    left therefore satisfies the loop's gate and not the adapter's, and the
+    adapter used to answer that with a bare RuntimeError, which killed the
+    process. Mid-session that costs the whole recording.
+
+    Holding the frame is the established response to a class that came out too
+    thin — it is what `[arm:all-arm]` does, and for the same reason: a stall is
+    visible and recoverable, while acting on two points is a silently wrong
+    command. Worse here, because the regrasp direction is latched ONCE per
+    episode and would steer every remaining step of the attempt.
+
+    Raised by the adapter, caught in the predict block, and it costs no step.
+    """
+
+
+def _warn_hold(msg: str, every_s: float = 1.0) -> None:
+    """Rate-limited notice that a frame was skipped. Once a second is enough.
+
+    At the control rate an unrate-limited print is seven lines a second of the
+    same sentence, which buries the step log it is supposed to annotate.
+    """
+    now = time.time()
+    if now - getattr(_warn_hold, "_last", 0.0) >= every_s:
+        _warn_hold._last = now
+        print(f"[hold] {msg}", flush=True)
+
+
 def read_gripper_norm(assume_open: bool) -> float:
     """Normalized finger position for robot_state[25]: 1 = open, 0 = closed.
 
@@ -1303,6 +1447,22 @@ def read_gripper_norm(assume_open: bool) -> float:
     if gripper_finger_m is None:
         return 1.0 if assume_open else 0.0
     return float(np.clip(gripper_finger_m / GRIPPER_MAX_FINGER_M, 0.0, 1.0))
+
+
+def aperture_mm(finger_m: Optional[float]) -> Optional[float]:
+    """One finger's travel -> the gap between the jaws, in millimetres.
+
+    `gripper_finger_m` is the half-sum of the two prismatic joints, i.e. how far
+    ONE finger has moved, which is what robot_state[25] normalises. The opening
+    an object has to fit through is twice it. Kept as a named function rather
+    than a `2 * 1000 *` at each call site because the factor of two between the
+    two conventions is exactly the kind of thing that gets dropped once and then
+    shows up as an object that measures 17 mm in the log and 34 mm with a
+    caliper. None in, None out: before the first /franka_gripper/joint_states
+    message there is no reading, and an empty CSV cell says that honestly where
+    a 0.0 would read as a closed gripper.
+    """
+    return None if finger_m is None else 2000.0 * float(finger_m)
 
 
 # -----------------------------------------------------------------------------
@@ -1378,6 +1538,23 @@ def load_bc_policy(policy_dir: Path, ckpt: str, device: str):
 
 
 @torch.no_grad()
+def grip_logit_of(model) -> float:
+    """The gripper logit behind the {0,1} bit `predict` returns, or NaN.
+
+    THE BIT HIDES THE ONLY NUMBER THAT MATTERS WHEN IT WILL NOT CLOSE. `predict`
+    thresholds `sigmoid(logit) > 0.5`, so a policy that is one millivolt from
+    closing and one that is refusing outright produce the identical observation
+    on the robot: an open gripper. Negative commands a close, and the magnitude
+    says how sure it is — on run 19's own close-labelled states the mean is
+    -3.8, so a reading near zero means "marginal" and +3 means "actively
+    refusing", which are different problems with different fixes.
+    """
+    raw = getattr(model, "last_raw", None)
+    if raw is None:
+        return float("nan")
+    return float(raw.reshape(-1, raw.shape[-1])[0, 6])
+
+
 def policy_act(model, pc: np.ndarray, rs: np.ndarray, device: str) -> np.ndarray:
     """[7] deployable action: BCPolicy.predict denormalizes ch0..5 and
     hard-thresholds the gripper logit to {0, 1}. Same call BCRunner.act makes."""
@@ -1894,8 +2071,22 @@ class RateCommander:
             # the desired one would make every tick look like a perfect move and
             # freeze the estimate at its starting value.
             commanded0, start_xyz, u0, want = self._pending
-            achieved = float((T_now[:3, 3] - start_xyz) @ u0)
-            if commanded0 > 1e-6 and want > 1e-6:
+            disp = T_now[:3, 3] - start_xyz
+            moved = float(np.linalg.norm(disp))
+            achieved = float(disp @ u0)
+            # A TICK THE ARM SPENT GOING SOMEWHERE ELSE IS NOT A GAIN
+            # MEASUREMENT. The test is whether the motion was MOSTLY the one
+            # commanded — see RATE_ALIGN_FRAC — and not merely whether its sign
+            # was right: the samples that walk the lead to its cap are small and
+            # positive, an arm 80 degrees off the heading it was just handed.
+            #
+            # A true STALL is exempt and must stay so. There `moved` is under
+            # the pose noise, the ratio is decided by nothing, and the sample is
+            # real evidence that this arm does not execute what it is told —
+            # which is how the estimator learns a stiff arm at all. Break-away
+            # below handles the rest of that case.
+            aligned = moved < RATE_STUCK_M or achieved >= RATE_ALIGN_FRAC * moved
+            if commanded0 > 1e-6 and want > 1e-6 and aligned:
                 self.droop.observe_move(commanded0, u0 * (want - achieved),
                                         u0 * want)
             # BREAK-AWAY, and it is load-bearing on small steps. observe_move
@@ -1913,7 +2104,27 @@ class RateCommander:
             # re-derive-per-move discipline, for the same reason: friction
             # depends on direction, so a lead earned going one way is not
             # evidence about the next.
-            if achieved < RATE_STUCK_M:
+            #
+            # STUCK MEANS THE ARM DID NOT MOVE, which is the DISTANCE it
+            # covered and not the component of it along the last command. The
+            # two differ exactly when the policy reverses, and near the object
+            # it reverses constantly: the period after a reversal is spent
+            # decelerating and turning round, so the arm can travel centimetres
+            # while projecting under half a millimetre onto the direction it
+            # was asked for one tick ago. Read through `achieved` that is a
+            # stall, and break-away then adds 10 mm of lead for it — pushing
+            # HARDER into the new direction precisely because the arm was busy
+            # obeying the old one. Every reversal earns another 10 mm, the cap
+            # is reached in about 1.5 s, and the equilibrium then sits 100 mm
+            # from the arm in a direction that alternates at the control rate.
+            # That is a bang-bang limit cycle, and on hardware it is the
+            # shaking people report when the gripper gets close to the object.
+            #
+            # Static friction, which is the only thing break-away exists to
+            # overcome, does not care which way the arm is going — an arm that
+            # moved at all has already broken away. So the norm is not merely
+            # safer here, it is the quantity the mechanism was always about.
+            if moved < RATE_STUCK_M:
                 self._stuck_lead = min(self._stuck_lead + CREEP_BREAKAWAY_M,
                                        MAX_COMMAND_LEAD_M)
             else:
@@ -2132,6 +2343,14 @@ class Phase4Policy:
     Everything below is a no-op hook for this policy and a real one for regrasp.
     """
 
+    # Does `--run` / `--policy-dir` / `--ckpt` actually name what this adapter
+    # loads? False for the regrasp policy, which is named by --regrasp-run and
+    # ignores all three — and a startup banner that printed them anyway would
+    # put "Policy dir: checkpoint/run12" at the top of a session log driven by
+    # regrasp_run19. Someone reading that log a month later has no way to know
+    # it is vestigial.
+    uses_policy_dir = True
+
     def load(self, args, device: str, policy_dir: Path, ckpt: str) -> None:
         self.device = device
         self.model, self.run_cfg = load_bc_policy(policy_dir, ckpt, device)
@@ -2143,11 +2362,517 @@ class Phase4Policy:
 
     def act(self, pc: np.ndarray, rs: np.ndarray, *, fused=None,
             T_base_hand=None) -> np.ndarray:
-        return policy_act(self.model, pc, rs, self.device)
+        a = policy_act(self.model, pc, rs, self.device)
+        self.grip_logit = grip_logit_of(self.model)
+        return a
 
     def hud(self) -> str:
         """Extra text for the on-screen HUD, or empty."""
         return ""
+
+    # ---- --exp-mode hooks ---------------------------------------------------
+
+    def set_command(self, label: str) -> None:
+        """Point the policy at the next command in an --exp-mode sequence."""
+        raise SystemExit(
+            f"this policy takes no command: it grasps a held object however it "
+            f"likes, so {label!r} means nothing to it. --exp-bins names "
+            "DIRECTIONS, which only the direction-conditioned regrasp policy "
+            "reads. Run my_regrasp_policy_runner.py.")
+
+    def validate_commands(self, labels) -> None:
+        """Refuse a whole sequence up front, before a camera opens or anything moves.
+
+        A bad label at position 3 must not surface after two attempts have
+        already been run, recorded and timed.
+        """
+        if labels:
+            self.set_command(labels[0])         # the same refusal, one message
+
+    def record_spec(self):
+        """(extra steps.csv columns, extra binary array spec) for the recorder."""
+        return (), {}
+
+    def record_step(self):
+        """(extra csv values, extra arrays) for the step just taken."""
+        return {}, {}
+
+    def record_outcome_fields(self):
+        """Extra attempts.csv columns this policy fills in at an attempt's end.
+
+        Pinned here rather than taken from the first row, for the reason every
+        other column list in the recorder is pinned: two attempts with
+        different natural key sets would mis-align against a header written
+        from whichever landed first.
+        """
+        return ()
+
+    def record_outcome(self):
+        """Those columns' values, measured from the LAST observation acted on.
+
+        Called once, from `ExperimentSession.attempt_ended`, so it sees the
+        pose and the cloud the policy stopped at — a grasp pose after a close,
+        and wherever it ran out of budget after a timeout.
+        """
+        return {}
+
+
+class ExperimentSession:
+    """The --exp-mode sequencer: which command is next, and what phase we are in.
+
+    IT DECIDES AND RECORDS; IT DOES NOT MOVE THE ROBOT. Every freeze, home,
+    gripper open and target publish stays in `main()`'s loop, where all of them
+    already live. That split is the whole point of this class being a class: the
+    two runners share one loop precisely so they cannot diverge in how the arm
+    is driven, and a sequencer that published would be a second driver of it.
+
+    Five phases, each pinned to loop state that already exists rather than to a
+    parallel set of flags that would have to be kept in step with it:
+
+        IDLE     before the first 's'      armed=False  episode_over=False
+        RUNNING  an attempt is live        armed=True   episode_over=False
+        VERDICT  closed, awaiting p/f      armed=False  episode_over=True
+        BETWEEN  outcome written           armed=False  episode_over=True
+        DONE     every command judged      armed=False  episode_over=True
+
+    "Frozen after a failure" is deliberately NOT a sixth phase: it is BETWEEN
+    with `froze` set on the row just written. The loop state is identical, and a
+    second phase would be one more thing to keep in step for no gain — the HUD
+    tells them apart from the last row.
+    """
+
+    def __init__(self, labels, max_steps: int, recorder=None, adapter=None):
+        self.labels = list(labels)
+        self.max_steps = int(max_steps)
+        self.recorder = recorder
+        # Only ever asked for `record_outcome()`, once per attempt. The session
+        # still drives nothing — that is main()'s loop — it just carries the
+        # one measurement only the policy can make.
+        self.adapter = adapter
+        # ONE timestamp for the whole session. The recorder reads this rather
+        # than taking its own: two independently computed stamps put the outcome
+        # table and the per-attempt files under different names.
+        self.session_id = time.strftime("%Y%m%d_%H%M%S")
+        self.cursor = 0
+        self.phase = "IDLE"
+        self.cur: Optional[dict] = None
+        self.rows: list[dict] = []
+        self._tries: dict[int, int] = {}
+        # Tightest per-finger travel seen since the attempt ended. See
+        # note_gripper.
+        self._grip_min_m: Optional[float] = None
+        # Set by `attempt_ended` when it also decides the verdict, so the two
+        # halves of one ending print as one block. See `_say`.
+        self._pending_head = self._pending_landed = None
+
+    # ---- queries ------------------------------------------------------------
+
+    @property
+    def next_label(self) -> Optional[str]:
+        return None if self.cursor >= len(self.labels) else self.labels[self.cursor]
+
+    def elapsed(self) -> Optional[float]:
+        if self.cur is None:
+            return None
+        return (self.cur["t_end"] or time.time()) - self.cur["t_start"]
+
+    # ---- the jaws -----------------------------------------------------------
+
+    def note_gripper(self, finger_m: Optional[float]) -> None:
+        """One float compare per control iteration, from main()'s loop.
+
+        HOW TIGHT THE FINGERS GOT IS NOT RECOVERABLE ANY OTHER WAY. It is the
+        measured thickness of whatever they caught — the fingers are commanded
+        to 0.0 m, so they stop on the object or they stop on each other — which
+        is the difference between "the policy closed" and "the policy grasped".
+        But sampling it once at the verdict does not get it: the operator can
+        press 'p' a tenth of a second after the grasp goal goes out, while the
+        fingers are still travelling, and steps.csv only carries whatever the
+        last iteration happened to sample. A running minimum is independent of
+        when the human's hand moved.
+
+        Only while an attempt is in flight or owes a verdict, so the release
+        that follows a pass — and the fully open jaws between attempts — cannot
+        contaminate the next row.
+        """
+        if finger_m is None or self.cur is None:
+            return
+        if self._grip_min_m is None or finger_m < self._grip_min_m:
+            self._grip_min_m = float(finger_m)
+
+    def _grip_min_mm(self) -> Optional[float]:
+        return aperture_mm(self._grip_min_m)
+
+    # ---- what the operator reads -------------------------------------------
+
+    RULE = "\u2500" * 66
+
+    def _say(self, head: str, *lines: str, rule: bool = True) -> None:
+        """One block: a headline, some facts, and what to press. Always that.
+
+        THE TERMINAL IS THE ONLY INTERFACE DURING AN ATTEMPT — the operator's
+        hands are near the robot and their eyes are not on the HUD — so the
+        rule is one block per TRANSITION and nothing per step. Everything the
+        session prints goes through here, which is what stops it drifting back
+        into the scatter of one-off prints this replaced: a headline you can
+        find by scrolling, the facts that headline needs, and a NEXT line that
+        never has to be remembered.
+        """
+        out = [f"\n{self.RULE}" if rule else ""]
+        out.append(f"  {head}")
+        out += [f"    {ln}" for ln in lines if ln]
+        nxt = self.next_line()
+        if nxt:
+            out.append(f"  NEXT  {nxt}")
+        print("\n".join(x for x in out if x != ""), flush=True)
+
+    def next_line(self) -> str:
+        """The keys that do something RIGHT NOW, in the order you would use them.
+
+        Only the live ones. Listing 'p' during an approach or 'f' before there
+        is anything to fail teaches the operator to stop reading the line.
+        """
+        n = len(self.labels)
+        if self.phase == "RUNNING":
+            return "f = policy failed (stops the arm)   t = void   q = quit"
+        if self.phase == "VERDICT":
+            return "p = PASS   f = FAIL   (the arm is carrying it home)"
+        if self.phase == "IDLE":
+            return f"s = start 1/{n}: {self.labels[0]}"
+        last = self.rows[-1]["bin"] if self.rows else None
+        bits = []
+        if self.next_label:
+            bits.append(f"s = start {self.cursor + 1}/{n}: {self.next_label}")
+        if last is not None and self._can_retry():
+            bits.append(f"r = retry {last}")
+        if self.rows and self.rows[-1].get("froze"):
+            bits.append("h = home first")
+        bits.append("q = quit")
+        return "   ".join(bits)
+
+    def tally(self) -> str:
+        n = lambda v: sum(1 for r in self.rows if r["verdict"] == v)
+        out = f"{n('pass')} pass / {n('fail')} fail"
+        return out + (f" / {n('void')} void" if n("void") else "")
+
+    # ---- transitions --------------------------------------------------------
+
+    def _can_retry(self) -> bool:
+        """Is there a finished attempt whose bin the cursor could be rolled back to?
+
+        False after a VOID, because 't' never advanced the cursor — the bin is
+        already the next one up and 'r' would be a no-op dressed as an action.
+        """
+        if self.phase not in ("BETWEEN", "DONE") or not self.rows:
+            return False
+        return int(self.rows[-1]["attempt"]) - 1 < self.cursor
+
+    def retry_requested(self) -> bool:
+        """'r'. Re-offer the bin that just finished. True when the cursor moved.
+
+        A RETRY DOES NOT ERASE THE ATTEMPT IT REPEATS. The failed row stays in
+        `rows` and on disk with its own `try` number, and the retry is written
+        beside it — so a bin retried three times shows three rows, and the
+        session's success rate is over attempts rather than over whichever
+        attempt the operator decided to keep. That is the same rule 't' already
+        follows, and it is the difference between a log and a highlight reel.
+
+        Only the cursor moves. Nothing is republished, no arm state changes:
+        the next 's' simply commands the same bin again.
+        """
+        n = len(self.labels)
+        if self.phase == "RUNNING":
+            self._say(f"RUNNING {self.cur['bin']} \u2014 nothing to retry yet",
+                      "'f' records a failure, 't' voids the attempt; either "
+                      "then offers 'r'.")
+            return False
+        if self.phase == "VERDICT":
+            self._say(f"VERDICT OWED for {self.cur['bin']}",
+                      "judge it first \u2014 a retry after 'f' re-offers the "
+                      "same bin.")
+            return False
+        if not self.rows:
+            self._say("NOTHING TO RETRY", "no attempt has finished yet.")
+            return False
+        last = self.rows[-1]
+        if not self._can_retry():
+            self._say(f"{last['bin']} IS ALREADY NEXT",
+                      f"'t' does not consume an attempt, so {last['bin']} was "
+                      "never passed over.")
+            return False
+        self.cursor = int(last["attempt"]) - 1
+        self.phase = "BETWEEN"
+        self._say(f"RETRY {last['bin']}  \u2014  attempt "
+                  f"{self.cursor + 1}/{n}, try {int(last['try']) + 1}",
+                  f"the {last['verdict']} just recorded is KEPT; this is an "
+                  "extra attempt, not a replacement.")
+        return True
+
+    def start_requested(self) -> Optional[str]:
+        """'s'. The label to command, or None with a printed reason.
+
+        REFUSING IS AS MUCH OF THE MACHINE AS ACCEPTING. 's' during a verdict
+        wait would start the next command with the last one unjudged, and after
+        the final one it must do nothing at all — that is what ends a session
+        rather than rolling it on.
+        """
+        if self.phase == "RUNNING":
+            self._say(f"ALREADY RUNNING {self.cur['bin']}")
+            return None
+        if self.phase == "VERDICT":
+            self._say(f"VERDICT OWED for {self.cur['bin']} "
+                      f"({self.cur['attempt']}/{len(self.labels)})")
+            return None
+        if self.next_label is None:
+            self._say(f"SESSION COMPLETE — {len(self.labels)} bins, "
+                      f"{self.tally()}")
+            return None
+        return self.next_label
+
+    def attempt_started(self, t_start: Optional[float] = None) -> str:
+        label = self.labels[self.cursor]
+        self._tries[self.cursor] = self._tries.get(self.cursor, 0) + 1
+        self.cur = {"session_id": self.session_id, "attempt": self.cursor + 1,
+                    "n_attempts": len(self.labels),
+                    "try": self._tries[self.cursor], "bin": label,
+                    "t_start": time.time() if t_start is None else t_start,
+                    "max_steps": self.max_steps, "t_end": None,
+                    "elapsed_s": None, "ending": None, "steps": None,
+                    "verdict": None, "t_verdict": None, "froze": False,
+                    "grip_end_mm": None, "grip_min_mm": None,
+                    "grip_verdict_mm": None}
+        self.phase = "RUNNING"
+        self._grip_min_m = None
+        # 'f' MUST INTERRUPT A settle()/move_to() IN PROGRESS, and only while an
+        # attempt is running: during the verdict wait the same key is a verdict
+        # and must not abort the arm carrying the object home.
+        STOP_KEYS.add("f")
+        self._say(f"ATTEMPT {self.cur['attempt']}/{len(self.labels)} · "
+                  f"bin {label} · try {self._tries[self.cursor]}",
+                  f"clock running · max {self.max_steps} steps · {self.tally()}")
+        if self.recorder is not None:
+            self.recorder.on_attempt_start(dict(self.cur))
+        return label
+
+    def attempt_ended(self, ending: str, steps: int, verdict=None,
+                      t_end=None, froze: bool = False) -> None:
+        STOP_KEYS.discard("f")
+        if self.cur is None:
+            print(f"[exp] {ending} with no attempt in flight — ignored",
+                  flush=True)
+            return
+        self.cur.update(t_end=time.time() if t_end is None else t_end,
+                        ending=ending, steps=int(steps), froze=bool(froze),
+                        grip_end_mm=aperture_mm(gripper_finger_m))
+        self.cur["elapsed_s"] = self.cur["t_end"] - self.cur["t_start"]
+        # RE-ARMED HERE, not left running from the approach. The minimum that
+        # means anything is the one the CLOSING makes; a minimum spanning the
+        # approach would just report the same open jaws with extra steps.
+        self._grip_min_m = None
+        # WHERE THE GRIPPER ACTUALLY ENDED UP, taken now and not at the verdict.
+        # The verdict comes after the carry home, by which time the pose that
+        # answers "which side did it approach from" is gone. Wrapped because a
+        # measurement is never worth losing the outcome row over.
+        if self.adapter is not None:
+            try:
+                self.cur.update(self.adapter.record_outcome() or {})
+            except Exception as exc:                      # noqa: BLE001
+                print(f"[exp] outcome measurement failed ({exc}) — the row is "
+                      "written without it", flush=True)
+        # WHICH SIDE IT ACTUALLY CAME FROM belongs in this block and not a
+        # later one: a grasp that succeeded from the wrong bin is a different
+        # result from one that succeeded from the commanded one, and the
+        # verdict key cannot tell them apart.
+        rb, de = self.cur.get("bin_realized"), self.cur.get("dir_err_deg")
+        landed = ""
+        if rb:
+            hit = self.cur.get("bin_hit")
+            landed = (f"commanded {self.cur['bin']}, landed {rb}"
+                      + ("" if de is None else f" ({de:.0f}\u00b0 off)")
+                      + ("" if hit is None else
+                         ("  \u2713 bin hit" if hit else "  \u2717 wrong sector")))
+        w = self.cur["grip_end_mm"]
+        if verdict is None:
+            self.phase = "VERDICT"
+            self._say(f"{self.cur['bin']} CLOSED · {self.cur['elapsed_s']:.1f}s "
+                      f"· {steps} steps",
+                      landed,
+                      "the arm is carrying the object home; a key pressed "
+                      "during that move is read when it finishes")
+        else:
+            self._pending_head = (
+                f"{self.cur['bin']} {ending.upper()} · "
+                f"{self.cur['elapsed_s']:.1f}s · {steps} steps"
+                + ("" if w is None else f" · jaws {w:.0f} mm"))
+            self._pending_landed = landed
+            self.verdict_given(verdict)
+
+    def verdict_given(self, verdict: str) -> bool:
+        """Close the row out and advance. True when the fingers are HOLDING."""
+        if self.cur is None:
+            return False
+        self.cur.update(verdict=verdict, t_verdict=time.time(),
+                        grip_verdict_mm=aperture_mm(gripper_finger_m),
+                        grip_min_mm=self._grip_min_mm())
+        row = dict(self.cur)
+        self.rows.append(row)
+        held = row["ending"] == "close"
+        self.cur = None
+        self.cursor += 1
+        self.phase = "DONE" if self.cursor >= len(self.labels) else "BETWEEN"
+        if self.recorder is not None:
+            self.recorder.on_attempt_done(row)
+        # THE JAWS ARE PART OF THE VERDICT because they are the check on it:
+        # "pass" beside a 0.4 mm closure is an operator who judged too early,
+        # or an object that was never between the fingers.
+        mn, at = row["grip_min_mm"], row["grip_verdict_mm"]
+        jaws = "" if mn is None else (
+            f"jaws closed to {mn:.1f} mm"
+            + ("" if at is None or abs(at - mn) < 0.5
+               else f", {at:.1f} mm at the verdict \u2014 it slipped"))
+        # `attempt_ended` stashes these when it decides the verdict itself (a
+        # timeout or an 'f'), so that ending gets ONE block rather than two.
+        head = getattr(self, "_pending_head", None) or (
+            f"{row['bin']} {verdict.upper()} · {row['elapsed_s']:.1f}s · "
+            f"{row['steps']} steps")
+        landed = getattr(self, "_pending_landed", None) or ""
+        self._pending_head = self._pending_landed = None
+        self._say(f"{head}  \u2192  {verdict.upper()}",
+                  landed, jaws,
+                  ("ARM FROZEN where it stopped" if row["froze"] else ""),
+                  f"session so far: {self.tally()}")
+        return held
+
+    def attempt_voided(self, steps: int) -> None:
+        """'t' during an attempt. The command is RE-OFFERED, not consumed.
+
+        A user stop is not a policy failure — 'f' is — and a slip of the finger
+        should not cost an attempt out of the session.
+        """
+        STOP_KEYS.discard("f")
+        if self.cur is None:
+            return
+        self.cur.update(t_end=time.time(), ending="user_stop",
+                        steps=int(steps), verdict="void", froze=True,
+                        t_verdict=time.time(),
+                        grip_end_mm=aperture_mm(gripper_finger_m),
+                        grip_verdict_mm=aperture_mm(gripper_finger_m))
+        # grip_min_mm stays empty: a void never closed, so there is no closure
+        # to report, and the approach's open jaws written into that column
+        # would read as a grasp that stopped at 80 mm.
+        self.cur["elapsed_s"] = self.cur["t_end"] - self.cur["t_start"]
+        row = dict(self.cur)
+        self.rows.append(row)
+        self.cur = None
+        self.phase = "BETWEEN"                  # the cursor does NOT advance
+        if self.recorder is not None:
+            self.recorder.on_attempt_done(row)
+        self._say(f"{row['bin']} VOIDED by 't' · {row['elapsed_s']:.1f}s · "
+                  f"{steps} steps",
+                  "a user stop is not a policy failure, so the bin is NOT "
+                  "consumed",
+                  "ARM FROZEN where it stopped",
+                  f"session so far: {self.tally()}")
+
+    def close(self, reason: str) -> dict:
+        """From main()'s finally. Nothing after this runs: __main__ leaves
+        through os._exit(0), which flushes stdout and stderr and nothing else."""
+        STOP_KEYS.discard("f")
+        if self.cur is not None:
+            # Read BEFORE the update, because "did this attempt reach a close"
+            # is what decides whether the tracked minimum means anything, and
+            # the update is about to overwrite `ending` with "abandoned".
+            closed = self.cur["ending"] == "close"
+            self.cur.update(
+                t_end=self.cur["t_end"] or time.time(),
+                ending=self.cur["ending"] or "abandoned",
+                steps=self.cur["steps"] or 0, verdict="abandoned",
+                # Whatever was already captured at the ending, else the jaws as
+                # they are now — quitting mid-approach still records an opening.
+                grip_end_mm=(self.cur["grip_end_mm"]
+                             if self.cur["grip_end_mm"] is not None
+                             else aperture_mm(gripper_finger_m)),
+                grip_verdict_mm=aperture_mm(gripper_finger_m),
+                # Only if the fingers were actually asked to close. Abandoning
+                # mid-approach leaves a minimum that is just the open jaws.
+                grip_min_mm=self._grip_min_mm() if closed else None)
+            self.cur["elapsed_s"] = self.cur["t_end"] - self.cur["t_start"]
+            self.rows.append(dict(self.cur))
+            if self.recorder is not None:
+                self.recorder.on_attempt_done(self.rows[-1])
+            self.cur = None
+        summary = {"session_id": self.session_id, "reason": reason,
+                   "labels": list(self.labels), "rows": list(self.rows),
+                   "attempted": self.cursor, "n_attempts": len(self.labels)}
+        print(f"\n{self.RULE}\n  SESSION {self.session_id} ENDED — {reason}\n"
+              f"    {self.cursor}/{len(self.labels)} bins · {self.tally()}\n"
+              f"  {'':2s}{'#':>4s} {'bin':>3s} {'ending':>11s} {'time':>6s} "
+              f"{'steps':>6s} {'jaws':>7s} {'landed':>7s}  verdict")
+        for r in self.rows:
+            mn = r.get("grip_min_mm")
+            rb = r.get("bin_realized") or "--"
+            de = r.get("dir_err_deg")
+            print(f"  {'':2s}{r['attempt']}.{r['try']:<2d} {r['bin']:>3s} "
+                  f"{str(r['ending']):>11s} {r['elapsed_s']:5.1f}s "
+                  f"{r['steps']:6d} "
+                  f"{'     --' if mn is None else f'{mn:5.1f}mm'} "
+                  f"{rb:>3s}"
+                  f"{'    ' if de is None else f'{de:4.0f}'}  {r['verdict']}")
+        if self.recorder is not None:
+            self.recorder.on_session_end(summary)
+        return summary
+
+    # ---- the HUD ------------------------------------------------------------
+
+    def status_line(self, step: int, max_steps: int,
+                    auto_home_in: Optional[float] = None) -> str:
+        n = len(self.labels)
+        if self.phase == "IDLE":
+            return f"EXP 0/{n} — press 's' for 1/{n}: {self.next_label}"
+        if self.phase == "RUNNING":
+            return (f"RUNNING {self.cur['attempt']}/{n} {self.cur['bin']}   "
+                    f"t={self.elapsed():.1f}s   step {step}/{max_steps}")
+        if self.phase == "VERDICT":
+            # THE LIVE CLOSURE, so the verdict is a reading and not a guess.
+            # The fingers are commanded to 0.0 m: settling near zero means they
+            # met each other and the object is not in them, whatever it looked
+            # like from across the room.
+            mn = self._grip_min_mm()
+            s = (f"CLOSED {self.cur['attempt']}/{n} {self.cur['bin']} at "
+                 f"{self.cur['elapsed_s']:.2f}s / {self.cur['steps']} steps"
+                 + ("" if mn is None else f"   jaws {mn:.1f} mm")
+                 + " — VERDICT? 'p'=pass 'f'=fail")
+            return s + ("" if auto_home_in is None
+                        else f"   CARRYING HOME IN {auto_home_in:.1f}s")
+        if self.phase == "DONE":
+            return f"SESSION COMPLETE — {n}/{n}, {self.tally()}. 'q' to end."
+        last = self.rows[-1] if self.rows else {}
+        head = ("FAILED" if last.get("verdict") == "fail" else
+                "VOIDED" if last.get("verdict") == "void" else "PASS")
+        return (f"{head} {last.get('attempt')}/{n} {last.get('bin')} "
+                f"({last.get('ending')}, {last.get('elapsed_s', 0.0):.2f}s)"
+                + ("  ARM FROZEN — 'h' to home, then" if last.get("froze")
+                   else ".")
+                + f" 's' for {self.cursor + 1}/{n}: {self.next_label}   "
+                f"[{self.tally()}]")
+
+    def key_line(self) -> str:
+        """The HUD legend. Derived from `next_line` so the overlay and the
+        terminal cannot drift apart, plus the keys that are live in EVERY phase
+        and so are left out of the terminal's NEXT line as noise."""
+        base = self.next_line()
+        if self.phase == "RUNNING":
+            return base
+        return base + ("   h = home   t = STOP" if self.phase != "VERDICT"
+                       else "   h = home now   t = cancel the carry")
+
+
+def _exp_bins(text: str) -> list[str]:
+    """'+x,+y,-y' -> ['+x', '+y', '-y']. Order is the session; repeats are legal."""
+    labels = [t.strip() for t in str(text).split(",") if t.strip()]
+    if not labels:
+        raise argparse.ArgumentTypeError("--exp-bins is empty")
+    return labels
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2212,6 +2937,15 @@ def build_parser() -> argparse.ArgumentParser:
                         f"{RATE_CONTROL_HZ:.2f} Hz = the paper's "
                         "POLICY.TIME_ACTION_REPEAT of 0.15 s). Ignored by "
                         "--control settle.")
+    p.add_argument("--rate-anchor", choices=("obs", "now"), default="obs",
+                   help="which pose the policy's delta hangs off. 'obs' "
+                        "(default, and what every run so far used) is the pose "
+                        "the observation was taken at, matching sim. 'now' "
+                        "re-reads the pose at publish time, ~120 ms later, so "
+                        "each step gets a full delta of fresh travel from where "
+                        "the arm actually is — try it if the arm stops and "
+                        "lurches or reverses near the object, and judge it on "
+                        "the moved=/res= columns.")
     p.add_argument("--step-mode", action="store_true",
                    help="SAFE MODE: preview each predicted step and only execute "
                         "it when you press SPACE. Nothing moves unprompted.")
@@ -2231,6 +2965,55 @@ def build_parser() -> argparse.ArgumentParser:
                         "can reliably land — it has ~17 mm of standing droop and "
                         "a gain that varies 2x between moves — makes the refine "
                         "overshoot and hunt instead of stopping.")
+    p.add_argument("--auto-home-delay", type=float, default=AUTO_HOME_DELAY_S,
+                   metavar="SEC",
+                   help=f"seconds to wait after the policy CLOSES the gripper "
+                        f"before homing on its own (default {AUTO_HOME_DELAY_S}). "
+                        "The wait is a deadline, not a sleep: perception, the "
+                        "overlays and every key keep running through it, and "
+                        "'t', 'h' or 's' all cancel the pending move. Only a "
+                        "close schedules one — a stop, a max-steps ending or a "
+                        "quit never does.")
+    p.add_argument("--no-auto-home", action="store_true",
+                   help="never home on its own after a close; wait for 'h', "
+                        "which is how this behaved before. Worth having while "
+                        "you are debugging a policy that closes in the wrong "
+                        "place, since the automatic move drags the arm out of "
+                        "the pose you wanted to look at.")
+    p.add_argument("--exp-mode", action="store_true",
+                   help="run a SESSION: an ordered sequence of attempts from "
+                        "--exp-bins, one per 's', each timed and recorded. "
+                        "Implies --home, --home-gripper and --enable-gripper. "
+                        "'f' fails the running attempt and stops the arm where "
+                        "it stands; after a close the arm carries the object "
+                        "home and waits for 'p' (pass) or 'f' (fail); 'q' ends "
+                        "the session once every command has been judged.")
+    p.add_argument("--exp-bins", type=_exp_bins, default=None, metavar="A,B,C",
+                   help="the ORDERED sequence of commands, one attempt each: "
+                        "--exp-bins +x,+y,+z,-y. Repeats are legal and mean "
+                        "run it again. What a label may BE is the policy's "
+                        "business — the regrasp runner takes directions and "
+                        "refuses any its run has no demonstrations for, up "
+                        "front, before a camera opens.")
+    p.add_argument("--exp-out", type=str, default=None, metavar="DIR",
+                   help="where the session's records go. A subdirectory named "
+                        "for the session timestamp is created inside it. Only "
+                        "read under --exp-mode; without it nothing is recorded, "
+                        "which is what you want for a rehearsal.")
+    p.add_argument("--exp-no-depth", action="store_true",
+                   help="skip the depth stream. Depth is ~94%% of the data "
+                        "(~260 MB per attempt per two cameras against ~15 MB "
+                        "without) and it is the ONLY thing that makes the raw "
+                        "cloud reconstructable offline — the video and the "
+                        "labels cannot be turned back into 3D. Use this for "
+                        "long rehearsals, not for data you intend to keep.")
+    p.add_argument("--exp-video-fps", type=float, default=None, metavar="FPS",
+                   help="the frame rate declared in the mp4 headers. Defaults "
+                        "to --rate-hz under --control rate (so playback is "
+                        "real time) and 10 otherwise. It is NOMINAL: one video "
+                        "frame is written per recorded step and the true "
+                        "timestamps are in steps.csv, so this changes playback "
+                        "speed and nothing about which frame is which.")
     p.add_argument("--home-stepwise", action="store_true",
                    help="home the old way: settle on every 2 cm waypoint. That "
                         "is one dead stop per waypoint — fifteen for a 30 cm "
@@ -2400,6 +3183,42 @@ def main(adapter: "Phase4Policy | None" = None,
     adapter = adapter or Phase4Policy()
     args = args if args is not None else parse_args()
 
+    # ---- --exp-mode: refuse the contradictions before anything opens --------
+    exp_labels = list(getattr(args, "exp_bins", None) or [])
+    if args.exp_mode:
+        # WHAT IT IMPLIES, and why it implies rather than requires. A session
+        # whose fingers were never homed reports an uncalibrated width for every
+        # attempt, which poisons robot_state[25] and the finger exclusion boxes
+        # silently — see FrankaGripper.prepare. Making that a flag you can
+        # forget makes it a failure mode you will not see.
+        if args.dry_run:
+            raise SystemExit("--exp-mode drives the robot and times attempts; "
+                             "--dry-run publishes nothing. Pass one.")
+        if args.home_only:
+            raise SystemExit("--exp-mode and --home-only are contradictory.")
+        if args.step_mode:
+            raise SystemExit(
+                "--exp-mode and --step-mode are contradictory: the elapsed time "
+                "an attempt reports would be however long you took to press "
+                "SPACE. Run the session continuously.")
+        if args.no_auto_home:
+            raise SystemExit(
+                "--exp-mode homes after every close, carrying the object, and "
+                "waits for your verdict. --no-auto-home deletes exactly that "
+                "step. Use --auto-home-delay to change WHEN, not whether.")
+        if not exp_labels:
+            raise SystemExit("--exp-mode needs --exp-bins, e.g. "
+                             "--exp-bins +x,+y,+z,-y")
+        args.home = True             # home the ARM at startup
+        args.home_gripper = True     # ... and CALIBRATE the fingers
+        args.enable_gripper = True   # a close that does nothing is not an attempt
+        print(f"[exp] session of {len(exp_labels)} attempts: "
+              f"{', '.join(exp_labels)}\n"
+              "[exp] --home, --home-gripper and --enable-gripper are implied.")
+        adapter.validate_commands(exp_labels)   # BEFORE any camera or motion
+    elif exp_labels or args.exp_out is not None:
+        raise SystemExit("--exp-bins / --exp-out are only read under --exp-mode.")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
         raise RuntimeError(
@@ -2469,8 +3288,9 @@ def main(adapter: "Phase4Policy | None" = None,
             "    there is no pose-independent view left to anchor it.\n"
             f"    Calibration in use: session {args.calib_session!r}.\n")
 
-    print(f"Policy dir     : {policy_dir}")
-    print(f"Checkpoint     : {ckpt}")
+    if adapter.uses_policy_dir:
+        print(f"Policy dir     : {policy_dir}")
+        print(f"Checkpoint     : {ckpt}")
     print(f"Hand seg ckpt  : {hand_seg_ckpt}")
     print("EE offset z    : "
           + (f"{args.ee_offset_z:.4f} m (OVERRIDE)" if args.ee_offset_z is not None
@@ -2478,6 +3298,19 @@ def main(adapter: "Phase4Policy | None" = None,
           + " (panda_hand -> published frame)")
     print(f"Gripper        : {'ENABLED' if args.enable_gripper else 'disabled'}")
     print(f"Droop comp     : {'off' if args.no_droop_compensation else 'on'}")
+    if args.control == "rate":
+        print(f"Step anchored  : {args.rate_anchor}"
+              + ("  (the pose the observation was taken at, as in sim)"
+                 if args.rate_anchor == "obs" else
+                 "  (re-read at publish time, ~120 ms later — A/B)"))
+    # None means "never", which is what the CLOSE branch tests. Resolved here so
+    # there is one answer rather than a flag pair re-read at the call site.
+    auto_home_s = (None if args.no_auto_home or args.dry_run
+                   else max(0.0, float(args.auto_home_delay)))
+    print("Auto-home      : "
+          + (f"{auto_home_s:.1f}s after a policy CLOSE" if auto_home_s is not None
+             else "off, --dry-run publishes nothing" if args.dry_run
+             else "off (press 'h')"))
     print(f"Step motion    : {'multi-pass (stops between passes)' if args.no_creep else 'creep (one stop per step)'}")
     print(f"Cameras        : {', '.join(camera_names)}"
           + (f"  (calib session {args.calib_session})" if fixed_names else ""))
@@ -2503,6 +3336,10 @@ def main(adapter: "Phase4Policy | None" = None,
     sub = pub = gripper_sub = None
     rigs: list = []          # referenced by the finally block before it is filled
     viewer = None
+    # Same reason as `rigs`: the finally block closes these, and a failure
+    # during camera bring-up must not turn into a NameError that hides it.
+    exp = rec = None
+    stop_reason = "did not start"
     gripper = FrankaGripper(None, False)
     publish_seq = 0   # shared by homing and the policy loop
 
@@ -2927,10 +3764,12 @@ def main(adapter: "Phase4Policy | None" = None,
         # when the robot is moving and an abort is worth having.
         def _poll_keys() -> bool:
             hit = False
+            now = time.time()
             k = cv2.waitKey(1) & 0xFF
             if 32 <= k < 127:
                 c = chr(k)
-                if c == "t":
+                if c in STOP_KEYS:
+                    request_stop(c, now)
                     hit = True
                 else:
                     _swallowed_keys.append(c)
@@ -2938,13 +3777,52 @@ def main(adapter: "Phase4Policy | None" = None,
                 _swallowed_keys.append("q")
             if viewer.enabled:
                 for c in viewer.drain_keys():
-                    if c == "t":
+                    if c in STOP_KEYS:
+                        request_stop(c, now)
                         hit = True
                     else:
                         _swallowed_keys.append(c)
             return hit
 
         globals()["_stop_poller"] = _poll_keys
+
+        # ---- the session and its recorder ----------------------------------
+        # Constructed here, before announce_end and start_episode, so both can
+        # close over `exp`. The recorder is optional: --exp-mode without
+        # --exp-out runs the whole key flow and writes nothing, which is what a
+        # rehearsal wants.
+        exp = (ExperimentSession(exp_labels, args.max_steps, adapter=adapter)
+               if args.exp_mode else None)
+        if exp is not None and args.exp_out:
+            import exp_recorder as _expr
+            # NOT the checkpoint's DATA.pc_channels. `policy_pc.f4` records
+            # build_policy_cloud's output, whose width is fixed at 5 for every
+            # policy; a regrasp run's 7-channel cloud is a separate stream the
+            # adapter declares itself. Passing 7 in here declared a stride the
+            # writer never used. See adapter_spec.
+            fields, spec = _expr.adapter_spec(adapter)
+            fps = (args.exp_video_fps if args.exp_video_fps
+                   else (args.rate_hz if args.control == "rate" else 10.0))
+            rec = _expr.ExpRecorder(
+                Path(args.exp_out).expanduser() / exp.session_id, rigs,
+                record_depth=not args.exp_no_depth, video_fps=fps,
+                extra_fields=fields, arrays_spec=spec,
+                attempt_csv_fields=_expr.attempt_fields(adapter),
+                manifest=_expr.build_manifest(
+                    args, rigs, adapter, exp.session_id,
+                    extra={"transforms": {
+                        "T_SIMWORLD_BASE": T_SIMWORLD_BASE.tolist(),
+                        "T_ctrl_hand": T_ctrl_hand.tolist(),
+                        "ee_offset_z": float(ee_offset_z)}}),
+                row_constants={"runner": Path(sys.argv[0]).stem,
+                               "control": args.control,
+                               "cameras": ",".join(r.name for r in rigs),
+                               "segmentation": args.segmentation,
+                               "policy_run": str(getattr(adapter, "run_dir",
+                                                         policy_dir)),
+                               "anchor_ref": getattr(adapter, "anchor_ref", ""),
+                               "d_rule": getattr(adapter, "d_rule", "")})
+            exp.recorder = rec
 
         step = 0
         stop_reason = "max steps reached"
@@ -2967,11 +3845,46 @@ def main(adapter: "Phase4Policy | None" = None,
         # window opens; step mode gets it too, so both modes start the same way.
         armed = False
 
+        # WHEN THE ARM WILL HOME ITSELF, or None for "it will not". Set only by
+        # the CLOSE branch: a grasp is the one episode ending where the next
+        # thing you want is always the same, and standing over the keyboard to
+        # type 'h' with an object in the fingers is the part worth deleting.
+        #
+        # A DEADLINE, NOT A SLEEP. The loop keeps grabbing frames, segmenting
+        # and reading keys through the whole wait, so 't' still stops, 'h' still
+        # homes now, 's' still starts the next episode — and each of those
+        # CLEARS this, because a key press that meant something else must not be
+        # followed by the arm moving on its own a moment later. That is the
+        # whole safety argument for the feature: nothing here can move the robot
+        # that a keypress in the preceding seconds did not leave scheduled.
+        auto_home_at: Optional[float] = None
+
         def announce_end(reason: str) -> None:
             print(f"Episode ended after {step} policy steps: {reason}")
+            if exp is not None:
+                return      # the session prints what to press; "'s' to run
+                            # another episode" is false during a verdict wait
             print("Episode over - camera and cloud windows stay live. "
                   "'h' to re-home, 's' to run another episode, 'q' to quit.",
                   flush=True)
+
+        def release_object() -> None:
+            """Open the fingers at a moment the operator CHOSE.
+
+            start_episode() re-opens them anyway — it has to, because a shut
+            gripper reads as robot_state[25] = 0 for the whole next approach and
+            collapses the finger exclusion boxes onto the object. But that
+            moment is the next 's', with the arm at home 0.7 m up and about to
+            move: the object would drop from there while the operator's
+            attention was on the arm. Doing it on the verdict instead costs
+            nothing, happens while the arm is stationary, and makes prepare()'s
+            wait return on its first poll rather than after a full open.
+            """
+            if not gripper.enabled:
+                return
+            print("[exp] releasing — take the object.", flush=True)
+            gripper.open()
+            gripper.wait_for_width(GRIPPER_MAX_FINGER_M, timeout_s=4.0)
 
         def start_episode() -> None:
             """Begin a new episode without restarting the process.
@@ -2990,9 +3903,12 @@ def main(adapter: "Phase4Policy | None" = None,
             That is the same failure that made consecutive PROCESS runs behave
             oddly; restarting in-process reintroduces it by a shorter path.
             """
-            nonlocal step, episode_over, stop_reason, armed
+            nonlocal step, episode_over, stop_reason, armed, auto_home_at
             nonlocal prev_target, prev_arm
             prev_target = prev_arm = None
+            # Pressing 's' inside the post-close wait means "go again from
+            # here", not "go again and then wander home mid-approach".
+            auto_home_at = None
             step = 0
             stop_reason = "max steps reached"
             episode_over = False
@@ -3013,6 +3929,20 @@ def main(adapter: "Phase4Policy | None" = None,
             if not episode_over and step >= args.max_steps:
                 episode_over = True
                 announce_end(stop_reason)
+                if exp is not None and exp.phase == "RUNNING":
+                    # A TIMEOUT IS A RECORDED FAILURE, and it stops the arm
+                    # where it stands for the same reason 'f' does: the pose the
+                    # policy ran out of budget in is the pose worth looking at.
+                    # freeze_arm does not block, so this is safe at the loop
+                    # top; it is also necessary under --control rate, where the
+                    # last commanded target is one the arm is still travelling
+                    # toward.
+                    publish_seq = freeze_arm(pub, publish_seq)
+                    gripper.stop()
+                    armed = False
+                    auto_home_at = None
+                    exp.attempt_ended("timeout", steps=step, verdict="fail",
+                                      froze=True)
 
             # Keyed on whether a pose EXISTS, not on --dry-run. A dry run with a
             # fixed camera subscribes precisely so this branch can be the real
@@ -3035,6 +3965,11 @@ def main(adapter: "Phase4Policy | None" = None,
             # robot state. Reading it twice would let the two disagree by a
             # frame, and the finger exclusion boxes are placed from it.
             gripper_norm = read_gripper_norm(assume_open=True)
+            if exp is not None:
+                # The SAME reading the cloud and robot_state are built from, on
+                # purpose: a second read of the global would be a frame out and
+                # the recorded closure would not be the one the policy saw.
+                exp.note_gripper(gripper_finger_m)
             _t = time.time()
             fused = perception.observe(
                 T_base_hand, gripper_norm * GRIPPER_MAX_FINGER_M)
@@ -3052,6 +3987,12 @@ def main(adapter: "Phase4Policy | None" = None,
             clamped = False
             delta6 = None
             T_base_ctrl_target = None
+            # Reset per iteration like the others. It was not, which was
+            # harmless while only the execute path read it (that path cannot
+            # run on a CLOSE step) — but anything reading it on a CLOSE step or
+            # the first iteration would get the previous step's target or an
+            # UnboundLocalError, and the recorder reads it every step.
+            T_base_hand_target = None
 
             if have_obs:
                 # return_index costs nothing and is what lets the 3D view colour
@@ -3082,15 +4023,79 @@ def main(adapter: "Phase4Policy | None" = None,
                 rs = build_robot_state(T_base_hand, gripper_norm)
 
                 _t = time.time()
-                action = adapter.act(pc, rs, fused=fused,
-                                     T_base_hand=T_base_hand)  # [7], ch6 {0,1}
+                try:
+                    action = adapter.act(pc, rs, fused=fused,
+                                         T_base_hand=T_base_hand)  # [7], ch6
+                except ObservationNotUsable as exc:
+                    # HOLD THE FRAME RATHER THAN DIE. The observation cleared
+                    # `usable` and still was not enough for the adapter — see
+                    # ObservationNotUsable. Treating it as "nothing segmented"
+                    # reuses the path that already exists for that: no target is
+                    # published, no step is consumed, and the next perception
+                    # pass is a fresh chance. Under --exp-mode the alternative
+                    # was losing the session to a traceback.
+                    have_obs = False
+                    action = None
+                    _warn_hold(f"skipped a frame: {exc}")
                 ms_pol = (time.time() - _t) * 1e3
-                grasp_close = bool(action[6] < 0.5)
 
-                if not grasp_close:
+                grasp_close = bool(have_obs and action[6] < 0.5)
+                if have_obs and not grasp_close:
                     delta6, clamped = clamp_action_delta(action[:6])
-                    T_base_hand_target = T_base_hand @ unpack_action(delta6)
+                    # WHICH POSE THE DELTA HANGS OFF, and it is not obvious.
+                    #
+                    # The action is "from where you are, move like this", and in
+                    # sim there is no gap between the two readings of "where you
+                    # are": the observation and the command are the same
+                    # instant. On the robot they are not. `T_base_hand` was read
+                    # BEFORE observe(), and observe() plus inference is ~120 ms
+                    # of a 150 ms period — so by the time this target is
+                    # published the arm has covered most of a step under the
+                    # PREVIOUS command, and the pose the delta is hung off is
+                    # that far behind it.
+                    #
+                    # While consecutive deltas agree, that costs nothing: the
+                    # arm is travelling the right way and simply keeps going.
+                    # When they disagree — which near the object is most ticks —
+                    # the new target can land BEHIND the arm, so the arm stops
+                    # or reverses inside the period, `achieved` collapses, and
+                    # the lead estimator is fed a stall that never happened.
+                    # `--rate-anchor now` re-reads the pose here instead, giving
+                    # every step a full delta of fresh travel from wherever the
+                    # arm actually is.
+                    #
+                    # DEFAULT IS `obs`, which is what the policy was trained
+                    # against and what every run so far used. This is an A/B, to
+                    # be judged on the `moved=`/`res=` columns, not a fix that
+                    # has been shown to be one.
+                    T_anchor = T_base_hand
+                    if args.rate_anchor == "now" and current_msg is not None:
+                        T_anchor = (pose_msg_to_matrix(copy.deepcopy(current_msg))
+                                    @ T_ctrl_hand)
+                    T_base_hand_target = T_anchor @ unpack_action(delta6)
                     T_base_ctrl_target = clamp_target_pose(T_base_hand_target @ T_hand_ctrl)
+
+            # ---- RECORD ----
+            # Before the display block on purpose. `overlay_mask` copies today,
+            # but the HUD path draws with cv2.putText into the first rig's
+            # `view`, which is one refactor away from drawing into the frame
+            # being recorded. Recording first makes the ordering explicit
+            # rather than lucky.
+            if rec is not None:
+                rec.on_step(
+                    step=step, t_mono=_t, perception=perception, fused=fused,
+                    T_base_hand=T_base_hand, gripper_norm=gripper_norm,
+                    pc=pc if have_obs else None,
+                    robot_state=rs if have_obs else None,
+                    action=action if have_obs else None,
+                    have_obs=have_obs, armed=armed,
+                    executed=bool(armed and not episode_over and have_obs),
+                    grasp_close=grasp_close, clamped=clamped,
+                    ms_obs=ms_obs, ms_pol=ms_pol, adapter=adapter,
+                    grip_logit=getattr(adapter, "grip_logit", float("nan")),
+                    target=T_base_hand_target,
+                    d_world=getattr(adapter, "d_world", None))
+                rec.check()
 
             # ---- display ----
             # One overlay window per camera, so a camera that has stopped
@@ -3133,34 +4138,57 @@ def main(adapter: "Phase4Policy | None" = None,
                     cv2.imshow(f"cam: {rig.name}", view)
 
             lines = [
-                f"step {step}/{args.max_steps}  obj={len(object_policy)} "
-                f"hand={len(hand_policy)}   {fused.summary()}",
+                f"step {step}/{args.max_steps}  "
+                f"obj={len(object_policy)}{_range_txt(object_policy)} "
+                f"hand={len(hand_policy)}{_range_txt(hand_policy)}   "
+                f"{fused.summary()}",
             ]
+            if exp is not None:
+                # Index 1, so it inherits the existing yellow highlight and the
+                # adapter's direction line sits right under it. That pairing is
+                # the visual confirmation that set_command took effect: if
+                # adapter.hud() still names the previous command after an 's',
+                # the re-point failed.
+                lines.append(exp.status_line(
+                    step, args.max_steps,
+                    auto_home_in=(None if auto_home_at is None
+                                  else max(0.0, auto_home_at - time.time()))))
             extra = adapter.hud()
             if extra:
                 lines.append(extra)
-            if episode_over:
-                lines.append(f"EPISODE OVER: {stop_reason}  -  's' to run again")
-            elif not armed:
+            if rec is not None:
+                lines.append(rec.hud())
+            if episode_over and exp is None:
+                left = (None if auto_home_at is None
+                        else max(0.0, auto_home_at - time.time()))
+                lines.append(
+                    f"EPISODE OVER: {stop_reason}  -  's' to run again"
+                    + ("" if left is None
+                       else f"   AUTO-HOME IN {left:.1f}s ('t' cancels)"))
+            elif not armed and exp is None:
                 # Still shows what the policy WOULD do, so you can watch the
                 # prediction settle before arming rather than after.
                 lines.append("NOT STARTED - press 's'"
                              + ("" if not have_obs else
                                 ("   (would CLOSE)" if grasp_close else
-                                 f"   (would move {np.linalg.norm(delta6[:3])*100:.1f}cm)")))
+                                 f"   (would move {np.linalg.norm(delta6[:3])*100:.1f}cm)")
+                                + _grip_txt(adapter)))
             elif not have_obs:
                 lines.append("NO OBSERVATION - holding")
             elif grasp_close:
-                lines.append("PENDING: CLOSE GRIPPER")
+                lines.append(f"PENDING: CLOSE GRIPPER{_grip_txt(adapter)}")
             else:
                 lines.append(
                     f"PENDING: d={np.linalg.norm(delta6[:3])*100:.1f}cm "
                     f"r={np.rad2deg(np.linalg.norm(Rot.from_matrix(unpack_action(delta6)[:3, :3]).as_rotvec())):.1f}deg"
-                    + ("  CLAMPED" if clamped else ""))
-            lines.append("s=new episode  h=home  t=STOP  q=quit" if episode_over
-                         else "s=start  h=home  t=STOP  q=quit" if not armed
-                         else ("SPACE=execute  t=STOP  h=home  q=quit" if args.step_mode
-                               else "t=STOP  q=quit  h=home"))
+                    + ("  CLAMPED" if clamped else "")
+                    + _grip_txt(adapter))
+            lines.append(
+                exp.key_line() if exp is not None
+                else "s=new episode  h=home  t=STOP  q=quit" if episode_over
+                else "s=start  h=home  t=STOP  q=quit" if not armed
+                else ("SPACE=execute  t=STOP  h=home  q=quit" if args.step_mode
+                      else "t=STOP  q=quit  h=home"))
 
             for i, text in enumerate(lines):
                 cv2.putText(overlay, text, (10, 22 + 20 * i),
@@ -3229,6 +4257,13 @@ def main(adapter: "Phase4Policy | None" = None,
             if _swallowed_keys:
                 pressed.extend(_swallowed_keys)
                 _swallowed_keys.clear()
+            # A stop raised from INSIDE a motion never reached `pressed`: the
+            # poller had to consume the key to see it. Put it back, so there is
+            # ONE dispatch table rather than two, and so which key it was
+            # survives — 't' is a user stop and 'f' is a recorded policy
+            # failure, and they must not collapse into each other here.
+            if stop_requested and stop_reason_key and stop_reason_key not in pressed:
+                pressed.append(stop_reason_key)
 
             # View-only keys never touch the robot, so they are handled here and
             # dropped before the step keys below see them.
@@ -3243,14 +4278,24 @@ def main(adapter: "Phase4Policy | None" = None,
                     print(f"white scene cloud "
                           f"{'on' if viewer.show_context else 'off'}")
                     last_cloud_draw = 0.0
-                elif k == "r":
+                elif k == "m":
+                    # 'm' and not 'r'. --exp-mode needs 'r' for RETRY, which is
+                    # an action on the experiment and far more consequential
+                    # than cycling how a mouse drag orbits the view. Moved
+                    # unconditionally rather than per-mode, so a key means one
+                    # thing everywhere.
                     viewer.cycle_rotate_mode()
                 elif k == "z":
                     viewer.roll(-10.0)
                 elif k == "x":
                     viewer.roll(+10.0)
 
-            if "t" in pressed or stop_requested:
+            if "t" in pressed:
+                # FIRST, before anything else in this branch: a stop that left a
+                # pending auto-home armed would freeze the arm and then drive
+                # it home a few seconds later, which is the exact opposite of
+                # what 't' means.
+                auto_home_at = None
                 publish_seq = freeze_arm(pub, publish_seq)
                 clear_stop()
                 gripper.stop()
@@ -3259,10 +4304,64 @@ def main(adapter: "Phase4Policy | None" = None,
                     episode_over = True
                     announce_end(stop_reason)
                 armed = False
+                if exp is not None and exp.phase == "RUNNING":
+                    # 't' VOIDS the attempt rather than failing it: a failure is
+                    # something the POLICY did and 'f' records that. The command
+                    # is re-offered, so the next 's' retries the same one.
+                    exp.attempt_voided(steps=step)
                 print("[STOP] equilibrium re-commanded at the current pose. "
                       "This is a SOFT stop — the arm is holding, not braked. "
                       "Use the hardware E-stop if it is not enough.", flush=True)
                 continue
+            # ---- EXPERIMENT MODE: the outcome keys ----
+            # AFTER 't', which outranks everything, and BEFORE 's', because
+            # _swallowed_keys can deliver several keys in one batch and an 'f'
+            # arriving alongside an 's' must be the reason THIS attempt ended,
+            # not a key the next one inherits. It consumes the iteration either
+            # way: "f s" must not start the next attempt before you have
+            # re-homed by hand, and 'h' is dispatched below 's'.
+            # RETRY, before 's': `_swallowed_keys` can deliver several keys in
+            # one batch, and an "r s" batch must roll the cursor back BEFORE
+            # 's' reads which bin is next — otherwise the retry silently starts
+            # the following bin instead.
+            if exp is not None and "r" in pressed:
+                exp.retry_requested()
+                continue
+            if exp is not None and ("f" in pressed or "p" in pressed):
+                verdict = "fail" if "f" in pressed else "pass"
+                if exp.phase == "RUNNING":
+                    if verdict == "pass":
+                        print("[exp] 'p' means nothing yet — the policy has not "
+                              "closed. 'f' fails it, 't' voids it.", flush=True)
+                    else:
+                        # THE KEY'S OWN PRESS TIME, not now: when 'f' arrived
+                        # through the abort poller it interrupted a settle(),
+                        # and `stop_at` is when that happened. Read it BEFORE
+                        # clear_stop() wipes it.
+                        t_f = stop_at if stop_at is not None else time.time()
+                        auto_home_at = None
+                        publish_seq = freeze_arm(pub, publish_seq)
+                        clear_stop()
+                        gripper.stop()
+                        stop_reason = "policy failed ('f')"
+                        episode_over = True
+                        armed = False
+                        announce_end(stop_reason)
+                        exp.attempt_ended("policy_fail", steps=step,
+                                          verdict="fail", t_end=t_f, froze=True)
+                elif exp.phase == "VERDICT":
+                    # A VERDICT DOES NOT STOP THE ARM, so this branch leaves
+                    # `auto_home_at` alone — unlike 't', 's' and 'h', all of
+                    # which clear it. An 'f' here says the GRASP failed, not
+                    # that the carry-home should abort; press 't' as well if you
+                    # want the arm stopped too.
+                    if exp.verdict_given(verdict) and auto_home_at is None:
+                        release_object()
+                else:
+                    print(f"[exp] nothing to judge ({exp.phase.lower()}) — "
+                          "'s' starts the next attempt.", flush=True)
+                continue
+
             if "q" in pressed:
                 stop_reason = "user quit"
                 break
@@ -3270,6 +4369,22 @@ def main(adapter: "Phase4Policy | None" = None,
             # window too — which is where you will be looking when you decide
             # the scene is ready.
             if "s" in pressed:
+                if exp is not None:
+                    label = exp.start_requested()   # None + a printed reason
+                    if label is not None:
+                        adapter.set_command(label)
+                        # ALWAYS through start_episode(), never the bare
+                        # `armed = True` path: adapter.act() runs on every
+                        # iteration that has an observation, including before
+                        # 's', so a regrasp adapter has already latched its
+                        # direction off the idle scene. start_episode()'s
+                        # adapter.reset() drops that latch, and its `continue`
+                        # means the re-latch happens on a fresh observation
+                        # with the NEW command.
+                        start_episode()
+                        exp.attempt_started()       # clock starts after the
+                                                    # gripper open, not before
+                    continue
                 if episode_over:
                     start_episode()
                     # Fresh observation before acting. start_episode() re-opens
@@ -3280,6 +4395,12 @@ def main(adapter: "Phase4Policy | None" = None,
                     armed = True
                     print("Policy started.", flush=True)
             if "h" in pressed:
+                if exp is not None and exp.phase == "RUNNING":
+                    print("[exp] refusing to home mid-attempt — the clock is "
+                          "running. 'f' fails it, 't' voids it, then 'h'.",
+                          flush=True)
+                    continue
+                auto_home_at = None          # you did it by hand; nothing left to do
                 if args.dry_run:
                     print("[home] ignored in --dry-run")
                 else:
@@ -3289,6 +4410,30 @@ def main(adapter: "Phase4Policy | None" = None,
                                           stream=not args.home_stepwise,
                                           speed_m_s=args.home_speed,
                                           tol_m=args.home_tol)
+                continue
+
+            # ---- AUTO-HOME AFTER A CLOSE ----
+            # Placed after every key branch on purpose, so a key pressed on this
+            # same iteration is honoured and this is not. `go_home` blocks while
+            # it streams, and its own abort poller reads 't' throughout, so the
+            # move is interruptible once it starts as well as before.
+            if auto_home_at is not None and time.time() >= auto_home_at:
+                # No --dry-run guard: `auto_home_s` is already None there, so a
+                # deadline is never scheduled in the first place.
+                auto_home_at = None
+                print("[home] auto-homing now (policy closed the gripper)",
+                      flush=True)
+                publish_seq = go_home(pub, T_ctrl_hand, T_hand_ctrl,
+                                      publish_seq, droop,
+                                      creep=not args.no_creep,
+                                      stream=not args.home_stepwise,
+                                      speed_m_s=args.home_speed,
+                                      tol_m=args.home_tol)
+                # The verdict may have been given during the 5 s delay, in
+                # which case the release was deferred to here so the object is
+                # let go at HOME rather than at the grasp pose.
+                if exp is not None and exp.phase != "VERDICT":
+                    release_object()
                 continue
 
             # ---- EXECUTE ----
@@ -3310,11 +4455,27 @@ def main(adapter: "Phase4Policy | None" = None,
                 continue
 
             if grasp_close:
-                print(f"[{step:02d}] policy commanded CLOSE", flush=True)
+                print(f"[{step:02d}] policy commanded CLOSE{_grip_txt(adapter)}",
+                      flush=True)
+                t_close = time.time()        # before the goal goes out
                 gripper.close()
                 stop_reason = "policy closed the gripper"
                 episode_over = True
                 announce_end(stop_reason)
+                if exp is not None:
+                    armed = False
+                    # verdict=None means "a verdict is owed" -> phase VERDICT.
+                    exp.attempt_ended("close", steps=step, verdict=None,
+                                      t_end=t_close)
+                if auto_home_s is not None:
+                    auto_home_at = time.time() + auto_home_s
+                    # LOUD, because the arm is now going to move with nobody
+                    # touching anything. The delay exists so the fingers have
+                    # settled on the object before it is carried anywhere, and
+                    # so there is a window to change your mind.
+                    print(f"[home] AUTO-HOME in {auto_home_s:.1f}s — the arm "
+                          "will move on its own. 't' cancels, 'h' homes now, "
+                          "'s' starts the next episode instead.", flush=True)
                 continue
 
             pos = T_base_ctrl_target[:3, 3]
@@ -3348,7 +4509,12 @@ def main(adapter: "Phase4Policy | None" = None,
 
             print(f"[{step:02d}] target xyz=({pos[0]:+.3f}, {pos[1]:+.3f}, "
                   f"{pos[2]:+.3f})  |d|={np.linalg.norm(delta6[:3]):.4f}m "
-                  f"obj={len(object_policy):4d} hand={len(hand_policy):4d}"
+                  f"obj={len(object_policy):4d}{_range_txt(object_policy, True)}"
+                  f" hand={len(hand_policy):4d}{_range_txt(hand_policy)}"
+                  # HERE TOO, not only on the overlay. The HUD is drawn into an
+                  # image; the terminal is what gets copied into a bug report,
+                  # and "it would not close" is not a report without this number.
+                  f"{_grip_txt(adapter)}"
                   f"  {fused.summary()}"
                   f"{'  CLAMPED' if clamped else ''}{diag}", flush=True)
 
@@ -3401,6 +4567,24 @@ def main(adapter: "Phase4Policy | None" = None,
             print(f"Episode ended after {step} policy steps: {stop_reason}")
 
     finally:
+        # FIRST, before the cameras, the viewer or ROS. Nothing here depends on
+        # any of them, and `__main__` leaves through exit_without_finalizing()
+        # — os._exit(0), which flushes stdout and stderr and NOTHING ELSE. No
+        # atexit hook runs and no daemon thread gets another slice, so a flush
+        # that has not happened by the time this returns has not happened at
+        # all. Putting it first means a failure in camera teardown cannot cost
+        # a session's data.
+        if exp is not None:
+            try:
+                exp.close(stop_reason)
+            except Exception:
+                traceback.print_exc()
+        if rec is not None:
+            try:
+                rec.close()
+            except Exception:
+                traceback.print_exc()
+
         for rig in rigs:
             try:
                 rig.camera.stop()

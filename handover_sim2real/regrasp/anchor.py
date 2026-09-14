@@ -302,26 +302,39 @@ def object_points_world(pc5, obs, panda_base_inv_tf, base_pos, base_quat):
                            base_pos, base_quat)
 
 
-def centroid_to_world(c_ee, obs, panda_base_inv_tf, base_pos, base_quat):
-    """An EE-frame point -> WORLD, via the panda base.
+def points_to_world(p_ee, obs, panda_base_inv_tf, base_pos, base_quat):
+    """EE-frame points `[N, 3]` -> WORLD `[N, 3]`, via the panda base.
 
-    ONLY THE ANCHOR NEEDS THIS. The per-point channels are dot products, so they
-    work entirely in the EE frame and never convert anything; the anchor is the
-    one place that has to compare the centroid against a world-frame wrist.
+    ONLY THE ANCHOR AND THE VIEWERS NEED THIS. The per-point channels are dot
+    products, so they work entirely in the EE frame and never convert anything;
+    the anchor is the one place that has to compare the centroid against a
+    world-frame wrist, and a viewer is the other, to draw the cloud where the
+    object is.
 
     The chain mirrors `_point_cloud`'s in reverse. `_ee_pose_mat` gives the EE in
     the panda BASE frame (that is the pose `se3_transform_pc` was applied with),
     so it is EE -> base -> world — the same round trip
     `rollout_regrasp_policy.draw_pointcloud` performs to overlay a cloud.
+
+    BATCHED BECAUSE THE SCALAR FORM IN A LOOP IS PATHOLOGICAL: the EE pose and
+    the base rotation do not depend on the point, and rebuilding both per point
+    costs a thousand scipy calls to draw one cloud.
     """
     from scipy.spatial.transform import Rotation as Rot
     from collect_bc_dataset import _ee_pose_mat
 
+    p = np.atleast_2d(np.asarray(p_ee, dtype=np.float64))
     ee_mat = _ee_pose_mat(obs["panda_body"], obs["panda_link_ind_hand"],
                           panda_base_inv_tf)
-    p_base = ee_mat[:3, :3] @ np.asarray(c_ee, dtype=np.float64) + ee_mat[:3, 3]
+    p_base = p @ ee_mat[:3, :3].T + ee_mat[:3, 3]
     R_base = Rot.from_quat(np.asarray(base_quat, dtype=np.float64)).as_matrix()
-    return R_base @ p_base + np.asarray(base_pos, dtype=np.float64)
+    return p_base @ R_base.T + np.asarray(base_pos, dtype=np.float64)
+
+
+def centroid_to_world(c_ee, obs, panda_base_inv_tf, base_pos, base_quat):
+    """One EE-frame point -> WORLD. `points_to_world` for a single point."""
+    return points_to_world(c_ee, obs, panda_base_inv_tf,
+                           base_pos, base_quat)[0]
 
 
 # ── the anchor from THIS step's observation (`SIM.anchor_update`) ─────────────

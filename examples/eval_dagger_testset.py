@@ -153,6 +153,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pin-table", default=None,
                    help="default: the run's own path with the split substituted "
                         "(grasp_pin_table_train_omg.json -> ..._test_omg.json)")
+    p.add_argument("--no-pin-table", action="store_true",
+                   help="score EVERY scene of the split, including the ones OMG "
+                        "cannot plan for. The pin table is two things at once — "
+                        "the grasp each close is scored against, and the filter "
+                        "deciding which scenes are usable — and `stable_grasp` "
+                        "needs neither: it scores release-and-hold on the "
+                        "rollout alone. Dropping it takes the s0 test split from "
+                        "130 scenes to all 144. COST: the pose diagnostics "
+                        "(near_rate, chance_rate, mean_pos_err, eval_min_pos) "
+                        "become NaN for every scene, because there is no pinned "
+                        "pose to measure against. Refused under "
+                        "EVAL.success_mode: proximity, which scores that "
+                        "distance and so cannot work without one.")
     p.add_argument("--allow-pin-mismatch", action="store_true",
                    help="proceed even when the split's pin table was built under "
                         "different settings than the run's — see PIN_PROVENANCE")
@@ -368,8 +381,23 @@ def main() -> None:
     sim = cfg4["SIM"]
     run_pin = str(sim.get("grasp_pin_table", ""))
     sim["split"] = args.split
-    sim["grasp_pin_table"] = (args.pin_table
-                              or split_pin_path(run_pin, args.split))
+    # THE PIN TABLE IS ALSO THE SCENE FILTER, and that is why dropping it widens
+    # the split. `build_phase4_context` sets `usable = set(pin_table.entries)`,
+    # so the 14 s0-test scenes OMG cannot plan for are absent from the table and
+    # therefore never evaluated — not because the POLICY needs a plan (it does
+    # not; `stable_grasp` scores release-and-hold on the rollout alone) but
+    # because the filter and the scoring reference are the same object.
+    if args.no_pin_table:
+        if str((cfg4.get("EVAL") or {}).get("success_mode", "stable_grasp")) \
+                == "proximity":
+            raise SystemExit(
+                "--no-pin-table cannot work under EVAL.success_mode: proximity, "
+                "which scores distance to the pinned grasp. Only stable_grasp "
+                "scores a rollout without one.")
+        sim["grasp_pin_table"] = None
+    else:
+        sim["grasp_pin_table"] = (args.pin_table
+                                  or split_pin_path(run_pin, args.split))
 
     # `exclude_scenes` IS SPLIT-DEPENDENT, and getting it wrong is silent. It
     # lists the scenes of the TRAIN split whose base demonstration succeeded;
@@ -382,7 +410,7 @@ def main() -> None:
         sim.pop("exclude_scenes", None)
         excluded_applied = 0
 
-    if not Path(sim["grasp_pin_table"]).exists():
+    if not args.no_pin_table and not Path(sim["grasp_pin_table"]).exists():
         raise SystemExit(
             f"{sim['grasp_pin_table']} not found. Build the {args.split}-split "
             f"pin table first, with the run's own pin settings:\n"
@@ -407,11 +435,16 @@ def main() -> None:
 
     ctx = build_phase4_context(cfg4, seed=seed)
     ckpt = args.ckpt or ctx.eval_ckpt
-    # `run_pin` is the path as SAVED in the run's config, captured before it was
-    # overwritten above — it is the reference the split's table is checked
-    # against, and there is no other record of how the run pinned.
-    check_pin_provenance(ctx.pin_table, run_pin, sim["grasp_pin_table"],
-                         split=args.split, allow=args.allow_pin_mismatch)
+    if args.no_pin_table:
+        print("[pin] DISABLED — every scene of the split is scored, and the pose "
+              "diagnostics (near_rate, chance_rate, mean_pos_err, eval_min_pos) "
+              "are NaN because there is no pinned pose to measure against.")
+    else:
+        # `run_pin` is the path as SAVED in the run's config, captured before it
+        # was overwritten above — it is the reference the split's table is
+        # checked against, and there is no other record of how the run pinned.
+        check_pin_provenance(ctx.pin_table, run_pin, sim["grasp_pin_table"],
+                             split=args.split, allow=args.allow_pin_mismatch)
 
     held_out = args.split != "train"
     print("=" * 78)
@@ -424,7 +457,7 @@ def main() -> None:
           + (f"  (the in-loop eval used {inloop_n} of the train split)"
              if inloop_n else ""))
     print(f"  checkpoint  : {ckpt}     success={ctx.eval_params.success_mode}")
-    print(f"  pin table   : {sim['grasp_pin_table']}")
+    print(f"  pin table   : {sim['grasp_pin_table'] or 'DISABLED (--no-pin-table)'}")
     print(f"  pinning     : {ctx.pin_table.describe() if ctx.pin_table else 'OFF'}")
     print(f"  exclude     : {'applied' if excluded_applied else 'dropped (train artifact)'}")
     print(f"  writing     : {log_path}")
@@ -459,7 +492,7 @@ def main() -> None:
         row.update({"iter": i, "run_dir": str(run_dir), "ckpt": ckpt,
                     "split": args.split, "num_scenes": len(ctx.eval_scenes),
                     "n_episodes": int(m.get("n", 0)), "eval_s": round(eval_s, 1),
-                    "pin_table": sim["grasp_pin_table"],
+                    "pin_table": sim["grasp_pin_table"] or "(disabled)",
                     "excluded_applied": excluded_applied, "n_fail": n_fail})
         for k in TEST_FIELDS:
             if k in m:

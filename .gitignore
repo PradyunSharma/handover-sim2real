@@ -104,6 +104,59 @@ venv*/*
 *.pth
 *.safetensors
 
+# Real-robot SESSION RECORDINGS (handover_sim2real/sim2real/output/).
+# `exp_recorder.py` writes one directory per run of the rig, holding a raw dump
+# per attempt: the policy's input cloud and action as flat float arrays, the
+# tripod depth frame as uint16, plus the per-attempt json/csv/jsonl around them.
+# Measured at 2.4 GB across 601 files for 17 sessions — larger than everything
+# else in this repository combined, and it grows by ~140 MB every time the rig
+# is run.
+#
+# NOT DERIVED, AND STILL NOT TRACKED. Unlike curves.png these cannot be
+# regenerated — the robot moved once. They are primary data, and that is an
+# argument for BACKING THEM UP, not for putting them in git: blobs are permanent,
+# so a session committed today is paid for by every clone forever, and a later
+# `git rm` does not shrink the history. Sync them the way the .h5 shards are
+# synced.
+#
+# THE SESSION DIRECTORIES, NOT THE FOLDER THEY SIT IN. Two hand-authored results
+# sheets live loose in real_experiments/ among the dumps — `Thesis -
+# Experiments - Regrasp - filled.csv` and `results_subject1_right.csv`, 1.3 KB,
+# written by a person rather than by the recorder and not reproducible from
+# anything. A blanket rule on the folder swept those out along with 2.4 GB of
+# arrays they have nothing in common with, so only the dated session dirs one
+# level down are ignored and anything loose in real_experiments/ stays tracked.
+handover_sim2real/sim2real/output/*
+!handover_sim2real/sim2real/output/real_experiments/
+handover_sim2real/sim2real/output/real_experiments/*/
+
+# The recorder's raw array dumps, UNANCHORED — same lesson as the weights rule
+# above. A path-anchored pattern is dodged the moment a session is written from
+# a different cwd, and these are exactly the files that must never land in a
+# commit by accident.
+*.f4
+*.f8
+*.u16
+
+# Per-iteration copies inside a DEPLOYMENT bundle
+# (handover_sim2real/sim2real/checkpoint/<run>/iter_NN/).
+# `output/.gitignore` already worked this out for output/dagger_runs/*/iters/
+# and the same argument applies verbatim here, because the deploy script copies
+# the whole run: 26 iterations x {config.yaml, log.csv, normalization.npz} = 78
+# of the 90 files in a bundle, against the 12 that are the bundle.
+#
+# A normalizer is only worth keeping next to the checkpoint it denormalizes, and
+# the ONLY checkpoints a bundle carries are best/ and last/ — the per-iteration
+# .pt were never copied and never tracked, so these 78 normalize nothing. The
+# per-iter log.csv is epoch-level detail already summarised one row per
+# iteration in the bundle's own dagger_log.csv.
+#
+# What stays: README.md, config.yaml, command_axes.json, dagger_log.csv, and
+# best/ and last/ complete with their config.yaml, normalization.npz and
+# source.txt. That handful IS the deployment record — it is what the robot
+# loads and what says which run it came from.
+handover_sim2real/sim2real/checkpoint/*/iter_*/
+
 # The stray duplicate package tree itself. It holds nothing but the checkpoint
 # above; the real tree is at the repo root.
 handover_sim2real/sim2real/handover_sim2real/

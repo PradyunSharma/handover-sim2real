@@ -284,7 +284,7 @@ def rollout(env, model, point_listener, scene_idx, device,
             grasp_idx=0, show_anchor_frame=False, show_bin_sphere=False,
             bin_sphere_radius=0.10, bin_sphere_points=2400,
             command_axes="BINS", show_d=False, d_rule=None,
-            bin_override=None):
+            bin_override=None, show_wrist=False):
     obs = env.reset(idx=scene_idx)
 
     # REGRASP: which DIRECTION this roll is commanded to approach from. It is
@@ -365,7 +365,7 @@ def rollout(env, model, point_listener, scene_idx, device,
             pybullet.removeUserDebugItem(_d)
         goal_marker_ids.clear()
 
-    if show_anchor_frame or show_bin_sphere or show_d:
+    if show_anchor_frame or show_bin_sphere or show_d or show_wrist:
         meta = (pin_table.scene_meta.get(int(scene_idx), {})
                 if pin_table is not None else {})
         a_R = meta.get("anchor_R")
@@ -383,6 +383,12 @@ def rollout(env, model, point_listener, scene_idx, device,
             if show_anchor_frame:
                 draw_anchor_frame(a_R, c_w, goal_marker_ids,
                                   length=max(bin_sphere_radius * 1.5, 0.12))
+            if show_wrist:
+                _r = _viz.draw_hand_anchor(meta.get("wrist_world"), c_w,
+                                           goal_marker_ids)
+                print("  wrist: none recorded (base-frame fallback)"
+                      if _r is None else
+                      f"  horizontal wrist -> object {_r * 100:.1f} cm")
             b = None if cmd_bin is None or int(cmd_bin) < 0 else int(cmd_bin)
             print(f"  anchor frame at centroid {c_w.round(3)}  mode="
                   f"{meta.get('anchor_mode', '?')}  commanded bin="
@@ -769,6 +775,14 @@ def parse_args():
                         "is expressed in, read from the pin table's scene_meta "
                         "so it matches what the demonstrations were captioned "
                         "with. Needs --grasp-pin-table.")
+    p.add_argument("--show-wrist", action="store_true",
+                   help="mark the MANO wrist and the object cloud centroid — "
+                        "the two points the anchor frame is built from — and "
+                        "the horizontal chord between them that defines +x. "
+                        "Read from the pin table's scene_meta, so these are "
+                        "the points the frame was actually built on rather "
+                        "than the hand's live position. Needs "
+                        "--grasp-pin-table.")
     p.add_argument("--show-bin-sphere", action="store_true",
                    help="draw a see-through sphere around the object whose "
                         "points are coloured by BIN, so the k Voronoi cells and "
@@ -1107,6 +1121,7 @@ def main():
                        grasp_idx=(_gi if g is None else g),
                        bin_override=(_bo if g is None else None),
                        show_anchor_frame=(args.show_anchor_frame and draw),
+                       show_wrist=(args.show_wrist and draw),
                        show_bin_sphere=(args.show_bin_sphere and draw),
                        bin_sphere_radius=args.bin_sphere_radius,
                        bin_sphere_points=args.bin_sphere_points,

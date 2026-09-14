@@ -1,0 +1,6 @@
+subject,hand,object,Pose1 +x,Pose1 +x bin landed,Pose1 +y,Pose1 +y bin landed,Pose1 +z,Pose1 +z bin landed,Pose1 -y,Pose1 -y bin landed,Pose2 +x,Pose2 +x bin landed,Pose2 +y,Pose2 +y bin landed,Pose2 +z,Pose2 +z bin landed,Pose2 -y,Pose2 -y bin landed,Pose1 session,Pose2 session
+1,right,cardboard box,0,-y,0,+z,1,+z,1,+z,0,+z,1,+y,0,+z,0,+z,20260910_190014_imp,20260910_191520_imp
+1,right,yellow flashlight,0,+z,1,+z,0,+z,1,+z,0,+z,1,+z,1,+z,0,+z,20260910_191809_imp,20260910_192033_imp
+1,right,plate,0,+z,0,+z,0,+z,0,+z,,,,,,,,,20260910_192544_imp,
+1,right,power drill,0,+z,1,+z,1,+z,0,+z,0,+z,1,+y,0,+z,0,-y,20260910_193018_imp,20260910_193301_imp
+1,right,tape roll,0,+z,1,+y,1,+z,0,+x,1,+x,1,+z,1,+z,0,+z,20260910_193626_imp,20260910_193854_imp

@@ -287,15 +287,46 @@ def main() -> None:
         if meta["mode"] == "base":
             n_fallback += 1
 
+        # ANCHOR-ONLY ENTRY, and this is the point of the ordering above.
+        #
+        # The anchor frame is a function of the OBSERVATION alone — the object
+        # cloud's centroid, the MANO wrist, and world up — so it is already
+        # computed and valid by the time the planner is called. A scene OMG
+        # cannot plan for therefore has no GRASP, but it does have a perfectly
+        # good frame, and `d = to_world(command_axes[b], anchor_R)` needs nothing
+        # else. Writing `None` here used to discard that frame and remove the
+        # scene from every downstream stage, which quietly made "the expert could
+        # not solve it" mean "the policy will never be asked". On s0/test that is
+        # 14 of 144 scenes, all with `n_no_hand: 0` and `n_anchor_fallback: 0` —
+        # every one of them anchorable.
+        #
+        # `bins: {}` marks the entry as commandable but undemonstrated. Only
+        # `--full-bin-coverage` reaches these (they supply no on-table slot), and
+        # they land in `succ_bin_all_*` rather than `succ_bin_*`, which is the
+        # correct population: no demonstration for any bin exists.
+        def _anchor_only():
+            return {
+                "goal_set_size": 0,
+                "wrist_world": None if wrist is None else wrist.tolist(),
+                "centroid_world": c_world.tolist(),
+                "anchor_R": R.tolist(),
+                "anchor_mode": meta["mode"],
+                "anchor_horiz_norm": float(meta["horiz_norm"]),
+                "mano_side": side,
+                "hand_present": wrist is not None,
+                "no_plan": True,
+                "bins": {},
+            }
+
         plan, _ = env.run_omg_planner(int(cfg.RL_MAX_STEP), idx, reset_scene=True)
         if plan is None:
             n_no_plan += 1
-            table[str(idx)] = None
+            table[str(idx)] = _anchor_only()
             continue
         poses = np.asarray(env.goal_set_ee_poses(), dtype=np.float64)
         if len(poses) == 0:
             n_no_plan += 1
-            table[str(idx)] = None
+            table[str(idx)] = _anchor_only()
             continue
 
         # EVERY goal-set member, not an FPS subsample -- this is the whole point.

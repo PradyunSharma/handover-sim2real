@@ -73,6 +73,13 @@ is never armed. Wrist-only dry runs need no robot at all.
 perception and the cloud keep running so the deciding frame stays inspectable.
 `q` is the only way out.
 
+**After a CLOSE the arm homes itself**, 5 s later by default. Only a close
+schedules this — a `t` stop, a max-steps ending and a quit never do. The wait is
+a deadline the main loop watches, not a sleep, so perception, the overlays and
+every key stay live through it and the HUD counts it down; `t`, `h` and `s` each
+cancel the pending move, and `t` still interrupts it once it has started.
+`--auto-home-delay` changes the wait, `--no-auto-home` restores waiting for `h`.
+
 ---
 
 ## Arguments (`my_policy_runner.py`)
@@ -95,6 +102,7 @@ perception and the cloud keep running so the deciding frame stays inspectable.
 |---|---|---|
 | `--control {settle,rate}` | `settle` | `settle` blocks until the arm arrives; `rate` publishes once and dwells. See [Control mode](#control-mode-settle-vs-rate) |
 | `--rate-hz N` | `6.67` | policy rate for `--control rate` (the paper's 0.15 s) |
+| `--rate-anchor {obs,now}` | `obs` | which pose the delta hangs off. `obs` matches sim; `now` re-reads it at publish time, ~120 ms later. See [Shaking near the object](#shaking-near-the-object-and-what-caused-it) |
 | `--step-mode` | off | preview each step, execute only on `SPACE` |
 | `--max-steps N` | `50` | episode length |
 | `--step-tol-frac F` | `0.6` | arrival tolerance as a fraction of the step |
@@ -111,6 +119,13 @@ perception and the cloud keep running so the deciding frame stays inspectable.
 | `--home-speed N` | `0.08` | Cartesian speed of the streamed path, m/s |
 | `--home-tol N` | `0.02` | how close to home is close enough, m. Tighter than the arm can land makes the refine hunt |
 | `--home-stepwise` | off | old behaviour: settle on every 2 cm waypoint |
+| `--auto-home-delay SEC` | `5.0` | wait after a policy CLOSE before homing on its own |
+| `--no-auto-home` | off | never home on its own; wait for `h` |
+| `--exp-mode` | off | run a timed, recorded session of sequenced attempts |
+| `--exp-bins A,B,C` | — | the ordered sequence, one attempt each |
+| `--exp-out DIR` | — | where the session is recorded; omit to record nothing |
+| `--exp-no-depth` | off | skip depth: ~15 MB/attempt instead of ~260 MB |
+| `--exp-video-fps N` | `--rate-hz` | nominal fps in the mp4 headers |
 
 ### Gripper
 
@@ -236,6 +251,10 @@ checkpoint/regrasp_run9/         REGRASP run 9 — approach_axis, all 26
                                  iterations plus best/ and last/. See its README.
 checkpoint/regrasp_run11/        REGRASP run 11 — grasp_offset, same layout.
                                  A DIFFERENT command, not another tuning.
+checkpoint/regrasp_run19/        REGRASP run 19 — approach_axis, same layout.
+                                 THE BEST: 0.743 success, even across bins.
+                                 NB not the same policy as checkpoint/run19/,
+                                 which is Phase-4 and 5-channel.
    best.pt / normalization.npz / config.yaml / source.txt
 ```
 
@@ -635,6 +654,62 @@ between hand and object); and mixed blobs are cut **point by point** when betwee
 5 % and 95 % behind the threshold. The residual 2 % is forearm within 7 cm of the
 hand centroid.
 
+#### A seed and a re-seed must both be plausible
+
+SAM2 tracks; the seed comes from Grounding DINO. Two separate holes let a wrong
+detection steer a whole episode, and they show up as two different symptoms.
+
+**The mask jumps when you press `s`.** `perception.reset()` drops the SAM2
+session at every episode boundary — it must, because a memory bank carried
+across episodes is confidently wrong rather than merely stale — so **every `s`
+is a fresh detection**. And `_pick_object` was a bare argmin over "nearest
+candidate box to the hand" with no upper bound, so when every candidate was
+wrong the least-wrong one was seeded and then tracked happily. Nearest is not
+the same as near. The pick is now bounded by the rig's own
+`object_max_radius_m` (0.26 m for a fixed camera) times `SEED_DIST_SLACK`,
+because that parameter already answers "how far from the hand may a point be
+and still be the object" — beyond it the deprojection stage deletes nearly
+every point of the box anyway, so accepting it buys a track that cannot survive
+its own crop. A refusal takes `_seed`'s existing failure path and says why:
+`nearest object box is 55 cm from the hand (limit 36); nothing detected is
+being held`.
+
+**The mask jumps mid-episode.** When the watchdog says the track has stopped
+describing what it was seeded on, the backend re-detects and tracks the new box
+on the same frame. That recovery had no plausibility check, because
+`note_reseed` **cleared** the centroid history — so `max_centroid_jump_m` could
+not fire on the frame after a re-seed, and a re-seed was a free pass to relocate
+the object anywhere in the image.
+
+Measured on a `+x` attempt under `--control settle`: at step 26 `tripod_reseeds`
+went 0 → 1 and the object mask moved 140 px to a region with **zero overlap**
+with the mask it replaced — all 5336 object pixels newly object, none of them
+previously hand. The object cloud's median leapt 14.7 → 21.4 cm while the hand's
+fell 25.8 → 15.6 cm; the two classes swapped places. The wrong region was then
+tracked for six more steps, and the policy, told the object had retreated,
+hovered at 19 cm and never closed.
+
+Nothing downstream could catch either case. A wrong region is a healthy
+1300-point cloud, far above `min_object_points`, and `reject_arm_clusters` is
+deliberately skipped whenever the segmenter supplies a positive object mask — on
+the reasoning that a segmenter asked for the object has already excluded the
+forearm, which is sound right up until the segmenter answers about a *different*
+object.
+
+So the centroid is now **carried across** the re-seed and the replacement held
+to it within `max_reseed_jump_m` — the same 0.22 m as the tracking limit on
+purpose, since a re-seed runs on the same frame and the real object has not
+moved at all. Area is still cleared, because a fresh detection of a partly
+occluded object legitimately changes size; what it may not do is move. A refused
+re-seed returns **empty masks**, the same honest answer a failed seed gives: the
+arm holds, no step is consumed, and the next frame is a fresh chance. That is
+reserved for this one fault — an ordinary drifting track still returns its masks
+and lets the point floors judge, because a drifting track is still mostly on its
+object.
+
+`python sam2_segmenter.py` checks all of it offline: no torch, no camera, no
+checkpoint.
+
 #### `[arm:all-arm]`
 
 When no blob survives the object class goes **empty** and the caller holds the
@@ -848,6 +923,91 @@ delta forever. Measured on a 4 mm step against a 12 mm stall band: 0.00 mm over
 60 ticks. First run on hardware: `--step-mode --control rate` gives the
 fixed-rate command shape while `SPACE` still gates each tick.
 
+#### Shaking near the object, and what caused it
+
+Reported from hardware: the arm tracks cleanly across the room and then starts
+shaking once the gripper is close to the object. It was the **stall predicate**
+in `RateCommander`, and it is worth understanding because the mechanism is not
+in the policy at all.
+
+`_stuck_lead` exists to break static friction: a tick where the arm did not move
+adds 10 mm (`CREEP_BREAKAWAY_M`) to the commanded lead, and any tick where it
+moved clears it back to zero. That is the same re-derive-per-move discipline
+creep uses. But "did it move" was tested as the component of the arm's
+displacement along the heading commanded *one tick ago*. Those two agree while
+the policy holds a heading, and part company the instant it reverses — which
+near the object it does constantly, because that is where the network is least
+certain. The arm spends the period decelerating and turning round, travels
+centimetres, and projects a negative number onto the stale heading. The loop
+reads a stall and pushes **harder into the new direction, precisely because the
+arm was busy obeying the old one**.
+
+It compounds: each reversal earns another 10 mm, `MAX_COMMAND_LEAD_M` (100 mm)
+is reached in about ten ticks — 1.5 s at 6.7 Hz — and the equilibrium then sits
+100 mm from the arm in a heading that flips at the control rate. A bang-bang
+limit cycle, not a tracking error, and no amount of tuning the policy removes
+it. The same reversals were also being fed to `observe_move` as if they were
+under-travel, walking the gain estimate down and the droop lead up.
+
+Both are now guarded, and the second guard needed two passes to get right. A
+stall is the **distance** the arm covered, not its projection: static friction
+does not care which way the arm is going, so an arm that moved at all has
+already broken away. And a tick counts as a gain measurement only if the motion
+was *mostly the motion commanded* — `RATE_ALIGN_FRAC`, cos ≥ 0.5.
+
+A sign test is not enough there, which a hardware run showed directly. The
+samples that do the damage are small and **positive**: an arm 80° off the
+heading it was just handed travels 20 mm and projects 1.7 mm, reading as a gain
+of 0.06 and answered with a lead of fifteen times the step. It compounds,
+because a larger lead makes `commanded` larger while `achieved` stays governed
+by the whipsaw. Measured over one 58-step episode: gain 0.78 → 0.10 (the floor),
+lead 29 mm → 160 mm, `res` going negative — the arm overshooting its target —
+and `moved` negative on nine steps, the arm reversing between consecutive policy
+steps.
+
+`test_step_motion.py` covers both directions: `_reversal_is_not_a_stall` drives
+24 full-amplitude reversals and asserts no break-away accrues,
+`_off_axis_motion_is_not_under_travel` drives an arm 80° off every command and
+asserts the gain holds — *and* that a collinear under-travelling arm is still
+learned from, so the guard cannot degenerate into "never adapt". The 4 mm step
+against a 12 mm dead band still depends on break-away, and is still covered.
+
+#### The dead time, and `--rate-anchor`
+
+There is a third thing, and it is not a bug so much as a gap between sim and
+hardware that only shows up when the policy stops agreeing with itself.
+
+`T_base_hand` is read at the top of the loop, *before* `observe()`. Observation
+plus inference is ~120 ms of a 150 ms period on a single tripod camera, so by
+the time the target is published the arm has covered most of a step under the
+**previous** command, and the pose the delta was hung off is that far behind
+it. In sim there is no such gap: the observation and the command are the same
+instant, which is why `T_base_hand @ unpack_action(delta)` is the faithful
+translation there and only there.
+
+While consecutive deltas agree this costs nothing — the arm is travelling the
+right way and simply keeps going. When they disagree, which near the object is
+most ticks, the new target can land *behind* the arm. The arm then stops or
+reverses inside the period, `achieved` collapses, and the gain estimator is fed
+a stall that never happened. That is the same runaway as above arriving by a
+different road, and the guards bound it rather than remove its cause.
+
+`--rate-anchor now` re-reads the pose at publish time, so every step gets a full
+delta of fresh travel from wherever the arm actually is. It is **off by
+default** because `obs` is what the policy was trained against and what every
+run so far used; this is an A/B to be judged on the `moved=`/`res=` columns, not
+a fix that has been shown to be one.
+
+**If it still shakes**, the remaining candidates are separable from the terminal
+alone, because every step prints `moved=…/…mm res=…mm` — how far the arm got
+against the previous target. A large negative `res` is the arm going *past* its
+target, which is the controller; a target that jumps direction step to step with
+the arm tracking it faithfully is the policy or the perception, and the
+`|d|=…CLAMPED` and `obj=` counts on the same line say which. `--control settle`
+is the clean A/B: it waits for a dead stop every step, so it has no dead time
+and no standing lead, and if the shaking survives it then the rate loop is not
+the cause.
+
 ### Homing is streamed
 
 The waypoint loop used to call `settle()` on each 2 cm waypoint — a 30 cm home
@@ -942,7 +1102,16 @@ python my_regrasp_policy_runner.py --direction +x --cameras tripod \
 python my_regrasp_policy_runner.py --direction +x --cameras tripod \
     --calib-session d455 --home --step-mode
 
-python my_regrasp_policy_runner.py --regrasp-iter 23     --cameras tripod --calib-session d455 --segmentation sam2     --seg-object-prompt "a brown cuboidal box." --home --control rate --enable-gripper --home-gripper --show-cloud --direction +x
+python my_regrasp_policy_runner.py --regrasp-run 19 --direction +x \
+    --cameras tripod --calib-session D455 --segmentation sam2 \
+    --seg-object-prompt "object in hand." --home --control rate \
+    --enable-gripper --home-gripper --show-cloud
+
+# a whole session: one attempt per 's', timed, judged and recorded
+python my_regrasp_policy_runner.py --regrasp-run 19 \
+    --exp-mode --exp-bins +x,+y,+z,-y --exp-out output/real_experiments \
+    --cameras tripod --calib-session D455 --segmentation sam2 \
+    --seg-object-prompt "object in hand." --control rate
 ```
 
 Every flag of `my_policy_runner` works here — same control modes, homing,
@@ -953,13 +1122,22 @@ bring-up. Only the policy differs.
 | extra flag | default | meaning |
 |---|---|---|
 | `--direction {+x,+y,-y,+z}` | **required** | which side to approach from; `-y` and `=-y` both parse |
-| `--regrasp-run {9,11}` | `9` | which installed regrasp run — different `d_rule` |
+| `--regrasp-run {9,11,19}` | `9` | which installed regrasp run — **19 is the best** |
 | `--regrasp-iter N` | `best` | pick an iteration by number, or `best` / `last` |
 | `--anchor-ref {base,hand}` | `base` | which point the anchor azimuth is measured from |
 | `--regrasp-run-dir DIR` | — | a run dir anywhere else; overrides `--regrasp-run` |
 | `--regrasp-ckpt` | `best` | `best` or `last` inside the run |
 | `--command-axes PATH` | beside the run dir | the deployment axes |
+| `--exp-mode` | off | run a timed, recorded session instead of one attempt |
+| `--exp-bins +x,+y,+z,-y` | — | the ordered sequence, one attempt per `s` |
+| `--exp-out DIR` | — | where the session is recorded; omit to record nothing |
+| `--exp-no-depth` | off | skip depth: ~15 MB/attempt instead of ~260 MB |
+| `--exp-video-fps N` | `--rate-hz` | nominal fps in the mp4 headers |
 | `--selftest` | off | check the direction geometry offline and exit |
+
+`--direction` and `--exp-bins` are mutually exclusive: one names a single
+attempt, the other a whole session. See [Experiment mode](#experiment-mode) for
+what the session does and what it writes.
 
 **`--anchor-ref` is the one place a regrasp deployment can be quietly wrong.**
 Run 9's bins are *named* in an anchor frame whose azimuth reference is the MANO
@@ -1007,8 +1185,17 @@ centroids are **not** mutually orthogonal — `+y` and `-y` meet at **150.5°**,
 `-x` (over the giver's fingers) and `-z` (from beneath) are bins but have no
 demonstrations behind them, so they are not offered.
 
-**Which run.** Two are installed, and they take a *different* command rather
-than being two tunings of one. Run 9's `d_rule` is `approach_axis` — `d` is the
+**Which run.** Three are installed. **Run 19 is the one to deploy** — it is run
+9 plus DART collision shielding and 20 training epochs an iteration instead of
+15, and it is better on every axis that matters: success 0.743 against 0.592,
+close rate 0.866 against 0.685, the same command-following (`bin_hit` 0.65,
+`cond_sep` 0.82), and — the part that matters most on hardware — **even per-bin
+rates**, +x 0.74 / +y 0.78 / -y 0.70 / +z 0.74, where run 9's `-y` collapses to
+0.43. Run 9 remains the default only so that existing commands keep driving the
+policy they were written for.
+
+Runs 9 and 19 take the same kind of command; run 11 takes a *different* one
+rather than being another tuning of it. Run 9's `d_rule` is `approach_axis` — `d` is the
 gripper's approach axis, "come at the object from this side". Run 11's is
 `grasp_offset` — `d` is the grasp point's offset from the object centroid,
 "grasp this part of the object". Their `command_axes.json` files are therefore
@@ -1022,6 +1209,7 @@ six bins live where run 9 has four, and its `-y` scores 0.600 against run 9's
 0.434. Full comparison in `checkpoint/regrasp_run11/README.md`.
 
 ```bash
+python my_regrasp_policy_runner.py --direction +x --regrasp-run 19   # iter 25
 python my_regrasp_policy_runner.py --direction +x --regrasp-run 9    # iter 23
 python my_regrasp_policy_runner.py --direction -y --regrasp-run 11   # iter 22
 ```
@@ -1060,6 +1248,188 @@ the two are not the same frame, which is the check that would have caught the
 run-16 mismatch — that every command is a unit vector producing a *different*
 action (so the conditioning reaches the network), and that anchoring preserves
 every pairwise angle. It needs no camera, robot or ROS.
+
+---
+
+## Experiment mode
+
+One attempt per keypress, through an ordered sequence of commands, each timed
+and recorded. This is how a real-robot success rate per direction gets measured
+instead of remembered.
+
+```bash
+python my_regrasp_policy_runner.py --exp-mode --exp-bins +x,+y,+z,-y \
+    --exp-out output/real_experiments --regrasp-run 9 \
+    --cameras wrist,tripod --calib-session D435 --segmentation sam2 \
+    --seg-object-prompt "a brown cuboidal box." --control rate
+```
+
+`--exp-mode` implies `--home`, `--home-gripper` and `--enable-gripper`: a session
+whose fingers were never homed reports an uncalibrated width for every attempt,
+which poisons `robot_state[25]` and the finger exclusion boxes silently. It
+refuses `--dry-run`, `--home-only`, `--step-mode` (the elapsed time would be
+however long you took to press SPACE) and `--no-auto-home` (which deletes the
+carry-home the verdict depends on). Every command in the sequence is validated
+against the run's live bins **before a camera opens**, so a bad bin at position
+three cannot surface after two recorded attempts. Repeats are legal and mean run
+it again.
+
+### The keys
+
+| key | during an attempt | after a close | between attempts |
+|---|---|---|---|
+| `s` | refused, the clock is running | refused, a verdict is owed | start the next command |
+| `f` | **fail** — freezes the arm where it stands, records it | **fail** the grasp | — |
+| `p` | — | **pass** the grasp; the fingers open | — |
+| `t` | **void** — the command is re-offered, not consumed | cancels the carry-home | — |
+| `h` | refused mid-attempt | homes now | homes |
+| `q` | — | — | ends the session |
+
+An attempt ends three ways. The policy **closes**, and the arm carries the object
+home with the fingers shut and waits for `p` or `f` — the key may be pressed
+during the move and is read when it finishes. You press **`f`**, and the arm
+freezes immediately: `f` is a stop key for the duration of an attempt, so it
+interrupts a `settle()` rather than waiting up to three seconds for one to
+finish. Or it hits `--max-steps` without ever closing, which is a **timeout**
+failure and freezes it too.
+
+**After an `f` or a timeout the arm stays where it stopped.** Press `h` before
+the next `s`, or that attempt starts from wherever the last one died, which is
+off-distribution and makes its result incomparable. The HUD says so.
+
+**The fingers re-open on the verdict**, with the arm at home and stationary, so
+you choose the moment the object drops. `start_episode()` would otherwise open
+them at the next `s` — 0.71 m up, at the same instant the clock starts and the
+arm begins moving.
+
+### What a session records
+
+Nothing is recorded without `--exp-out`, which is what you want for a rehearsal
+of the key flow. With it:
+
+```
+<out>/<session>/
+  manifest.json      intrinsics, T_base_cam, per-camera depth scale,
+                     ExtractionParams, argv, git commit
+  attempts.csv       one row per attempt: bin, ending, verdict, elapsed,
+                     steps, and the jaw closure in mm
+  events.jsonl       append-only audit trail
+  attempt_000/
+    steps.csv          one row per step: pose, action, per-camera counts, timings
+    rgb_<cam>.mp4      mp4v (avc1 is not available in this OpenCV build)
+    labels_<cam>/*.png lossless uint8, 0=background 1=hand 2=object
+    depth_<cam>.u16    raw uint16, 614400 B/record, no header
+    policy_pc.f4       the [1024,5] the network ate, one record per step
+    policy_pc7.f4      the [1024,7] with the conditioning channels (regrasp)
+    policy_rs.f4  policy_action.f4  pose_base_hand.f8  d_ee.f8
+```
+
+**Depth rather than point clouds**, because it is the same information at a
+sixth of the size and near-zero CPU — a memcpy against a deprojection — and any
+cloud is reconstructable from it offline, bit-exactly. Under `--segmentation
+sam2` no full-scene cloud is computed at the time anyway; the positive-mask path
+returns before that step.
+
+**Which bin it actually landed in.** `attempts.csv` also carries the real-robot
+analogue of the sim eval's `dir_err` and `bin_hit_rate`, measured at the moment
+the attempt ends — before the carry home destroys the pose that answers it:
+
+| column | meaning |
+|---|---|
+| `bin_cmd` / `bin_realized` | commanded vs achieved bin, in the attempt's own anchor frame |
+| `dir_err_deg` | angle between the commanded `d` and the one the gripper achieved under this run's `d_rule` |
+| `sector_err_deg` | angle between the commanded `d` and (object centroid → EE): not *is it oriented right* but *did it end up on the right side* |
+| `bin_hit` | `sector_err_deg < 30` (`BIN_HIT_DEG`), exactly the sim metric |
+| `d_ach_*` | the achieved direction in the base frame, so any of the above is re-derivable |
+| `outcome_note` | which rule produced the number, or why it could not be measured |
+
+It is computed with `DirectionRule.of`, `from_world` and `bin_of` — the same
+three functions `regrasp/evaluator.py` uses — so the numbers are comparable to
+run 19's 0.65 `bin_hit` and not merely plausible. Everything is in the **base**
+frame, because that is the frame `R_anchor` was built in; `d_world` is the
+sim-world copy that pairs with `robot_state`, and using it here would rotate the
+answer and confidently name the wrong bin.
+
+This is what separates *the grasp worked* from *the command worked*. A `pass`
+beside `bin_realized` two sectors away is a policy ignoring its conditioning and
+succeeding anyway, which the verdict key cannot tell you. The terminal prints it
+as it happens: `commanded +y, landed +y (8.4 deg off)  BIN HIT`.
+
+**The jaws are measured, not inferred.** `GRASP_WIDTH_M` is 0.0, so the fingers
+are always commanded fully shut and whatever they settle at *is* the thickness
+of what they caught. `attempts.csv` therefore carries three widths, all in
+millimetres of total opening (twice the per-finger travel that `grip_norm` in
+`steps.csv` normalises, because the gap an object has to fit through is what a
+caliper reads): `grip_end_mm` at the instant the attempt ended, `grip_min_mm`
+for the tightest the jaws got between that and the verdict, and
+`grip_verdict_mm` for the reading when you judged it.
+
+`grip_min_mm` is the one to plot. Near zero means the grasp closed on air; 34 mm
+means it closed on a 34 mm object — which separates *the policy closed* from
+*the policy grasped* with no human in the loop, and is the check on a `pass` you
+gave from across the room. It is a minimum rather than a sample because you can
+press `p` a tenth of a second after the goal goes out, while the fingers are
+still travelling, and a single sample would then record a gripper caught
+mid-close and be indistinguishable from an object that slipped. When the two
+disagree — `grip_min_mm` small, `grip_verdict_mm` wide — the object was held and
+then lost on the way home, which the verdict alone records as a plain `fail`.
+The verdict HUD line shows the live number so the call is a reading.
+
+**The label PNGs look black, and they are correct.** They hold `{0, 1, 2}` —
+background, hand, object — so on a 0–255 scale every non-zero pixel is one or
+two parts in 255 and no viewer will show it. That is the point of a *label* map
+rather than a picture: it is lossless and it is what a training script wants.
+To look at one, scale it:
+
+```bash
+python -c "
+import cv2, numpy as np, sys
+lab = cv2.imread(sys.argv[1], cv2.IMREAD_UNCHANGED)
+print(np.unique(lab, return_counts=True))
+cv2.imwrite('/tmp/lab.png', (lab * 120).astype(np.uint8))
+" attempt_000/labels_tripod/000042.png
+```
+
+`tripod_lab_hand_px` and `tripod_lab_obj_px` in `steps.csv` are the pixel counts
+per frame, so you can tell an empty mask from a dark one without opening
+anything.
+
+Two indices and only two: `step` counts control iterations and indexes every
+light stream, and `heavy_idx` is the mp4 frame ordinal, the depth record ordinal
+and the label PNG name at once. `heavy_idx = -1` means that frame was shed under
+backpressure. They are equal whenever nothing was dropped, which is the normal
+case.
+
+**Cost:** ~260 MB per attempt per two cameras, ~1 GB for a four-attempt session,
+8 MiB/s sustained. `--exp-no-depth` drops that to ~15 MB/attempt at the cost of
+the clouds. A finished session compresses to ~300 MB losslessly and seekably:
+
+```bash
+ffmpeg -f rawvideo -pix_fmt gray16le -s 640x480 -r 10 \
+    -i depth_tripod.u16 -c:v ffv1 -level 3 -g 1 depth_tripod.mkv
+```
+
+**The recorder costs ~1 ms of the control thread per step** — measured, two
+cameras, 0.7% of a 150 ms period. It copies four arrays and puts them on a
+queue; one daemon thread does every encode and every write. When that thread
+falls behind (a full disk, `--exp-out` on a slow filesystem) it sheds *frames*,
+never rows or policy tensors, and says so five ways: `heavy_idx = -1` in the CSV,
+the HUD, a printed warning, `events.jsonl`, and the attempt's JSON.
+
+### Reading it back
+
+```bash
+python read_exp_session.py output/real_experiments/20260910_143355
+python read_exp_session.py output/real_experiments/20260910_143355 \
+    --attempt 2 --frame 42 --camera tripod
+```
+
+`read_exp_session.py` uses numpy, cv2 and the stdlib and imports nothing from
+this repo — that is the point of it, and it is why the formats are what they
+are. It **refuses** a session whose attempt directories and `attempts.csv`
+disagree, naming the offenders: an attempt killed mid-flight leaves files with no
+summary row, and a loader that trusted the summary would quietly use three
+attempts of four.
 
 ---
 

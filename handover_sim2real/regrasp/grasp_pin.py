@@ -35,9 +35,24 @@ import numpy as np
 
 
 def _normalize_entry(value):
-    """Phase-4 scalar entry or Phase-5 {'grasps': [...]} -> list of grasp dicts."""
+    """Phase-4 scalar entry or Phase-5 {'grasps': [...]} -> list of grasp dicts.
+
+    Returns None to DROP the scene, `[]` to keep it with no grasps, and a
+    non-empty list otherwise. The middle case exists for exactly one thing: a
+    scene OMG cannot plan for but which still carries a valid anchor frame.
+
+    WHY `grasps or None` WAS NOT ENOUGH. An empty list is ambiguous — it means
+    "this scene has no usable grasp" in every table written before
+    `build_direction_table` learned to record an anchor without a plan, and
+    "this scene is commandable but undemonstrated" after. Collapsing both to None
+    kept the old tables correct and made the new case impossible: the entry was
+    dropped in the loader, so the anchor never reached `scene_meta` and the scene
+    could not be commanded. The `no_plan` marker disambiguates explicitly, so no
+    existing table changes behaviour and the new one is not guessed at.
+    """
     if value is None:
         return None
+    anchor_only = bool(isinstance(value, dict) and value.get("no_plan"))
     if isinstance(value, dict) and "grasps" in value:
         grasps = value["grasps"]
     elif isinstance(value, list):
@@ -45,7 +60,9 @@ def _normalize_entry(value):
     else:
         grasps = [value]                       # a Phase-4 table: one grasp, slot 0
     grasps = [g for g in grasps if g is not None]
-    return grasps or None
+    if grasps:
+        return grasps
+    return [] if anchor_only else None
 
 
 class GraspPinTable:

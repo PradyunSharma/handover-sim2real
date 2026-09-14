@@ -82,7 +82,16 @@ ROTATE_MODES = [
 # Open3D reports keys as gui.KeyName enums; the main loop's handler is written
 # against the single characters cv2.waitKey returns. Mapping here keeps the two
 # windows on one set of actions instead of two parallel handlers.
-INTERACTIVE_KEYS = "cwrzxq"
+#
+# EVERY KEY THE MAIN LOOP ACTS ON BELONGS HERE, not just the view keys. A key
+# outside this string is returned as None by `_key_char`, `_on_key` reports it
+# unhandled, and it goes to the SceneWidget instead — i.e. it does nothing. So
+# 't', 's' and 'h' were silently dead whenever the cloud window had focus,
+# which is the window you are looking at while the arm moves. --exp-mode's 'f'
+# and 'p' made that unacceptable: pressing 'f' on a failure and having the arm
+# carry on is the worst version of the bug. The cost of adding them is that
+# these letters no longer reach the SceneWidget, which navigates with the mouse.
+INTERACTIVE_KEYS = "cwrzxqtshfp"
 
 
 def _fixed_size(xyz: np.ndarray, n: int) -> np.ndarray:

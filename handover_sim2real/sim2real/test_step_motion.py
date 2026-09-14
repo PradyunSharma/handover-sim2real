@@ -26,7 +26,7 @@ cap that looked obviously correct, worked on one plant and deadlocked another.
 from __future__ import annotations
 
 import argparse
-
+import ast
 import sys
 from pathlib import Path
 
@@ -841,6 +841,163 @@ def _fixed_rate_tracks_and_never_deadlocks() -> None:
           f"{settle_s*1000:.0f} ms ({settle_s/rate_s:.1f}x)")
 
 
+def _reversal_is_not_a_stall() -> None:
+    """A policy that changes its mind must not be answered with break-away.
+
+    This is the bug that made the arm shake near the object, and it is entirely
+    in the STALL PREDICATE. `_stuck_lead` exists to break static friction, and
+    friction is beaten by moving at all — but the test for "did it move" used
+    the component of the arm's displacement along the direction commanded ONE
+    TICK AGO. Those agree while the policy holds a heading and part company the
+    instant it reverses, which near the object it does on almost every tick: the
+    arm travels centimetres and projects a negative number onto the stale
+    heading, so the loop reads a stall and adds 10 mm of lead — pushing harder
+    into the new direction *because* the arm was busy obeying the old one.
+
+    It compounds. Every reversal earns another 10 mm, MAX_COMMAND_LEAD_M is
+    reached in about ten ticks (1.5 s at 6.7 Hz), and the equilibrium then sits
+    100 mm from the arm in a heading that flips at the control rate. That is a
+    bang-bang limit cycle, not a tracking error, and no amount of tuning the
+    policy removes it.
+
+    So: an arm that is plainly moving must carry NO break-away lead, however
+    badly the heading it was given agrees with the last one. The stall case
+    itself is covered by _fixed_rate_tracks_and_never_deadlocks, whose 4 mm step
+    against a 12 mm dead band still depends on break-away accruing.
+    """
+    plant = Plant([0.45, 0.0, 0.50], seed=5, stall_m=0.0)
+    h = Harness(plant)
+    real_time, m.time = m.time, h
+    try:
+        droop = m.DroopCompensator(enabled=True)
+        rc = m.RateCommander(h, m.RATE_CONTROL_HZ, droop)
+        centre = plant.p.copy()
+        axis = np.array([0.0, 1.0, 0.0])
+        seq, leads, spread = 0, [], []
+        for k in range(24):
+            # The worst case the policy can present: a full-amplitude delta
+            # that reverses every single tick. `unpack_action` is bypassed
+            # because only the translation matters here.
+            target = plant.p + axis * (m.MAX_STEP_TRANS_M * (1 if k % 2 else -1))
+            seq, _ = rc.command(_pose(target), seq)
+            leads.append(rc._stuck_lead)
+            spread.append(float(np.linalg.norm(plant.p - centre)))
+    finally:
+        m.time = real_time
+        m.current_msg = None
+
+    assert max(leads) == 0.0, (
+        f"break-away accrued to {max(leads)*1000:.0f} mm against an arm that "
+        f"moved {max(spread)*1000:.0f} mm — a reversal was read as a stall, "
+        "which is the shaking")
+    assert droop.g > 0.3, (
+        f"the gain estimate collapsed to {droop.g:.2f} on an arm with no dead "
+        "band and a healthy 0.75 gain — reversals were fed to observe_move as "
+        "if they were under-travel, which walks the lead to its cap")
+    assert max(spread) < 4 * m.MAX_STEP_TRANS_M, (
+        f"the arm swung {max(spread)*1000:.0f} mm about a target that never "
+        f"left +-{m.MAX_STEP_TRANS_M*1000:.0f} mm of where it started")
+    print(f"  24 reversals at +-{m.MAX_STEP_TRANS_M*1000:.0f} mm: no "
+          f"break-away, swing bounded at {max(spread)*1000:.0f} mm")
+
+
+class _OffAxisPlant:
+    """An arm that moves — really moves — but not the way it was just told.
+
+    The plant above under-travels ALONG the command, which is the honest model
+    of a stiff controller and the thing the gain estimator exists to measure.
+    This one is the other case: the displacement is large and its sign along the
+    command is positive, but its direction is `deg` away from it. That is what a
+    real arm looks like on the tick after the policy changed its mind — still
+    unwinding the previous heading, measured against the new one — and it is the
+    case a sign test cannot tell from genuine under-travel.
+    """
+
+    def __init__(self, p0, deg: float, reach_m: float = 0.025):
+        self.p = np.asarray(p0, dtype=np.float64).copy()
+        self.goal = self.p.copy()
+        self.deg = float(deg)
+        self.reach = float(reach_m)
+        self.commands = 0
+
+    def command(self, E: np.ndarray) -> None:
+        self.commands += 1
+        err = np.asarray(E, dtype=np.float64) - self.p
+        n = float(np.linalg.norm(err))
+        if n < 1e-12:
+            self.goal = self.p.copy()
+            return
+        th = np.deg2rad(self.deg)
+        c, s = float(np.cos(th)), float(np.sin(th))
+        R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+        self.goal = self.p + (R @ (err / n)) * min(n, self.reach)
+
+    def advance(self, dt: float) -> None:
+        self.p += (self.goal - self.p) * (1.0 - np.exp(-dt / 0.12))
+
+    def measured(self) -> np.ndarray:
+        return self.p.copy()
+
+
+def _off_axis_motion_is_not_under_travel() -> None:
+    """The gain estimator must not learn from a tick the arm spent elsewhere.
+
+    This is the runaway that survived the first fix, and the reason it survived
+    is that the damaging samples are POSITIVE. `observe_move` reads
+    (achieved / commanded) as "the fraction of a commanded displacement this arm
+    executes", and that reading is only true if the arm was trying to execute
+    it. An arm 80 degrees off the heading it was just handed travels 20 mm and
+    projects 3 mm — a gain of 0.1, and a lead of nine times the step in reply.
+
+    It compounds, which is what makes it a runaway rather than a bad tick: a
+    larger lead makes `commanded` larger while `achieved` stays governed by the
+    whipsaw, so the next sample is smaller still. Measured on hardware over one
+    58-step episode, gain 0.78 -> 0.10 and lead 29 mm -> 160 mm, with the arm
+    then overshooting its targets and reversing between policy steps.
+
+    The second half of this test is the one that stops the guard being vacuous:
+    an arm that under-travels ALONG the command must still be learned from, or
+    the fix is just "never adapt" and `--control rate` deadlocks on small steps.
+    """
+    def _drive(deg: float, ticks: int = 30):
+        plant = _OffAxisPlant([0.45, 0.0, 0.50], deg)
+        h = Harness(plant)
+        real_time, m.time = m.time, h
+        try:
+            droop = m.DroopCompensator(enabled=True)
+            rc = m.RateCommander(h, m.RATE_CONTROL_HZ, droop)
+            seq = 0
+            for k in range(ticks):
+                # A heading that turns every tick, so no two consecutive
+                # commands agree — exactly the near-object regime.
+                th = 0.7 * k
+                d = np.array([np.cos(th), np.sin(th), 0.2])
+                d /= np.linalg.norm(d)
+                seq, _ = rc.command(_pose(plant.p + d * 0.030), seq)
+            return droop
+        finally:
+            m.time = real_time
+            m.current_msg = None
+
+    off = _drive(80.0)
+    assert off.g > 0.9, (
+        f"the gain estimate fell to {off.g:.2f} on an arm that moved 30 mm "
+        "every tick — motion 80 deg off the command was read as under-travel, "
+        "which is the lead runaway")
+    assert off.s < 0.005, (
+        f"a lead of {off.s*1000:.0f} mm was learned from off-axis motion")
+
+    # ... and the guard is not vacuous: real under-travel still teaches it.
+    on = _drive(0.0)
+    assert on.g < 0.7, (
+        f"gain {on.g:.2f}: an arm reaching 25 mm of every 30 mm commanded was "
+        "not learned from at all — the alignment guard is rejecting the "
+        "measurements the estimator exists to make")
+    print(f"  80 deg off-axis: gain held at {off.g:.2f}, lead "
+          f"{off.s*1000:.1f} mm; collinear under-travel still learned "
+          f"(gain {on.g:.2f})")
+
+
 def _homing_is_continuous() -> None:
     """Streamed homing must land, and must not stop on the way.
 
@@ -1048,6 +1205,389 @@ def _abort_interrupts_a_motion_in_progress() -> None:
     print(f"  freeze_arm: {drift*1000:.2f} mm of drift over 1.0 s after the stop")
 
 
+def _auto_home_cannot_outrank_a_key() -> None:
+    """A key pressed during the post-close wait must beat the automatic move.
+
+    The auto-home is the only thing in this runner that moves the robot with
+    nobody touching anything, so the property that makes it safe is an ORDERING
+    one: every key branch that could mean "do not do that" runs first, and each
+    clears the pending deadline. That is a fact about statement order in a
+    600-line loop, which no behavioural test of a helper can reach and which a
+    later edit could silently break by moving one block.
+
+    So this reads the shipped source. It asserts the trigger sits after the 't',
+    'h' and 's' branches and that each of those cancels — 's' through
+    `start_episode`, which is where its reset already lives. Re-implementing the
+    loop to test it would only assert that the copy matches itself.
+    """
+    import ast
+
+    src = Path(m.__file__).read_text()
+    tree = ast.parse(src)
+    main_fn = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "main")
+
+    def clears(node) -> bool:
+        return any(isinstance(a, ast.Assign)
+                   and any(getattr(t, "id", "") == "auto_home_at" for t in a.targets)
+                   and isinstance(a.value, ast.Constant) and a.value.value is None
+                   for a in ast.walk(node))
+
+    ifs = [n for n in ast.walk(main_fn) if isinstance(n, ast.If)]
+    def find(fragment):
+        hits = [n for n in ifs if fragment in ast.unparse(n.test)]
+        assert len(hits) == 1, f"{fragment!r} matched {len(hits)} branches"
+        return hits[0]
+
+    # `ast.unparse` normalises quotes, so these fragments are single-quoted.
+    trigger = find("auto_home_at is not None and")
+    branches = {"'t' (stop)":  find("'t' in pressed"),
+                "'h' (home)":  find("'h' in pressed"),
+                "'s' (start)": find("'s' in pressed")}
+    start_ep = next(n for n in ast.walk(main_fn)
+                    if isinstance(n, ast.FunctionDef) and n.name == "start_episode")
+
+    for label, node in branches.items():
+        assert node.lineno < trigger.lineno, (
+            f"the {label} branch is at line {node.lineno}, AFTER the auto-home "
+            f"trigger at {trigger.lineno} — a key pressed on that iteration "
+            "would be handled only after the arm had already been sent home")
+        cancels = clears(node) or (label.startswith("'s'") and clears(start_ep))
+        assert cancels, (
+            f"the {label} branch does not clear auto_home_at, so the arm would "
+            "drive itself home seconds after a key that meant something else")
+        print(f"  {label:12} at line {node.lineno:5d}  cancels, and precedes "
+              f"the trigger at {trigger.lineno}")
+
+    # The CLOSE branch is the one that actually commands the gripper — matching
+    # on `grasp_close` alone would also catch the two HUD branches.
+    close_hits = [n for n in ifs
+                  if any(isinstance(c, ast.Call)
+                         and ast.unparse(c.func) == "gripper.close"
+                         for c in ast.walk(n))]
+    assert len(close_hits) == 1, f"{len(close_hits)} branches call gripper.close"
+    close = close_hits[0]
+    scheduled = [a for a in ast.walk(close)
+                 if isinstance(a, ast.Assign)
+                 and any(getattr(t, "id", "") == "auto_home_at" for t in a.targets)
+                 and not (isinstance(a.value, ast.Constant) and a.value.value is None)]
+    assert scheduled, ("nothing schedules the auto-home in the CLOSE branch — "
+                       "the feature is wired to nothing")
+    # And ONLY the close schedules one: a 't' stop or a max-steps ending that
+    # armed it would move the arm after an episode the policy did not finish.
+    armers = [a for a in ast.walk(main_fn)
+              if isinstance(a, ast.Assign)
+              and any(getattr(t, "id", "") == "auto_home_at" for t in a.targets)
+              and not (isinstance(a.value, ast.Constant) and a.value.value is None)]
+    assert len(armers) == 1, (
+        f"{len(armers)} places arm the auto-home; only the CLOSE branch may")
+    print(f"  scheduled in one place only, the CLOSE branch (line "
+          f"{scheduled[0].lineno})")
+
+    # The delay itself has to be a real wait, not a token one: franka_gripper's
+    # grasp action returns before the fingers have stopped.
+    assert m.AUTO_HOME_DELAY_S >= 2.0, (
+        f"AUTO_HOME_DELAY_S is {m.AUTO_HOME_DELAY_S}s — the arm would start "
+        "carrying the object before the grasp had settled")
+    print(f"  default delay {m.AUTO_HOME_DELAY_S:.1f}s")
+
+
+def _exp_session_walks_the_sequence() -> None:
+    """The --exp-mode state machine, driven through every ending it has.
+
+    The transitions are cheap to get subtly wrong and expensive to discover on
+    hardware: a cursor that advances on a void costs you an attempt, a phase
+    that accepts 's' during a verdict wait starts the next bin with the last one
+    unjudged, and a session that never reaches DONE never stops. So this walks
+    close -> pass, 'f', timeout and 't' in one sequence and asserts the phase,
+    the cursor and the row after each.
+    """
+    labels = ["+x", "+y", "-y", "+z"]
+    exp = m.ExperimentSession(labels, max_steps=50)
+    assert exp.phase == "IDLE" and exp.next_label == "+x"
+
+    # 1/4 — the policy closes, the operator passes it.
+    assert exp.start_requested() == "+x"
+    exp.attempt_started(t_start=100.0)
+    assert exp.phase == "RUNNING"
+    assert "f" in m.STOP_KEYS, (
+        "'f' must be a stop key while an attempt runs, or it cannot interrupt "
+        "a settle() and 'stop the robot right there' is up to 3 s late")
+    assert exp.start_requested() is None, "'s' restarted a running attempt"
+    exp.attempt_ended("close", steps=9, verdict=None, t_end=104.5)
+    assert exp.phase == "VERDICT" and exp.cursor == 0
+    assert "f" not in m.STOP_KEYS, (
+        "'f' is still a stop key during the verdict wait — an 'f' verdict "
+        "would abort the arm carrying the object home")
+    assert exp.start_requested() is None, "'s' skipped an owed verdict"
+    assert exp.verdict_given("pass") is True, (
+        "a close must report the fingers as HOLDING, which is what gates the "
+        "release")
+    assert exp.phase == "BETWEEN" and exp.cursor == 1
+    assert exp.rows[-1]["elapsed_s"] == 4.5, exp.rows[-1]["elapsed_s"]
+
+    # 2/4 — the operator fails it mid-flight. Frozen, and it counts.
+    assert exp.start_requested() == "+y"
+    exp.attempt_started(t_start=200.0)
+    exp.attempt_ended("policy_fail", steps=7, verdict="fail", t_end=206.25,
+                      froze=True)
+    assert exp.phase == "BETWEEN" and exp.cursor == 2
+    r = exp.rows[-1]
+    assert (r["ending"], r["verdict"], r["froze"]) == ("policy_fail", "fail", True)
+    assert r["elapsed_s"] == 6.25, r["elapsed_s"]
+
+    # 3/4 — it runs out of steps without ever closing.
+    assert exp.start_requested() == "-y"
+    exp.attempt_started(t_start=300.0)
+    exp.attempt_ended("timeout", steps=50, verdict="fail", t_end=330.0,
+                      froze=True)
+    assert exp.cursor == 3 and exp.rows[-1]["ending"] == "timeout"
+    assert exp.rows[-1]["steps"] == 50
+
+    # 4/4 — 't' VOIDS rather than fails, and the bin comes back.
+    assert exp.start_requested() == "+z"
+    # A void ends at wall-clock now(), so this one starts there too, or the
+    # printed elapsed reads as fifty years.
+    exp.attempt_started()
+    exp.attempt_voided(steps=3)
+    assert exp.cursor == 3, (
+        f"'t' consumed the attempt (cursor {exp.cursor}) — a user stop is not "
+        "a policy failure and the bin must be re-offered")
+    assert exp.next_label == "+z" and exp.rows[-1]["verdict"] == "void"
+    assert exp.start_requested() == "+z", "the voided bin was not re-offered"
+    t = exp.attempt_started() and None
+    assert exp.cur["try"] == 2, "the retry was not counted"
+    exp.attempt_ended("close", steps=11, verdict=None,
+                      t_end=exp.cur["t_start"] + 5.0)
+    exp.verdict_given("pass")
+
+    assert exp.phase == "DONE", f"phase {exp.phase} after the last verdict"
+    assert exp.start_requested() is None, "'s' started something after DONE"
+    assert exp.tally() == "2 pass / 2 fail / 1 void", exp.tally()
+    assert len(exp.rows) == 5, f"{len(exp.rows)} rows for 4 bins and 1 retry"
+    summary = exp.close("user quit")
+    assert summary["attempted"] == 4 and len(summary["rows"]) == 5
+    assert "f" not in m.STOP_KEYS, "close() left 'f' armed as a stop key"
+    print(f"  4 bins, 5 attempts, {exp.tally()}; every phase and cursor as "
+          "specified")
+
+
+def _exp_abandoned_attempt_is_still_written() -> None:
+    """Quitting mid-attempt must not lose the row.
+
+    `close()` runs from main()'s finally, and __main__ leaves through
+    os._exit(0). If the in-flight attempt were dropped here it would exist on
+    disk with no row in the summary — the shape of bug that silently trains on
+    82 of 354 episodes.
+    """
+    exp = m.ExperimentSession(["+x", "+y"], max_steps=50)
+    exp.start_requested()
+    exp.attempt_started()
+    summary = exp.close("user quit")
+    assert len(summary["rows"]) == 1, "the in-flight attempt was dropped"
+    assert summary["rows"][0]["verdict"] == "abandoned"
+    assert summary["rows"][0]["ending"] == "abandoned"
+    print("  an attempt in flight at quit is written as abandoned, not lost")
+
+
+def _src(name: str) -> ast.Module:
+    return ast.parse((Path(__file__).resolve().parent / name).read_text())
+
+
+def _literal_list(tree: ast.Module, name: str) -> list:
+    """The value of a module-level `name = [...]` of literals."""
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return [ast.literal_eval(e) for e in node.value.elts
+                    if isinstance(e, ast.Constant)]
+    raise AssertionError(f"{name} not found")
+
+
+def _exp_records_the_jaw_closure() -> None:
+    """The measured grasp width has to survive an early verdict.
+
+    THE NUMBER IS THE POINT. The fingers are commanded to 0.0 m, so whatever
+    they settle at is the thickness of what they caught — a grasp that closed
+    on air reads ~0 mm and one that caught a 34 mm box reads 34 mm. That is the
+    only signal in the session that distinguishes "the policy closed" from "the
+    policy grasped" without asking a human, and it decides nothing less than
+    whether a `pass` row means what it says.
+
+    So sampling once at the verdict is not enough, and this test is about
+    exactly that failure: the operator can press 'p' while the fingers are
+    still travelling, and the sample would then record a gripper caught in
+    mid-close, wider than the object and indistinguishable from a slip. The
+    minimum tracked across the closing window does not depend on when the
+    human's hand moved.
+    """
+    saved = m.gripper_finger_m
+    try:
+        exp = m.ExperimentSession(["+x", "+y"], max_steps=50)
+
+        # The approach: fully open, 40 mm per finger -> 80 mm of jaw.
+        m.gripper_finger_m = 0.040
+        exp.start_requested()
+        exp.attempt_started(t_start=100.0)
+        for _ in range(5):
+            exp.note_gripper(m.gripper_finger_m)
+        exp.attempt_ended("close", steps=9, verdict=None, t_end=104.5)
+        assert abs(exp.cur["grip_end_mm"] - 80.0) < 1e-6, exp.cur["grip_end_mm"]
+
+        # The fingers travel in. The operator judges at the FIRST sample after
+        # they settle, so the running minimum and the verdict sample agree.
+        for q in (0.030, 0.020, 0.012, 0.0085, 0.0085):
+            m.gripper_finger_m = q
+            exp.note_gripper(q)
+        exp.verdict_given("pass")
+        r = exp.rows[-1]
+        assert abs(r["grip_min_mm"] - 17.0) < 1e-6, r["grip_min_mm"]
+        assert abs(r["grip_verdict_mm"] - 17.0) < 1e-6, r["grip_verdict_mm"]
+        assert abs(r["grip_end_mm"] - 80.0) < 1e-6, r["grip_end_mm"]
+
+        # THE EARLY VERDICT. Same grasp, but judged one sample in, while the
+        # jaws are still at 60 mm. `grip_verdict_mm` honestly reports the 60;
+        # `grip_min_mm` is what a later reader plots.
+        m.gripper_finger_m = 0.040
+        exp.start_requested()
+        exp.attempt_started(t_start=200.0)
+        exp.note_gripper(0.040)
+        exp.attempt_ended("close", steps=6, verdict=None, t_end=203.0)
+        m.gripper_finger_m = 0.030
+        exp.note_gripper(0.030)
+        exp.verdict_given("pass")
+        r = exp.rows[-1]
+        assert abs(r["grip_verdict_mm"] - 60.0) < 1e-6, r["grip_verdict_mm"]
+        assert abs(r["grip_min_mm"] - 60.0) < 1e-6, (
+            "the approach's 80 mm leaked into the closing window — the minimum "
+            "must be re-armed at attempt_ended")
+
+        # A FAILURE NEVER CLOSED, so the jaws are the real open reading and the
+        # row still carries one: an empty cell there would be indistinguishable
+        # from a gripper that was never talking to us.
+        exp2 = m.ExperimentSession(["+x"], max_steps=50)
+        m.gripper_finger_m = 0.0395
+        exp2.start_requested()
+        exp2.attempt_started(t_start=300.0)
+        exp2.note_gripper(0.0395)
+        exp2.attempt_ended("policy_fail", steps=4, verdict="fail",
+                           t_end=306.0, froze=True)
+        r = exp2.rows[-1]
+        assert abs(r["grip_end_mm"] - 79.0) < 1e-6, r["grip_end_mm"]
+
+        # No gripper on the bus at all: None, not a 0.0 that reads as shut.
+        m.gripper_finger_m = None
+        exp3 = m.ExperimentSession(["+x"], max_steps=50)
+        exp3.start_requested()
+        exp3.attempt_started(t_start=400.0)
+        exp3.note_gripper(None)
+        exp3.attempt_ended("timeout", steps=50, verdict="fail", t_end=430.0)
+        assert exp3.rows[-1]["grip_end_mm"] is None
+        assert exp3.rows[-1]["grip_min_mm"] is None
+    finally:
+        m.gripper_finger_m = saved
+
+    # READ OFF THE SOURCE, not imported: exp_recorder pulls in cv2 and this
+    # file's whole point is that it runs with numpy and nothing else. The
+    # coupling is real either way — ATTEMPT_FIELDS is what csv.DictWriter is
+    # given, and extrasaction="ignore" means a column missing from it is
+    # dropped in silence rather than raising.
+    fields = _literal_list(_src("exp_recorder.py"), "ATTEMPT_FIELDS")
+    for k in ("grip_end_mm", "grip_min_mm", "grip_verdict_mm"):
+        assert k in fields, (
+            f"{k} is set on the row but missing from ATTEMPT_FIELDS, so "
+            "csv.DictWriter would drop it without a word")
+    print("  jaw closure recorded at the end, the verdict and as a running min")
+
+
+def _exp_keys_cannot_be_outranked() -> None:
+    """'f' and 'p' must be dispatched where the spec puts them.
+
+    Three orderings carry the whole design and none of them is visible in a
+    behavioural test of any single function:
+
+      * 't' outranks 'f', so an emergency stop is never recorded as a policy
+        failure;
+      * 'f'/'p' precede 's', because _swallowed_keys can deliver a whole batch
+        and an 'f' arriving with an 's' must end THIS attempt rather than be
+        inherited by the next one;
+      * every stop key routes through request_stop, so which key stopped the
+        motion survives to the dispatch that has to tell them apart.
+    """
+    import ast
+
+    src = Path(m.__file__).read_text()
+    tree = ast.parse(src)
+    main_fn = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "main")
+    ifs = [n for n in ast.walk(main_fn) if isinstance(n, ast.If)]
+
+    def find(fragment):
+        hits = [n for n in ifs if fragment in ast.unparse(n.test)]
+        assert len(hits) == 1, f"{fragment!r} matched {len(hits)} branches"
+        return hits[0]
+
+    t_br = find("'t' in pressed")
+    fp_br = find("'f' in pressed or 'p' in pressed")
+    q_br = find("'q' in pressed")
+    s_br = find("'s' in pressed")
+    assert t_br.lineno < fp_br.lineno, (
+        f"'t' is at {t_br.lineno}, AFTER the f/p branch at {fp_br.lineno} — an "
+        "emergency stop would be recorded as a policy failure")
+    assert fp_br.lineno < q_br.lineno < s_br.lineno, (
+        f"f/p ({fp_br.lineno}) must precede q ({q_br.lineno}) and s "
+        f"({s_br.lineno}): an 'f' batched with an 's' would start the next "
+        "attempt before the failure was recorded")
+    print(f"  t={t_br.lineno} < f/p={fp_br.lineno} < q={q_br.lineno} < "
+          f"s={s_br.lineno}")
+
+    # 't' must no longer be inferred from the flag, or an 'f'-raised stop would
+    # be dispatched as a user stop.
+    assert "stop_requested" not in ast.unparse(t_br.test), (
+        "the 't' branch still tests `stop_requested`, so a stop raised by 'f' "
+        "inside a motion would be recorded as \"stopped by user ('t')\"")
+
+    # Both poller paths must raise through request_stop, or stop_reason_key is
+    # never set and the normalisation below has nothing to put back.
+    poll = next(n for n in ast.walk(main_fn)
+                if isinstance(n, ast.FunctionDef) and n.name == "_poll_keys")
+    raises = [c for c in ast.walk(poll) if isinstance(c, ast.Call)
+              and ast.unparse(c.func) == "request_stop"]
+    assert len(raises) == 2, (
+        f"{len(raises)} request_stop calls in _poll_keys; the OpenCV path and "
+        "the 3D-window path must each raise one")
+    assert all("STOP_KEYS" in ast.unparse(n.test) for n in
+               [x for x in ast.walk(poll) if isinstance(x, ast.If)
+                if "in STOP_KEYS" in ast.unparse(x.test)]), "unreachable"
+    assert sum(1 for x in ast.walk(poll) if isinstance(x, ast.If)
+               and "STOP_KEYS" in ast.unparse(x.test)) == 2, (
+        "both poller paths must test STOP_KEYS, not a hard-coded 't'")
+
+    # The session and the recorder must be shut down FIRST in the finally, or
+    # os._exit(0) takes the buffered data with it.
+    tries = [n for n in ast.walk(main_fn) if isinstance(n, ast.Try)
+             and n.finalbody]
+    fin = max(tries, key=lambda n: len(n.finalbody)).finalbody
+    heads = [ast.unparse(st)[:40] for st in fin[:2]]
+    assert "exp is not None" in heads[0] and "rec is not None" in heads[1], (
+        f"the finally starts with {heads} — exp.close() and rec.close() must "
+        "come first, before the cameras, because __main__ exits through "
+        "os._exit(0) and nothing buffered survives it")
+    print("  finally closes the session and the recorder before anything else")
+
+    # And the 3D window must actually deliver the keys.
+    dcw = (Path(m.__file__).parent / "dual_cloud_window.py").read_text()
+    keys = next(n for n in ast.parse(dcw).body if isinstance(n, ast.Assign)
+                and getattr(n.targets[0], "id", "") == "INTERACTIVE_KEYS")
+    have = ast.literal_eval(keys.value)
+    missing = [k for k in "tshfpq" if k not in have]
+    assert not missing, (
+        f"INTERACTIVE_KEYS is {have!r}, missing {missing} — those keys are "
+        "silently dropped whenever the cloud window has focus, which is the "
+        "window you are looking at while the arm moves")
+    print(f"  the 3D window forwards {have!r}")
+
+
 def _sweep() -> None:
     """The conclusion has to hold across the plants that fit the measurements.
 
@@ -1126,11 +1666,20 @@ def main() -> None:
     _tolerance_can_never_skip_a_step()
     print("\nfixed-rate control (--control rate)")
     _fixed_rate_tracks_and_never_deadlocks()
+    _reversal_is_not_a_stall()
+    _off_axis_motion_is_not_under_travel()
     print("\nhoming motion")
     _homing_is_continuous()
     _second_home_does_not_hunt()
     print("\nabort key ('t')")
     _abort_interrupts_a_motion_in_progress()
+    print("\nauto-home after a close")
+    _auto_home_cannot_outrank_a_key()
+    print("\nexperiment mode")
+    _exp_session_walks_the_sequence()
+    _exp_abandoned_attempt_is_still_written()
+    _exp_records_the_jaw_closure()
+    _exp_keys_cannot_be_outranked()
     if args.sweep:
         _sweep()
     print("\nall step-motion checks passed")

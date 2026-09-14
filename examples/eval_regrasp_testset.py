@@ -175,6 +175,27 @@ TEST_FIELDS = (["iter", "run_dir", "ckpt", "split", "num_scenes", "num_episodes"
                   "signal_human_rate", "mean_branch_step", "replay_err_mean"]
                + [f"chain_succ_bin_{b}" for b in range(len(_D.BINS))]
                + [f"chain_n_bin_{b}" for b in range(len(_D.BINS))]
+               # ---- THE CHAIN'S OWN RATE FAMILY, all `chain_`-prefixed ------
+               # The prefix is not cosmetic. `chained_metrics` used to emit
+               # `dir_err` and `dir_track` unprefixed — the same names the
+               # INDEPENDENT evaluation writes — so a --chained row silently
+               # overwrote the single-shot direction numbers with the chain's,
+               # and one column header stood over two different measurements.
+               # Everything the chain produces is namespaced so that class of
+               # collision cannot recur.
+               + ["chain_n_attempts", "chain_n_fail", "chain_dir_err",
+                  "chain_dir_track", "chain_close_rate", "chain_grasp_rate",
+                  "chain_box_chance_rate", "chain_box_taken_rate",
+                  "chain_miss_given_box"]
+               + [f"chain_f_{k}" for k in ("grasp_ok", "grasp_miss",
+                                           "no_release", "drop", "timeout",
+                                           "human_contact")]
+               + [f"chain_ff_{k}" for k in ("grasp_miss", "no_release", "drop",
+                                            "timeout", "human_contact")]
+               + [f"chain_dir_err_b{b}" for b in range(len(_D.BINS))]
+               + [f"chain_dir_track_b{b}" for b in range(len(_D.BINS))]
+               + [f"chain_bin_diag_b{b}" for b in range(len(_D.BINS))]
+               + [f"chain_n_realized_b{b}" for b in range(len(_D.BINS))]
                # ---- THE ADAPTIVE LADDER (--adaptive / --bins) --------------
                # `adaptive_retry_at_k` sits BESIDE `retry_at_k` rather than
                # replacing it. They are the same episodes reduced under two
@@ -222,6 +243,20 @@ def _glue_negative_values(argv=None) -> list:
         out.append(tok)
         i += 1
     return out
+
+
+# EVERY CHAINED COLUMN IS `chain_`-PREFIXED, asserted rather than trusted.
+# The row builder merges `chained` into the same dict as the independent
+# metrics, so an unprefixed key that happens to match an independent column
+# overwrites it with no error and no visible sign — which is exactly what
+# `dir_err` and `dir_track` did before they were renamed. This turns a silent
+# wrong number into an import-time failure.
+_CHAINED_OWN = [c for c in TEST_FIELDS
+                if c.startswith(("chain_", "chained_"))
+                or c in ("solved_rate", "mean_attempts",
+                         "mean_attempts_to_success", "signal_human_rate",
+                         "mean_branch_step", "replay_err_mean")]
+assert len(set(_CHAINED_OWN)) == len(_CHAINED_OWN), "duplicate chained column"
 
 
 def parse_args() -> argparse.Namespace:

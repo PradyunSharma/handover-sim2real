@@ -7,6 +7,8 @@
 # Knobs, all optional, all read from the environment so one file serves every
 # run (`--export` them or put them inline as above):
 #
+#     FORCE     1 to re-score iterations already in the CSV (default off)
+#     OUT       CSV filename, e.g. test_chained_log.csv  (default <split>_log.csv)
 #     RUN       run NAME under $OUT_ROOT           (default regrasp_run9)
 #     RUN_DIR   full path, overrides RUN           (default $OUT_ROOT/$RUN)
 #     SPLIT     test | val | train                 (default test)
@@ -158,6 +160,8 @@ fi
 # and compute images do not have to agree, and losing a 3 h job to that is not
 # worth the two characters saved.
 EXTRA=()
+[ "${FORCE:-0}" = "1" ] && EXTRA+=(--force)
+[ -n "${OUT:-}" ]      && EXTRA+=(--out "$OUT")
 [ "${CHAINED:-0}" = "1" ]   && EXTRA+=(--chained)
 [ "${ADAPTIVE:-0}" = "1" ]  && EXTRA+=(--adaptive --rank-mode "${RANK_MODE:-ucb}")
 [ "${FULL_BINS:-0}" = "1" ] && EXTRA+=(--full-bin-coverage)

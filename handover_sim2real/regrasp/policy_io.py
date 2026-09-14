@@ -177,6 +177,13 @@ class BCRunner(PolicyRunner):
             # normalization of rs happens inside predict(), after this.
             d_ee = direction_in_ee_frame(rs, self.d_world)
             pc, self.last_cloud_info = build_model_cloud(pc, d_ee)
+            # KEPT FOR THE REAL-ROBOT RECORDER, at the cost of one reference to
+            # an array `build_model_cloud` just allocated. The [N, 7] the
+            # network actually ate is otherwise only re-derivable by re-running
+            # the kNN/PCA normal estimation, which couples a stored session to
+            # whichever scipy is installed when someone reads it back.
+            self.last_d_ee = d_ee
+            self.last_model_cloud = pc
         pc_t = torch.from_numpy(np.asarray(pc, dtype=np.float32)).unsqueeze(0).to(self.device)
         rs_t = torch.from_numpy(rs).float().unsqueeze(0).to(self.device)
         # BCPolicy.predict denormalizes ch0..5 and hard-thresholds ch6 to {0,1}.

@@ -444,6 +444,12 @@ class BCPolicy(nn.Module):
         if self.normalizer is not None:
             raw = self.normalizer.denormalize_action(raw)
         cont    = raw[..., :6]
+        # KEPT FOR DEPLOYMENT DIAGNOSTICS, at the cost of one detached tensor.
+        # The threshold below turns a real number into a bit, and on hardware
+        # that bit is the entire close decision — "it did not close" and "it
+        # nearly closed" are the same observation without this. A second forward
+        # pass to recover it would cost ~10 ms of a 150 ms control period.
+        self.last_raw = raw.detach()
         gripper = (torch.sigmoid(raw[..., 6:7]) > 0.5).float()
         return torch.cat([cont, gripper], dim=-1)
 

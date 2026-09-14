@@ -7,6 +7,10 @@
 # Knobs, all optional, all read from the environment so one file serves every
 # run (`--export` them or put them inline as above):
 #
+#     NO_PIN     1 to drop the pin table and score ALL 144 test scenes
+#                (pose diagnostics go NaN — see the script's --no-pin-table)
+#     FORCE      1 to re-score iterations already in the CSV (default off)
+#     OUT        CSV filename (default <split>_log.csv)
 #     RUN        run NAME under $OUT_ROOT            (default dagger4_run19)
 #     RUN_DIR    full path, overrides RUN            (default $OUT_ROOT/$RUN)
 #     SPLIT      test | val | train                  (default test)
@@ -124,6 +128,9 @@ fi
 # have to agree on the bash version and losing a 3 h job to that is not worth the
 # two characters saved.
 EXTRA=()
+[ "${NO_PIN:-0}" = "1" ] && EXTRA+=(--no-pin-table)
+[ "${FORCE:-0}" = "1" ] && EXTRA+=(--force)
+[ -n "${OUT:-}" ]      && EXTRA+=(--out "$OUT")
 [ -n "${CKPT:-}" ]       && EXTRA+=(--ckpt "$CKPT")
 [ -n "${PIN_TABLE:-}" ]  && EXTRA+=(--pin-table "$PIN_TABLE")
 [ -n "${NUM_SCENES:-}" ] && EXTRA+=(--num-scenes "$NUM_SCENES")

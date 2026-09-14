@@ -33,7 +33,8 @@ BIN_RGB = ((0.12, 0.47, 0.71),      # +x  free end        tab:blue
            (0.58, 0.40, 0.74))      # -z  from beneath    tab:purple
 
 
-def draw_anchor_frame(anchor_R, origin, ids, length=0.15, width=3.0):
+def draw_anchor_frame(anchor_R, origin, ids, length=0.15, width=3.0,
+                      label=True, short=False, text_size=1.0):
     """The gravity-aligned, wrist-anchored frame every direction is expressed in.
 
         x = horizontal(object centroid - giver's wrist)   "away from the hand"
@@ -46,6 +47,11 @@ def draw_anchor_frame(anchor_R, origin, ids, length=0.15, width=3.0):
 
     Positive axes are solid and labelled; negatives are drawn at half length so
     the handedness is readable without cluttering the object.
+
+    `label=False` drops the three captions and keeps the lines; `short=True`
+    replaces them with a bare `x` / `y` / `z`. The text is drawn at 1.12x the
+    axis length, i.e. right where the object and the grasp are, so the full
+    captions hide the thing they name on a busy scene while the letters do not.
     """
     import pybullet
 
@@ -54,6 +60,8 @@ def draw_anchor_frame(anchor_R, origin, ids, length=0.15, width=3.0):
     for k, (col, lab) in enumerate(((( 1.0, 0.25, 0.25), "x  away from hand"),
                                     (( 0.25, 1.0, 0.25), "y  lateral"),
                                     (( 0.35, 0.55, 1.0), "z  world up"))):
+        if short:
+            lab = lab[0]
         a = R[:, k]
         ids.append(pybullet.addUserDebugLine(
             origin.tolist(), (origin + length * a).tolist(),
@@ -61,9 +69,10 @@ def draw_anchor_frame(anchor_R, origin, ids, length=0.15, width=3.0):
         ids.append(pybullet.addUserDebugLine(
             origin.tolist(), (origin - 0.5 * length * a).tolist(),
             lineColorRGB=[c * 0.45 for c in col], lineWidth=width * 0.5))
-        ids.append(pybullet.addUserDebugText(
-            lab, (origin + 1.12 * length * a).tolist(),
-            textColorRGB=list(col), textSize=1.0))
+        if label:
+            ids.append(pybullet.addUserDebugText(
+                lab, (origin + 1.12 * length * a).tolist(),
+                textColorRGB=list(col), textSize=float(text_size)))
 
 
 def draw_bin_sphere(anchor_R, origin, ids, radius=0.10, n_points=2400,
@@ -167,3 +176,70 @@ def draw_grasp_point(grasp_pose, centroid_world, ids, *,
         c.tolist(), pt.tolist(), lineColorRGB=[v * 0.7 for v in colour],
         lineWidth=1.5))
     return float(np.linalg.norm(pt - c))
+
+
+def draw_hand_anchor(wrist, centroid, ids, *, size=11.0,
+                     centroid_colour=(0.10, 0.95, 0.95),
+                     wrist_colour=(1.00, 0.20, 0.80), label=True,
+                     text_size=1.0):
+    """The two POINTS the anchor frame is built from, and the chord between them.
+
+    `draw_anchor_frame` draws the RESULT — three axes at an origin. It does not
+    show where that origin came from or why +x points the way it does, and those
+    are exactly the two things that go wrong: a centroid computed on a partial
+    cloud sits off the object, and a wrist that has drifted behind the object
+    flips +x through 180 deg. Both are invisible in the axes alone.
+
+        cyan point      `c`, the object point-cloud centroid = the frame ORIGIN
+        magenta point   `p_wrist`, MANO link 7 (the wrist JOINT, at the base of
+                        the palm — NOT the hand-cloud centroid, which sits ~5 cm
+                        into the palm; `anchor.py` documents the difference)
+        thin grey       the raw chord `c - p_wrist`, which is 3-D
+        thick red       its HORIZONTAL part, drawn in the centroid's z-plane so
+                        it overlays the `x away from hand` axis exactly. The
+                        gap between the two lines is the vertical component the
+                        anchor throws away.
+
+    Returns the horizontal wrist-to-object distance in metres, which is the
+    quantity `anchor_rotation`'s hysteresis thresholds (0.04 / 0.08 m) are
+    compared against — print it and you can see how close a scene is to the
+    degenerate straight-overhead case that trips the base-frame fallback.
+
+    `wrist` may be None (no hand in the scene, or the fallback engaged): the
+    centroid is still marked and `None` comes back.
+    """
+    import pybullet
+
+    c = np.asarray(centroid, dtype=np.float64)
+    ids.append(pybullet.addUserDebugPoints(
+        [c.tolist()], [list(centroid_colour)], pointSize=float(size)))
+    if label:
+        ids.append(pybullet.addUserDebugText(
+            "c  object cloud centroid", (c + np.array([0.0, 0.0, 0.035])).tolist(),
+            textColorRGB=list(centroid_colour), textSize=float(text_size)))
+
+    if wrist is None:
+        return None
+    w = np.asarray(wrist, dtype=np.float64)
+    if not np.all(np.isfinite(w)):
+        return None
+
+    ids.append(pybullet.addUserDebugPoints(
+        [w.tolist()], [list(wrist_colour)], pointSize=float(size)))
+    if label:
+        ids.append(pybullet.addUserDebugText(
+            "MANO wrist", (w + np.array([0.0, 0.0, 0.035])).tolist(),
+            textColorRGB=list(wrist_colour), textSize=float(text_size)))
+
+    ids.append(pybullet.addUserDebugLine(
+        w.tolist(), c.tolist(), lineColorRGB=[0.55, 0.55, 0.55], lineWidth=1.5))
+
+    h = c - w
+    h[2] = 0.0
+    r = float(np.linalg.norm(h))
+    if r > 1e-9:
+        # In the centroid's z-plane, so it lies on top of the frame's +x axis.
+        ids.append(pybullet.addUserDebugLine(
+            (c - h).tolist(), c.tolist(),
+            lineColorRGB=[1.0, 0.25, 0.25], lineWidth=3.0))
+    return r

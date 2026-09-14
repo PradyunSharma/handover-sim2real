@@ -134,6 +134,16 @@ def parse_args() -> argparse.Namespace:
                         "Requires a table built with --members-per-bin >= N; an "
                         "older table has only the head and this silently reads "
                         "as 1, so the count is checked and reported.")
+    p.add_argument("--keep-unplanned", action="store_true",
+                   help="carry scenes OMG cannot plan for into the table with "
+                        "ZERO grasps but their anchor frame intact. They can "
+                        "then be COMMANDED (the anchor needs only the object "
+                        "cloud, the wrist and world up — no planner) though they "
+                        "demonstrate nothing, which takes s0/test from 129 "
+                        "scenes to 144. Only --full-bin-coverage reaches them, "
+                        "and they score into succ_bin_all_* rather than "
+                        "succ_bin_*. Off by default: it re-bases the denominator "
+                        "of every rate in the table.")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
@@ -180,7 +190,7 @@ def main() -> None:
     excluded, reasons = [], Counter()
     pairs_hist, seps = Counter(), []
     per_scene_bins = Counter()      # per-bin mode: scenes reaching each bin
-    n_paired = n_single = n_too_close = n_short = 0
+    n_paired = n_single = n_too_close = n_short = n_unplanned = 0
 
     # Scene order is fixed (sorted) so the greedy assignment is reproducible; the
     # emptiness tie-break makes it order-dependent, and an unstable order would
@@ -190,6 +200,26 @@ def main() -> None:
         feas = [e for e in s["bins"]
                 if e["bin"] not in drop
                 and float(e["angle_to_axis_deg"]) <= args.max_angle]
+        # A SCENE OMG COULD NOT PLAN FOR still has an anchor frame — see the
+        # `_anchor_only` entry in `build_direction_table.py`. It supplies no
+        # demonstration in any bin, so it can never appear in `succ_bin_*`, but
+        # `d = to_world(command_axes[b], anchor_R)` is perfectly well defined on
+        # it and the policy can be asked. `--keep-unplanned` carries it into the
+        # pin table with zero grasps, where only `--full-bin-coverage` reaches
+        # it and it lands in `succ_bin_all_*`.
+        #
+        # OFF BY DEFAULT, because it changes the denominator of every rate in
+        # the table and silently re-basing a run's own eval set is how two
+        # numbers stop being comparable without either looking wrong.
+        if s.get("no_plan") and not feas:
+            if args.keep_unplanned:
+                table[idx] = {**{k: v for k, v in s.items() if k != "bins"},
+                              "grasps": []}
+                n_unplanned += 1
+            else:
+                excluded.append(idx)
+                reasons["no_plan"] += 1
+            continue
         if len(feas) < max(1, args.min_bins):
             excluded.append(idx)
             reasons["no_feasible_bin" if not feas else "too_few_bins"] += 1

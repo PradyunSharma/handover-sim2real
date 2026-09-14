@@ -346,7 +346,7 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
                      grasp_pin_table=None, show_anchor_frame=False,
                      show_bin_sphere=False, bin_sphere_radius=0.10,
                      bin_sphere_points=2400, show_d=False, d_rule=None,
-                     d_point_depth=None, d_min_offset=None):
+                     d_point_depth=None, d_min_offset=None, show_wrist=False):
     import gym
     import pybullet
     import time
@@ -565,7 +565,7 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
         computed in — the conditioning channels use the visible-surface centroid,
         so that is what has to be drawn.
         """
-        if not (show_anchor_frame or show_bin_sphere or show_d):
+        if not (show_anchor_frame or show_bin_sphere or show_d or show_wrist):
             return
         aR = meta.get("anchor_R")
         if aR is None:
@@ -599,6 +599,19 @@ def visualize_replay(dataset_path, ep_idx, cfg_file, source="states",
                                     n_points=bin_sphere_points)
         if show_anchor_frame:
             _rg_viz.draw_anchor_frame(aR, c_world, goal_ids)
+        if show_wrist:
+            # THE STORED WRIST, NOT A LIVE ONE. The frame was built at step 0
+            # and the hand keeps moving through the replay, so reading the
+            # simulator would draw a point the labels were never computed
+            # against. `wrist_world` is NaN-filled when the episode had no hand.
+            r = _rg_viz.draw_hand_anchor(meta.get("wrist_world"), c_world, goal_ids)
+            mode = str(meta.get("anchor_mode", "?"))
+            if r is None:
+                print("  [anchor] no wrist recorded for this episode — the "
+                      f"frame came from the robot-base fallback (mode={mode}).")
+            else:
+                print(f"  [anchor] horizontal wrist -> object {r * 100:.1f} cm  "
+                      f"(mode={mode}; the fallback engages below 4 cm)")
 
         if not show_d:
             return
@@ -987,6 +1000,10 @@ def parse_args():
                         "BIN, with a labelled ray down each bin axis")
     p.add_argument("--bin-sphere-radius", type=float, default=0.10)
     p.add_argument("--bin-sphere-points", type=int, default=2400)
+    p.add_argument("--show-wrist", action="store_true",
+                   help="mark the MANO wrist and the object cloud centroid — "
+                        "the two points the anchor frame is built from — and "
+                        "the horizontal chord between them that defines +x.")
     p.add_argument("--show-d", action="store_true",
                    help="draw the conditioning vector: white = what the episode "
                         "was COMMANDED (`d_world`), yellow = this shard's d_rule "
@@ -1074,6 +1091,7 @@ def main():
                          show_bin_sphere=args.show_bin_sphere,
                          bin_sphere_radius=args.bin_sphere_radius,
                          bin_sphere_points=args.bin_sphere_points,
+                         show_wrist=args.show_wrist,
                          show_d=args.show_d, d_rule=args.d_rule,
                          d_point_depth=args.d_point_depth,
                          d_min_offset=args.d_min_offset)

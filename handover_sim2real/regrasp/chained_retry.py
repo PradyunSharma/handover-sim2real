@@ -179,6 +179,13 @@ class Attempt:
     grasp_pose: object = None
     d_world: object = None        # the command this attempt was given
     bin_idx: int = -1             # which bin that direction is
+    bin_realized: int = -1        # which bin the gripper ACTUALLY ended in
+    """Set in `chained_retry_scene`, where the anchor frame is in scope — it is
+    not recoverable here. `bin_idx == bin_realized` is the chain's analogue of
+    the evaluator's `bin_diag_rate`, and without it the chain can report "did
+    the arm end up pointing the right way" only as a mean angle, which cannot
+    distinguish a policy 40 deg off on every attempt from one that nails three
+    bins and inverts the fourth."""
     dir_err: float = float("nan")  # angle to the achieved approach axis, degrees
     stop_reason: str = ""         # SIGNAL_HUMAN when the ladder ran out
 
@@ -501,8 +508,16 @@ def chained_retry_scene(sim, runner, scene_idx: int, pose_of_bin, *,
         att.d_world = np.asarray(d_world, dtype=np.float64)
         att.bin_idx = int(bin_idx)
         if att.ee_final is not None:
-            att.dir_err = float(_rg_dirs.angle_between(
-                d_world, _rg_dirs.approach_direction(np.asarray(att.ee_final))))
+            achieved = _rg_dirs.approach_direction(np.asarray(att.ee_final))
+            att.dir_err = float(_rg_dirs.angle_between(d_world, achieved))
+            # THE REALISED BIN, named in the same frame the command was. The
+            # achieved direction is a WORLD vector; binning it without first
+            # projecting into the anchor frame would compare it against the
+            # octahedral axes in world coordinates, which are a different set of
+            # directions entirely. `from_world` is the projection the evaluator
+            # uses for exactly this, so the two agree by construction.
+            att.bin_realized = int(_rg_dirs.bin_of(
+                _rg_dirs.from_world(achieved, anchor_R)))
         attempts.append(att)
         if viz is not None:
             viz.end_attempt(att)
@@ -615,16 +630,66 @@ def chained_metrics(per_scene: dict, max_attempts: int = 4) -> dict:
     # which would make the retry inert however good the OR-over-attempts looks.
     errs = [a.dir_err for atts in per_scene.values() for a in atts
             if a.dir_err == a.dir_err]
-    out["dir_err"] = float(np.mean(errs)) if errs else float("nan")
-    out["dir_track"] = float(1.0 - np.mean(errs) / 90.0) if errs else float("nan")
+    # `chain_`-PREFIXED, and that is a bug fix. These were emitted as `dir_err`
+    # / `dir_track`, which are also the INDEPENDENT evaluation's column names —
+    # so writing the chained dict into the same row silently overwrote the
+    # single-shot numbers with the chain's, and the CSV then carried one label
+    # over two different measurements with no way to tell which had won.
+    out["chain_dir_err"] = float(np.mean(errs)) if errs else float("nan")
+    out["chain_dir_track"] = (float(1.0 - np.mean(errs) / 90.0) if errs
+                              else float("nan"))
     by_bin = {}
     for atts in per_scene.values():
         for a in atts:
             if a.bin_idx >= 0:
-                by_bin.setdefault(a.bin_idx, []).append(a.success)
+                by_bin.setdefault(a.bin_idx, []).append(a)
     for b, v in sorted(by_bin.items()):
-        out[f"chain_succ_bin_{b}"] = float(np.mean(v))
+        out[f"chain_succ_bin_{b}"] = float(np.mean([a.success for a in v]))
         out[f"chain_n_bin_{b}"] = len(v)
+        # PER-BIN DIRECTION TRACKING, over the attempts that COMMANDED that bin.
+        # The pooled `dir_err` above averages four physically different commands
+        # and cannot tell a policy that tracks every bin loosely from one that
+        # nails three and inverts the fourth — which is the whole reason the
+        # independent evaluation reports these per bin.
+        errs = [a.dir_err for a in v if a.dir_err == a.dir_err]
+        out[f"chain_dir_err_b{b}"] = float(np.mean(errs)) if errs else float("nan")
+        out[f"chain_dir_track_b{b}"] = (float(1.0 - np.mean(errs) / 90.0)
+                                        if errs else float("nan"))
+        # ...and how often the arm ENDED in the bin it was told, the chain's
+        # analogue of the evaluator's `bin_diag_rate`. Attempts whose
+        # `bin_realized` could not be derived (no final EE pose) are excluded
+        # rather than counted as misses.
+        real = [a for a in v if a.bin_realized >= 0]
+        out[f"chain_bin_diag_b{b}"] = (
+            float(np.mean([a.bin_realized == a.bin_idx for a in real]))
+            if real else float("nan"))
+        out[f"chain_n_realized_b{b}"] = len(real)
+
+    # ---- OPPORTUNITY AND COMMIT, pooled over every attempt ------------------
+    # The chain's twin of `box_chance_rate` / `box_taken_rate`. The `Attempt`
+    # dataclass has carried `box_chance` and `box_taken` since the module was
+    # written and nothing aggregated them, so a chained sweep could report how
+    # OFTEN it succeeded and never why — leaving "the arm never got the object
+    # between its fingers" and "it got it there and declined to close"
+    # indistinguishable, which is the single most useful split in the
+    # independent evaluation.
+    #
+    # OVER ATTEMPTS, NOT SCENES, and deliberately: an attempt is the unit that
+    # either got a chance or did not. Per scene it would have to be an OR over a
+    # variable number of attempts, which makes the denominator depend on how
+    # early the chain stopped — i.e. on how good the policy is.
+    all_att = [a for atts in per_scene.values() for a in atts]
+    n_att = max(len(all_att), 1)
+    n_box = sum(1 for a in all_att if a.box_chance)
+    out["chain_n_attempts"] = len(all_att)
+    out["chain_box_chance_rate"] = n_box / n_att
+    out["chain_box_taken_rate"] = (sum(a.box_taken for a in all_att) / n_box
+                                   if n_box else float("nan"))
+    out["chain_miss_given_box"] = (
+        sum(1 for a in all_att if a.box_chance and not a.success) / n_box
+        if n_box else float("nan"))
+    out["chain_close_rate"] = sum(1 for a in all_att if a.closed) / n_att
+    out["chain_grasp_rate"] = sum(1 for a in all_att if a.grasped) / n_att
     # How often the ladder ran out rather than the policy simply failing. A high
     # rate here means the feasibility mask is too tight, not that the policy is
     # bad, and the two must not be read as the same thing.
@@ -632,9 +697,35 @@ def chained_metrics(per_scene: dict, max_attempts: int = 4) -> dict:
                 if atts and atts[-1].stop_reason)
     out["signal_human_rate"] = n_sig / n_scenes
 
+    # ---- HOW THE ATTEMPTS ENDED -------------------------------------------
+    # `reasons` was computed here and returned as a raw dict, which no caller
+    # could write to a CSV — so a chained sweep has never reported a failure
+    # taxonomy. The fractions are emitted alongside it under fixed names, under
+    # BOTH denominators, matching `f_*` / `ff_*` in the independent evaluation:
+    #
+    #   chain_f_*   of every attempt. Moves whenever success moves.
+    #   chain_ff_*  of the FAILED attempts. The shape of the failure, and the
+    #               one that survives a change in the success rate.
+    #
+    # Note the population: ATTEMPTS, not scenes. A scene solved on attempt 2
+    # contributes one failure and one success, which is the honest accounting —
+    # the failed first attempt really did happen and really did cost a rollout.
     reasons = {}
     for atts in per_scene.values():
         for a in atts:
             reasons[a.reason] = reasons.get(a.reason, 0) + 1
     out["reasons"] = reasons
+    n_fail_att = sum(1 for a in all_att if not a.success)
+    out["chain_n_fail"] = n_fail_att
+    for part, name in (("GRASP_OK", "grasp_ok"), ("GRASP_MISS", "grasp_miss"),
+                       ("NO_RELEASE", "no_release"), ("DROP", "drop"),
+                       ("TIMEOUT", "timeout"),
+                       ("HUMAN_CONTACT", "human_contact")):
+        # `_status_name` can OR two failures into "DROP|HUMAN_CONTACT"; charge
+        # the attempt to each so none goes missing from the breakdown.
+        c = sum(n for r, n in reasons.items() if part in str(r).split("|"))
+        out[f"chain_f_{name}"] = c / n_att
+        if part != "GRASP_OK":
+            out[f"chain_ff_{name}"] = (c / n_fail_att if n_fail_att
+                                       else float("nan"))
     return out

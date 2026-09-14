@@ -133,6 +133,35 @@ class WatchdogLimits:
     # a scene the detector cannot resolve turns every frame into a detection and
     # the control loop stops meeting its rate.
     min_reseed_interval_s: float = 1.0
+    # HOW FAR A RE-SEED MAY MOVE THE OBJECT, and it is the same 0.22 m on
+    # purpose — a re-seed runs on the SAME FRAME as the track it replaces, so
+    # the real object has not moved at all and the whole allowance is detector
+    # box noise plus the one stale frame that triggered the fault. Anything
+    # beyond it is not a recovered track, it is a different object.
+    #
+    # THE HOLE THIS CLOSES WAS MEASURED ON HARDWARE. `note_reseed` clears the
+    # centroid history, so the jump test above could not fire on the frame
+    # after a re-seed: a re-seed was a free pass to relocate the object
+    # anywhere in the image. Observed on a `+x` attempt at step 26 — the object
+    # mask moved 140 px with ZERO overlap with the mask it replaced (all 5336
+    # pixels newly object, none of them previously hand), the object cloud's
+    # median leapt from 14.7 cm to 21.4 cm, and the wrong region was then
+    # tracked happily for the remaining six steps while the policy, told the
+    # object had retreated, hovered at 19 cm and never closed.
+    max_reseed_jump_m: float = 0.22
+
+
+# Prefix on the one fault that means "the REPLACEMENT is wrong", as opposed to
+# "the track has drifted". The two need different answers — see `segment` — and
+# the alternative to a marker is a second return value threaded through two call
+# sites for one bit.
+RESEED_FAULT = "re-seed landed elsewhere: "
+
+# How much further than the rig's own object crop radius a freshly detected
+# object box may sit from the hand. A 2D box's 3D median is a cruder estimate
+# than a mask's, so a little slack is right; 2x the crop radius is not, because
+# past the crop the deprojection stage deletes the points anyway.
+SEED_DIST_SLACK = 1.4
 
 
 class _Watchdog:
@@ -145,6 +174,11 @@ class _Watchdog:
     def reset(self) -> None:
         self._area: dict[int, int] = {}
         self._centroid: dict[int, np.ndarray] = {}
+        # The centroid as it was JUST BEFORE the current re-seed, kept so the
+        # replacement can be held to it. Consumed on the first check after the
+        # re-seed and not carried further: two re-seeds later it would be
+        # anchoring the track to a scene that has genuinely moved on.
+        self._pre_reseed: dict[int, np.ndarray] = {}
         self._last_reseed = 0.0
         self.reseeds = 0
         self.last_reason: Optional[str] = None
@@ -156,6 +190,11 @@ class _Watchdog:
         self._last_reseed = now
         self.reseeds += 1
         self.last_reason = reason
+        # AREA is cleared and the CENTROID is carried. A re-seeded mask may
+        # legitimately be a very different size — a fresh detection of a
+        # partly occluded object often is — but it may not be somewhere else,
+        # because it is a detection of the same frame.
+        self._pre_reseed = dict(self._centroid)
         self._area.clear()
         self._centroid.clear()
 
@@ -182,10 +221,20 @@ class _Watchdog:
         if centroid_m is not None and np.all(np.isfinite(centroid_m)):
             prev = self._centroid.get(obj_id)
             self._centroid[obj_id] = centroid_m
-            if prev is not None:
-                jump = float(np.linalg.norm(centroid_m - prev))
-                if jump > lim.max_centroid_jump_m:
-                    return f"{name} centroid jumped {jump*100:.0f} cm in one step"
+            # Against the previous frame normally; against the pre-re-seed
+            # centroid on the first check after a re-seed, which is the case
+            # the cleared history used to make unverifiable.
+            base, limit, when, tag = (prev, lim.max_centroid_jump_m,
+                                      "in one step", "")
+            if prev is None and self._pre_reseed.get(obj_id) is not None:
+                base = self._pre_reseed.pop(obj_id)
+                limit, when, tag = (lim.max_reseed_jump_m,
+                                    "from the track it replaced", RESEED_FAULT)
+            if base is not None:
+                jump = float(np.linalg.norm(centroid_m - base))
+                if jump > limit:
+                    return (f"{tag}{name} centroid jumped "
+                            f"{jump*100:.0f} cm {when}")
 
         if score < lim.min_score:
             return f"{name} track score {score:.2f}"
@@ -500,6 +549,10 @@ class Sam2Segmenter:
         self._cfg = config
         self._rigs = list(rigs)
         self._device = config.device
+        # Why `_pick_object` refused, carried the one frame from the pick to
+        # `_seed`'s return so the HUD says "35 cm from the hand" rather than
+        # the generic "no object box distinguishable from the hand box".
+        self._last_seed_reject: Optional[str] = None
 
         if config.sam2_model not in SAM2_MODELS:
             raise ValueError(
@@ -639,6 +692,18 @@ class Sam2Segmenter:
                 break
 
             debug["reason"] = fault
+            if fault.startswith(RESEED_FAULT):
+                # A REPLACEMENT THAT LANDED SOMEWHERE ELSE IS NOT A TRACK, and
+                # it is the one fault the point floors cannot catch: the wrong
+                # region is a perfectly healthy 1300-point cloud, well above
+                # `min_object_points`, so nothing downstream objects and the
+                # policy is steered by it for the rest of the episode. Empty
+                # masks are the honest answer here, exactly as they are for a
+                # failed seed above — the runner holds the arm, costs no step,
+                # and the next frame is a fresh chance.
+                debug["reseeds"] = session.watchdog.reseeds
+                debug["refused_reseed"] = True
+                return SegmentationResult(hand=empty, object=empty, debug=debug)
             if attempt == 1 or not session.watchdog.may_reseed(now):
                 # Rate-limited out, or already retried. Return what was measured
                 # with the fault recorded — the HUD shows it and the downstream
@@ -673,9 +738,11 @@ class Sam2Segmenter:
             return f"no box for {self._cfg.object_prompt!r}"
 
         hand_det = self._pick_hand(rig, hands)
+        self._last_seed_reject = None
         object_det = self._pick_object(rig, objects, hand_det)
         if object_det is None:
-            return "no object box distinguishable from the hand box"
+            return (self._last_seed_reject
+                    or "no object box distinguishable from the hand box")
 
         for obj_id, det in ((OBJ_HAND, hand_det), (OBJ_OBJECT, object_det)):
             self._predictor.add_new_points_or_box(
@@ -722,18 +789,43 @@ class Sam2Segmenter:
 
     def _pick_object(self, rig, dets: list[Detection],
                      hand: Detection) -> Optional[Detection]:
-        """The object box nearest the chosen hand in 3D.
+        """The object box nearest the chosen hand in 3D, AND near enough.
 
         An open-vocabulary detector asked for "an object" will happily return
         the hand, the arm, and the table as well. Nearness to the hand that was
         already disambiguated is the constraint that actually applies: the
         object is BEING HELD.
+
+        NEAREST IS NOT THE SAME AS NEAR, and this used to be a bare argmin with
+        no bound, so when every candidate was wrong the least-wrong one won and
+        was tracked for the rest of the episode with nothing downstream able to
+        object. The visible symptom is the mask jumping on 's': `perception.
+        reset()` drops the SAM2 session at every episode boundary — it must,
+        because a memory bank carried across episodes is confidently wrong
+        rather than merely stale — so every 's' is a fresh detection, and a
+        fresh detection is exactly where an unbounded argmin does its damage.
+
+        The bound is the rig's OWN `object_max_radius_m`, which is already the
+        answer to "how far from the hand may a point be and still be the
+        object" — 0.26 m for a fixed camera. Beyond it, the deprojection stage
+        would delete nearly every point of this box anyway, so accepting it
+        buys a track that cannot survive its own crop. `SEED_DIST_SLACK`
+        loosens it a little because a 2D box's 3D median is a cruder estimate
+        than a mask's, and being slightly generous here costs a little wrong
+        surface while being tight costs the whole seed.
+
+        Returning None sends `_seed` down its existing failure path: empty
+        masks, the arm holds, no step is consumed, and the next frame is a
+        fresh chance with the reason on the HUD.
         """
         hand_xyz = self._box_centroid_cam(rig, hand.box)
         candidates = [d for d in dets if _iou(d.box, hand.box) < 0.85]
         if not candidates:
             return None
         if hand_xyz is None:
+            # No depth to judge with. Falling back to the detector's ranking is
+            # the documented behaviour of every geometry helper here — it can
+            # only do better than confidence, never fail closed.
             return candidates[0]
 
         best, best_d = None, np.inf
@@ -744,7 +836,16 @@ class Sam2Segmenter:
             d = float(np.linalg.norm(xyz - hand_xyz))
             if d < best_d:
                 best, best_d = det, d
-        return best or candidates[0]
+        if best is None:
+            return candidates[0]        # depth answered for none of them
+        limit = SEED_DIST_SLACK * float(getattr(
+            rig.params, "object_max_radius_m", 0.26))
+        if best_d > limit:
+            self._last_seed_reject = (
+                f"nearest object box is {best_d*100:.0f} cm from the hand "
+                f"(limit {limit*100:.0f}); nothing detected is being held")
+            return None
+        return best
 
     # ── geometry helpers ─────────────────────────────────────────────────────
 
@@ -917,3 +1018,121 @@ def _iou(a: np.ndarray, b: np.ndarray) -> float:
     area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
     union = area_a + area_b - inter
     return float(inter / union) if union > 0 else 0.0
+
+
+# ── offline check ────────────────────────────────────────────────────────────
+
+def selftest() -> None:
+    """The track-health and seed-pick policy, with no torch and no camera.
+
+    Only the pure-numpy decision logic is exercised, which is where every bug
+    this file has had actually lived. The predictor and the detector need
+    weights and a GPU and are not testable here.
+    """
+    import types
+
+    lim = WatchdogLimits()
+    mask = np.zeros((48, 64), np.uint8)
+    mask[10:30, 10:30] = 1                      # 400 px, well over min_pixels
+    at = lambda x: np.array([float(x), 0.0, 1.0])
+
+    # ---- tracking, unchanged ------------------------------------------------
+    w = _Watchdog(lim)
+    assert w.check(OBJ_OBJECT, mask, 0.0, at(0.00)) is None
+    assert w.check(OBJ_OBJECT, mask, 0.0, at(0.05)) is None
+    f = w.check(OBJ_OBJECT, mask, 0.0, at(0.60))
+    assert f and "in one step" in f, f
+    assert not f.startswith(RESEED_FAULT), (
+        "an ordinary drift was tagged as a re-seed fault, which would throw "
+        "the frame away instead of letting the point floors judge it")
+
+    # ---- THE CASE THAT COST AN EPISODE -------------------------------------
+    # After a re-seed the history used to be cleared, so a replacement mask on
+    # the far side of the image passed every test.
+    w = _Watchdog(lim)
+    assert w.check(OBJ_OBJECT, mask, 0.0, at(0.00)) is None
+    w.note_reseed(time.time(), "object mask collapsed to 12 px")
+    f = w.check(OBJ_OBJECT, mask, 0.0, at(0.31))
+    assert f is not None, (
+        "a re-seed 31 cm from the track it replaced was accepted — it runs on "
+        "the same frame, so the object cannot have moved at all")
+    assert f.startswith(RESEED_FAULT) and "from the track it replaced" in f, f
+
+    # ... and a re-seed that lands where the object was is what re-seeding is
+    # FOR, so it must pass — otherwise the guard breaks recovery.
+    w = _Watchdog(lim)
+    assert w.check(OBJ_OBJECT, mask, 0.0, at(0.00)) is None
+    w.note_reseed(time.time(), "object track score -3.10")
+    assert w.check(OBJ_OBJECT, mask, 0.0, at(0.03)) is None, (
+        "a re-seed 3 cm from the old centroid was refused")
+    # The anchor is consumed, not kept: two frames later the scene has moved on.
+    assert w.check(OBJ_OBJECT, mask, 0.0, at(0.18)) is None
+
+    # Area is a fault while TRACKING and allowed across a re-seed, where a
+    # fresh detection of a partly occluded object legitimately differs.
+    w = _Watchdog(lim)
+    small = np.zeros((48, 64), np.uint8)
+    small[10:20, 10:20] = 1                     # 100 px
+    assert w.check(OBJ_OBJECT, mask, 0.0, at(0.0)) is None
+    f = w.check(OBJ_OBJECT, small, 0.0, at(0.0))
+    assert f and "area changed" in f, f
+    w = _Watchdog(lim)
+    assert w.check(OBJ_OBJECT, mask, 0.0, at(0.0)) is None
+    w.note_reseed(time.time(), "object mask area changed 4.0x")
+    assert w.check(OBJ_OBJECT, small, 0.0, at(0.0)) is None, (
+        "a re-seed was refused for changing size, which is the one thing a "
+        "fresh detection is allowed to do")
+
+    # ---- the seed pick, which every 's' goes through -----------------------
+    # `perception.reset()` drops the SAM2 session at each episode boundary, so
+    # pressing 's' always re-detects. `_pick_object` was a bare argmin, so when
+    # every candidate was wrong the least-wrong one was seeded and tracked.
+    class _Cam:
+        def depth_to_pointcloud(self, **kw):
+            raise AssertionError("the stub must not reach depth")
+
+    class _Rig:
+        name = "tripod"
+        params = types.SimpleNamespace(object_max_radius_m=0.26)
+        camera = _Cam()
+
+    seg = Sam2Segmenter.__new__(Sam2Segmenter)   # no torch, no weights
+    seg._last_seed_reject = None
+    boxes = {"hand": (10.0, 10.0, 40.0, 40.0),
+             "near": (42.0, 10.0, 70.0, 40.0),
+             "far": (300.0, 300.0, 340.0, 340.0)}
+    where = {boxes["hand"]: at(0.00), boxes["near"]: at(0.12),
+             boxes["far"]: at(0.55)}
+    seg._box_centroid_cam = lambda rig, box: where[tuple(box)]
+    D = lambda b: types.SimpleNamespace(box=boxes[b], score=0.9)
+    rig, hand = _Rig(), D("hand")
+
+    got = seg._pick_object(rig, [D("near"), D("far")], hand)
+    assert got is not None and tuple(got.box) == boxes["near"], (
+        "the held object 12 cm from the hand was not picked")
+
+    seg._last_seed_reject = None
+    got = seg._pick_object(rig, [D("far")], hand)
+    assert got is None, (
+        "a box 55 cm from the hand was seeded as the held object — nearest is "
+        "not the same as near, and this is the argmin that had no bound")
+    assert seg._last_seed_reject and "from the hand" in seg._last_seed_reject
+    print(f"    seed refused with: {seg._last_seed_reject}")
+
+    # A box just inside the bound must still be accepted, or the limit is
+    # asserting nothing but its own tightness.
+    edge = (200.0, 200.0, 240.0, 240.0)
+    where[edge] = at(SEED_DIST_SLACK * 0.26 - 0.01)
+    seg._last_seed_reject = None
+    got = seg._pick_object(rig, [types.SimpleNamespace(box=edge, score=0.5)],
+                           hand)
+    assert got is not None, (
+        f"a box just inside the {SEED_DIST_SLACK * 0.26 * 100:.0f} cm limit "
+        "was refused")
+
+    print("sam2: drift/collapse/area faults as before; a re-seed is held to "
+          "the track it replaced; a seed is held to the hand")
+
+
+if __name__ == "__main__":
+    selftest()
