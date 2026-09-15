@@ -211,14 +211,21 @@ def main() -> None:
         # OFF BY DEFAULT, because it changes the denominator of every rate in
         # the table and silently re-basing a run's own eval set is how two
         # numbers stop being comparable without either looking wrong.
-        if s.get("no_plan") and not feas:
+        # ANY scene with a frame and no feasible bin, not only the unplannable
+        # ones. A scene whose whole goal set falls in a dropped bin (`-x`, `-z`)
+        # or beyond `--max-angle` planned fine and still demonstrates nothing —
+        # to the policy it is indistinguishable from a scene OMG could not plan
+        # for, and keying this on `no_plan` alone excluded s0/test scene 104
+        # (goal set of 4, all in dropped bins) while keeping the 14 unplannable
+        # ones. Same anchor, same commandability, different branch: a hole.
+        if not feas and s.get("anchor_R") is not None:
             if args.keep_unplanned:
                 table[idx] = {**{k: v for k, v in s.items() if k != "bins"},
-                              "grasps": []}
+                              "grasps": [], "no_plan": True}
                 n_unplanned += 1
             else:
                 excluded.append(idx)
-                reasons["no_plan"] += 1
+                reasons["no_plan" if s.get("no_plan") else "no_feasible_bin"] += 1
             continue
         if len(feas) < max(1, args.min_bins):
             excluded.append(idx)

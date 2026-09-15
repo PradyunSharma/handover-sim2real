@@ -211,7 +211,8 @@ TEST_FIELDS = (["iter", "run_dir", "ckpt", "split", "num_scenes", "num_episodes"
                + ["rank_mode", "rank_order", "rank_order_idx",
                   "rank_seq_requested", "rank_stable_frac", "rank_reorders",
                   "mean_attempts_indep", "solved_rate_indep",
-                  "stop_on_success", "full_bin_coverage", "command_axes_src"]
+                  "stop_on_success", "full_bin_coverage", "command_axes_src",
+                  "max_steps"]
                + [f"rank_pos_b{b}" for b in range(len(_D.BINS))]
                + [f"rank_post_b{b}" for b in range(len(_D.BINS))]
                + [f"rank_emp_b{b}" for b in range(len(_D.BINS))]
@@ -385,6 +386,13 @@ def parse_args() -> argparse.Namespace:
                         "`best/` was selected on the TRAIN subsample and is not "
                         "necessarily best here, which is why this defaults to a "
                         "re-selection rather than to that.")
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="override EVAL.max_steps, the policy-step horizon per "
+                        "episode (run 19: 50 = 7.5 s; the benchmark's own clock "
+                        "is 13 s = 86 steps). ONLY the never-closed bucket can "
+                        "move: every other failure ends the episode before the "
+                        "horizon. Recorded in the CSV so two sweeps at different "
+                        "horizons cannot be confused.")
     p.add_argument("--pos-thresh", type=float, default=0.02)
     p.add_argument("--rot-thresh", type=float, default=0.34)
     return p.parse_args(_glue_negative_values())
@@ -1296,6 +1304,10 @@ def main() -> None:
     # is meaningless here for the same reason — nothing collects on test.
     ev["num_scenes"] = int(args.num_scenes) if args.num_scenes else 10 ** 6
     ev["holdout"] = False
+    if args.max_steps is not None:
+        print(f"[eval] max_steps {ev.get('max_steps')} -> {int(args.max_steps)} "
+              f"(--max-steps); only the never-closed bucket can change")
+        ev["max_steps"] = int(args.max_steps)
     seed = int(args.seed if args.seed is not None
                else cfg4.get("DAGGER", {}).get("seed", 0))
 
@@ -1512,6 +1524,7 @@ def main() -> None:
 
         row = {k: "" for k in TEST_FIELDS}
         row.update({"iter": i, "run_dir": str(run_dir), "ckpt": args.ckpt,
+                    "max_steps": int(ctx.eval_params.max_steps),
                     "split": args.split, "num_scenes": len(ctx.eval_scenes),
                     "num_episodes": int(m.get("n", 0)),
                     "eval_s": round(eval_s, 1),

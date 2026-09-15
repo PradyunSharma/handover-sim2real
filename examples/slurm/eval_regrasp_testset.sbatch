@@ -161,6 +161,7 @@ fi
 # worth the two characters saved.
 EXTRA=()
 [ "${FORCE:-0}" = "1" ] && EXTRA+=(--force)
+[ -n "${MAX_STEPS:-}" ] && EXTRA+=(--max-steps "$MAX_STEPS")
 [ -n "${OUT:-}" ]      && EXTRA+=(--out "$OUT")
 [ "${CHAINED:-0}" = "1" ]   && EXTRA+=(--chained)
 [ "${ADAPTIVE:-0}" = "1" ]  && EXTRA+=(--adaptive --rank-mode "${RANK_MODE:-ucb}")

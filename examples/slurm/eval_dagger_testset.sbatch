@@ -130,6 +130,7 @@ fi
 EXTRA=()
 [ "${NO_PIN:-0}" = "1" ] && EXTRA+=(--no-pin-table)
 [ "${FORCE:-0}" = "1" ] && EXTRA+=(--force)
+[ -n "${MAX_STEPS:-}" ] && EXTRA+=(--max-steps "$MAX_STEPS")
 [ -n "${OUT:-}" ]      && EXTRA+=(--out "$OUT")
 [ -n "${CKPT:-}" ]       && EXTRA+=(--ckpt "$CKPT")
 [ -n "${PIN_TABLE:-}" ]  && EXTRA+=(--pin-table "$PIN_TABLE")

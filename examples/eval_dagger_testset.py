@@ -128,7 +128,7 @@ PIN_PROVENANCE = ("mode", "tol", "setup", "hand_collision_filter",
                   "hand_collision_thresh", "valid_grasp_dict_path")
 
 TEST_FIELDS = (["iter", "run_dir", "ckpt", "split", "num_scenes", "n_episodes",
-                "eval_s", "pin_table", "excluded_applied"]
+                "eval_s", "pin_table", "excluded_applied", "max_steps"]
                + [c for c in EVAL_FIELDS
                   if c not in ("iter", "run_dir", "ckpt", "num_scenes", "eval_s")]
                + ["n_fail"] + list(FAIL_REASONS.values())
@@ -180,6 +180,13 @@ def parse_args() -> argparse.Namespace:
                    help="re-score iterations already in the CSV")
     p.add_argument("--plot-only", action="store_true",
                    help="skip evaluation, re-render the figures from the CSV")
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="override EVAL.max_steps, the policy-step horizon per "
+                        "episode (run 19: 50 = 7.5 s; the benchmark's own clock "
+                        "is 13 s = 86 steps). ONLY the never-closed bucket can "
+                        "move: every other failure ends the episode before the "
+                        "horizon. Recorded in the CSV so two sweeps at different "
+                        "horizons cannot be confused.")
     p.add_argument("--summary-iter", type=int, default=None,
                    help="which iteration <split>_summary.png shows (default: the "
                         "highest success_rate in the CSV). The run's own `best/` "
@@ -430,6 +437,10 @@ def main() -> None:
     # meaningless here for the same reason — nothing collects on test.
     ev["num_scenes"] = int(args.num_scenes) if args.num_scenes else 10 ** 6
     ev["holdout"] = False
+    if args.max_steps is not None:
+        print(f"[eval] max_steps {ev.get('max_steps')} -> {int(args.max_steps)} "
+              f"(--max-steps); only the never-closed bucket can change")
+        ev["max_steps"] = int(args.max_steps)
     seed = int(args.seed if args.seed is not None
                else cfg4.get("DAGGER", {}).get("seed", 0))
 
@@ -497,6 +508,7 @@ def main() -> None:
                     "split": args.split, "num_scenes": len(ctx.eval_scenes),
                     "n_episodes": int(m.get("n", 0)), "eval_s": round(eval_s, 1),
                     "pin_table": sim["grasp_pin_table"] or "(disabled)",
+                    "max_steps": int(ctx.eval_params.max_steps),
                     "excluded_applied": excluded_applied, "n_fail": n_fail})
         for k in TEST_FIELDS:
             if k in m:
